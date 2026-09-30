@@ -171,6 +171,7 @@ ecord/
 - [ ] **Dedicated palettes** for the two dark themes that currently fall back to `Dark`
 - [ ] Missing Lucide icons (GIF, sticker, inbox, shop) — currently placeholders
 - [ ] Cleanup in `main.rs` (remove the `println!("Hello, world!")`)
+- [ ] Make search bar functional
 
 ### 🔧 Quality & maintenance — `v0.2`
 - [ ] Merge `rest.rs` and `uwu_rest.rs` into a single REST client
