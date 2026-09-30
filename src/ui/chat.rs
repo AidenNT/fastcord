@@ -60,6 +60,10 @@ const TOOLBAR_BUTTON: f32 = 26.0;
 const TOOLBAR_WIDTH: f32 = 148.0;
 /// Ancho de la tarjeta "Hilo de respuestas" que va debajo de un mensaje.
 const THREAD_CARD_WIDTH: f32 = 380.0;
+/// Margen derecho de los mensajes (igual al izquierdo): sin él, en un panel
+/// angosto (el de hilos) embeds y tarjetas llegan hasta el borde y se ven
+/// cortados.
+const MESSAGE_RIGHT_GUTTER: f32 = 16.0;
 /// Pasado este tiempo sin mensajes, la tarjeta de un hilo dice que no hay
 /// mensajes recientes (3 días = el archivado automático por defecto).
 const THREAD_RECENT_MS: i64 = 3 * 24 * 60 * 60 * 1000;
@@ -849,6 +853,7 @@ fn message_row(
                 // mensaje anterior.
                 ui.add_space(AVATAR_GUTTER);
                 ui.vertical(|ui| {
+                    ui.set_max_width((ui.available_width() - MESSAGE_RIGHT_GUTTER).max(120.0));
                     ui.spacing_mut().item_spacing.y = 2.0;
                     message_body(ui, palette, msg, channels, index, toggled_reaction, actions);
                 });
@@ -869,6 +874,7 @@ fn message_row(
                 }
 
                 ui.vertical(|ui| {
+                    ui.set_max_width((ui.available_width() - MESSAGE_RIGHT_GUTTER).max(120.0));
                     ui.spacing_mut().item_spacing.y = 2.0;
                     ui.horizontal(|ui| {
                         // Como en Discord: el nombre lleva el color del rol
@@ -994,7 +1000,13 @@ fn thread_card(ui: &mut egui::Ui, palette: &Palette, card: &ThreadCard, actions:
         .corner_radius(CornerRadius::same(theme::RADIUS_SMALL))
         .inner_margin(Margin::symmetric(10, 7))
         .show(ui, |ui| {
-            ui.set_width(THREAD_CARD_WIDTH);
+            // Un ancho fijo de 380px (+ margen y borde, ~402px) no entra en
+            // el panel lateral de hilos (420px menos avatar y márgenes del
+            // mensaje): desbordaba y el panel entero crecía hacia la
+            // izquierda, quedando tapado por el chat central. Dentro del
+            // Frame `available_width` ya descuenta margen y borde, así que
+            // alcanza con topearlo.
+            ui.set_width(ui.available_width().min(THREAD_CARD_WIDTH));
             ui.spacing_mut().item_spacing = Vec2::new(8.0, 2.0);
             ui.horizontal(|ui| {
                 theme::text(ui, &card.name, theme::semibold(13.0), palette.text);
@@ -1852,7 +1864,10 @@ fn composer(
                 .corner_radius(CornerRadius::same(theme::RADIUS))
                 .inner_margin(Margin::symmetric(10, 5))
                 .show(ui, |ui| {
-                    ui.set_width(ui.available_width() - 32.0);
+                    // `available_width` ya descuenta el margen interno de ambos lados
+                    // del Frame: restar 16 deja 16px a la derecha (igual que a la
+                    // izquierda); con 32 quedaban 32px y el campo se veía corrido.
+                    ui.set_width(ui.available_width() - 16.0);
                     ui.horizontal(|ui| {
                         theme::text(ui, format!("Respondiendo a {}", reply.author), theme::regular(11.5), palette.dim);
                         theme::text(ui, &reply.preview, theme::regular(11.5), palette.secondary);
@@ -1874,11 +1889,14 @@ fn composer(
             .corner_radius(CornerRadius::same(theme::RADIUS + 2))
             .inner_margin(Margin::symmetric(12, 8))
             .show(ui, |ui| {
-                ui.set_width(ui.available_width() - 32.0);
+                // `available_width` ya descuenta el margen interno de ambos lados
+                    // del Frame: restar 16 deja 16px a la derecha (igual que a la
+                    // izquierda); con 32 quedaban 32px y el campo se veía corrido.
+                    ui.set_width(ui.available_width() - 16.0);
                 ui.horizontal(|ui| {
                     theme::icon(ui, Icon::CirclePlus, 16.0, palette.dim);
 
-                    let text_width = ui.available_width() - 80.0;
+                    let text_width = ui.available_width() - 44.0;
                     // `return_key`: Enter sin Shift no inserta un salto de
                     // línea (por defecto en un `multiline` SÍ lo haría) —
                     // se detecta más abajo como "hay que mandar" y se

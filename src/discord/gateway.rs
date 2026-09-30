@@ -57,7 +57,7 @@ use crate::discord::AppEvent;
 
 const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json&compress=zlib-stream";
 const MOCK_URL_URL: &str = "ws://localhost:5380";
-const USE_MOCK_URL: bool = true;
+const USE_MOCK_URL: bool = false;
 
 
 
@@ -167,6 +167,15 @@ pub enum GatewayCommand {
         self_mute: bool,
         self_deaf: bool,
     },
+    /// Opcode 20 (`STREAM_WATCH`): pedir ver el stream `stream_key`
+    /// (`guild:<guild>:<canal>:<usuario>` o `call:<canal>:<usuario>`).
+    /// Discord responde con `STREAM_CREATE` + `STREAM_SERVER_UPDATE`.
+    StreamWatch { stream_key: String },
+    /// Opcode 19 (`STREAM_DELETE`): dejar de ver (o cortar, si es el propio)
+    /// el stream `stream_key`.
+    StreamDelete { stream_key: String },
+    /// Opcode 22 (`STREAM_SET_PAUSED`): pausar/reanudar el stream.
+    StreamSetPaused { stream_key: String, paused: bool },
 }
 
 /// La suscripción a la lista de miembros vigente. Se guarda para volver a
@@ -227,6 +236,22 @@ fn update_voice_state_payload(
         },
     })
     .to_string()
+}
+
+/// Opcode 20: pedir ver un stream (Go Live).
+fn stream_watch_payload(stream_key: &str) -> String {
+    serde_json::json!({ "op": 20, "d": { "stream_key": stream_key } }).to_string()
+}
+
+/// Opcode 19: dejar de ver / terminar un stream.
+fn stream_delete_payload(stream_key: &str) -> String {
+    serde_json::json!({ "op": 19, "d": { "stream_key": stream_key } }).to_string()
+}
+
+/// Opcode 22: pausar o reanudar un stream.
+fn stream_set_paused_payload(stream_key: &str, paused: bool) -> String {
+    serde_json::json!({ "op": 22, "d": { "stream_key": stream_key, "paused": paused } })
+        .to_string()
 }
 
 #[derive(Serialize)]
@@ -523,6 +548,18 @@ async fn connect_and_run(
                             self_mute,
                             self_deaf,
                         );
+                        write.send(Message::Text(payload.into())).await?;
+                    }
+                    GatewayCommand::StreamWatch { stream_key } => {
+                        let payload = stream_watch_payload(&stream_key);
+                        write.send(Message::Text(payload.into())).await?;
+                    }
+                    GatewayCommand::StreamDelete { stream_key } => {
+                        let payload = stream_delete_payload(&stream_key);
+                        write.send(Message::Text(payload.into())).await?;
+                    }
+                    GatewayCommand::StreamSetPaused { stream_key, paused } => {
+                        let payload = stream_set_paused_payload(&stream_key, paused);
                         write.send(Message::Text(payload.into())).await?;
                     }
                 }
@@ -968,6 +1005,25 @@ fn handle_dispatch(
         "VOICE_SERVER_UPDATE" => {
             let server: super::VoiceServerUpdate = serde_json::from_value(data)?;
             let _ = tx.send(AppEvent::VoiceServerUpdate(server));
+        }
+        // Go Live. Al pedir ver un stream (opcode 20) llegan
+        // `STREAM_CREATE` (con el `rtc_server_id`) y `STREAM_SERVER_UPDATE`
+        // (con endpoint + token del servidor de media), en ese orden.
+        "STREAM_CREATE" => {
+            let stream: super::StreamCreate = serde_json::from_value(data)?;
+            let _ = tx.send(AppEvent::StreamCreate(stream));
+        }
+        "STREAM_SERVER_UPDATE" => {
+            let update: super::StreamServerUpdate = serde_json::from_value(data)?;
+            let _ = tx.send(AppEvent::StreamServerUpdate(update));
+        }
+        "STREAM_UPDATE" => {
+            let update: super::StreamUpdate = serde_json::from_value(data)?;
+            let _ = tx.send(AppEvent::StreamUpdate(update));
+        }
+        "STREAM_DELETE" => {
+            let delete: super::StreamDelete = serde_json::from_value(data)?;
+            let _ = tx.send(AppEvent::StreamDelete(delete));
         }
         // Alguien puso una reacción (en cualquier mensaje al que tengamos
         // acceso, no solo los nuestros). Un evento por cada

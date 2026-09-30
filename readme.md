@@ -160,7 +160,7 @@ ecord/
 - [x] Embedded video
 - [x] Notifications (in-app and desktop)
 - [x] Themes, wallpaper-based dynamic background, disk cache
-- [x] MIT license
+- [x] View streams 
 
 ### 🚧 Next — `v0.1` · Finish what's half-done
 - [ ] **Bot dropdown menus** (currently rendered disabled)

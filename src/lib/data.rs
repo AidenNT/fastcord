@@ -963,6 +963,10 @@ pub struct VoiceOccupant {
     /// implica silenciarse también, así que esto suele venir junto con
     /// `self_mute == true`.
     pub self_deaf: bool,
+    /// Transmite su pantalla (Go Live) desde este canal
+    /// (`VoiceState::self_stream`). Igual que `self_mute`, siempre sale del
+    /// último `VoiceState` recibido.
+    pub streaming: bool,
 }
 
 impl VoiceOccupant {
@@ -975,6 +979,7 @@ impl VoiceOccupant {
             known: state.known(),
             self_mute: state.self_mute,
             self_deaf: state.self_deaf,
+            streaming: state.self_stream,
         }
     }
 
@@ -1786,10 +1791,12 @@ impl Server {
                     // que se silencia justo antes de una foto completa
                     // (`READY_SUPPLEMENTAL`/`GUILD_CREATE`) se vería sin
                     // silenciar hasta el próximo cambio de canal.
-                    let (self_mute, self_deaf) = (occupant.self_mute, occupant.self_deaf);
+                    let (self_mute, self_deaf, streaming) =
+                        (occupant.self_mute, occupant.self_deaf, occupant.streaming);
                     occupant = previous.clone();
                     occupant.self_mute = self_mute;
                     occupant.self_deaf = self_deaf;
+                    occupant.streaming = streaming;
                 }
             }
             if let Some(channel) = self.channel_by_id_mut(channel_id) {

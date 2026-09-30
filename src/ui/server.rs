@@ -91,6 +91,14 @@ fn thread_side_panel(app: &mut App, ui: &mut egui::Ui, server_index: usize) {
         groups
     };
 
+    // Un título largo hacía que el placeholder ocupara dos líneas y se
+    // saliera de la barra de escribir.
+    let short_title: String = if title.chars().count() > 26 {
+        title.chars().take(25).collect::<String>() + "…"
+    } else {
+        title.clone()
+    };
+
     let mut close = false;
     let mut event = crate::ui::chat::ChatEvent::None;
 
@@ -137,7 +145,7 @@ fn thread_side_panel(app: &mut App, ui: &mut egui::Ui, server_index: usize) {
                         &palette,
                         &mut channel.messages,
                         &mut panel.compose_text,
-                        &format!("Enviar mensaje a \"{title}\""),
+                        &format!("Enviar mensaje a \"{}\"", short_title),
                         &own_name,
                         palette.accent,
                         send_target,
@@ -350,8 +358,23 @@ fn voice_member_row(
             ui.add_space(4.0);
             theme::icon(ui, Icon::MicOff, 11.0, palette.danger);
         }
+        if occupant.streaming {
+            ui.add_space(4.0);
+            live_pill(ui, palette);
+        }
     });
     ui.add_space(2.0);
+}
+
+/// Insignia roja "EN VIVO" para quien está transmitiendo (Go Live).
+fn live_pill(ui: &mut egui::Ui, palette: &Palette) {
+    Frame::new()
+        .fill(palette.danger)
+        .corner_radius(CornerRadius::same(4))
+        .inner_margin(Margin::symmetric(5, 1))
+        .show(ui, |ui| {
+            theme::text(ui, "EN VIVO", theme::semibold(9.5), palette.on_accent);
+        });
 }
 
 /// Espacio que se le quita al nombre para que no pise el candado.
@@ -649,14 +672,8 @@ fn forum_channel_view(
     }
 }
 
-/// Vista central para un canal de voz: no hay mensajes que mostrar (y
-/// esta demo no conecta audio de verdad — ver el aviso en
-/// `discord::gateway`), así que en cambio se ve la lista de quién está
-/// conectado ahora mismo.
-/// Panel central cuando el canal abierto es de voz: lista de quién está
-/// conectado (con anillo verde en el avatar del que está hablando ahora
-/// mismo, vía `App::user_voice_speaking_in_guild_str`) y, arriba, el
-/// botón para unirte vos — o "Conectado" si ya estás en este canal.
+/// Vista central de un canal de voz (con o sin integrantes). El dibujo vive
+/// en `ui::call_view`; acá solo se delega.
 fn voice_channel_view(
     app: &mut App,
     ui: &mut egui::Ui,
@@ -666,74 +683,7 @@ fn voice_channel_view(
     chan: usize,
     channel_name: &str,
 ) {
-    let server = &app.servers[server_index];
-    let guild_id = server.guild_id.clone();
-    let channel = server.channel(cat, chan);
-    let members = channel.map(|c| c.voice_members.clone()).unwrap_or_default();
-    let channel_id = channel.and_then(|c| c.channel_id.clone());
-    let already_connected = channel_id
-        .as_deref()
-        .is_some_and(|id| app.is_connected_to_voice_channel_str(&guild_id, id));
-
-    let mut join_clicked = false;
-    ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        ui.add_space(24.0);
-        ui.vertical_centered(|ui| {
-            theme::icon(ui, Icon::Volume2, 28.0, palette.dim);
-            ui.add_space(8.0);
-            theme::text(
-                ui,
-                if members.is_empty() {
-                    format!("Nadie está conectado a {channel_name} ahora mismo.")
-                } else {
-                    format!("{} conectado{} en {channel_name}", members.len(), if members.len() == 1 { "" } else { "s" })
-                },
-                theme::medium(13.0),
-                palette.dim,
-            );
-            ui.add_space(14.0);
-            if already_connected {
-                theme::soft_button(ui, palette, Some(Icon::Phone), "Conectado", true)
-                    .on_hover_text("Ya estás en este canal — usá la barra de llamada para salir");
-            } else if channel_id.is_some()
-                && theme::pill_button(ui, palette, "Unirse a la llamada", true).clicked()
-            {
-                join_clicked = true;
-            }
-        });
-        ui.add_space(20.0);
-        for occupant in &members {
-            let speaking = app.user_voice_speaking_in_guild_str(&guild_id, &occupant.user_id);
-            ui.horizontal(|ui| {
-                ui.add_space(24.0);
-                let (rect, _) = ui.allocate_exact_size(Vec2::splat(40.0), egui::Sense::hover());
-                if speaking {
-                    // Mismo verde que `Status::Online` (`ui::extra::status_color`):
-                    // no hay un color "success" separado en la paleta, el
-                    // acento de la app ya es ese verde.
-                    ui.painter().circle_stroke(rect.center(), 21.0, Stroke::new(2.0, palette.accent));
-                }
-                extra::avatar(ui, rect.center(), 20.0, occupant.avatar_url.as_deref(), occupant.avatar_color, &occupant.initial(), palette);
-                if occupant.self_deaf || occupant.self_mute {
-                    // Mismo badge que usa Discord: un círculo chico con el
-                    // ícono, apoyado en el borde inferior del avatar.
-                    let badge_center = rect.center() + Vec2::new(14.0, 14.0);
-                    ui.painter().circle_filled(badge_center, 9.0, palette.panel);
-                    let badge_icon = if occupant.self_deaf { Icon::VolumeX } else { Icon::MicOff };
-                    let badge_rect = egui::Rect::from_center_size(badge_center, Vec2::splat(11.0));
-                    theme::paint_icon(ui, badge_icon, badge_rect, 11.0, palette.danger);
-                }
-                theme::text(ui, &occupant.name, theme::regular(14.0), palette.text);
-            });
-            ui.add_space(10.0);
-        }
-    });
-
-    if join_clicked {
-        if let Some(channel_id) = channel_id {
-            app.join_voice_channel(&guild_id, &channel_id);
-        }
-    }
+    crate::ui::call_view::show(app, ui, palette, server_index, cat, chan, channel_name);
 }
 
 fn current_channel_name(server: &Server, cat: usize, chan: usize) -> String {

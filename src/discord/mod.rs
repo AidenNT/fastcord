@@ -20,9 +20,9 @@ pub(crate) mod ids;
 
 pub use voice::{
     CurrentVoiceConnectionState, MemberInfo, MicrophoneBufferMs, MicrophoneSensitivityDb,
-    VoiceAudioSettings, VoiceCache, VoiceConnectionStatus, VoiceParticipantState, VoiceScope,
-    VoiceServerInfo, VoiceSoundKind, VoiceStateInfo, VoiceParticipantPlaybackSettings,
-    VoiceParticipantVolumePercent, VoiceVolumePercent,
+    StreamWatchStatus, VoiceAudioSettings, VoiceCache, VoiceConnectionStatus,
+    VoiceParticipantState, VoiceScope, VoiceServerInfo, VoiceSoundKind, VoiceStateInfo,
+    VoiceParticipantPlaybackSettings, VoiceParticipantVolumePercent, VoiceVolumePercent,
 };
 pub use models::{
     Channel, Emoji, ForumPage, GatewayMessage, ThreadChannel, MemberListMember, MemberListUpdate, MessageUpdate,
@@ -40,6 +40,53 @@ pub struct VoiceServerUpdate {
     pub channel_id: Option<String>,
     pub endpoint: Option<String>,
     pub token: String,
+}
+
+/// `STREAM_CREATE`: alguien empezó a transmitir, o Discord confirma que
+/// pedimos ver un stream (`GatewayCommand::StreamWatch`). `rtc_server_id` es
+/// el id con el que hay que identificarse en el WebSocket de voz del stream.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct StreamCreate {
+    pub stream_key: String,
+    #[serde(default)]
+    pub rtc_server_id: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub viewer_ids: Vec<String>,
+    #[serde(default)]
+    pub paused: bool,
+}
+
+/// `STREAM_SERVER_UPDATE`: endpoint y token del servidor de media del stream
+/// (equivalente a `VOICE_SERVER_UPDATE`, pero para el Go Live).
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct StreamServerUpdate {
+    pub stream_key: String,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+/// `STREAM_UPDATE`: cambió la lista de espectadores o el estado de pausa.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct StreamUpdate {
+    pub stream_key: String,
+    #[serde(default)]
+    pub viewer_ids: Vec<String>,
+    #[serde(default)]
+    pub paused: bool,
+}
+
+/// `STREAM_DELETE`: el stream terminó (o dejó de estar disponible).
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct StreamDelete {
+    pub stream_key: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub unavailable: bool,
 }
 
 /// Todo lo que el hilo de Discord le puede avisar a la UI.
@@ -103,6 +150,22 @@ pub enum AppEvent {
     /// `VOICE_SERVER_UPDATE`: el endpoint y token para abrir el WebSocket de
     /// voz de la conexión que se acaba de pedir con `GatewayCommand::UpdateVoiceState`.
     VoiceServerUpdate(VoiceServerUpdate),
+    /// Go Live: alguien (o nosotros, al pedir verlo) creó un stream. Trae el
+    /// `rtc_server_id` que hace falta para conectarse al servidor de media.
+    StreamCreate(StreamCreate),
+    /// Endpoint + token del servidor de media de un stream que estamos viendo.
+    StreamServerUpdate(StreamServerUpdate),
+    /// Cambió la lista de espectadores / pausa de un stream.
+    StreamUpdate(StreamUpdate),
+    /// Un stream terminó.
+    StreamDelete(StreamDelete),
+    /// Progreso de la conexión de media del stream que estamos viendo
+    /// (`voice::spawn_stream_watch`): conectando, recibiendo video, falló...
+    StreamWatchStatus {
+        stream_key: String,
+        status: StreamWatchStatus,
+        message: Option<String>,
+    },
     /// Datos de un usuario pedidos por REST como respaldo, cuando un
     /// estado de voz llegó sin `member`/`user` embebido (ver
     /// `spawn_fetch_user`).

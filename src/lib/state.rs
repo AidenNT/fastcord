@@ -4,6 +4,8 @@ use egui::Color32;
 
 use crate::discord::models::{PrivateChannel, User, UserProfileResponse};
 use crate::discord::voice::VoiceRuntimeEvent;
+use crate::discord::voice::{StreamWatchHandle, StreamWatchParams, spawn_stream_watch};
+use crate::discord::StreamWatchStatus;
 use crate::discord::voice::{VoiceAudioSourceOptions, VoiceAudioSources, list_voice_audio_sources};
 use crate::discord::{AppEvent, CurrentVoiceConnectionState, VoiceAudioSettings, VoiceCache, VoiceConnectionStatus};
 use crate::lib::data::{demo_activity, demo_friends, demo_servers, ActivityCard, ChatMessage, Friend, NameResolver, Server};
@@ -254,6 +256,39 @@ pub struct FullProfile {
     pub tab: usize,
 }
 
+/// Lo que ya se sabe de un stream (Go Live) que pedimos ver. `STREAM_CREATE`
+/// y `STREAM_SERVER_UPDATE` llegan por separado y pueden invertirse, así que
+/// se van juntando acá hasta tener los tres datos (`try_start_stream_watch`).
+#[derive(Default)]
+struct PendingStreamSession {
+    rtc_server_id: Option<String>,
+    endpoint: Option<String>,
+    token: Option<String>,
+}
+
+/// El stream que se está viendo ahora mismo (a lo sumo uno).
+pub struct WatchedStream {
+    /// `guild:<guild>:<canal>:<usuario>` — identifica el stream en Discord.
+    pub stream_key: String,
+    /// Canal de voz donde transmite (para mostrar el visor en esa vista).
+    pub channel_id: String,
+    /// Nombre de quien transmite, para el título del visor.
+    pub owner_name: String,
+    pub status: StreamWatchStatus,
+    /// Detalle del error cuando `status == Failed`.
+    pub message: Option<String>,
+    /// Conexión de media. `None` hasta que llegan `rtc_server_id`, endpoint y
+    /// token; al soltarlo se corta la conexión.
+    handle: Option<StreamWatchHandle>,
+    /// Último frame subido a la GPU.
+    pub texture: Option<egui::TextureHandle>,
+    /// Tamaño en píxeles de `texture`, para respetar la proporción.
+    pub frame_size: [usize; 2],
+    /// Cuántos frames se subieron a la textura (contador de diagnóstico que
+    /// muestra el visor).
+    pub frames_shown: u64,
+}
+
 pub struct App {
     pub screen: Screen,
     pub auth: AuthStatus,
@@ -484,6 +519,15 @@ pub struct App {
     /// llamada activa (ver `toggle_self_mute`/`toggle_self_deafen`).
     pub self_mute: bool,
     pub self_deaf: bool,
+    /// Streams pedidos (Go Live) a los que todavía les falta algún dato del
+    /// Gateway, por `stream_key`.
+    stream_sessions: std::collections::HashMap<String, PendingStreamSession>,
+    /// Stream que se está viendo (`watch_stream`), si hay uno.
+    pub watching_stream: Option<WatchedStream>,
+    /// Contexto de egui, guardado para que el hilo de video pueda pedir un
+    /// repintado cada vez que hay un frame nuevo (los eventos de Discord se
+    /// procesan sin acceso al contexto).
+    egui_ctx: Option<egui::Context>,
 }
 
 impl Default for App {
@@ -596,6 +640,9 @@ impl Default for App {
             voice_connection_message: None,
             self_mute: false,
             self_deaf: false,
+            stream_sessions: std::collections::HashMap::new(),
+            watching_stream: None,
+            egui_ctx: None,
         };
         // Con el modo ya cargado, calculamos la paleta que corresponde
         // (y, si es `Wallpaper`, arrancamos el hilo que lo vigila) antes
@@ -1944,6 +1991,9 @@ impl App {
     /// curso pedimos repintar seguido para que el spinner se vea fluido
     /// aunque no haya otra interacción del usuario.
     fn poll_discord_events(&mut self, ctx: &egui::Context) {
+        if self.egui_ctx.is_none() {
+            self.egui_ctx = Some(ctx.clone());
+        }
         self.flush_member_subscription(ctx);
         let Some(rx) = &self.event_rx else { return };
         let pending: Vec<AppEvent> = rx.try_iter().collect();
@@ -2629,6 +2679,62 @@ impl App {
             // `App` — el endpoint/token de voz no se muestran en ningún
             // lado de la UI.
             AppEvent::VoiceServerUpdate(_) => {}
+            // Go Live: los tres datos para conectarse al servidor de media
+            // del stream llegan en dos eventos, en cualquier orden.
+            AppEvent::StreamCreate(create) => {
+                let key = create.stream_key.clone();
+                if self.watching_stream.as_ref().is_some_and(|w| w.stream_key == key) {
+                    self.stream_sessions.entry(key.clone()).or_default().rtc_server_id =
+                        create.rtc_server_id.clone();
+                    self.try_start_stream_watch(&key);
+                }
+            }
+            AppEvent::StreamServerUpdate(update) => {
+                let key = update.stream_key.clone();
+                if self.watching_stream.as_ref().is_some_and(|w| w.stream_key == key) {
+                    let pending = self.stream_sessions.entry(key.clone()).or_default();
+                    pending.endpoint = update.endpoint.clone();
+                    pending.token = update.token.clone();
+                    self.try_start_stream_watch(&key);
+                }
+            }
+            AppEvent::StreamUpdate(_) => {}
+            AppEvent::StreamDelete(delete) => {
+                self.stream_sessions.remove(&delete.stream_key);
+                if self.watching_stream.as_ref().is_some_and(|w| w.stream_key == delete.stream_key) {
+                    let name = self
+                        .watching_stream
+                        .as_ref()
+                        .map(|w| w.owner_name.clone())
+                        .unwrap_or_default();
+                    // El stream ya no existe: no hace falta avisarle nada al
+                    // Gateway, solo soltar la conexión y la textura.
+                    self.watching_stream = None;
+                    self.push_toast(
+                        ToastKind::Info,
+                        "Stream terminado",
+                        format!("{name} dejó de transmitir"),
+                    );
+                }
+            }
+            AppEvent::StreamWatchStatus { stream_key, status, message } => {
+                if let Some(watched) = self.watching_stream.as_mut()
+                    && watched.stream_key == stream_key
+                {
+                    watched.status = status;
+                    watched.message = message.clone();
+                    if status == StreamWatchStatus::Failed {
+                        // Se suelta la conexión (ya murió) pero el visor queda
+                        // mostrando el error hasta que se cierre.
+                        watched.handle = None;
+                        self.push_toast(
+                            ToastKind::Warning,
+                            "No se pudo ver el stream",
+                            message.unwrap_or_else(|| "Error de conexión".to_string()),
+                        );
+                    }
+                }
+            }
             AppEvent::VoiceConnectionStatusChanged { status, message, .. } => {
                 // Al cortar la conexión (`Disconnected`/`Failed`) limpiamos
                 // también lo que habíamos pedido, para que la barra de
@@ -3419,6 +3525,8 @@ impl App {
     /// Corta la conexión de voz actual, si hay una (canal de server o
     /// llamada de DM). Botón de colgar de la barra de llamada.
     pub fn leave_voice(&mut self) {
+        // Un stream se ve estando en el canal: al salir se corta también.
+        self.stop_watching_stream();
         if self.voice_target.is_none() {
             return;
         }
@@ -3733,6 +3841,132 @@ fn apply_remote_reaction(msg: &mut ChatMessage, emoji: crate::lib::data::Reactio
     }
 }
 
+// ---- Go Live: ver el stream de otra persona ----
+impl App {
+    /// Pide ver el stream de `owner_user_id` en el canal de voz `channel_id`
+    /// del server `guild_id` (opcode 20). Discord responde con
+    /// `STREAM_CREATE` + `STREAM_SERVER_UPDATE`, y recién ahí
+    /// (`try_start_stream_watch`) se abre la conexión de media.
+    ///
+    /// Hay que estar conectado a ese canal de voz: la UI solo ofrece el botón
+    /// en ese caso.
+    pub fn watch_stream(&mut self, guild_id: &str, channel_id: &str, owner_user_id: &str, owner_name: &str) {
+        let stream_key = format!("guild:{guild_id}:{channel_id}:{owner_user_id}");
+        if self.watching_stream.as_ref().is_some_and(|w| w.stream_key == stream_key) {
+            return;
+        }
+        // Solo se ve un stream a la vez: se deja el anterior primero.
+        self.stop_watching_stream();
+        let Some(commands) = self.gateway_commands.clone() else {
+            self.push_toast(ToastKind::Warning, "Sin conexión", "Todavía no hay conexión con Discord");
+            return;
+        };
+        self.stream_sessions.remove(&stream_key);
+        self.watching_stream = Some(WatchedStream {
+            stream_key: stream_key.clone(),
+            channel_id: channel_id.to_string(),
+            owner_name: owner_name.to_string(),
+            status: StreamWatchStatus::Connecting,
+            message: None,
+            handle: None,
+            texture: None,
+            frame_size: [0, 0],
+            frames_shown: 0,
+        });
+        let _ = commands.send(crate::discord::gateway::GatewayCommand::StreamWatch { stream_key });
+    }
+
+    /// Deja de ver el stream actual (botón de cerrar del visor, o al salir de
+    /// la llamada): le avisa al Gateway (opcode 19) y corta la conexión.
+    pub fn stop_watching_stream(&mut self) {
+        let Some(watched) = self.watching_stream.take() else { return };
+        self.stream_sessions.remove(&watched.stream_key);
+        if let Some(commands) = self.gateway_commands.clone() {
+            let _ = commands.send(crate::discord::gateway::GatewayCommand::StreamDelete {
+                stream_key: watched.stream_key.clone(),
+            });
+        }
+        // `watched` se suelta acá: `StreamWatchHandle::drop` corta la conexión.
+    }
+
+    /// Si ya se juntaron `rtc_server_id`, endpoint y token del stream que se
+    /// quiere ver, abre la conexión de media.
+    fn try_start_stream_watch(&mut self, stream_key: &str) {
+        let Some(pending) = self.stream_sessions.get(stream_key) else { return };
+        let (Some(rtc_server_id), Some(endpoint), Some(token)) =
+            (pending.rtc_server_id.clone(), pending.endpoint.clone(), pending.token.clone())
+        else {
+            return;
+        };
+        let Some(watched) = self.watching_stream.as_mut() else { return };
+        if watched.stream_key != stream_key || watched.handle.is_some() {
+            return;
+        }
+        // stream_key = "guild:<guild>:<canal>:<usuario>" o "call:<canal>:<usuario>":
+        // el último tramo es siempre quien transmite.
+        let owner_user_id = stream_key
+            .rsplit(':')
+            .next()
+            .and_then(crate::discord::voice::parse_user_id);
+        let user_id = self.me.as_ref().and_then(|me| crate::discord::voice::parse_user_id(&me.id));
+        let (Some(owner_user_id), Some(user_id)) = (owner_user_id, user_id) else {
+            watched.status = StreamWatchStatus::Failed;
+            watched.message = Some("No se pudo identificar al usuario del stream".to_string());
+            return;
+        };
+        let Some(event_tx) = self.event_tx.clone() else { return };
+        if self.gateway_session_id.is_empty() {
+            return;
+        }
+        let repaint_ctx = self.egui_ctx.clone();
+        let repaint: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+            if let Some(ctx) = &repaint_ctx {
+                ctx.request_repaint();
+            }
+        });
+        let params = StreamWatchParams {
+            stream_key: stream_key.to_string(),
+            rtc_server_id,
+            endpoint,
+            token,
+            user_id,
+            session_id: self.gateway_session_id.clone(),
+            owner_user_id,
+        };
+        watched.handle = Some(spawn_stream_watch(params, event_tx, repaint));
+    }
+
+    /// Pasa el último frame decodificado (si llegó uno) a la textura del
+    /// visor. Se llama una vez por frame de UI.
+    fn pump_stream_frames(&mut self, ctx: &egui::Context) {
+        let Some(watched) = self.watching_stream.as_mut() else { return };
+        // Respaldo: aunque el hilo de video no logre despertar la UI, mientras
+        // se mira un stream se repinta unas 10 veces por segundo.
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        let Some(handle) = watched.handle.as_ref() else { return };
+        let Some(frame) = handle.frames.take_new() else { return };
+        let size = [frame.width as usize, frame.height as usize];
+        if size[0] == 0 || size[1] == 0 || frame.rgba.len() != size[0] * size[1] * 4 {
+            return;
+        }
+        let image = egui::ColorImage::from_rgba_unmultiplied(size, &frame.rgba);
+        match watched.texture.as_mut() {
+            Some(texture) => texture.set(image, egui::TextureOptions::LINEAR),
+            None => {
+                watched.texture = Some(ctx.load_texture("stream_view", image, egui::TextureOptions::LINEAR));
+            }
+        }
+        watched.frame_size = size;
+        watched.frames_shown += 1;
+        if watched.frames_shown == 1 {
+            crate::logging::debug(
+                "stream",
+                format!("first stream frame uploaded to the viewer texture: {}x{}", size[0], size[1]),
+            );
+        }
+    }
+}
+
 impl eframe::App for App {
     /// Framebuffer transparente: la ventana se crea con `with_transparent(true)`
     /// (ver `main.rs`) y es `Backdrop::paint` el que decide, cada frame, cuánto
@@ -3772,6 +4006,7 @@ impl eframe::App for App {
         // nuevo se avisa dentro de la app o en el escritorio.
         self.window_focused = ui.ctx().input(|i| i.viewport().focused.unwrap_or(true));
         self.poll_discord_events(ui.ctx());
+        self.pump_stream_frames(ui.ctx());
         self.clear_viewed_mentions();
         self.ack_viewed_channel();
         self.sync_window_title(ui.ctx());
@@ -3834,6 +4069,8 @@ impl eframe::App for App {
             Screen::Server(_) => crate::ui::server::show(self, ui),
         }
 
+        // Popup del stream que se está viendo cuando no estás en la vista de la llamada.
+        crate::ui::call_view::show_popup(self, ui);
         // Overlays flotantes, siempre por encima de todo lo demás:
         // notificaciones apiladas en una esquina y el popup modal actual.
         crate::ui::overlay::show_toasts(self, ui);
@@ -3847,5 +4084,8 @@ impl eframe::App for App {
         crate::ui::video_player::show_fullscreen(ui.ctx());
         // Suelta los players de GIF (embeds `gifv`) que ya no se dibujan.
         crate::ui::video_player::end_frame(ui.ctx());
+        // Si la vista de llamada quedó en pantalla completa pero ya no se dibuja,
+        // saca la ventana de pantalla completa.
+        crate::ui::call_view::end_frame(ui.ctx());
     }
 }

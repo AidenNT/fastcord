@@ -116,6 +116,10 @@ prost-types = "0.13"
 # Compilar en `--release` u `opt-level=3`: en debug la reproducción va lenta.
 egui-video = { path = "vendor/egui-video" }
 url = "2.5.8"
+# Visor de streams (Go Live, src/discord/voice/video_decode.rs): decodifica el
+# H.264 que llega por RTP. Misma crate y versión que usa `vendor/egui-video`,
+# así que Cargo las unifica y no hay que instalar nada extra.
+ffmpeg-the-third = "6.0.0"
 
 # --- REST "undetected" de UwUDev (vendorizado con su workspace completo:
 # discord_client_structs/macros/utils como hermanos bajo vendor/) ---

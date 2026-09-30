@@ -278,12 +278,19 @@ pub(crate) fn user_bar(ui: &mut egui::Ui, app: &mut App) {
     let mut deafen_clicked = false;
     let mut mute_clicked = false;
 
+    // Margen vertical para que la tarjeta llene TODA la barra del `nav`
+    // (`FOOTER_HEIGHT` menos 2px de borde): fila de 32px (el avatar) + 2 × pad.
+    // Así el contenido queda centrado y no sobra una franja vacía abajo.
+    let pad_y = ((crate::ui::nav::FOOTER_HEIGHT - 2.0 - 32.0) / 2.0).round() as i8;
     Frame::new()
         .fill(palette.surface)
-        .inner_margin(Margin::symmetric(8, 8))
+        .inner_margin(Margin::symmetric(8, pad_y))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
+                // `nav::show` pone `item_spacing = ZERO` para todo su
+                // contenido: sin esto el nombre queda pegado al avatar.
+                ui.spacing_mut().item_spacing.x = 10.0;
                 let (rect, _) = ui.allocate_exact_size(Vec2::splat(32.0), egui::Sense::hover());
                 let (me_name, me_avatar_url) = match app.me.as_ref() {
                     Some(me) => (me.display_name().to_string(), me.avatar_url()),
@@ -291,6 +298,7 @@ pub(crate) fn user_bar(ui: &mut egui::Ui, app: &mut App) {
                 };
                 extra::avatar(ui, rect.center(), 16.0, me_avatar_url.as_deref(), palette.accent, "A", &palette);
                 ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
                     theme::text(ui, &me_name, theme::semibold(12.5), palette.text);
                     theme::text(ui, "En línea", theme::regular(10.5), palette.dim);
                 });

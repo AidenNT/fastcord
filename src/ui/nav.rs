@@ -15,7 +15,7 @@ use crate::lib::state::{App, Screen};
 use crate::ui::{call_bar, friends_panel, rail, server};
 
 /// Alto de la barra de usuario combinada de abajo.
-const FOOTER_HEIGHT: f32 = 64.0;
+pub(crate) const FOOTER_HEIGHT: f32 = 64.0;
 
 /// Dibuja el rail de servidores + panel de DMs/canales + barra de usuario,
 /// como un único panel izquierdo.
@@ -94,7 +94,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     // `FOOTER_HEIGHT` le reservó arriba al calcular
                     // `top_height` — la diferencia quedaba sin pintar,
                     // mostrando el negro de fondo debajo de la barra.
-                    ui.set_min_height(FOOTER_HEIGHT);
+                    // El Frame suma 1px de borde arriba y 1px abajo: se
+                    // los restamos para que la barra mida EXACTAMENTE
+                    // `FOOTER_HEIGHT` y no se pase 2px del panel.
+                    ui.set_min_height(FOOTER_HEIGHT - 2.0);
                     friends_panel::user_bar(ui, app);
                 });
         });

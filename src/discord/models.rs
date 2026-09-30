@@ -936,6 +936,14 @@ pub struct VoiceState {
     pub self_deaf: bool,
     #[serde(default)]
     pub self_mute: bool,
+    /// `true` mientras la persona transmite su pantalla (Go Live) desde este
+    /// canal. Es lo que hace aparecer la insignia "EN VIVO" y el botón de
+    /// ver el stream en la lista de conectados.
+    #[serde(default)]
+    pub self_stream: bool,
+    /// Cámara prendida. Se guarda por completitud; la UI todavía no la usa.
+    #[serde(default)]
+    pub self_video: bool,
 }
 
 impl VoiceState {

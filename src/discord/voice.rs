@@ -25,6 +25,11 @@ mod playback;
 mod rtp;
 mod runtime;
 mod state;
+// Ver streams (Go Live): depaquetizador H.264, decoder de ffmpeg y la sesión
+// de media del stream. Ver `stream_watch.rs`.
+mod h264;
+mod stream_watch;
+mod video_decode;
 
 pub(crate) use devices::{VoiceAudioSourceOptions, VoiceAudioSources, list_voice_audio_sources};
 #[cfg(all(feature = "voice-playback", not(test)))]
@@ -46,6 +51,8 @@ use microphone::*;
 use runtime::{VoiceRuntimeAction, VoiceRuntimeState};
 pub(crate) use runtime::{forward_app_event, run_voice_runtime};
 pub use state::{CurrentVoiceConnectionState, VoiceAudioSettings, VoiceCache, VoiceParticipantState};
+pub use stream_watch::{StreamFrame, StreamFrameSlot, StreamWatchStatus};
+pub(crate) use stream_watch::{StreamWatchHandle, StreamWatchParams, spawn_stream_watch};
 // `parse_*_id` son `pub(in crate::discord)` en `state.rs` (privado hacia
 // afuera del subsistema de voz); acá se re-exportan como `pub(crate)` para
 // que `lib::state` (las acciones join_voice/leave_voice/etc.) puedan armar
