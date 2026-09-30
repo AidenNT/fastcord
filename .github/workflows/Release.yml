@@ -1,0 +1,194 @@
+# Compila ecord para Windows x64 y lo publica como release de GitHub.
+#
+#   * Tag `v*`  (git tag v0.1.0 && git push origin v0.1.0)  -> compila y crea el release.
+#   * A mano (Actions > Release > Run workflow):
+#       - con "tag" -> compila y crea/actualiza ese release;
+#       - sin "tag" -> solo compila y deja el zip como artefacto de la ejecución.
+#
+# El proyecto necesita FFmpeg (dev libs), LLVM (bindgen),
+# NASM + CMake (BoringSSL / opus) y MSVC. Es lo mismo que resuelve build.ps1,
+# pero con FFmpeg precompilado de BtbN (build "shared" LGPL, con include/ lib/
+# bin/) en vez de compilarlo con vcpkg: baja en segundos.
+# OJO: BtbN ya no publica la 7.0 (solo 8.1, 9.0 y master), asi que se usa la 8.1.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag del release (p. ej. v0.1.0). Vacío = solo compilar, sin release."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # FFmpeg de BtbN (https://github.com/BtbN/FFmpeg-Builds/releases/tag/latest).
+  # Para cambiar de version: otro nombre de la lista de esa pagina (sin `.zip`),
+  # p. ej. ffmpeg-n9.0-latest-win64-lgpl-shared-9.0. "lgpl-shared" = DLLs + headers
+  # + .lib, sin GPL.
+  FFMPEG_ASSET: ffmpeg-n8.1-latest-win64-lgpl-shared-8.1
+  FFMPEG_DIR: C:\ffmpeg
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- Versión / ¿hay que publicar release? ----
+      - name: Versión
+        shell: pwsh
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if ($env:REF_TYPE -eq 'tag') { $version = $env:REF_NAME; $release = 'true' }
+          elseif ($env:INPUT_TAG)      { $version = $env:INPUT_TAG.Trim(); $release = 'true' }
+          else                         { $version = "dev-$($env:GITHUB_SHA.Substring(0,7))"; $release = 'false' }
+          "VERSION=$version" >> $env:GITHUB_ENV
+          "RELEASE=$release" >> $env:GITHUB_ENV
+          Write-Host "Versión: $version (release: $release)"
+
+      # ---- Rust ----
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # ---- MSVC (INCLUDE/LIB/PATH) ----
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # ---- FFmpeg de BtbN (con caché) ----
+      - name: Caché de FFmpeg
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.FFMPEG_DIR }}
+          key: ${{ env.FFMPEG_ASSET }}
+
+      - name: Descargar FFmpeg
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/$env:FFMPEG_ASSET.zip"
+          $zip = Join-Path $env:RUNNER_TEMP "ffmpeg.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+          $tmp = "C:\ffmpeg_tmp"
+          Expand-Archive -Path $zip -DestinationPath $tmp -Force
+          # Adentro viene una carpeta con bin/ include/ lib/.
+          $inner = Get-ChildItem $tmp -Directory | Select-Object -First 1
+          Move-Item $inner.FullName $env:FFMPEG_DIR
+          Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+
+      - name: Verificar FFmpeg
+        shell: pwsh
+        run: |
+          foreach ($f in @("include\libavcodec\avcodec.h", "lib\avcodec.lib")) {
+            if (-not (Test-Path "$env:FFMPEG_DIR\$f")) { throw "Falta $f en $env:FFMPEG_DIR (¿cambió el layout del zip?)" }
+          }
+          if (-not (Get-ChildItem "$env:FFMPEG_DIR\bin" -Filter "avcodec-*.dll")) { throw "Faltan las DLL en $env:FFMPEG_DIR\bin" }
+          Get-Content "$env:FFMPEG_DIR\include\libavutil\ffversion.h" | Select-String FFMPEG_VERSION
+
+      # ---- NASM (BoringSSL), LLVM (libclang para bindgen) y variables de build ----
+      - name: Herramientas y entorno de compilación
+        shell: pwsh
+        run: |
+          # NASM
+          $nasm = Get-Command nasm -ErrorAction SilentlyContinue
+          if (-not $nasm) {
+            choco install nasm -y --no-progress
+            $env:Path += ";C:\Program Files\NASM"
+            "C:\Program Files\NASM" >> $env:GITHUB_PATH
+            $nasm = Get-Command nasm
+          }
+          "ASM_NASM=$($nasm.Source)" >> $env:GITHUB_ENV
+          "CMAKE_ASM_NASM_COMPILER=$($nasm.Source)" >> $env:GITHUB_ENV
+
+          # LLVM / libclang
+          $llvm = "C:\Program Files\LLVM\bin"
+          if (-not (Test-Path "$llvm\libclang.dll")) {
+            choco install llvm -y --no-progress
+          }
+          if (-not (Test-Path "$llvm\libclang.dll")) { throw "No se encontró libclang.dll en $llvm" }
+          "LIBCLANG_PATH=$llvm" >> $env:GITHUB_ENV
+
+          # CMake: Ninja en vez de "Visual Studio NN": el runner ya trae VS 18 (2026)
+          # y el generador de VS 17 no lo encuentra. Con el entorno de MSVC cargado
+          # por msvc-dev-cmd, Ninja usa el mismo cl.exe sin depender de la versión.
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            choco install ninja -y --no-progress
+          }
+          "CMAKE_GENERATOR=Ninja" >> $env:GITHUB_ENV
+
+          # FFmpeg: include al frente y DLLs en el PATH
+          $ffInclude = "$env:FFMPEG_DIR\include"
+          "INCLUDE=$ffInclude;$env:INCLUDE" >> $env:GITHUB_ENV
+          "$env:FFMPEG_DIR\bin" >> $env:GITHUB_PATH
+
+          # bindgen: mismos defines/rutas que cl.exe (ver build.ps1)
+          $inc = $env:INCLUDE -split ';' | Where-Object { $_ }
+          $msvcInc = $inc | Where-Object { $_ -match 'VC\\Tools\\MSVC' } | Select-Object -First 1
+          $sdkInc  = $inc | Where-Object { $_ -match 'Windows Kits' }
+          $clangArgs = @(
+            '-fms-extensions', '-fms-compatibility', '-fdelayed-template-parsing',
+            '-D_CRT_SECURE_NO_WARNINGS', '-D_WIN32', '-D_WIN64', '-D_WIN32_WINNT=0x0A00',
+            '-DHAVE_UNISTD_H=0', "-I`"$ffInclude`""
+          )
+          if ($msvcInc) { $clangArgs += "-I`"$msvcInc`"" }
+          foreach ($p in $sdkInc) { $clangArgs += "-I`"$p`"" }
+          "BINDGEN_EXTRA_CLANG_ARGS=$($clangArgs -join ' ')" >> $env:GITHUB_ENV
+
+      # ---- Compilar ----
+      - name: cargo build --release
+        shell: pwsh
+        run: |
+          if (Test-Path Cargo.lock) { cargo build --release --locked } else { cargo build --release }
+          if ($LASTEXITCODE -ne 0) { throw "cargo build falló" }
+
+      # ---- Empaquetar: exe + DLLs de FFmpeg (y sus dependencias) ----
+      - name: Empaquetar
+        shell: pwsh
+        run: |
+          $name = "ecord-$env:VERSION-windows-x64"
+          $stage = "dist\$name"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item target\release\ecord.exe $stage
+          Copy-Item "$env:FFMPEG_DIR\bin\*.dll" $stage  # solo DLLs (sin ffmpeg.exe/ffplay.exe)
+          Compress-Archive -Path "$stage\*" -DestinationPath "dist\$name.zip" -Force
+          $hash = (Get-FileHash "dist\$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File "dist\$name.zip.sha256" -Encoding ascii
+          Remove-Item $stage -Recurse -Force
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ecord-${{ env.VERSION }}-windows-x64
+          path: dist/*
+          if-no-files-found: error
+
+      # ---- Release ----
+      - name: Publicar release
+        if: env.RELEASE == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: ecord ${{ env.VERSION }}
+          generate_release_notes: true
+          prerelease: ${{ contains(env.VERSION, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.zip
+            dist/*.sha256

@@ -1,0 +1,22 @@
+[package]
+name = "discord_client_structs"
+version = "0.2.0"
+edition = "2024"
+authors = ["UwUDev"]
+description = "Discord API/gateway structs with serde support"
+repository = "https://github.com/UwUDev/discord-client-rs"
+license = "MIT"
+
+[lib]
+name = "discord_client_structs"
+path = "src/lib.rs"
+
+[dependencies]
+discord_client_macros = { path = "../discord_client_macros" }
+serde = "1.0.219"
+serde_json = "1.0.140"
+chrono = "0.4.41"
+derive_builder = "0.20.2"
+base64 = "0.22.1"
+strum_macros = "0.27.1"
+uuid = { version = "1.18.1", features = ["v4"] }

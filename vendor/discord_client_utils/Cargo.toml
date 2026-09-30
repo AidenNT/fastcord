@@ -1,0 +1,12 @@
+[package]
+name = "discord_client_utils"
+version = "0.1.0"
+edition = "2024"
+authors = ["UwUDev"]
+description = "Undetected discord client backend reimplementation"
+
+[dependencies]
+discord_client_structs = { path = "../discord_client_structs" }
+wreq = { version = "6.0.0-rc.29", features = ["gzip", "deflate", "zstd", "brotli", "json", "cookies"] }
+wreq-util = "3.0.0-rc.14"
+tokio = { version = "1.45.0", features = ["rt", "macros", "rt-multi-thread"] }

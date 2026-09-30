@@ -1,0 +1,680 @@
+use convert_case::{Case, Casing};
+use proc_macro::TokenStream;
+use quote::{format_ident, quote};
+use syn::{Data, DeriveInput, Fields, GenericArgument, PathArguments, Type, parse_macro_input};
+
+fn is_u64_type(ty: &Type) -> bool {
+    if let Type::Path(type_path) = ty {
+        if let Some(segment) = type_path.path.segments.last() {
+            return segment.ident == "u64" && segment.arguments.is_empty();
+        }
+    }
+    false
+}
+
+fn inner_generic<'a>(ty: &'a Type, wrapper: &str) -> Option<&'a Type> {
+    if let Type::Path(type_path) = ty {
+        if let Some(segment) = type_path.path.segments.last() {
+            if segment.ident == wrapper {
+                if let PathArguments::AngleBracketed(ref args) = segment.arguments {
+                    if args.args.len() == 1 {
+                        if let GenericArgument::Type(inner_type) = &args.args[0] {
+                            return Some(inner_type);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn is_option_u64_type(ty: &Type) -> bool {
+    inner_generic(ty, "Option").is_some_and(is_u64_type)
+}
+
+fn is_vec_u64_type(ty: &Type) -> bool {
+    inner_generic(ty, "Vec").is_some_and(is_u64_type)
+}
+
+fn is_option_vec_u64_type(ty: &Type) -> bool {
+    inner_generic(ty, "Option").is_some_and(is_vec_u64_type)
+}
+
+#[proc_macro_derive(EnumFromPrimitive, attributes(default))]
+pub fn derive_enum_from_primitive(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let enum_name = &input.ident;
+
+    let variants = match input.data {
+        Data::Enum(data) => data.variants,
+        _ => panic!("EnumFromPrimitive can only be used on enums"),
+    };
+
+    let mut match_arms = Vec::new();
+    let mut as_u8_arms = Vec::new();
+    let mut default_variant = None;
+    let mut has_unknown = false;
+
+    for variant in &variants {
+        let var_name = &variant.ident;
+
+        if var_name == "Unknown" {
+            if let syn::Fields::Unnamed(fields) = &variant.fields {
+                if fields.unnamed.len() == 1 {
+                    has_unknown = true;
+                    continue;
+                }
+            }
+            panic!("The Unknown variant must be of type Unknown(...)");
+        }
+
+        let is_default = variant.attrs.iter().any(|a| a.path().is_ident("default"));
+
+        let discr = variant
+            .discriminant
+            .as_ref()
+            .and_then(|(_, expr)| {
+                if let syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Int(lit),
+                    ..
+                }) = expr
+                {
+                    Some(lit.base10_parse::<u16>().unwrap())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "The {} variant must have an explicit discriminant",
+                    var_name
+                )
+            });
+
+        if is_default {
+            if default_variant.is_some() {
+                panic!("Multiple variants marked with #[default]");
+            }
+            default_variant = Some((var_name, discr));
+        }
+
+        match_arms.push(quote! { #discr => #enum_name::#var_name, });
+        as_u8_arms.push(quote! { #enum_name::#var_name => #discr, });
+    }
+
+    if !has_unknown {
+        panic!("The enum must contain a variant Unknown(...)");
+    }
+
+    let default_impl = if let Some((var_name, _discr)) = default_variant {
+        quote! {
+            impl Default for #enum_name {
+                fn default() -> Self {
+                    #enum_name::#var_name
+                }
+            }
+        }
+    } else {
+        quote! {
+            impl Default for #enum_name {
+                fn default() -> Self {
+                    #enum_name::Unknown(0)
+                }
+            }
+        }
+    };
+
+    let expanded = quote! {
+        impl From<u16> for #enum_name {
+            fn from(value: u16) -> Self {
+                match value {
+                    #(#match_arms)*
+                    _ => #enum_name::Unknown(value),
+                }
+            }
+        }
+
+        impl #enum_name {
+            pub fn as_u16(&self) -> u16 {
+                match self {
+                    #(#as_u8_arms)*
+                    #enum_name::Unknown(u) => *u,
+                }
+            }
+        }
+
+        #default_impl
+
+        impl serde::Serialize for #enum_name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.serialize_u16(self.as_u16())
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for #enum_name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = u16::deserialize(deserializer)?;
+                Ok(Self::from(value))
+            }
+        }
+    };
+
+    TokenStream::from(expanded)
+}
+
+#[proc_macro_derive(EnumFromString, attributes(str_value))]
+pub fn derive_enum_from_string(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let enum_name = &input.ident;
+
+    let variants = match &input.data {
+        syn::Data::Enum(data) => &data.variants,
+        _ => panic!("EnumFromString can only be used on enums"),
+    };
+
+    let mut as_str_arms = Vec::new();
+    let mut from_str_raw_arms = Vec::new();
+    let mut from_str_result_arms = Vec::new();
+
+    for variant in variants {
+        let var_ident = &variant.ident;
+        let lit = variant
+            .attrs
+            .iter()
+            .find(|a| a.path().is_ident("str_value"))
+            .map(|attr| {
+                attr.parse_args::<syn::LitStr>()
+                    .expect("str_value must be a string literal")
+                    .value()
+            })
+            .unwrap_or_else(|| var_ident.to_string().to_lowercase());
+
+        as_str_arms.push(quote! {
+            #enum_name::#var_ident => #lit,
+        });
+
+        from_str_raw_arms.push(quote! {
+            #lit => #enum_name::#var_ident,
+        });
+
+        from_str_result_arms.push(quote! {
+            #lit => Ok(#enum_name::#var_ident),
+        });
+    }
+
+    let expanded = quote! {
+        impl #enum_name {
+            pub fn as_str(&self) -> &str {
+                match self {
+                    #(#as_str_arms)*
+                }
+            }
+
+            pub fn from_str(s: &str) -> Self {
+                match s {
+                    #(#from_str_raw_arms)*
+                    _ => #enum_name::Unknown,
+                }
+            }
+        }
+
+        impl std::str::FromStr for #enum_name {
+            type Err = ();
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                match s {
+                    #(#from_str_result_arms)*
+                    _ => Err(()),
+                }
+            }
+        }
+
+        impl serde::Serialize for #enum_name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                self.as_str().serialize(serializer)
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for #enum_name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let s = String::deserialize(deserializer)?;
+                Ok(Self::from_str(&s))
+            }
+        }
+    };
+
+    TokenStream::from(expanded)
+}
+
+#[proc_macro_derive(Flags, attributes(flag_enum))]
+pub fn derive_flags(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    generate_flags_impl(input)
+}
+
+fn generate_flags_impl(input: DeriveInput) -> TokenStream {
+    let struct_name = &input.ident;
+    let mut output = quote! {};
+
+    if let Data::Struct(data) = &input.data {
+        if let Fields::Named(fields) = &data.fields {
+            for field in &fields.named {
+                let field_name = field.ident.as_ref().unwrap();
+                let field_type = &field.ty;
+
+                let flag_enum_attr = field
+                    .attrs
+                    .iter()
+                    .find(|attr| attr.path().is_ident("flag_enum"));
+
+                if let Some(attr) = flag_enum_attr {
+                    let is_option = is_option_u64_type(field_type);
+                    let is_u64 = is_u64_type(field_type);
+
+                    if !is_option && !is_u64 {
+                        return syn::Error::new_spanned(
+                            field_type,
+                            "Field with #[flag_enum] must be of type u64 or Option<u64>",
+                        )
+                        .to_compile_error()
+                        .into();
+                    }
+
+                    let flags_content = attr
+                        .parse_args::<syn::LitStr>()
+                        .expect("flag_enum attribute must contain a string with flag definitions")
+                        .value();
+
+                    let enum_name = format_ident!(
+                        "{}{}",
+                        struct_name.to_string(),
+                        field_name.to_string().to_case(Case::Pascal)
+                    );
+
+                    let flag_enum = generate_simple_flag_enum(&enum_name, &flags_content);
+                    let conversion_methods = generate_flag_conversion_methods(
+                        struct_name,
+                        field_name,
+                        &enum_name,
+                        is_option,
+                    );
+
+                    output = quote! {
+                        #output
+                        #flag_enum
+                        #conversion_methods
+                    };
+                }
+            }
+        }
+    }
+
+    output.into()
+}
+
+fn generate_simple_flag_enum(
+    enum_name: &syn::Ident,
+    flags_content: &str,
+) -> proc_macro2::TokenStream {
+    let flag_data: Vec<_> = flags_content
+        .split(',')
+        .map(|s| {
+            let parts: Vec<_> = s.trim().split('=').collect();
+            let name = format_ident!("{}", parts[0].trim());
+            let value: u8 = parts[1].trim().parse().expect("Invalid flag value");
+            (name, value)
+        })
+        .collect();
+
+    let flag_variants = flag_data.iter().map(|(name, value)| {
+        quote! { #name = #value }
+    });
+
+    let extract_flag_checks = flag_data.iter().map(|(name, value)| {
+        quote! {
+            if value & (1u64 << #value) != 0 {
+                flags.push(#enum_name::#name);
+            }
+        }
+    });
+
+    let from_bit_arms = flag_data.iter().map(|(name, value)| {
+        quote! { #value => Some(#enum_name::#name) }
+    });
+
+    quote! {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        #[repr(u8)]
+        pub enum #enum_name {
+            #(#flag_variants,)*
+        }
+
+        impl #enum_name {
+            pub fn bit_value(&self) -> u64 {
+                1u64 << (*self as u8)
+            }
+
+            pub fn from_bit_position(bit: u8) -> Option<Self> {
+                match bit {
+                    #(#from_bit_arms,)*
+                    _ => None,
+                }
+            }
+
+            pub fn extract_flags(value: u64) -> Vec<Self> {
+                let mut flags = Vec::new();
+                #(#extract_flag_checks)*
+                flags
+            }
+
+            pub fn combine_flags(flags: &[Self]) -> u64 {
+                flags.iter().fold(0u64, |acc, flag| acc | flag.bit_value())
+            }
+        }
+    }
+}
+
+fn generate_flag_conversion_methods(
+    struct_name: &syn::Ident,
+    field_name: &syn::Ident,
+    enum_name: &syn::Ident,
+    is_option: bool,
+) -> proc_macro2::TokenStream {
+    let getter_name = format_ident!("get_{}", field_name);
+    let setter_name = format_ident!("set_{}", field_name);
+    let has_flag_name = format_ident!("has_{}", field_name);
+    let add_flag_name = format_ident!("add_{}", field_name);
+    let remove_flag_name = format_ident!("remove_{}", field_name);
+
+    if is_option {
+        quote! {
+            impl #struct_name {
+                pub fn #getter_name(&self) -> Vec<#enum_name> {
+                    self.#field_name
+                        .map(|value| #enum_name::extract_flags(value))
+                        .unwrap_or_default()
+                }
+
+                pub fn #setter_name(&mut self, flags: Vec<#enum_name>) {
+                    if flags.is_empty() {
+                        self.#field_name = None;
+                    } else {
+                        self.#field_name = Some(#enum_name::combine_flags(&flags));
+                    }
+                }
+
+                pub fn #has_flag_name(&self, flag: #enum_name) -> bool {
+                    self.#field_name
+                        .map(|value| value & flag.bit_value() != 0)
+                        .unwrap_or(false)
+                }
+
+                pub fn #add_flag_name(&mut self, flag: #enum_name) {
+                    let current = self.#field_name.unwrap_or(0);
+                    self.#field_name = Some(current | flag.bit_value());
+                }
+
+                pub fn #remove_flag_name(&mut self, flag: #enum_name) {
+                    if let Some(current) = self.#field_name {
+                        let new_value = current & !flag.bit_value();
+                        self.#field_name = if new_value == 0 { None } else { Some(new_value) };
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {
+            impl #struct_name {
+                pub fn #getter_name(&self) -> Vec<#enum_name> {
+                    #enum_name::extract_flags(self.#field_name)
+                }
+
+                pub fn #setter_name(&mut self, flags: Vec<#enum_name>) {
+                    self.#field_name = #enum_name::combine_flags(&flags);
+                }
+
+                pub fn #has_flag_name(&self, flag: #enum_name) -> bool {
+                    self.#field_name & flag.bit_value() != 0
+                }
+
+                pub fn #add_flag_name(&mut self, flag: #enum_name) {
+                    self.#field_name |= flag.bit_value();
+                }
+
+                pub fn #remove_flag_name(&mut self, flag: #enum_name) {
+                    self.#field_name &= !flag.bit_value();
+                }
+            }
+        }
+    }
+}
+
+fn snowflake_accessor_name(field: &str) -> String {
+    let base = if field == "id" {
+        ""
+    } else if let Some(b) = field.strip_suffix("_id") {
+        b
+    } else if let Some(b) = field.strip_prefix("id_") {
+        b
+    } else {
+        field
+    };
+    if base.is_empty() {
+        "created_at".to_string()
+    } else {
+        format!("{}_created_at", base)
+    }
+}
+
+struct SnowflakeOpts {
+    no_created_at: bool,
+    rename: Option<String>,
+}
+
+fn parse_snowflake_opts(attr: &syn::Attribute) -> SnowflakeOpts {
+    let mut opts = SnowflakeOpts {
+        no_created_at: false,
+        rename: None,
+    };
+    if matches!(attr.meta, syn::Meta::Path(_)) {
+        return opts;
+    }
+    let _ = attr.parse_nested_meta(|meta| {
+        if meta.path.is_ident("no_created_at") {
+            opts.no_created_at = true;
+        } else if meta.path.is_ident("rename") {
+            let value = meta.value()?;
+            let lit: syn::LitStr = value.parse()?;
+            opts.rename = Some(lit.value());
+        }
+        Ok(())
+    });
+    opts
+}
+
+#[proc_macro_attribute]
+pub fn discord_struct(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let mut no_builder = false;
+    let mut no_default = false;
+    let mut no_serialize = false;
+    let mut no_deserialize = false;
+    if !attr.is_empty() {
+        let parser = syn::punctuated::Punctuated::<syn::Ident, syn::Token![,]>::parse_terminated;
+        match syn::parse::Parser::parse(parser, attr) {
+            Ok(idents) => {
+                for id in idents {
+                    match id.to_string().as_str() {
+                        "no_builder" => no_builder = true,
+                        "no_default" => no_default = true,
+                        "no_serialize" => no_serialize = true,
+                        "no_deserialize" => no_deserialize = true,
+                        other => {
+                            return syn::Error::new_spanned(
+                                id.clone(),
+                                format!("unknown discord_struct option `{}`", other),
+                            )
+                            .to_compile_error()
+                            .into();
+                        }
+                    }
+                }
+            }
+            Err(e) => return e.to_compile_error().into(),
+        }
+    }
+
+    let mut item_struct = parse_macro_input!(item as syn::ItemStruct);
+    let name = item_struct.ident.clone();
+
+    let mut has_flags = false;
+    let mut accessors: Vec<proc_macro2::TokenStream> = Vec::new();
+
+    if let syn::Fields::Named(named) = &mut item_struct.fields {
+        for field in named.named.iter_mut() {
+            if field.attrs.iter().any(|a| a.path().is_ident("flag_enum")) {
+                has_flags = true;
+            }
+
+            let snowflake = field
+                .attrs
+                .iter()
+                .find(|a| a.path().is_ident("snowflake"))
+                .cloned();
+
+            let Some(sf_attr) = snowflake else {
+                continue;
+            };
+
+            let opts = parse_snowflake_opts(&sf_attr);
+            field.attrs.retain(|a| !a.path().is_ident("snowflake"));
+
+            let ty = &field.ty;
+            let is_u64 = is_u64_type(ty);
+            let is_opt = is_option_u64_type(ty);
+            let is_vec = is_vec_u64_type(ty);
+            let is_opt_vec = is_option_vec_u64_type(ty);
+
+            let (de, ser): (&str, &str) = if is_u64 {
+                (
+                    "::discord_client_structs::deserializer::deserialize_string_to_u64",
+                    "::discord_client_structs::serializer::serialize_u64_as_string",
+                )
+            } else if is_opt {
+                (
+                    "::discord_client_structs::deserializer::deserialize_option_string_to_u64",
+                    "::discord_client_structs::serializer::serialize_option_u64_as_string",
+                )
+            } else if is_vec {
+                (
+                    "::discord_client_structs::deserializer::deserialize_string_to_vec_u64",
+                    "::discord_client_structs::serializer::serialize_vec_u64_as_string",
+                )
+            } else if is_opt_vec {
+                (
+                    "::discord_client_structs::deserializer::deserialize_option_string_to_vec_u64",
+                    "::discord_client_structs::serializer::serialize_option_vec_u64_as_string",
+                )
+            } else {
+                return syn::Error::new_spanned(
+                    ty,
+                    "#[snowflake] fields must be u64, Option<u64>, Vec<u64>, or Option<Vec<u64>>",
+                )
+                .to_compile_error()
+                .into();
+            };
+            if !no_deserialize {
+                field
+                    .attrs
+                    .push(syn::parse_quote! { #[serde(deserialize_with = #de)] });
+            }
+            if !no_serialize {
+                field
+                    .attrs
+                    .push(syn::parse_quote! { #[serde(serialize_with = #ser)] });
+            }
+
+            if !opts.no_created_at && (is_u64 || is_opt) {
+                let fname = field.ident.clone().unwrap();
+                let acc = opts
+                    .rename
+                    .unwrap_or_else(|| snowflake_accessor_name(&fname.to_string()));
+                let acc_ident = format_ident!("{}", acc);
+                let body = if is_opt {
+                    quote! {
+                        pub fn #acc_ident(&self) -> Option<::chrono::DateTime<::chrono::Utc>> {
+                            self.#fname.and_then(|id| {
+                                let ts = (id >> 22) + 1420070400000;
+                                <::chrono::Utc as ::chrono::TimeZone>::timestamp_millis_opt(&::chrono::Utc, ts as i64).single()
+                            })
+                        }
+                    }
+                } else {
+                    quote! {
+                        pub fn #acc_ident(&self) -> Option<::chrono::DateTime<::chrono::Utc>> {
+                            let ts = (self.#fname >> 22) + 1420070400000;
+                            <::chrono::Utc as ::chrono::TimeZone>::timestamp_millis_opt(&::chrono::Utc, ts as i64).single()
+                        }
+                    }
+                };
+                accessors.push(body);
+            }
+        }
+    } else {
+        return syn::Error::new_spanned(
+            &item_struct,
+            "#[discord_struct] only supports structs with named fields",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let mut derives: Vec<proc_macro2::TokenStream> = vec![quote!(Debug), quote!(Clone)];
+    if !no_serialize {
+        derives.push(quote!(::serde::Serialize));
+    }
+    if !no_deserialize {
+        derives.push(quote!(::serde::Deserialize));
+    }
+    if !no_default {
+        derives.push(quote!(Default));
+    }
+    if !no_builder {
+        derives.push(quote!(::derive_builder::Builder));
+    }
+    if has_flags {
+        derives.push(quote!(::discord_client_macros::Flags));
+    }
+
+    let builder_attr = if no_builder {
+        quote!()
+    } else {
+        quote!(#[builder(setter(into, strip_option), default)])
+    };
+
+    let impl_block = if accessors.is_empty() {
+        quote!()
+    } else {
+        quote! { impl #name { #(#accessors)* } }
+    };
+
+    quote! {
+        #[derive(#(#derives),*)]
+        #builder_attr
+        #item_struct
+        #impl_block
+    }
+    .into()
+}

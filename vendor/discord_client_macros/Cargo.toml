@@ -1,0 +1,19 @@
+[package]
+name = "discord_client_macros"
+version = "0.2.0"
+edition = "2024"
+authors = ["UwUDev"]
+description = "Macros for discord-client-rs crates"
+repository = "https://github.com/UwUDev/discord-client-rs"
+license = "MIT"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2.0", features = ["full", "extra-traits"] }
+quote = "1.0"
+darling = "0.20"
+proc-macro2 = "1.0.95"
+chrono = "0.4.41"
+convert_case = "0.8.0"

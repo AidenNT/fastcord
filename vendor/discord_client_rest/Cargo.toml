@@ -1,0 +1,28 @@
+[package]
+name = "discord_client_rest"
+version = "0.1.1"
+edition = "2024"
+authors = ["UwUDev"]
+description = "Undetected discord client rest API reimplementation"
+repository = "https://github.com/UwUDev/discord-client-rs"
+readme = "README.md"
+license = "MIT"
+autoexamples = false
+
+[dependencies]
+discord_client_structs = { path = "../discord_client_structs" }
+discord_client_utils = { path = "../discord_client_utils" }
+wreq = { version = "6.0.0-rc.29", features = ["gzip", "deflate", "zstd", "brotli", "json", "cookies", "socks"] }
+wreq-util = "3.0.0-rc.14"
+tokio = { version = "1.45.0", features = ["rt", "macros", "rt-multi-thread", "signal", "time"] }
+regex = "1.11.1"
+iana-time-zone = "0.1.63"
+current_locale = "0.1.1"
+serde_json = { version = "1.0.140", features = ["preserve_order"] }
+base64 = "0.22.1"
+serde = { version = "1.0.219", features = ["derive"] }
+log = "0.4.27"
+pretty_env_logger = "0.5.0"
+derive_builder = "0.20.2"
+chrono = "0.4.41"
+rand = "0.9.4"

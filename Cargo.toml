@@ -1,0 +1,174 @@
+[package]
+name = "ecord"
+version = "0.0.1"
+edition = "2024"
+# bidi.rs y system_fonts.rs usan let-chains ("if let ... && ...", estabilizado
+# en la edición 2024), así que hace falta un rustc razonablemente reciente.
+rust-version = "1.88"
+
+[dependencies]
+web-local-storage-api = "0.0.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+eframe = { version = "0.36", default-features = false, features = ["accesskit", "glow", "default_fonts", "links", "wayland", "x11", "persistence"] }
+egui = "0.36"
+# theme.rs: install_image_loaders (image/svg para los íconos Lucide).
+# `http` es el que faltaba para los avatares/íconos del CDN de Discord:
+# sin él, `install_image_loaders` no registra ningún loader capaz de bajar
+# una URL y egui tira "No matching BytesLoader" al intentar cargar
+# https://cdn.discordapp.com/... Los otros loaders solo manejan bytes ya
+# en memoria (`bytes://`, usado por el QR) o archivos locales.
+# `gif` y `webp` agregan los loaders ANIMADOS (`GifLoader`/`WebPLoader`):
+# sin ellos un GIF/WebP animado se dibuja congelado en el primer cuadro,
+# y en un chat casi todo lo que mandan es un GIF (Tenor, Giphy, adjuntos).
+egui_extras = { version = "0.36", features = ["image", "svg", "http", "file", "gif", "webp"] }
+# El loader de `egui_extras` decodifica con la crate `image`, pero los
+# formatos concretos dependen de los features de ESTA crate. Discord sirve
+# los avatares como .png y, si son animados, .gif.
+image = { version = "0.25", default-features = false, features = ["png", "gif", "jpeg", "webp", "bmp"] }
+# theme.rs: fondo dinámico según el wallpaper del sistema (ThemeMode::Wallpaper).
+# `wallpaper::get()` ubica el archivo del fondo de escritorio actual en
+# Windows/macOS/GNOME/KDE/Cinnamon/XFCE/etc.
+wallpaper = "3"
+# theme.rs: color dominante del wallpaper ya decodificado (`sample_wallpaper_color_from_path`).
+color-thief = "0.2"
+# theme.rs: alinea el baseline de las fuentes fallback con Inter.
+# system_fonts.rs: lee y rankea las fuentes instaladas en el sistema.
+skrifa = "0.44"
+memmap2 = "0.9"
+# system_fonts.rs: ubica las carpetas de fuentes del sistema.
+directories = "6"
+# bidi.rs: soporte de texto RTL (árabe/hebreo).
+unicode-bidi = "0.3"
+# system_fonts.rs usa log::debug!/log::warn! (no hace falta inicializar
+# ningún logger para que compile, pero si querés ver esos mensajes agregá
+# env_logger u otro logger e inicializalo en main()).
+log = "0.4"
+env_logger = "0.11"
+
+# --- Cliente real de Discord (src/discord/) ---
+# Runtime async para el hilo de fondo que habla con la API REST y el
+# Gateway; eframe/egui siguen corriendo sync en el hilo principal.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net"] }
+# API REST (perfil, relaciones/amigos, guilds, canales, mensajes).
+#reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "system-proxy", "rustls-tls-native-roots"] }
+reqwest = { version = "0.12", features = [
+    "json",
+    "blocking",       # ← http_cache.rs: descargas de imágenes en hilos aparte
+    "cookies",        # ← sin esto, `reqwest::cookie::CookieStore` no existe
+    "gzip",
+    "brotli",         # ← el header Accept-Encoding pide `br`
+    "zstd",           # ← y `zstd`
+    "rustls-tls",     # ← o `native-tls` si preferís OpenSSL/SChannel
+    "system-proxy",   # ← usa el proxy del sistema # ← usa el proxy del sistema para HTTPS
+    "rustls-tls-native-roots",
+] }
+# 0.8 es la que depende de reqwest 0.12 y cookie_store 0.21 (la 0.10 pide
+# reqwest 0.13 + cookie_store 0.22 y choca con las versiones de abajo).
+reqwest_cookie_store = "0.8"   # implementa CookieStore sobre cookie_store
+cookie_store = "0.21"          # el store en sí (save/load JSON)
+uuid = { version = "1", features = ["v4"] }
+iana-time-zone = "0.1.65"
+chrono = "0.4"
+toml = "0.8"
+sys-locale = "0.3.2"
+# WebSocket del Gateway y del "remote auth" (login por QR).
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+# discord/gateway.rs: el Gateway real de Discord manda todo comprimido en
+# un único stream zlib de por vida de la conexión (`compress=zlib-stream`
+# en la URL) — sin esto un `READY` grande (todos tus servers/amigos de
+# una) puede superar el límite de un frame de WebSocket sin comprimir.
+flate2 = "1"
+# Login por QR: Discord manda claves/tickets cifrados con RSA-OAEP que hay
+# que descifrar con la clave privada que genera el cliente.
+rsa = "0.9"
+sha2 = "0.10"
+rand = "0.8"
+base64 = "0.22"
+# Generar el código QR (como SVG) que se muestra en la pantalla de login.
+# `svg` es justamente el feature que renderiza a SVG en login.rs —
+# `default-features = false` sin esto lo apaga y no compila.
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+# Manejo de errores cómodo en discord/{remote_auth,gateway}.rs.
+anyhow = "1"
+
+# --- Proto de configuración de cuenta de Discord (src/discord/user_settings.rs) ---
+# `PreloadedUserSettings`: tema, locale, status, notificaciones,
+# privacidad, favoritos, etc., tal cual lo sincronizan entre sí los
+# clientes oficiales (`GET/PATCH /users/@me/settings-proto/1`). El código
+# del mensaje lo genera `build.rs` con `prost-build` a partir de
+# `proto/discord_user_settings.proto`; acá solo hace falta el runtime
+# (`prost::Message`, encode/decode) para poder usarlo.
+prost = "0.13"
+# El proto usa `google.protobuf.Timestamp` (guild_recents_dismissed_at,
+# etc.) — prost-build genera esos campos como `::prost_types::Timestamp`,
+# así que esta dependencia tiene que estar en runtime, no solo en build.rs.
+prost-types = "0.13"
+
+# --- Reproductor de video embebido (ui/video_player.rs) ---
+# Fork vendorizado de egui-video, portado a egui 0.36 (el original y el fork
+# de Lxtharia dependen de egui 0.31 y chocan con el 0.36 de esta app).
+# Decodifica con ffmpeg 6/7 (libs de desarrollo instaladas al compilar y
+# libs dinámicas disponibles al ejecutar) y reproduce audio con cpal, así
+# que ya no hace falta SDL2.
+# Compilar en `--release` u `opt-level=3`: en debug la reproducción va lenta.
+egui-video = { path = "vendor/egui-video" }
+url = "2.5.8"
+
+# --- REST "undetected" de UwUDev (vendorizado con su workspace completo:
+# discord_client_structs/macros/utils como hermanos bajo vendor/) ---
+# Ver src/discord/uwu_rest.rs para el wrapper que lo conecta con el login
+# y con el fingerprint compartido de fingerprint.rs.
+discord_client_rest = { path = "vendor/discord_client_rest" }
+discord_client_structs = { path = "vendor/discord_client_structs" }
+wreq = { version = "6.0.0-rc.29", features = ["gzip", "deflate", "zstd", "brotli", "json", "cookies", "socks"] }
+
+# --- Llamadas de voz (src/discord/voice/, portado de concord) ---
+# Cifrado RTP de extremo a extremo del canal de voz.
+aes-gcm = "0.11"
+chacha20poly1305 = "0.11"
+# DAVE (Discord's end-to-end encryption for calls); requerido por Discord
+# para conectar a un canal de voz.
+davey = "0.1.4"
+# Socket UDP crudo del transporte de voz (discovery + envío/recepción RTP).
+socket2 = "0.6"
+# Captura/reproducción de audio del micrófono y los parlantes.
+cpal = { version = "0.18", optional = true, features = ["pulseaudio", "realtime"] }
+# Supresión de ruido del micrófono (ajuste "Reducir ruido de fondo").
+nnnoiseless = { version = "0.5", default-features = false, optional = true }
+
+# --- Notificaciones de escritorio (src/lib/notifications.rs) ---
+# Notificación nativa del SO (D-Bus en Linux, centro de notificaciones en
+# Windows/macOS) para cuando llega una mención/DM con la ventana sin foco.
+notify-rust = "4"
+
+[target.'cfg(all(target_arch = "arm", target_os = "linux"))'.dependencies]
+opus = { version = "1.6.1", package = "opusic-c", features = ["no-simd"] }
+
+[target.'cfg(not(all(target_arch = "arm", target_os = "linux")))'.dependencies]
+opus = { version = "1.6.1", package = "opusic-c" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+alsa = { version = "0.11", optional = true }
+
+[features]
+default = ["voice-playback"]
+# Captura/reproducción real de audio de voz (micrófono y parlantes). Sin
+# este feature, el cliente igual puede unirse a canales de voz y ver quién
+# está hablando, pero no transmite ni reproduce audio (útil para compilar
+# en una plataforma sin `cpal`/ALSA andando, o para un build más liviano).
+voice-playback = ["dep:cpal", "dep:alsa", "dep:nnnoiseless"]
+
+# system_fonts.rs: lee el idioma de la UI de Windows para elegir la variante
+# de fuente CJK correcta.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Globalization"] }
+
+# --- Compilación del proto de settings de Discord (build.rs) ---
+[build-dependencies]
+prost-build = "0.13"
+# Trae un binario de `protoc` prearmado para la plataforma del que
+# compila, así `build.rs` no depende de tener `protoc` instalado a mano.
+protoc-bin-vendored = "3"
