@@ -5,10 +5,14 @@ use wreq::header::HeaderMap;
 
 #[derive(Debug, Deserialize)]
 pub struct CaptchaRequiredError {
+    #[serde(default)]
     pub captcha_key: Vec<String>,
     pub captcha_sitekey: String,
+    #[serde(default)]
     pub captcha_service: String,
+    #[serde(default)]
     pub captcha_rqdata: String,
+    #[serde(default)]
     pub captcha_rqtoken: String,
 }
 impl Display for CaptchaRequiredError {
@@ -39,7 +43,13 @@ impl SolvedCaptcha {
     }
 
     pub fn add_headers(&self, headers: &mut HeaderMap) {
-        headers.insert("x-captcha-key", self.key.parse().unwrap());
-        headers.insert("x-captcha-rqtoken", self.rqtoken.parse().unwrap());
+        if let Ok(value) = self.key.parse() {
+            headers.insert("x-captcha-key", value);
+        }
+        if !self.rqtoken.is_empty() {
+            if let Ok(value) = self.rqtoken.parse() {
+                headers.insert("x-captcha-rqtoken", value);
+            }
+        }
     }
 }

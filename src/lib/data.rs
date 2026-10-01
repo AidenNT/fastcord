@@ -183,6 +183,139 @@ pub struct RepliedMessage {
     pub deleted: bool,
 }
 
+/// Copia de UN mensaje reenviado (un `message_snapshots[]` de Discord): lo
+/// que se dibuja dentro del bloque "Reenviado" de un [`ChatMessage`].
+#[derive(Clone, Default)]
+pub struct ForwardedMessage {
+    pub content: String,
+    /// Hora del mensaje original (mismo formato que `ChatMessage::time`).
+    pub time: String,
+    pub edited: bool,
+    /// (user_id, nombre) de los mencionados, para resolver `<@id>`.
+    pub mentions: Vec<(String, String)>,
+    pub attachments: Vec<Attachment>,
+    pub embeds: Vec<Embed>,
+    pub stickers: Vec<StickerItem>,
+}
+
+/// Un mensaje reenviado: lo que trae `message_snapshots` más de dónde venía
+/// (`message_reference`). Ver `ui::chat::forward_block`.
+#[derive(Clone, Default)]
+pub struct Forward {
+    /// Vacío si Discord no mandó el contenido (o no se pudo leer): el bloque
+    /// muestra un aviso en vez de quedar en blanco.
+    pub snapshots: Vec<ForwardedMessage>,
+    /// Canal del mensaje original, para mostrar "#canal" si lo conocemos.
+    pub source_channel_id: Option<String>,
+    /// Server del mensaje original (`message_reference.guild_id`): de ahí
+    /// salen el nombre y el ícono del pie del bloque, como en el cliente
+    /// real. `None` si el reenvío viene de un DM.
+    pub source_guild_id: Option<String>,
+}
+
+/// Lo mínimo de un server para rotular de dónde viene un reenvío (ver
+/// [`publish_guild_directory`]).
+#[derive(Clone)]
+pub struct GuildBrief {
+    pub name: String,
+    pub icon_url: Option<String>,
+    pub initial: String,
+    pub color: Color32,
+}
+
+fn guild_directory_id() -> egui::Id {
+    egui::Id::new("ecord_guild_directory")
+}
+
+/// Deja en la memoria de egui un índice `guild_id → nombre/ícono` de los
+/// servers de la cuenta, para que `ui::chat` rotule de dónde viene un
+/// reenvío sin tener que recibir la lista de servers por parámetro en cada
+/// llamada. Se reconstruye si cambia la cantidad de servers o cada 3 s
+/// (un cambio de nombre/ícono es raro), así que el costo por frame es casi
+/// nulo.
+pub fn publish_guild_directory(ctx: &egui::Context, servers: &[Server]) {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let stamp_id = egui::Id::new("ecord_guild_directory_stamp");
+    let fresh = ctx
+        .data(|d| d.get_temp::<(usize, Instant)>(stamp_id))
+        .is_some_and(|(len, at)| len == servers.len() && at.elapsed() < Duration::from_secs(3));
+    if fresh {
+        return;
+    }
+    let directory: std::collections::HashMap<String, GuildBrief> = servers
+        .iter()
+        .filter(|s| !s.guild_id.is_empty())
+        .map(|s| {
+            (
+                s.guild_id.clone(),
+                GuildBrief {
+                    name: s.name.clone(),
+                    icon_url: s.icon_url.clone(),
+                    initial: s.icon_initial.clone(),
+                    color: s.icon_color,
+                },
+            )
+        })
+        .collect();
+    ctx.data_mut(|d| {
+        d.insert_temp(guild_directory_id(), Arc::new(directory));
+        d.insert_temp(stamp_id, (servers.len(), Instant::now()));
+    });
+}
+
+/// Nombre e ícono de un server de la cuenta, si se conoce (ver
+/// [`publish_guild_directory`]). `None` si la cuenta no está en ese server.
+pub fn guild_brief(ctx: &egui::Context, guild_id: &str) -> Option<GuildBrief> {
+    use std::sync::Arc;
+    ctx.data(|d| d.get_temp::<Arc<std::collections::HashMap<String, GuildBrief>>>(guild_directory_id()))
+        .and_then(|directory| directory.get(guild_id).cloned())
+}
+
+impl Forward {
+    /// `None` si el mensaje no es un reenvío.
+    pub fn from_discord(msg: &crate::discord::models::GatewayMessage) -> Option<Self> {
+        if !msg.is_forward() {
+            return None;
+        }
+        if msg.message_snapshots.is_empty() {
+            // Señal para diagnosticar: Discord marcó el mensaje como reenvío
+            // pero no llegó (o no se pudo leer) el contenido.
+            log::warn!(
+                "Reenvío {} sin snapshots legibles (flags={}, tipo de referencia={:?})",
+                msg.id,
+                msg.flags,
+                msg.message_reference.as_ref().map(|r| r.kind)
+            );
+        }
+        Some(Self {
+            snapshots: msg
+                .message_snapshots
+                .iter()
+                .map(|snapshot| {
+                    let original = &snapshot.message;
+                    ForwardedMessage {
+                        content: original.content.clone(),
+                        time: format_timestamp(&original.timestamp),
+                        edited: original.edited_timestamp.is_some(),
+                        mentions: original
+                            .mentions
+                            .iter()
+                            .map(|u| (u.id.clone(), u.display_name().to_string()))
+                            .collect(),
+                        attachments: original.attachments.clone(),
+                        embeds: original.embeds.clone(),
+                        stickers: original.sticker_items.clone(),
+                    }
+                })
+                .collect(),
+            source_channel_id: msg.message_reference.as_ref().and_then(|r| r.channel_id.clone()),
+            source_guild_id: msg.message_reference.as_ref().and_then(|r| r.guild_id.clone()),
+        })
+    }
+}
+
 /// Un mensaje de chat, usado tanto en DMs como en canales de servidor.
 #[derive(Clone)]
 pub struct ChatMessage {
@@ -226,6 +359,10 @@ pub struct ChatMessage {
     /// original para mostrar arriba (ver `ui::chat::message_row`). `None`
     /// cuando el mensaje no responde a nada.
     pub replied_to: Option<RepliedMessage>,
+    /// Si este mensaje es un REENVÍO (`message_snapshots`): el contenido del
+    /// original, que se dibuja en un bloque "Reenviado" (el `content` propio
+    /// del mensaje viene vacío). `None` en un mensaje normal.
+    pub forwarded: Option<Forward>,
     /// Tipo de mensaje de Discord (`GatewayMessage::kind`): 0 normal, 18 =
     /// "X empezó un hilo" (mensaje de sistema). Los mensajes de demo/eco
     /// local son 0.
@@ -306,6 +443,7 @@ impl ChatMessage {
             embeds: Vec::new(),
             stickers: Vec::new(),
             replied_to: None,
+            forwarded: None,
             kind: 0,
             components: Vec::new(),
             thread: None,
@@ -333,6 +471,7 @@ impl ChatMessage {
             embeds: Vec::new(),
             stickers: Vec::new(),
             replied_to: None,
+            forwarded: None,
             kind: 0,
             components: Vec::new(),
             thread: None,
@@ -405,6 +544,7 @@ impl ChatMessage {
             embeds: msg.embeds.clone(),
             stickers: msg.sticker_items.clone(),
             replied_to: Self::replied_to_from_discord(msg, names),
+            forwarded: Forward::from_discord(msg),
             kind: msg.kind,
             components: msg.components.clone(),
             thread: msg.thread.as_ref().map(ThreadCard::from_thread).or_else(|| {
@@ -465,6 +605,13 @@ impl ChatMessage {
         msg: &crate::discord::models::GatewayMessage,
         names: Option<NameResolver<'_>>,
     ) -> Option<RepliedMessage> {
+        // Un reenvío también trae `message_reference` (con el id del
+        // original) pero nunca `referenced_message`: no es una respuesta, y
+        // sin esta guarda caería en el caso 3 y mostraría "Mensaje original
+        // eliminado". Su contenido se dibuja aparte (`Forward`).
+        if msg.is_forward() {
+            return None;
+        }
         if let Some(original) = &msg.referenced_message {
             let author_base = original.author.display_name().to_string();
             let (author, author_color) = match names {
@@ -476,7 +623,7 @@ impl ChatMessage {
                 author_id: original.author.id.clone(),
                 author_base,
                 author_color,
-                preview: crate::ui::chat::preview_text(&original.content),
+                preview: reply_preview(original),
                 deleted: false,
             });
         }
@@ -768,6 +915,26 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
 /// `"2026-09-15T14:32:00.123000+00:00"`) a `"HH:MM"`. Best-effort: si el
 /// formato no matchea devuelve el string tal cual llegó en vez de
 /// explotar.
+/// Resumen del mensaje citado para el banner de una respuesta. Si el original
+/// no tenía texto (solo una imagen, un sticker...) se dice qué era en vez de
+/// dejar el banner con el autor solo.
+fn reply_preview(original: &crate::discord::models::GatewayMessage) -> String {
+    if !original.content.trim().is_empty() {
+        return crate::ui::chat::preview_text(&original.content);
+    }
+    if original.is_forward() {
+        "Mensaje reenviado".to_string()
+    } else if !original.attachments.is_empty() {
+        "Adjunto".to_string()
+    } else if !original.sticker_items.is_empty() {
+        "Sticker".to_string()
+    } else if !original.embeds.is_empty() {
+        "Embed".to_string()
+    } else {
+        String::new()
+    }
+}
+
 fn format_timestamp(ts: &str) -> String {
     ts.split('T')
         .nth(1)
@@ -2826,6 +2993,112 @@ mod chat_names_tests {
             "author": { "id": author_id, "username": "ana_user", "global_name": "Ana" }
         }))
         .expect("mensaje válido")
+    }
+
+    fn message_with(extra: serde_json::Value) -> GatewayMessage {
+        let mut value = json!({
+            "id": "1", "channel_id": "2",
+            "timestamp": "2026-01-01T10:30:00.000000+00:00",
+            "content": "",
+            "author": { "id": "10", "username": "ana_user", "global_name": "Ana" }
+        });
+        value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(value).expect("mensaje válido")
+    }
+
+    #[test]
+    fn forwarded_message_shows_its_snapshot_and_is_not_a_reply() {
+        let msg = message_with(json!({
+            "message_reference": { "type": 1, "message_id": "77", "channel_id": "88", "guild_id": "66" },
+            "message_snapshots": [{ "message": {
+                "content": "texto original",
+                "timestamp": "2025-12-31T23:59:00.000000+00:00",
+                "edited_timestamp": null,
+                "attachments": [{ "id": "5", "filename": "a.png", "url": "https://cdn/a.png" }],
+                "embeds": [],
+                "mentions": [{ "id": "20", "username": "bob_user", "global_name": "Bob" }],
+                "type": 0, "flags": 0
+            }}]
+        }));
+        let chat = ChatMessage::from_discord_in(&msg, "99", None);
+        // Sin la guarda de `replied_to_from_discord` esto saldría como
+        // "Mensaje original eliminado".
+        assert!(chat.replied_to.is_none());
+        let forward = chat.forwarded.expect("es un reenvío");
+        assert_eq!(forward.source_channel_id.as_deref(), Some("88"));
+        assert_eq!(forward.source_guild_id.as_deref(), Some("66"));
+        assert_eq!(forward.snapshots.len(), 1);
+        let snapshot = &forward.snapshots[0];
+        assert_eq!(snapshot.content, "texto original");
+        assert_eq!(snapshot.time, "23:59");
+        assert!(!snapshot.edited);
+        assert_eq!(snapshot.attachments.len(), 1);
+        assert_eq!(snapshot.mentions, vec![("20".to_string(), "Bob".to_string())]);
+    }
+
+    #[test]
+    fn unreadable_snapshot_still_marks_the_message_as_a_forward() {
+        let msg = message_with(json!({
+            "message_reference": { "type": 1, "message_id": "77", "channel_id": "88" },
+            "message_snapshots": ["basura"]
+        }));
+        let chat = ChatMessage::from_discord_in(&msg, "99", None);
+        assert!(chat.replied_to.is_none());
+        assert!(chat.forwarded.expect("es un reenvío").snapshots.is_empty());
+    }
+
+    #[test]
+    fn forward_is_detected_from_the_snapshot_flag_alone() {
+        // Sin `type` en la referencia y sin snapshots: solo el flag HAS_SNAPSHOT.
+        let msg = message_with(json!({
+            "flags": 16384,
+            "message_reference": { "message_id": "77", "channel_id": "88" }
+        }));
+        let chat = ChatMessage::from_discord_in(&msg, "99", None);
+        assert!(chat.replied_to.is_none());
+        assert!(chat.forwarded.is_some());
+    }
+
+    #[test]
+    fn a_bad_embed_inside_a_snapshot_does_not_lose_the_text() {
+        let msg = message_with(json!({
+            "message_reference": { "type": 1, "message_id": "77", "channel_id": "88" },
+            "message_snapshots": [{ "message": {
+                "content": "sigue acá",
+                "embeds": ["no soy un embed", 7],
+                "mentions": [null]
+            }}]
+        }));
+        let chat = ChatMessage::from_discord_in(&msg, "99", None);
+        let forward = chat.forwarded.expect("es un reenvío");
+        assert_eq!(forward.snapshots.len(), 1);
+        assert_eq!(forward.snapshots[0].content, "sigue acá");
+        assert!(forward.snapshots[0].embeds.is_empty());
+    }
+
+    #[test]
+    fn plain_reply_keeps_working_with_and_without_the_embedded_original() {
+        // Original borrado/viejo: referencia sin `referenced_message`.
+        let gone = message_with(json!({ "type": 19, "message_reference": { "message_id": "5" } }));
+        let chat = ChatMessage::from_discord_in(&gone, "99", None);
+        assert!(chat.forwarded.is_none());
+        assert!(chat.replied_to.expect("banner").deleted);
+
+        // Original solo con un adjunto: el banner lo dice en vez de quedar vacío.
+        let with_attachment = message_with(json!({
+            "type": 19,
+            "message_reference": { "message_id": "5" },
+            "referenced_message": {
+                "id": "5", "channel_id": "2", "content": "",
+                "author": { "id": "20", "username": "bob_user", "global_name": "Bob" },
+                "attachments": [{ "id": "6", "filename": "b.png", "url": "https://cdn/b.png" }]
+            }
+        }));
+        let chat = ChatMessage::from_discord_in(&with_attachment, "99", None);
+        let replied = chat.replied_to.expect("banner");
+        assert!(!replied.deleted);
+        assert_eq!(replied.author, "Bob");
+        assert_eq!(replied.preview, "Adjunto");
     }
 
     #[test]

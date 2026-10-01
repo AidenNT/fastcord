@@ -25,14 +25,19 @@
 //! de dejarte pedir nada.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, OnceLock, RwLock};
 
+use discord_client_rest::captcha::{CaptchaRequiredError, SolvedCaptcha};
 use discord_client_rest::rest::{RequestProperties, RequestPropertiesBuilder, RestClient as UwuInner};
 use discord_client_rest::structs::referer::{DmChannelReferer, GuildChannelReferer, Referer};
 use discord_client_structs::structs::client::BuildNumbers;
 use discord_client_structs::structs::message::{Message, MessageBuilder, MessageReferenceBuilder};
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio::sync::Mutex as AsyncMutex;
+
+use super::captcha::{self, CaptchaCancelled, CaptchaChallenge};
 
 use super::fingerprint::{CLIENT_BUILD_NUMBER, ClientFingerprint};
 use super::models::{
@@ -66,6 +71,12 @@ fn shared_fingerprint() -> Arc<ClientFingerprint> {
         }
     }
     Arc::new(ClientFingerprint::new(CLIENT_BUILD_NUMBER))
+}
+
+/// User-Agent del fingerprint compartido: la ventana del captcha lo usa para
+/// presentarse igual que el resto de las requests.
+pub(super) fn shared_user_agent() -> String {
+    shared_fingerprint().user_agent.clone()
 }
 
 // --- Cliente conectado, cacheado por token ----------------------------------
@@ -147,18 +158,128 @@ fn err(e: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!("{e}")
 }
 
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// El cliente vendorizado con captcha automático: expone los mismos
+/// `get`/`post`/`put`/`patch`/`delete` que `UwuInner`, pero si Discord
+/// contesta que hace falta un captcha (`CaptchaRequiredError`) le pide a la
+/// persona que lo resuelva (`captcha::solve`, que abre la ventana con
+/// hCaptcha) y repite la MISMA request con `X-Captcha-Key` y
+/// `X-Captcha-Rqtoken` (el `SolvedCaptcha` del vendor). Como todos los
+/// métodos de `UwuRest` pasan por acá, cualquier endpoint que algún día
+/// pida captcha queda cubierto sin tocar a quien lo llama: si la persona lo
+/// resuelve la request termina bien; si cierra la ventana, falla con
+/// `CaptchaCancelled`.
+#[derive(Clone)]
+struct CaptchaClient {
+    inner: Arc<UwuInner>,
+}
+
+impl CaptchaClient {
+    /// Ejecuta `call` con las `props` dadas; si falla pidiendo un captcha
+    /// hCaptcha, lo hace resolver y reintenta con la respuesta agregada a
+    /// las `props`. Corta a los `MAX_SOLVES_PER_REQUEST` captchas para no
+    /// abrir ventanas sin fin si Discord los rechaza todos.
+    async fn run<T, F, Fut>(props: Option<RequestProperties>, mut call: F) -> Result<T, BoxError>
+    where
+        F: FnMut(Option<RequestProperties>) -> Fut,
+        Fut: Future<Output = Result<T, BoxError>>,
+    {
+        let mut solved: Option<SolvedCaptcha> = None;
+        let mut solves = 0;
+        loop {
+            let attempt_props = match solved.take() {
+                None => props.clone(),
+                Some(solution) => Some(props.clone().unwrap_or_default().with_solved_captcha(solution)),
+            };
+            let error = match call(attempt_props).await {
+                Ok(value) => return Ok(value),
+                Err(error) => error,
+            };
+            let challenge = error
+                .downcast_ref::<CaptchaRequiredError>()
+                .and_then(CaptchaChallenge::from_vendor);
+            let Some(challenge) = challenge else {
+                return Err(error);
+            };
+            if solves >= captcha::MAX_SOLVES_PER_REQUEST {
+                return Err(error);
+            }
+            solves += 1;
+            log::info!("Discord pidió un captcha; esperando a que la persona lo resuelva");
+            let Some(solution) = captcha::solve(challenge).await else {
+                return Err(Box::new(CaptchaCancelled));
+            };
+            solved = Some(solution.to_vendor());
+        }
+    }
+
+    async fn get<T>(
+        &self,
+        path: &str,
+        query: Option<HashMap<String, String>>,
+        props: Option<RequestProperties>,
+    ) -> Result<T, BoxError>
+    where
+        T: DeserializeOwned + Default + Send,
+    {
+        let inner = Arc::clone(&self.inner);
+        let path = path.to_owned();
+        Self::run(props, move |props| {
+            let inner = Arc::clone(&inner);
+            let path = path.clone();
+            let query = query.clone();
+            async move { inner.get::<T>(&path, query, props).await }
+        })
+        .await
+    }
+}
+
+/// `post`/`put`/`patch`/`delete` son idénticos salvo por el método del
+/// cliente vendorizado al que delegan.
+macro_rules! captcha_body_method {
+    ($($name:ident),+ $(,)?) => {
+        impl CaptchaClient {
+            $(
+                async fn $name<T, B>(
+                    &self,
+                    path: &str,
+                    body: Option<B>,
+                    props: Option<RequestProperties>,
+                ) -> Result<T, BoxError>
+                where
+                    T: DeserializeOwned + Default + Send,
+                    B: Serialize + Send + Sync + Clone,
+                {
+                    let inner = Arc::clone(&self.inner);
+                    let path = path.to_owned();
+                    Self::run(props, move |props| {
+                        let inner = Arc::clone(&inner);
+                        let path = path.clone();
+                        let body = body.clone();
+                        async move { inner.$name::<T, B>(&path, body, props).await }
+                    })
+                    .await
+                }
+            )+
+        }
+    };
+}
+
+captcha_body_method!(post, put, patch, delete);
+
 /// Reemplazo de `rest::RestClient`. Mismos métodos, misma pinta de uso;
 /// la diferencia es que construirlo valida el token contra Discord (por
 /// eso `for_token` es async y falible, a diferencia del viejo que era
 /// sync e infalible).
 pub struct UwuRest {
-    client: Arc<UwuInner>,
+    client: CaptchaClient,
 }
 
 impl UwuRest {
     pub async fn for_token(token: String) -> anyhow::Result<Self> {
-        let client = connected_client(&token).await?;
-        Ok(Self { client })
+        let inner = connected_client(&token).await?;
+        Ok(Self { client: CaptchaClient { inner } })
     }
 
     fn home() -> RequestProperties {
@@ -438,7 +559,8 @@ impl UwuRest {
         let props = RequestPropertiesBuilder::default()
             .referer::<Referer>(referer)
             // .context(...)
-            // .solved_captcha(...)
+            // El captcha no se pasa acá: `CaptchaClient` lo agrega solo al
+            // reintentar cuando Discord lo pide.
             .build()
             .map_err(err)?;
 
@@ -632,6 +754,6 @@ impl UwuRest {
     /// todavía no cubre (cualquiera de los ~270 métodos en
     /// `vendor/discord_client_rest/src/api/*.rs`, por ejemplo).
     pub fn get_http_client(&self) -> &wreq::Client {
-        self.client.get_http_client()
+        self.client.inner.get_http_client()
     }
 }

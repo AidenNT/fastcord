@@ -1126,6 +1126,13 @@ pub struct GatewayMessage {
     /// `Box` porque es, ella misma, otro `GatewayMessage` completo.
     #[serde(default)]
     pub referenced_message: Option<Box<GatewayMessage>>,
+    /// Copias de los mensajes reenviados (`message_snapshots`). Un mensaje
+    /// reenviado llega con `content` vacío, `message_reference.type == 1` y
+    /// acá el contenido real del original (texto, adjuntos, embeds...).
+    /// Lenient: un snapshot con una forma rara se descarta en vez de tirar
+    /// abajo el mensaje entero (ver [`GatewayMessage::is_forward`]).
+    #[serde(default, deserialize_with = "lenient_snapshots")]
+    pub message_snapshots: Vec<MessageSnapshot>,
     /// Tipo de mensaje de Discord: 0 = normal, 19 = respuesta, 18 = "X
     /// empezó un hilo" (mensaje de sistema, su `content` es el nombre del
     /// hilo) y 21 = mensaje inicial de un hilo (su `referenced_message` es
@@ -1162,6 +1169,89 @@ pub struct MessageReference {
     pub channel_id: Option<String>,
     #[serde(default)]
     pub guild_id: Option<String>,
+    /// Tipo de referencia: 0 = respuesta (o cita), [`MESSAGE_REFERENCE_FORWARD`]
+    /// (1) = reenvío.
+    #[serde(rename = "type", default)]
+    pub kind: u8,
+}
+
+/// `message_reference.type` de un mensaje reenviado: `message_id`/`channel_id`
+/// apuntan al ORIGINAL, pero Discord no manda `referenced_message` — el
+/// contenido viaja en `message_snapshots`.
+pub const MESSAGE_REFERENCE_FORWARD: u8 = 1;
+
+impl GatewayMessage {
+    /// ¿Es un mensaje reenviado? Cualquiera de tres señales alcanza (así un
+    /// payload al que le falte una sigue mostrándose como reenvío): el tipo
+    /// de la referencia, el flag `HAS_SNAPSHOT` (`1 << 14`) o que traiga
+    /// snapshots.
+    pub fn is_forward(&self) -> bool {
+        const HAS_SNAPSHOT: u64 = 1 << 14;
+        self.message_reference
+            .as_ref()
+            .is_some_and(|reference| reference.kind == MESSAGE_REFERENCE_FORWARD)
+            || self.flags & HAS_SNAPSHOT != 0
+            || !self.message_snapshots.is_empty()
+    }
+}
+
+/// Un elemento de `message_snapshots`: `{ "message": { ... } }`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MessageSnapshot {
+    #[serde(default)]
+    pub message: SnapshotMessage,
+}
+
+/// El mensaje original tal como era al reenviarlo (subconjunto de los campos
+/// de un mensaje normal; sin autor: Discord no lo incluye).
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotMessage {
+    pub content: String,
+    pub timestamp: String,
+    pub edited_timestamp: Option<String>,
+    pub mentions: Vec<User>,
+    pub attachments: Vec<Attachment>,
+    pub embeds: Vec<Embed>,
+    pub sticker_items: Vec<StickerItem>,
+}
+
+/// Campo por campo y sin quejarse: un embed o un usuario con una forma rara
+/// se descarta solo a él, en vez de perder el snapshot entero (y con él el
+/// texto del reenvío).
+impl<'de> Deserialize<'de> for SnapshotMessage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        fn list<T: serde::de::DeserializeOwned>(value: &serde_json::Value, key: &str) -> Vec<T> {
+            value
+                .get(key)
+                .and_then(|v| v.as_array())
+                .map(|items| items.iter().filter_map(|item| serde_json::from_value(item.clone()).ok()).collect())
+                .unwrap_or_default()
+        }
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let text = |key: &str| value.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+        Ok(Self {
+            content: text("content").unwrap_or_default(),
+            timestamp: text("timestamp").unwrap_or_default(),
+            edited_timestamp: text("edited_timestamp"),
+            mentions: list(&value, "mentions"),
+            attachments: list(&value, "attachments"),
+            embeds: list(&value, "embeds"),
+            sticker_items: list(&value, "sticker_items"),
+        })
+    }
+}
+
+/// Como [`lenient_components`], para `message_snapshots`.
+fn lenient_snapshots<'de, D>(deserializer: D) -> Result<Vec<MessageSnapshot>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Option<Vec<serde_json::Value>> = Option::deserialize(deserializer)?;
+    Ok(raw
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|value| serde_json::from_value(value).ok())
+        .collect())
 }
 
 /// `MESSAGE_UPDATE`: mensaje editado o, MUY a menudo, Discord terminó de

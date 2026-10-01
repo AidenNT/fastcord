@@ -12,6 +12,7 @@ pub mod remote_auth;
 pub mod rest;
 pub mod fingerprint;
 pub mod password_auth;
+pub mod captcha;
 pub mod user_settings;
 pub mod uwu_rest;
 pub mod voice;

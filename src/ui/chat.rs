@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 use egui::{Area, Color32, CornerRadius, Frame, Margin, Order, ScrollArea, Sense, Stroke, Vec2};
 
 use crate::lib::data::{
-    ChatMessage, ComponentClick, CustomEmoji, EmojiGroup, ReactionKind, RepliedMessage, ReplyTarget, ThreadCard,
+    ChatMessage, ComponentClick, CustomEmoji, EmojiGroup, Forward, ReactionKind, RepliedMessage, ReplyTarget,
+    ThreadCard,
 };
 use crate::ui::emoji as twemoji;
 use crate::ui::extra;
@@ -959,6 +960,9 @@ fn message_body(
         let ctx = MentionCtx { mentions: &msg.mentions, channels };
         crate::ui::markdown::show(ui, palette, &msg.content, 13.5, palette.text, &ctx);
     }
+    if let Some(forward) = &msg.forwarded {
+        forward_block(ui, palette, forward, channels);
+    }
     media::show_attachments(ui, palette, &msg.attachments);
     media::show_stickers(ui, palette, &msg.stickers);
     media::show_embeds(ui, palette, &msg.embeds);
@@ -974,6 +978,86 @@ fn message_body(
     if let Some(card) = msg.thread.as_ref() {
         thread_card(ui, palette, card, actions);
     }
+}
+
+/// Bloque "Reenviado" de un mensaje reenviado (`message_snapshots`): una
+/// barra a la izquierda, el rótulo, el contenido del original (texto,
+/// adjuntos, stickers, embeds — con los mismos renderers que un mensaje
+/// normal) y, al pie, la hora original y el canal de donde venía si lo
+/// conocemos.
+fn forward_block(ui: &mut egui::Ui, palette: &Palette, forward: &Forward, channels: Option<&HashMap<String, String>>) {
+    let source_channel = forward
+        .source_channel_id
+        .as_deref()
+        .and_then(|id| channels.and_then(|names| names.get(id)));
+    // Server de origen (nombre + ícono): solo si la cuenta está en él.
+    let source_guild = forward
+        .source_guild_id
+        .as_deref()
+        .and_then(|id| crate::lib::data::guild_brief(ui.ctx(), id));
+
+    let block = ui.horizontal_top(|ui| {
+        // Hueco para la barra, que se pinta después, cuando ya se sabe la
+        // altura del bloque.
+        ui.add_space(10.0);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 3.0;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                theme::icon(ui, Icon::ArrowRight, 13.0, palette.dim);
+                ui.label(
+                    egui::RichText::new("Reenviado")
+                        .font(theme::semibold(12.0))
+                        .color(palette.dim)
+                        .italics(),
+                );
+            });
+
+            if forward.snapshots.is_empty() {
+                theme::text(ui, "No se pudo cargar el mensaje reenviado", theme::regular(12.5), palette.dim);
+            }
+            for snapshot in &forward.snapshots {
+                if !media::hides_content(&snapshot.content, &snapshot.embeds) {
+                    let ctx = MentionCtx { mentions: &snapshot.mentions, channels };
+                    crate::ui::markdown::show(ui, palette, &snapshot.content, 13.5, palette.text, &ctx);
+                }
+                media::show_attachments(ui, palette, &snapshot.attachments);
+                media::show_stickers(ui, palette, &snapshot.stickers);
+                media::show_embeds(ui, palette, &snapshot.embeds);
+
+                // Pie como en el cliente real: [ícono] Server · hora. Sin el
+                // server (DM, o uno donde la cuenta no está) queda "#canal"
+                // si es de este mismo server, y si no solo la hora.
+                let mut when = snapshot.time.clone();
+                if snapshot.edited {
+                    when = format!("{when} (editado)").trim().to_string();
+                }
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 5.0;
+                    let mut origin = false;
+                    if let Some(guild) = &source_guild {
+                        let (rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+                        extra::avatar(ui, rect.center(), 8.0, guild.icon_url.as_deref(), guild.color, &guild.initial, palette);
+                        theme::text(ui, &guild.name, theme::medium(12.0), palette.dim);
+                        origin = true;
+                    } else if let Some(name) = source_channel {
+                        theme::text(ui, format!("#{name}"), theme::medium(12.0), palette.dim);
+                        origin = true;
+                    }
+                    if !when.is_empty() {
+                        if origin {
+                            theme::text(ui, "•", theme::regular(11.0), palette.dim);
+                        }
+                        theme::text(ui, &when, theme::regular(12.0), palette.dim);
+                    }
+                });
+            }
+        });
+    });
+
+    let rect = block.response.rect;
+    let bar = egui::Rect::from_min_size(rect.left_top(), Vec2::new(3.0, rect.height()));
+    ui.painter().rect_filled(bar, CornerRadius::same(2), palette.dim);
 }
 
 /// Segundos -> "hace 5 min" / "hace 3 h" / "hace 19 d".

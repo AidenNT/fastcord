@@ -96,13 +96,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                             password_form(app, ui, &palette);
                         }
                         AuthStatus::PasswordSubmitting => {
-                            spinner_row(ui, &palette, "Iniciando sesión…");
+                            submitting_row(app, ui, &palette, "Iniciando sesión…");
                         }
                         AuthStatus::PasswordMfaRequired => {
                             mfa_form(app, ui, &palette);
                         }
                         AuthStatus::PasswordMfaSubmitting => {
-                            spinner_row(ui, &palette, "Verificando código…");
+                            submitting_row(app, ui, &palette, "Verificando código…");
                         }
                         AuthStatus::Starting => {
                             spinner_row(ui, &palette, "Generando código QR…");
@@ -165,6 +165,33 @@ fn spinner_row(ui: &mut egui::Ui, palette: &crate::ui::theme::Palette, label: &s
         theme::spinner(ui, 18.0, palette.accent);
         theme::text(ui, label, theme::medium(14.0), palette.text);
     });
+}
+
+/// Como `spinner_row`, pero si Discord pidió un captcha y hay una ventana
+/// esperando a la persona, lo dice (y deja cancelar) en vez de parecer que
+/// el login se colgó.
+fn submitting_row(app: &mut App, ui: &mut egui::Ui, palette: &crate::ui::theme::Palette, label: &str) {
+    if !app.captcha.is_waiting() {
+        spinner_row(ui, palette, label);
+        return;
+    }
+    spinner_row(ui, palette, "Esperando el captcha…");
+    ui.add_space(8.0);
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(
+                "Se abrió una ventana con la verificación de Discord. \
+                 Resolvela y el inicio de sesión sigue solo.",
+            )
+            .font(theme::regular(12.0))
+            .color(palette.secondary),
+        )
+        .wrap(),
+    );
+    ui.add_space(14.0);
+    if text_link(ui, palette, "Cancelar") {
+        app.captcha.cancel_all();
+    }
 }
 
 /// Renderiza `url` como un código QR (SVG) y lo muestra centrado. Si por

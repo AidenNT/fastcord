@@ -1,6 +1,6 @@
 # eCord
 
-An **unofficial** Discord desktop client written in Rust with [egui](https://github.com/emilk/egui). Native UI — no Electron, no webview — with a custom borderless window, customizable themes, voice calls, embedded video, and much of what you'd expect from the official client.
+An **unofficial** Discord desktop client written in Rust with [egui](https://github.com/emilk/egui). Native UI — no Electron, no webview (except for captcha) — with a custom borderless window, customizable themes, voice calls, embedded video, and much of what you'd expect from the official client.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -146,7 +146,7 @@ ecord/
 
 ## Roadmap
 
-> A proposal based on the current state of the code (comments, `TODO`s, and features marked as pending). Adjust it to your priorities.
+> This is a unfinished roadmap, maybe it will change.
 
 ### ✅ Done — `v0.0.x`
 - [x] QR and username/password login (TOTP/SMS)
@@ -161,12 +161,13 @@ ecord/
 - [x] Notifications (in-app and desktop)
 - [x] Themes, wallpaper-based dynamic background, disk cache
 - [x] View streams 
+- [ ] **General captcha handling** (currently not tested)
 
 ### 🚧 Next — `v0.1` · Finish what's half-done
 - [ ] **Bot dropdown menus** (currently rendered disabled)
 - [ ] **Choosing a target channel or DM** for actions that ask for one (currently shows "not supported yet")
 - [ ] **Visible send errors**: a failed message or action is currently dropped silently → show a notice + retry
-- [ ] **Password login with captcha**: currently you must fall back to QR
+- [ ] ~**Password login with captcha**: currently you must fall back to QR~ (Replaced with general captcha handling)
 - [ ] **More 2FA methods** (beyond TOTP and SMS)
 - [ ] **Dedicated palettes** for the two dark themes that currently fall back to `Dark`
 - [ ] Missing Lucide icons (GIF, sticker, inbox, shop) — currently placeholders

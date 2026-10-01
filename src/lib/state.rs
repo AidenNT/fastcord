@@ -474,6 +474,10 @@ pub struct App {
     /// necesita esto para saber qué métodos ofrecer y con qué ticket
     /// contestar).
     pub pending_mfa: Option<crate::discord::password_auth::MfaChallenge>,
+    /// Captchas (hCaptcha) que Discord pidió en cualquier request —login,
+    /// mensajes, DMs...— y la ventana donde la persona los resuelve. Ver
+    /// `discord::captcha`.
+    pub captcha: crate::discord::captcha::CaptchaController,
     /// Participantes por canal/DM y ajustes de audio persistidos; ver
     /// `discord::voice::state::VoiceCache`. Se actualiza desde
     /// `apply_voice_wire_event` (definido ahí mismo, adentro de
@@ -627,6 +631,7 @@ impl Default for App {
             login_sms_sent: false,
             login_error: None,
             pending_mfa: None,
+            captcha: Default::default(),
             voice: VoiceCache {
                 audio: voice_audio_settings,
                 audio_sources: voice_audio_sources,
@@ -683,6 +688,7 @@ impl App {
     /// simplemente van a un canal sin receptor y se ignoran, así que
     /// termina solo en el próximo paso que intente mandar algo.
     pub fn cancel_sign_in(&mut self) {
+        self.captcha.cancel_all();
         self.auth = AuthStatus::SignedOut;
         self.event_rx = None;
         self.event_tx = None;
@@ -704,6 +710,7 @@ impl App {
     /// activamente un pedido en vuelo, solo deja de escuchar la
     /// respuesta.
     pub fn switch_to_qr_form(&mut self) {
+        self.captcha.cancel_all();
         self.login_email.clear();
         self.login_password.clear();
         self.login_mfa_code.clear();
@@ -1993,7 +2000,23 @@ impl App {
     fn poll_discord_events(&mut self, ctx: &egui::Context) {
         if self.egui_ctx.is_none() {
             self.egui_ctx = Some(ctx.clone());
+            // Los pedidos de captcha nacen en hilos de fondo: necesitan poder
+            // despertar a la UI aunque esté quieta.
+            crate::discord::captcha::set_repaint_context(ctx);
         }
+        for notice in self.captcha.poll() {
+            match notice {
+                crate::discord::captcha::CaptchaNotice::Opened => self.push_toast(
+                    ToastKind::Info,
+                    "Verificación",
+                    "Discord pidió un captcha. Resolvelo en la ventana que se abrió.",
+                ),
+                crate::discord::captcha::CaptchaNotice::OpenFailed(message) => {
+                    self.push_toast(ToastKind::Warning, "Captcha", message)
+                }
+            }
+        }
+        crate::lib::data::publish_guild_directory(ctx, &self.servers);
         self.flush_member_subscription(ctx);
         let Some(rx) = &self.event_rx else { return };
         let pending: Vec<AppEvent> = rx.try_iter().collect();

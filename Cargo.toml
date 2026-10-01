@@ -94,6 +94,16 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 # Manejo de errores cómodo en discord/{remote_auth,gateway}.rs.
 anyhow = "1"
 
+# --- Ventana del captcha (src/discord/captcha.rs) ---
+# El captcha de hCaptcha que pide Discord en el login se resuelve en un
+# WebView. Corre en un proceso hijo (este mismo ejecutable con
+# `--captcha-window`) para no pelear con el event loop de eframe. En Windows
+# usa WebView2 (viene con Edge / Windows 10+); en Linux hace falta
+# libwebkit2gtk-4.1-dev y gtk3. Si cargo se queja de versiones cruzadas,
+# `cargo update -p wry -p tao` o alinear ambas a las últimas compatibles.
+wry = "0.47"
+tao = "0.31"
+
 # --- Proto de configuración de cuenta de Discord (src/discord/user_settings.rs) ---
 # `PreloadedUserSettings`: tema, locale, status, notificaciones,
 # privacidad, favoritos, etc., tal cual lo sincronizan entre sí los

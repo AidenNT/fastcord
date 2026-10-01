@@ -15,6 +15,11 @@ mod ui;
 use lib::state::App;
 
 fn main() -> eframe::Result<()> {
+    // Este mismo ejecutable también es la ventana del captcha de hCaptcha
+    // (ver `discord::captcha`): en ese caso no se arranca eframe.
+    if std::env::args().any(|arg| arg == discord::captcha::WINDOW_FLAG) {
+        discord::captcha::run_window();
+    }
     env_logger::init();
     println!("Hello, world!");
     let options = eframe::NativeOptions {

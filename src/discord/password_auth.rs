@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 
 use crate::discord::AppEvent;
 use crate::discord::auth_http::{DiscordAuthSession, discord_login_headers};
+use crate::discord::captcha::{self, CaptchaCancelled};
 
 const LOGIN_URL: &str = "https://discord.com/api/v10/auth/login";
 const SUSPENDED_ACCOUNT_ERROR: &str =
@@ -146,28 +147,80 @@ enum LoginOutcome {
     RequiredActions(Vec<String>),
 }
 
+/// `POST` con cuerpo JSON contra la API de auth, con captcha automático: si
+/// Discord contesta 400 pidiendo un hCaptcha, se lo hace resolver a la
+/// persona (`captcha::solve`, que abre la ventana) y se repite el pedido con
+/// el token (`captcha_key` en el cuerpo, `X-Captcha-Key` y
+/// `X-Captcha-Rqtoken` en los headers). Devuelve el estado y el cuerpo de la
+/// respuesta final; `send_error` es el prefijo del error si no se puede ni
+/// mandar el pedido.
+async fn post_json(
+    auth_session: &DiscordAuthSession,
+    url: &str,
+    mut body: Value,
+    send_error: &str,
+) -> Result<(reqwest::StatusCode, String), String> {
+    use reqwest::header::{HeaderName, HeaderValue};
+
+    let mut solved: Option<captcha::CaptchaSolution> = None;
+    let mut solves = 0;
+    loop {
+        let mut headers = discord_login_headers(auth_session.fingerprint());
+        if let Some(solution) = solved.take() {
+            body["captcha_key"] = json!(solution.token);
+            if let Ok(value) = HeaderValue::from_str(&solution.token) {
+                headers.insert(HeaderName::from_static("x-captcha-key"), value);
+            }
+            if let Some(value) = solution.rqtoken.as_deref().and_then(|token| HeaderValue::from_str(token).ok()) {
+                headers.insert(HeaderName::from_static("x-captcha-rqtoken"), value);
+            }
+        }
+
+        let response = auth_session
+            .http()
+            .post(url)
+            .headers(headers)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| format!("{send_error}: {error}"))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|error| format!("No se pudo leer la respuesta de Discord: {error}"))?;
+
+        if status == reqwest::StatusCode::BAD_REQUEST && solves < captcha::MAX_SOLVES_PER_REQUEST {
+            if let Some(challenge) = captcha::parse_challenge(&text) {
+                solves += 1;
+                match captcha::solve(challenge).await {
+                    Some(solution) => {
+                        solved = Some(solution);
+                        continue;
+                    }
+                    None => return Err(CaptchaCancelled.to_string()),
+                }
+            }
+        }
+        return Ok((status, text));
+    }
+}
+
 async fn login_with_password(
     login: &str,
     password: &str,
     auth_session: &DiscordAuthSession,
 ) -> Result<LoginOutcome, String> {
-    let response = auth_session
-        .http()
-        .post(LOGIN_URL)
-        .headers(discord_login_headers(auth_session.fingerprint()))
-        .json(&json!({
+    let (status, body) = post_json(
+        auth_session,
+        LOGIN_URL,
+        json!({
             "login": normalize_login_identifier(login),
             "password": password,
-        }))
-        .send()
-        .await
-        .map_err(|error| format!("No se pudo mandar el login a Discord: {error}"))?;
-
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|error| format!("No se pudo leer la respuesta de Discord: {error}"))?;
+        }),
+        "No se pudo mandar el login a Discord",
+    )
+    .await?;
 
     if status.is_success() {
         parse_login_success(&body)
@@ -182,20 +235,13 @@ async fn send_mfa_sms(ticket: &str, auth_session: &DiscordAuthSession) -> Result
         phone: Option<String>,
     }
 
-    let response = auth_session
-        .http()
-        .post(MFA_SMS_SEND_URL)
-        .headers(discord_login_headers(auth_session.fingerprint()))
-        .json(&json!({ "ticket": ticket }))
-        .send()
-        .await
-        .map_err(|error| format!("No se pudo pedir el SMS a Discord: {error}"))?;
-
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|error| format!("No se pudo leer la respuesta de Discord: {error}"))?;
+    let (status, body) = post_json(
+        auth_session,
+        MFA_SMS_SEND_URL,
+        json!({ "ticket": ticket }),
+        "No se pudo pedir el SMS a Discord",
+    )
+    .await?;
 
     if status.is_success() {
         let response: SmsResponse = serde_json::from_str(&body)
@@ -214,24 +260,17 @@ async fn verify_mfa(
     auth_session: &DiscordAuthSession,
 ) -> Result<String, String> {
     let url = format!("{MFA_VERIFY_URL}/{}", method.endpoint_name());
-    let response = auth_session
-        .http()
-        .post(url)
-        .headers(discord_login_headers(auth_session.fingerprint()))
-        .json(&json!({
+    let (status, body) = post_json(
+        auth_session,
+        &url,
+        json!({
             "code": code.trim(),
             "login_instance_id": login_instance_id,
             "ticket": ticket,
-        }))
-        .send()
-        .await
-        .map_err(|error| format!("No se pudo mandar el código a Discord: {error}"))?;
-
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|error| format!("No se pudo leer la respuesta de Discord: {error}"))?;
+        }),
+        "No se pudo mandar el código a Discord",
+    )
+    .await?;
 
     if status.is_success() {
         mfa_token_from_body(&body)
@@ -309,7 +348,7 @@ fn format_login_error(status: reqwest::StatusCode, body: &str) -> String {
         return format!("El login falló (HTTP {status})");
     };
     if error.captcha_key.is_some() {
-        return "Discord pide verificación por captcha, así que no se puede completar el login por usuario/contraseña acá. Iniciá sesión por código QR en su lugar.".to_string();
+        return "Discord no aceptó la verificación por captcha (o pidió una que no se puede mostrar). Probá de nuevo o iniciá sesión por código QR.".to_string();
     }
     if error.suspended_user_token.is_some() {
         return SUSPENDED_ACCOUNT_ERROR.to_owned();

@@ -278,7 +278,9 @@ pub fn preview(msg: &GatewayMessage) -> String {
     let cleaned = clean_content(msg);
     let one_line = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     if one_line.is_empty() {
-        let fallback = if !msg.attachments.is_empty() {
+        let fallback = if msg.is_forward() {
+            "Reenvió un mensaje"
+        } else if !msg.attachments.is_empty() {
             "Envió un archivo adjunto"
         } else if !msg.sticker_items.is_empty() {
             "Envió un sticker"
