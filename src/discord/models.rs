@@ -74,6 +74,10 @@ pub struct User {
     /// aplicación, que hace falta para contestar a sus botones.
     #[serde(default)]
     pub bot: bool,
+    /// Insignias públicas (bits). `1 << 16` = bot verificado (el tilde del
+    /// distintivo APP).
+    #[serde(default)]
+    pub public_flags: u64,
 }
 
 /// Etiqueta de servidor de un usuario, lista para dibujar.
@@ -1143,6 +1147,14 @@ pub struct GatewayMessage {
     /// los arma junto a sus embeds; ver [`Component`].
     #[serde(default, deserialize_with = "lenient_components")]
     pub components: Vec<Component>,
+    /// Comando (slash) que provocó este mensaje, formato viejo: `{ name,
+    /// user, .. }`. El encabezado "X ha utilizado /comando".
+    #[serde(default, deserialize_with = "lenient_interaction")]
+    pub interaction: Option<MessageInteraction>,
+    /// Lo mismo, formato nuevo (`interaction_metadata`): trae `user` y, en
+    /// versiones recientes, también `name`.
+    #[serde(default, deserialize_with = "lenient_interaction")]
+    pub interaction_metadata: Option<MessageInteraction>,
     /// Hilo que nació de ESTE mensaje, si tiene uno (Discord lo embebe en
     /// el mensaje; su `id` es el mismo que el del mensaje).
     #[serde(default)]
@@ -1496,6 +1508,25 @@ pub struct Embed {
     pub fields: Vec<EmbedField>,
 }
 
+/// Quién usó qué comando para provocar un mensaje de bot
+/// (`interaction` / `interaction_metadata`).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MessageInteraction {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub user: Option<User>,
+}
+
+/// Lee una interacción sin que una forma rara tire abajo el mensaje.
+fn lenient_interaction<'de, D>(deserializer: D) -> Result<Option<MessageInteraction>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    Ok(raw.and_then(|v| serde_json::from_value(v).ok()))
+}
+
 /// Lee `components` sin que un componente raro (un tipo nuevo de Discord, un
 /// campo con otra forma) tire abajo el mensaje entero: los que no se pueden
 /// leer se descartan y el resto se queda.
@@ -1590,6 +1621,42 @@ pub struct Component {
     pub min_length: Option<u32>,
     #[serde(default)]
     pub max_length: Option<u32>,
+    /// Componentes V2: galería de medios (12), sus `items`.
+    #[serde(default)]
+    pub items: Vec<GalleryItem>,
+    /// Componentes V2: miniatura (11), `media` con la imagen.
+    #[serde(default)]
+    pub media: Option<EmbedMedia>,
+    /// Componentes V2: archivo (13), `file` con la URL (`attachment://...`
+    /// o la del CDN), más `name` y `size` que a veces trae el componente.
+    #[serde(default)]
+    pub file: Option<EmbedMedia>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub size: Option<u64>,
+    /// Contenedor (17): color de la barra lateral (`0xRRGGBB`).
+    #[serde(default)]
+    pub accent_color: Option<u32>,
+    /// Contenedor / miniatura / archivo: tapado como spoiler.
+    #[serde(default)]
+    pub spoiler: bool,
+    /// Separador (14): `divider` dibuja una línea; `spacing` 1 chico, 2 grande.
+    #[serde(default)]
+    pub divider: Option<bool>,
+    #[serde(default)]
+    pub spacing: Option<u8>,
+}
+
+/// Un elemento de una galería de medios (componente V2 tipo 12).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GalleryItem {
+    #[serde(default)]
+    pub media: EmbedMedia,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub spoiler: bool,
 }
 
 impl Component {

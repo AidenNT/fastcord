@@ -835,6 +835,9 @@ fn message_row(
     if let Some(replied) = &msg.replied_to {
         reply_preview_row(ui, palette, replied);
     }
+    if let Some(line) = &msg.interaction {
+        interaction_row(ui, palette, line);
+    }
     ui
         .horizontal(|ui| {
             // Fuerza a que la fila ocupe todo el ancho disponible (no solo
@@ -896,6 +899,9 @@ fn message_row(
                                 msg.avatar_color,
                             );
                         }
+                        if msg.is_bot {
+                            app_tag(ui, palette, msg.bot_verified);
+                        }
                         theme::text(ui, &msg.time, theme::regular(10.5), palette.dim);
                     });
                     message_body(ui, palette, msg, channels, index, toggled_reaction, actions);
@@ -905,6 +911,76 @@ fn message_row(
     })
     .response
     .rect
+}
+
+/// Insignia "APP" que Discord pone junto al nombre de un bot (con un tilde
+/// si es un bot verificado).
+fn app_tag(ui: &mut egui::Ui, palette: &Palette, verified: bool) {
+    let galley = ui
+        .painter()
+        .layout_no_wrap("APP".to_string(), theme::semibold(9.5), palette.on_accent);
+    let check = if verified { 10.0 } else { 0.0 };
+    let gap = if verified { 2.0 } else { 0.0 };
+    let size = Vec2::new(galley.size().x + check + gap + 8.0, 15.0);
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    if ui.is_rect_visible(rect) {
+        ui.painter().rect_filled(rect, CornerRadius::same(3), palette.accent);
+        let mut x = rect.left() + 4.0;
+        if verified {
+            let icon = egui::Rect::from_min_size(egui::pos2(x, rect.center().y - 5.0), Vec2::splat(10.0));
+            theme::paint_icon(ui, Icon::Check, icon, 10.0, palette.on_accent);
+            x += check + gap;
+        }
+        ui.painter().galley(
+            egui::pos2(x, rect.center().y - galley.size().y / 2.0),
+            galley,
+            palette.on_accent,
+        );
+    }
+}
+
+/// Encabezado "[avatar] Fulano ha utilizado /comando" arriba de la respuesta
+/// de un bot a un comando, con el mismo gancho en L que una cita.
+fn interaction_row(ui: &mut egui::Ui, palette: &Palette, line: &crate::lib::data::InteractionLine) {
+    ui.horizontal(|ui| {
+        ui.set_min_width(ui.available_width());
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let (hook_rect, _) = ui.allocate_exact_size(Vec2::new(AVATAR_GUTTER, 14.0), Sense::hover());
+        let stroke = Stroke::new(1.5, palette.dim);
+        let x = hook_rect.right() - 22.0;
+        let mid_y = hook_rect.center().y;
+        ui.painter().line_segment([egui::pos2(x, hook_rect.top()), egui::pos2(x, mid_y)], stroke);
+        ui.painter().line_segment([egui::pos2(x, mid_y), egui::pos2(hook_rect.right() - 4.0, mid_y)], stroke);
+
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::click());
+        extra::avatar(
+            ui,
+            rect.center(),
+            8.0,
+            line.avatar_url.as_deref(),
+            line.avatar_color,
+            line.user.chars().next().map(|c| c.to_string()).unwrap_or_default().as_str(),
+            palette,
+        );
+        let name = theme::text(ui, &line.user, theme::semibold(11.5), palette.dim);
+        if response.clicked() || ui.interact(name.rect, name.id.with("profile"), Sense::click()).clicked() {
+            crate::ui::profile_popup::request_open(
+                ui.ctx(),
+                &line.user_id,
+                &line.user,
+                line.avatar_url.clone(),
+                line.avatar_color,
+            );
+        }
+        theme::text(ui, "ha utilizado", theme::regular(11.5), palette.dim);
+        Frame::new()
+            .fill(palette.accent.gamma_multiply(0.22))
+            .corner_radius(CornerRadius::same(4))
+            .inner_margin(Margin::symmetric(5, 1))
+            .show(ui, |ui| {
+                theme::text(ui, &format!("/{}", line.command), theme::medium(11.5), palette.accent);
+            });
+    });
 }
 
 /// Línea "Fulano  contenido citado..." que aparece ARRIBA de un mensaje

@@ -146,6 +146,10 @@ pub fn show(ui: &mut Ui, palette: &Palette, text: &str, size: f32, color: Color3
                 render_paragraph(ui, palette, &text, size + bump, color, true, ctx);
             }
             Block::Quote(text) => quote_block(ui, palette, &text, size, color, ctx),
+            // `-# texto`: subtexto, más chico y apagado.
+            Block::Subtext(text) => {
+                render_paragraph(ui, palette, &text, (size - 2.5).max(10.0), palette.dim, false, ctx)
+            }
             Block::List(items) => {
                 for item in items {
                     ui.horizontal(|ui| {
@@ -169,8 +173,14 @@ enum Block {
     CodeBlock(String),
     Heading(u8, String),
     Quote(String),
+    Subtext(String),
     List(Vec<String>),
     Paragraph(String),
+}
+
+/// `-# texto` (subtexto de Discord). Devuelve el texto sin el marcador.
+fn subtext_line(line: &str) -> Option<&str> {
+    line.trim_start().strip_prefix("-# ")
 }
 
 fn heading_level(line: &str) -> Option<(u8, &str)> {
@@ -236,6 +246,11 @@ fn split_blocks(text: &str) -> Vec<Block> {
             continue;
         }
 
+        if let Some(rest) = subtext_line(line) {
+            blocks.push(Block::Subtext(rest.to_string()));
+            continue;
+        }
+
         // `>>> ` cita TODO lo que sigue, incluidas las líneas siguientes.
         if let Some(rest) = line.trim_start().strip_prefix(">>> ") {
             let mut quote_lines = vec![rest.to_string()];
@@ -276,6 +291,7 @@ fn split_blocks(text: &str) -> Vec<Block> {
             let stops = next.trim().is_empty()
                 || is_fence_start(next)
                 || heading_level(next).is_some()
+                || subtext_line(next).is_some()
                 || next.trim_start().starts_with("> ")
                 || next.trim_start().starts_with(">>> ")
                 || is_list_item(next);

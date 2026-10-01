@@ -20,6 +20,8 @@ use egui::{Color32, CornerRadius, Frame, Margin, Sense, Stroke, Vec2};
 use crate::discord::models::Component;
 use crate::lib::data::{ChatMessage, ComponentClick};
 use crate::ui::emoji as twemoji;
+use crate::ui::markdown::{self, MentionCtx};
+use crate::ui::media;
 use crate::ui::theme::{self, Icon, Palette};
 
 /// Alto de un botón (el de Discord mide 32 px).
@@ -27,6 +29,9 @@ const BUTTON_HEIGHT: f32 = 32.0;
 const BUTTON_PAD_X: f32 = 14.0;
 const EMOJI_SIZE: f32 = 16.0;
 const EMOJI_GAP: f32 = 6.0;
+/// Lado de la miniatura de una sección V2 y ancho máximo de un contenedor.
+const THUMB_SIDE: f32 = 80.0;
+const CONTAINER_MAX_W: f32 = 480.0;
 
 /// Bit de `flags` de un mensaje efímero (solo lo ve quien lo provocó).
 pub const FLAG_EPHEMERAL: u64 = 1 << 6;
@@ -38,9 +43,10 @@ pub fn show(ui: &mut egui::Ui, palette: &Palette, msg: &ChatMessage) -> Option<C
         return None;
     }
     let mut clicked: Option<String> = None;
+    let ctx = MentionCtx { mentions: &msg.mentions, channels: None };
     ui.add_space(4.0);
     for component in &msg.components {
-        draw(ui, palette, component, &mut clicked);
+        draw(ui, palette, component, &ctx, &mut clicked);
     }
     clicked.map(|custom_id| ComponentClick {
         message_id: msg.id.clone(),
@@ -52,7 +58,13 @@ pub fn show(ui: &mut egui::Ui, palette: &Palette, msg: &ChatMessage) -> Option<C
 }
 
 /// Un componente cualquiera (recursivo para filas, contenedores y secciones).
-fn draw(ui: &mut egui::Ui, palette: &Palette, component: &Component, clicked: &mut Option<String>) {
+fn draw(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    component: &Component,
+    ctx: &MentionCtx,
+    clicked: &mut Option<String>,
+) {
     match component.kind {
         // Fila de acciones: los botones van uno al lado del otro, y si no
         // entran, siguen abajo.
@@ -60,7 +72,7 @@ fn draw(ui: &mut egui::Ui, palette: &Palette, component: &Component, clicked: &m
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
                 for child in &component.components {
-                    draw(ui, palette, child, clicked);
+                    draw(ui, palette, child, ctx, clicked);
                 }
             });
             ui.add_space(2.0);
@@ -68,42 +80,124 @@ fn draw(ui: &mut egui::Ui, palette: &Palette, component: &Component, clicked: &m
         Component::BUTTON => button(ui, palette, component, clicked),
         // Menús desplegables: caja apagada con el texto de ayuda.
         3 | 5 | 6 | 7 | 8 => select_placeholder(ui, palette, component),
-        // Texto suelto (componentes nuevos).
+        // Texto suelto (componentes nuevos): con el markdown de Discord
+        // (negrita, cursiva, `-#` subtexto, menciones, emojis...).
         10 => {
             if let Some(content) = component.content.as_deref().filter(|c| !c.is_empty()) {
-                ui.add(
-                    egui::Label::new(egui::RichText::new(content).font(theme::regular(13.5)).color(palette.text))
-                        .wrap(),
-                );
+                markdown::show(ui, palette, content, 13.5, palette.text, ctx);
             }
         }
-        // Sección: texto a la izquierda y, si hay, un botón (accesorio) a la derecha.
+        // Sección: texto a la izquierda y, si hay, un accesorio a la derecha
+        // (una miniatura o un botón).
         9 => {
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
-                for child in &component.components {
-                    draw(ui, palette, child, clicked);
-                }
-                if let Some(accessory) = component.accessory.as_deref() {
-                    draw(ui, palette, accessory, clicked);
-                }
-            });
-        }
-        // Contenedor: caja con borde a la izquierda, como un embed.
-        17 => {
-            Frame::new()
-                .fill(palette.surface)
-                .stroke(Stroke::new(1.0, palette.outline))
-                .corner_radius(CornerRadius::same(theme::RADIUS_SMALL))
-                .inner_margin(Margin::symmetric(12, 8))
-                .show(ui, |ui| {
+            let thumb = component.accessory.as_deref().filter(|a| a.kind == 11);
+            if let Some(thumb) = thumb {
+                let text_w = (ui.available_width() - THUMB_SIDE - 12.0).max(120.0);
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(text_w);
+                        for child in &component.components {
+                            draw(ui, palette, child, ctx, clicked);
+                        }
+                    });
+                    ui.add_space(4.0);
+                    draw(ui, palette, thumb, ctx, clicked);
+                });
+            } else {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
                     for child in &component.components {
-                        draw(ui, palette, child, clicked);
+                        draw(ui, palette, child, ctx, clicked);
+                    }
+                    if let Some(accessory) = component.accessory.as_deref() {
+                        draw(ui, palette, accessory, ctx, clicked);
                     }
                 });
+            }
+        }
+        // Miniatura (accesorio de una sección).
+        11 => {
+            if let Some(m) = component.media.as_ref() {
+                let alt = component.description.as_deref().unwrap_or("");
+                media::component_media(ui, palette, m, Some(THUMB_SIDE), component.spoiler, alt);
+            }
+        }
+        // Galería de medios: una imagen/GIF a todo el ancho, o una grilla.
+        12 => {
+            let n = component.items.len();
+            if n == 0 {
+                return;
+            }
+            ui.add_space(2.0);
+            if n == 1 {
+                let item = &component.items[0];
+                let alt = item.description.as_deref().unwrap_or("");
+                media::component_media(ui, palette, &item.media, None, item.spoiler, alt);
+            } else {
+                let side = ((ui.available_width() - 4.0) / 2.0).clamp(80.0, 200.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::splat(4.0);
+                    for item in &component.items {
+                        let alt = item.description.as_deref().unwrap_or("");
+                        media::component_media(ui, palette, &item.media, Some(side), item.spoiler, alt);
+                    }
+                });
+            }
+            ui.add_space(2.0);
+        }
+        // Archivo adjunto: un link con el nombre.
+        13 => {
+            if let Some(f) = component.file.as_ref().filter(|f| f.has_url()) {
+                let url = f.display_url().to_string();
+                let label = component.name.clone().unwrap_or_else(|| {
+                    let last = f.url.rsplit('/').next().unwrap_or("archivo");
+                    last.split(['?', '#']).next().unwrap_or("archivo").to_string()
+                });
+                let resp = ui.link(egui::RichText::new(label).font(theme::medium(13.5)));
+                if resp.clicked() && (url.starts_with("https://") || url.starts_with("http://")) {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                }
+            }
+        }
+        // Separador: espacio y, si `divider`, una línea fina.
+        14 => {
+            let gap = if component.spacing == Some(2) { 16.0 } else { 8.0 };
+            ui.add_space(gap / 2.0);
+            if component.divider.unwrap_or(true) {
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+                ui.painter().rect_filled(rect, CornerRadius::ZERO, palette.outline);
+            }
+            ui.add_space(gap / 2.0);
+        }
+        // Contenedor: caja con la barra de color a la izquierda (el
+        // `accent_color`), como un embed.
+        17 => {
+            let radius = theme::RADIUS_SMALL;
+            let bar_color = component.accent_color.map(rgb_from_int).unwrap_or(palette.outline);
+            let inner = Frame::new()
+                .fill(palette.surface)
+                .corner_radius(CornerRadius { nw: radius, ne: radius, sw: radius, se: radius })
+                .inner_margin(Margin { left: 16, right: 12, top: 8, bottom: 8 })
+                .show(ui, |ui| {
+                    ui.set_max_width(ui.available_width().min(CONTAINER_MAX_W));
+                    for child in &component.components {
+                        draw(ui, palette, child, ctx, clicked);
+                    }
+                });
+            let r = inner.response.rect;
+            let bar = egui::Rect::from_min_max(r.min, egui::pos2(r.min.x + 4.0, r.max.y));
+            ui.painter().rect_filled(
+                bar,
+                CornerRadius { nw: radius, ne: 0, sw: radius, se: 0 },
+                bar_color,
+            );
         }
         _ => {}
     }
+}
+
+fn rgb_from_int(c: u32) -> Color32 {
+    Color32::from_rgb(((c >> 16) & 0xff) as u8, ((c >> 8) & 0xff) as u8, (c & 0xff) as u8)
 }
 
 /// Colores (fondo, fondo con el mouse encima, texto) de un botón según su estilo.

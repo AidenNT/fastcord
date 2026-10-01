@@ -214,6 +214,58 @@ pub fn hides_content(content: &str, embeds: &[Embed]) -> bool {
 // Adjuntos
 // ---------------------------------------------------------------------
 
+/// Imagen/GIF de un componente V2 (galería de medios o miniatura de una
+/// sección). `side` = lado máximo de la caja (miniaturas, grillas); `None` =
+/// el ancho disponible como en un adjunto suelto. Un spoiler se dibuja tapado
+/// hasta que se lo clickea; un click normal abre la imagen original.
+pub fn component_media(
+    ui: &mut Ui,
+    palette: &Palette,
+    media: &crate::discord::models::EmbedMedia,
+    side: Option<f32>,
+    spoiler: bool,
+    alt: &str,
+) {
+    if !media.has_url() {
+        return;
+    }
+    let max = match side {
+        Some(side) => Vec2::splat(side),
+        None => Vec2::new(ui.available_width().min(MEDIA_MAX_W).max(80.0), MEDIA_MAX_H),
+    };
+    if spoiler {
+        let key = egui::Id::new(("ecord_spoiler", media.url.as_str()));
+        let revealed = ui
+            .ctx()
+            .memory(|m| m.data.get_temp::<bool>(key).unwrap_or(false));
+        if !revealed {
+            let size = box_size(media.width, media.height, max);
+            if spoiler_cover(ui, palette, size).clicked() {
+                ui.ctx().memory_mut(|m| m.data.insert_temp(key, true));
+            }
+            return;
+        }
+    }
+    let response = media_box(
+        ui,
+        palette,
+        MediaSpec {
+            url: media.display_url(),
+            width: media.width,
+            height: media.height,
+            max,
+            radius: MEDIA_RADIUS,
+            alt: if alt.is_empty() { "No se pudo cargar la imagen" } else { alt },
+            format: "webp",
+            play: false,
+            badge: None,
+        },
+    );
+    if response.clicked() {
+        open(ui, &media.url);
+    }
+}
+
 fn attachment_image(ui: &mut Ui, palette: &Palette, att: &Attachment, max: Vec2) {
     // Spoiler: mientras no se lo clickee, solo se dibuja una tapa del
     // mismo tamaño que tendría la imagen (no se pide nada a la red).

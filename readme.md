@@ -167,7 +167,7 @@ ecord/
 - [ ] **Bot dropdown menus** (currently rendered disabled)
 - [ ] **Choosing a target channel or DM** for actions that ask for one (currently shows "not supported yet")
 - [ ] **Visible send errors**: a failed message or action is currently dropped silently → show a notice + retry
-- [ ] ~**Password login with captcha**: currently you must fall back to QR~ (Replaced with general captcha handling)
+- [ ] ~~Password login with captcha: currently you must fall back to QR~~ (Replaced with general captcha handling)
 - [ ] **More 2FA methods** (beyond TOTP and SMS)
 - [ ] **Dedicated palettes** for the two dark themes that currently fall back to `Dark`
 - [ ] Missing Lucide icons (GIF, sticker, inbox, shop) — currently placeholders

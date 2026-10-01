@@ -380,6 +380,22 @@ pub struct ChatMessage {
     pub application_id: Option<String>,
     /// `flags` del mensaje de Discord (`1 << 6` = efímero).
     pub flags: u64,
+    /// El autor es un bot/app: se dibuja la insignia APP junto al nombre.
+    pub is_bot: bool,
+    /// Bot verificado (tilde dentro de la insignia APP).
+    pub bot_verified: bool,
+    /// Si el mensaje es la respuesta a un comando: quién lo usó y cuál.
+    pub interaction: Option<InteractionLine>,
+}
+
+/// Encabezado "X ha utilizado /comando" de la respuesta de un bot.
+#[derive(Debug, Clone, Default)]
+pub struct InteractionLine {
+    pub user_id: String,
+    pub user: String,
+    pub avatar_url: Option<String>,
+    pub avatar_color: Color32,
+    pub command: String,
 }
 
 /// Un botón apretado en un mensaje (`ui::components` → `App::press_component`).
@@ -450,6 +466,9 @@ impl ChatMessage {
             channel_id: String::new(),
             application_id: None,
             flags: 0,
+            is_bot: false,
+            bot_verified: false,
+            interaction: None,
         }
     }
 
@@ -478,6 +497,9 @@ impl ChatMessage {
             channel_id: String::new(),
             application_id: None,
             flags: 0,
+            is_bot: false,
+            bot_verified: false,
+            interaction: None,
         }
     }
 
@@ -560,7 +582,43 @@ impl ChatMessage {
             channel_id: msg.channel_id.clone(),
             application_id,
             flags: msg.flags,
+            is_bot: msg.author.bot,
+            bot_verified: msg.author.public_flags & (1 << 16) != 0,
+            interaction: Self::interaction_from_discord(msg, names),
         }
+    }
+
+    /// Arma el encabezado "X ha utilizado /comando". Discord manda quién y
+    /// cuál en `interaction` (viejo) y/o `interaction_metadata` (nuevo, el
+    /// nombre del comando solo viene en versiones recientes): se juntan los
+    /// dos. Sin usuario o sin nombre no hay nada que mostrar.
+    fn interaction_from_discord(
+        msg: &crate::discord::models::GatewayMessage,
+        names: Option<NameResolver<'_>>,
+    ) -> Option<InteractionLine> {
+        let user = msg
+            .interaction
+            .as_ref()
+            .and_then(|i| i.user.as_ref())
+            .or_else(|| msg.interaction_metadata.as_ref().and_then(|i| i.user.as_ref()))?;
+        let command = msg
+            .interaction
+            .as_ref()
+            .and_then(|i| i.name.clone())
+            .or_else(|| msg.interaction_metadata.as_ref().and_then(|i| i.name.clone()))
+            .filter(|n| !n.is_empty())?;
+        let base = user.display_name().to_string();
+        let name = match names {
+            Some(names) => names.identity(&user.id, &base).0,
+            None => base,
+        };
+        Some(InteractionLine {
+            user_id: user.id.clone(),
+            user: name,
+            avatar_url: user.avatar_url(),
+            avatar_color: color_from_id(&user.id),
+            command,
+        })
     }
 
     /// ¿Es el mismo autor que `other`, a efectos de agrupar mensajes
