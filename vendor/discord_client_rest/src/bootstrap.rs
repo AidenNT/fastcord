@@ -38,7 +38,7 @@ pub(crate) fn build_emulated_client(proxy: Option<&str>) -> BoxedResult<Client> 
     // por más que ahí esté instalada la CA de la herramienta). Seteá la
     // variable de entorno ECORD_INSECURE_TLS=1 antes de correr el programa
     // mientras estés debuggeando, y sacala/apagala para uso normal.
-    if std::env::var("ECORD_INSECURE_TLS").as_deref() == Ok("1") {
+    if crate::insecure_tls_enabled() {
         log::warn!(
             "ECORD_INSECURE_TLS=1: verificación de certificados TLS desactivada, solo para debug"
         );

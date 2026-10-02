@@ -17,6 +17,48 @@ pub mod user_settings;
 pub mod uwu_rest;
 pub mod voice;
 mod auth_http;
+
+/// Texto con el que Discord (vía el cliente REST vendorizado) rechaza un
+/// token: lo devuelve tal cual ante un 401 que no es de MFA.
+pub(crate) const VENDOR_INVALID_TOKEN: &str = "Invalid token";
+
+/// Mensaje que ve la persona cuando la sesión guardada dejó de valer.
+/// También es la marca con la que `App` reconoce, dentro de un
+/// `AppEvent::Error` armado por cualquier `spawn_*`, que el problema es el
+/// token y no un fallo cualquiera.
+pub const INVALID_SESSION_MESSAGE: &str = "Tu sesión de Discord ya no es válida. Iniciá sesión de nuevo.";
+
+/// Discord dejó de aceptar el token (401 en REST o cierre 4004 del
+/// Gateway): reintentar con el mismo token no sirve, hay que borrarlo y
+/// volver a pedir login. Cualquier OTRO error (red caída, timeout, 5xx...)
+/// NO es esto: el token sigue valiendo y se puede reintentar con él.
+#[derive(Debug, Clone, Copy)]
+pub struct InvalidSession;
+
+impl std::fmt::Display for InvalidSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(INVALID_SESSION_MESSAGE)
+    }
+}
+
+impl std::error::Error for InvalidSession {}
+
+/// Avisa a la UI de la acción que se está haciendo. Los pasos se muestran
+/// solo mientras la pantalla está en "Conectando…"; después se ignoran.
+pub(crate) fn step(tx: &std::sync::mpsc::Sender<AppEvent>, text: &str) {
+    let _ = tx.send(AppEvent::ConnectionStep(text.to_owned()));
+}
+
+/// Traduce el error con el que terminó la conexión (`gateway::run` o la
+/// validación previa del token) al evento que corresponde: sesión inválida
+/// (se borra el token) o conexión perdida por otra causa (se conserva).
+fn connection_failure_event(context: &str, error: &anyhow::Error) -> AppEvent {
+    if error.downcast_ref::<InvalidSession>().is_some() {
+        AppEvent::SessionInvalid(INVALID_SESSION_MESSAGE.to_owned())
+    } else {
+        AppEvent::GatewayLost(format!("{context}: {error}"))
+    }
+}
 pub(crate) mod ids;
 
 pub use voice::{
@@ -216,6 +258,18 @@ pub enum AppEvent {
     /// La reconexión automática después de un `GatewayDisconnected`
     /// funcionó.
     GatewayReconnected,
+    /// Qué está haciendo la conexión en este momento ("Comprobando
+    /// sesión…", "Autenticando…"). Solo informativo: la pantalla de
+    /// "Conectando con Discord…" lo muestra debajo del spinner.
+    ConnectionStep(String),
+    /// Discord ya no acepta el token (ver [`InvalidSession`]). `App` borra
+    /// el token guardado y vuelve a la pantalla de login.
+    SessionInvalid(String),
+    /// Se perdió el Gateway para siempre (se agotaron los reintentos, o
+    /// Discord rechazó la conexión) por algo que NO es el token. `App`
+    /// vuelve a la pantalla de login pero CONSERVA el token: "Probar de
+    /// nuevo" reconecta con él, sin pedir un QR.
+    GatewayLost(String),
     /// El extremo de envío para mandarle comandos al Gateway (suscribirse
     /// a la lista de miembros de un canal). Llega una vez por cada
     /// conexión nueva que arranca (`spawn_login_flow` /
@@ -373,6 +427,7 @@ pub fn spawn_login_flow(tx: std::sync::mpsc::Sender<AppEvent>) {
                     // por bueno. Si el QR devolvió algo que Discord no
                     // acepta, nos enteramos acá en vez de recién al fallar
                     // el gateway más adelante.
+                    step(&tx, "Comprobando sesión…");
                     if let Err(e) = uwu_rest::UwuRest::for_token(token.clone()).await {
                         let _ = tx.send(AppEvent::Error(format!(
                             "El token que dio el QR no pasó la validación: {e}"
@@ -386,9 +441,7 @@ pub fn spawn_login_flow(tx: std::sync::mpsc::Sender<AppEvent>) {
                     let (commands_tx, commands_rx) = tokio::sync::mpsc::unbounded_channel();
                     let _ = tx.send(AppEvent::GatewayCommands(commands_tx));
                     if let Err(e) = gateway::run(token, fingerprint, tx.clone(), commands_rx).await {
-                        let _ = tx.send(AppEvent::Error(format!(
-                            "Se cortó la conexión con Discord: {e}"
-                        )));
+                        let _ = tx.send(connection_failure_event("Se cortó la conexión con Discord", &e));
                     }
                 }
                 Err(e) => {
@@ -1044,12 +1097,15 @@ pub fn spawn_gateway_with_token(token: String, tx: std::sync::mpsc::Sender<AppEv
             return;
         };
         rt.block_on(async move {
+            step(&tx, "Preparando el cliente…");
             let fingerprint = init_fingerprint().await;
 
+            // Solo un 401 de verdad (`InvalidSession`) significa que el
+            // token ya no sirve; un fallo de red u otro error se informa
+            // aparte y deja el token guardado para reintentar.
+            step(&tx, "Comprobando sesión…");
             if let Err(e) = uwu_rest::UwuRest::for_token(token.clone()).await {
-                let _ = tx.send(AppEvent::Error(format!(
-                    "El token guardado ya no es válido: {e}"
-                )));
+                let _ = tx.send(connection_failure_event("No se pudo conectar con Discord", &e));
                 return;
             }
 
@@ -1057,9 +1113,7 @@ pub fn spawn_gateway_with_token(token: String, tx: std::sync::mpsc::Sender<AppEv
             let (commands_tx, commands_rx) = tokio::sync::mpsc::unbounded_channel();
             let _ = tx.send(AppEvent::GatewayCommands(commands_tx));
             if let Err(e) = gateway::run(token, fingerprint, tx.clone(), commands_rx).await {
-                let _ = tx.send(AppEvent::Error(format!(
-                    "Se cortó la conexión con Discord: {e}"
-                )));
+                let _ = tx.send(connection_failure_event("Se cortó la conexión con Discord", &e));
             }
         });
     });

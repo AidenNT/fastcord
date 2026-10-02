@@ -150,14 +150,15 @@ enum LoginOutcome {
 /// `POST` con cuerpo JSON contra la API de auth, con captcha automático: si
 /// Discord contesta 400 pidiendo un hCaptcha, se lo hace resolver a la
 /// persona (`captcha::solve`, que abre la ventana) y se repite el pedido con
-/// el token (`captcha_key` en el cuerpo, `X-Captcha-Key` y
-/// `X-Captcha-Rqtoken` en los headers). Devuelve el estado y el cuerpo de la
+/// el token (headers `X-Captcha-Key`, `X-Captcha-Rqtoken` y, si el desafío
+/// traía `captcha_session_id`, `X-Captcha-Session-Id`; mandar la solución en
+/// el cuerpo está deprecado). Devuelve el estado y el cuerpo de la
 /// respuesta final; `send_error` es el prefijo del error si no se puede ni
 /// mandar el pedido.
 async fn post_json(
     auth_session: &DiscordAuthSession,
     url: &str,
-    mut body: Value,
+    body: Value,
     send_error: &str,
 ) -> Result<(reqwest::StatusCode, String), String> {
     use reqwest::header::{HeaderName, HeaderValue};
@@ -167,12 +168,14 @@ async fn post_json(
     loop {
         let mut headers = discord_login_headers(auth_session.fingerprint());
         if let Some(solution) = solved.take() {
-            body["captcha_key"] = json!(solution.token);
             if let Ok(value) = HeaderValue::from_str(&solution.token) {
                 headers.insert(HeaderName::from_static("x-captcha-key"), value);
             }
             if let Some(value) = solution.rqtoken.as_deref().and_then(|token| HeaderValue::from_str(token).ok()) {
                 headers.insert(HeaderName::from_static("x-captcha-rqtoken"), value);
+            }
+            if let Some(value) = solution.session_id.as_deref().and_then(|id| HeaderValue::from_str(id).ok()) {
+                headers.insert(HeaderName::from_static("x-captcha-session-id"), value);
             }
         }
 

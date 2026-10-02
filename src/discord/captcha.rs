@@ -100,6 +100,9 @@ pub struct CaptchaChallenge {
     pub rqdata: Option<String>,
     /// Identifica el desafío; hay que devolverlo en `X-Captcha-Rqtoken`.
     pub rqtoken: Option<String>,
+    /// `captcha_session_id`; si viene, hay que devolverlo en
+    /// `X-Captcha-Session-Id`.
+    pub session_id: Option<String>,
 }
 
 impl CaptchaChallenge {
@@ -116,6 +119,7 @@ impl CaptchaChallenge {
             sitekey: error.captcha_sitekey.clone(),
             rqdata: Some(error.captcha_rqdata.clone()).filter(|data| !data.is_empty()),
             rqtoken: Some(error.captcha_rqtoken.clone()).filter(|token| !token.is_empty()),
+            session_id: Some(error.captcha_session_id.clone()).filter(|id| !id.is_empty()),
         })
     }
 }
@@ -125,6 +129,7 @@ impl CaptchaChallenge {
 pub struct CaptchaSolution {
     pub token: String,
     pub rqtoken: Option<String>,
+    pub session_id: Option<String>,
 }
 
 impl CaptchaSolution {
@@ -132,18 +137,21 @@ impl CaptchaSolution {
     /// (agrega `X-Captcha-Key` y `X-Captcha-Rqtoken`).
     pub fn to_vendor(&self) -> SolvedCaptcha {
         SolvedCaptcha::new(self.token.clone(), self.rqtoken.clone().unwrap_or_default())
+            .with_session_id(self.session_id.clone().unwrap_or_default())
     }
 }
 
 /// Lee los campos `captcha_*` de un cuerpo de error de Discord (para los
-/// pedidos hechos con `reqwest`, como el login). `None` si no es un
-/// desafío de hCaptcha que se pueda mostrar.
+/// pedidos hechos con `reqwest`, como el login). Según la doc, un captcha se
+/// identifica por el 400 + la presencia de `captcha_key` (sin mirar su
+/// contenido). `None` si no es un desafío de hCaptcha que se pueda mostrar.
 pub(super) fn parse_challenge(body: &str) -> Option<CaptchaChallenge> {
     #[derive(Deserialize)]
     struct Raw {
         captcha_key: Option<Value>,
         captcha_sitekey: Option<String>,
         captcha_service: Option<String>,
+        captcha_session_id: Option<String>,
         captcha_rqdata: Option<String>,
         captcha_rqtoken: Option<String>,
     }
@@ -158,6 +166,7 @@ pub(super) fn parse_challenge(body: &str) -> Option<CaptchaChallenge> {
         sitekey,
         rqdata: raw.captcha_rqdata.filter(|data| !data.is_empty()),
         rqtoken: raw.captcha_rqtoken.filter(|token| !token.is_empty()),
+        session_id: raw.captcha_session_id.filter(|id| !id.is_empty()),
     })
 }
 
@@ -300,6 +309,7 @@ fn spawn_window(id: u64, challenge: &CaptchaChallenge) -> Result<CaptchaWindow, 
     let watcher = Arc::clone(&child);
     let watcher_outcome = Arc::clone(&outcome);
     let rqtoken = challenge.rqtoken.clone();
+    let session_id = challenge.session_id.clone();
     std::thread::spawn(move || {
         let token = BufReader::new(stdout)
             .lines()
@@ -321,7 +331,7 @@ fn spawn_window(id: u64, challenge: &CaptchaChallenge) -> Result<CaptchaWindow, 
         }
 
         let solved = token.is_some();
-        resolve(id, token.map(|token| CaptchaSolution { token, rqtoken }));
+        resolve(id, token.map(|token| CaptchaSolution { token, rqtoken, session_id }));
         watcher_outcome.store(if solved { SOLVED } else { CLOSED }, Ordering::Release);
         wake_ui();
     });
@@ -527,11 +537,12 @@ mod tests {
 
     #[test]
     fn parses_hcaptcha_challenge() {
-        let body = r#"{"captcha_key":["captcha-required"],"captcha_sitekey":"site","captcha_service":"hcaptcha","captcha_rqdata":"data","captcha_rqtoken":"token"}"#;
+        let body = r#"{"captcha_key":["captcha-required"],"captcha_sitekey":"site","captcha_service":"hcaptcha","captcha_session_id":"sess","captcha_rqdata":"data","captcha_rqtoken":"token"}"#;
         let challenge = parse_challenge(body).expect("challenge should parse");
         assert_eq!(challenge.sitekey, "site");
         assert_eq!(challenge.rqdata.as_deref(), Some("data"));
         assert_eq!(challenge.rqtoken.as_deref(), Some("token"));
+        assert_eq!(challenge.session_id.as_deref(), Some("sess"));
     }
 
     #[test]
@@ -552,7 +563,13 @@ mod tests {
                 .expect("missing rqdata/rqtoken/service should still deserialize");
         let challenge = CaptchaChallenge::from_vendor(&error).expect("challenge");
         assert_eq!(challenge.sitekey, "site");
-        assert!(challenge.rqdata.is_none() && challenge.rqtoken.is_none());
+        assert!(challenge.rqdata.is_none() && challenge.rqtoken.is_none() && challenge.session_id.is_none());
+
+        // `captcha_sitekey` es `?string`: un null no debe romper la deserialización.
+        let nullable: CaptchaRequiredError =
+            serde_json::from_str(r#"{"captcha_key":["x"],"captcha_sitekey":null,"captcha_service":"recaptcha_enterprise"}"#)
+                .expect("null sitekey should deserialize");
+        assert!(nullable.captcha_sitekey.is_empty());
 
         let recaptcha: CaptchaRequiredError = serde_json::from_str(
             r#"{"captcha_key":["x"],"captcha_sitekey":"s","captcha_service":"recaptcha"}"#,
@@ -564,7 +581,7 @@ mod tests {
     #[test]
     fn broker_round_trip_and_cancel() {
         fn challenge(sitekey: &str) -> CaptchaChallenge {
-            CaptchaChallenge { sitekey: sitekey.to_owned(), rqdata: None, rqtoken: Some("rq".to_owned()) }
+            CaptchaChallenge { sitekey: sitekey.to_owned(), rqdata: None, rqtoken: Some("rq".to_owned()), session_id: None }
         }
         fn run_solve(challenge: CaptchaChallenge) -> std::thread::JoinHandle<Option<CaptchaSolution>> {
             std::thread::spawn(move || {
@@ -587,10 +604,11 @@ mod tests {
         let solver = run_solve(challenge("a"));
         let request = wait_for_request();
         assert_eq!(request.challenge.sitekey, "a");
-        resolve(request.id, Some(CaptchaSolution { token: "tok".into(), rqtoken: Some("rq".into()) }));
+        resolve(request.id, Some(CaptchaSolution { token: "tok".into(), rqtoken: Some("rq".into()), session_id: Some("sess".into()) }));
         let solution = solver.join().unwrap().expect("solved");
         assert_eq!(solution.token, "tok");
         assert_eq!(solution.to_vendor().rqtoken, "rq");
+        assert_eq!(solution.to_vendor().session_id, "sess");
 
         // Cancelado.
         let waiter = run_solve(challenge("b"));

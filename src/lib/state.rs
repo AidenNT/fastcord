@@ -451,6 +451,15 @@ pub struct App {
     shown_title_count: Option<u32>,
     /// Popup modal actualmente abierto, si hay alguno.
     pub modal: Option<Modal>,
+    /// Cola de diálogos (avisos, confirmaciones, novedades, formularios) del
+    /// sistema `ui::dialog`; se muestra de a uno, el primero de la cola.
+    /// Usar `App::open_dialog`.
+    pub dialogs: std::collections::VecDeque<crate::ui::dialog::Dialog>,
+    /// Token de la sesión guardada que NO se conectó al arrancar porque hay un
+    /// aviso de seguridad pendiente (ver `ui::security_warning`). Se usa (y se
+    /// vacía) cuando la persona acepta el aviso; si cierra ecord, nunca se
+    /// envía a ningún lado.
+    pub pending_resume_token: Option<String>,
     /// Tarjeta de perfil de usuario actualmente abierta, si hay alguna
     /// (ver `App::open_user_profile` / `ui::profile_popup`).
     pub profile_popup: Option<ProfilePopup>,
@@ -504,6 +513,10 @@ pub struct App {
     /// mostrarlo arriba del formulario en vez de mandar a la pantalla
     /// genérica de `AuthStatus::Failed` (que perdería lo ya tipeado).
     pub login_error: Option<String>,
+    /// Acciones que va haciendo la conexión mientras se muestra "Conectando
+    /// con Discord…" (las últimas, la más reciente al final). Se vacía al
+    /// arrancar cada conexión y al volver al login.
+    pub connection_steps: Vec<String>,
     /// Desafío de 2FA que mandó Discord (`AuthStatus::PasswordMfaRequired`
     /// necesita esto para saber qué métodos ofrecer y con qué ticket
     /// contestar).
@@ -652,6 +665,8 @@ impl Default for App {
             mute_rules: crate::lib::notifications::MuteRules::default(),
             shown_title_count: None,
             modal: None,
+            dialogs: std::collections::VecDeque::new(),
+            pending_resume_token: None,
             profile_popup: None,
             role_popup: None,
             dm_profile: None,
@@ -669,6 +684,7 @@ impl Default for App {
             login_mfa_code: String::new(),
             login_sms_sent: false,
             login_error: None,
+            connection_steps: Vec::new(),
             pending_mfa: None,
             captcha: Default::default(),
             voice: VoiceCache {
@@ -695,16 +711,24 @@ impl Default for App {
 
         // Si ya había una sesión guardada, nos saltamos el QR y vamos
         // directo al Gateway con ese token.
+        let security_dialog = crate::ui::security_warning::detect();
         if user_db.logged_in {
             if let Some(token) = user_db.token {
-                let (tx, rx) = std::sync::mpsc::channel();
-                app.discord_token = Some(token.clone());
-                app.event_tx = Some(tx.clone());
-                app.event_rx = Some(rx);
-                app.auth = AuthStatus::Connecting;
-                crate::discord::spawn_gateway_with_token(token, tx);
+                if security_dialog.is_some() {
+                    // Modo inseguro (mock / TLS sin verificar): NO se toca la
+                    // red con el token hasta que la persona acepte el aviso.
+                    app.pending_resume_token = Some(token);
+                } else {
+                    app.resume_saved_session(token);
+                }
             }
         }
+        // El aviso de seguridad va primero en la cola; después, las novedades
+        // si es la primera vez que se abre esta versión.
+        if let Some(dialog) = security_dialog {
+            app.dialogs.push_back(dialog);
+        }
+        crate::ui::changelog::queue_if_new(&mut app);
 
         app
     }
@@ -715,6 +739,7 @@ impl App {
     /// que hace todo el handshake de `remote_auth` y, si sale bien, sigue
     /// derecho a la conexión del Gateway.
     pub fn start_sign_in(&mut self) {
+        self.login_error = None;
         self.auth = AuthStatus::Starting;
         let (tx, rx) = std::sync::mpsc::channel();
         self.event_tx = Some(tx.clone());
@@ -733,8 +758,120 @@ impl App {
         self.event_tx = None;
     }
 
+    /// "Probar de nuevo" de la pantalla de error. Si todavía tenemos un
+    /// token (el error fue de red/Discord, no de la sesión) se reconecta
+    /// con ESE token — no tiene sentido pedir un QR si la cuenta ya está
+    /// autenticada. Solo sin token guardado se arranca el login por QR.
     pub fn retry_sign_in(&mut self) {
-        self.start_sign_in();
+        match self.discord_token.clone() {
+            Some(token) => self.reconnect_with_token(token),
+            None => self.start_sign_in(),
+        }
+    }
+
+    /// Conecta el Gateway con el token de la sesión guardada, saltándose el
+    /// QR. Se llama al arrancar o, si había un aviso de seguridad pendiente,
+    /// cuando la persona lo acepta (ver `ui::security_warning`).
+    pub fn resume_saved_session(&mut self, token: String) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.discord_token = Some(token.clone());
+        self.event_tx = Some(tx.clone());
+        self.event_rx = Some(rx);
+        self.auth = AuthStatus::Connecting;
+        self.connection_steps.clear();
+        crate::discord::spawn_gateway_with_token(token, tx);
+    }
+
+    /// Reconecta con un token que ya tenemos, saltándose el QR (mismo
+    /// camino que el arranque con sesión guardada, ver `App::default`).
+    fn reconnect_with_token(&mut self, token: String) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.event_tx = Some(tx.clone());
+        self.event_rx = Some(rx);
+        self.login_error = None;
+        self.connection_steps.clear();
+        self.auth = AuthStatus::Connecting;
+        crate::discord::spawn_gateway_with_token(token, tx);
+    }
+
+    /// Anota la acción que está haciendo la conexión (la ve la pantalla de
+    /// "Conectando…"). Ignora repeticiones y se queda con las últimas.
+    fn push_connection_step(&mut self, text: String) {
+        if self.connection_steps.last() == Some(&text) {
+            return;
+        }
+        self.connection_steps.push(text);
+        let excess = self.connection_steps.len().saturating_sub(5);
+        self.connection_steps.drain(..excess);
+    }
+
+    /// ¿Hay un token guardado con el que "Probar de nuevo" reconectaría?
+    pub fn has_saved_session(&self) -> bool {
+        self.discord_token.is_some()
+    }
+
+    /// Descarta la sesión guardada a pedido de la persona ("Usar otra
+    /// cuenta"): borra el token y deja la pantalla de login inicial.
+    pub fn forget_saved_session(&mut self) {
+        self.forget_stored_token();
+        self.drop_connection();
+        self.login_error = None;
+        self.auth = AuthStatus::SignedOut;
+    }
+
+    /// Borra el token de memoria y de `localStorage`, para que la próxima
+    /// vez que se abra la app no intente entrar con una sesión muerta.
+    fn forget_stored_token(&mut self) {
+        self.discord_token = None;
+        if let Ok(json) = serde_json::to_string(&UserDB::default()) {
+            let _ = web_local_storage_api::set_item("current_user", &json);
+        }
+    }
+
+    /// Corta lo que quede de la conexión actual y vuelve a la pantalla de
+    /// login. No toca el token guardado (eso lo decide quien llama).
+    fn drop_connection(&mut self) {
+        self.captcha.cancel_all();
+        // Primero se sale de la voz (corta también un stream que se esté
+        // viendo) mientras todavía existen los canales; recién después se
+        // sueltan.
+        self.leave_voice();
+        self.voice_runtime_tx = None;
+        self.voice_connection_status = None;
+        self.voice_connection_message = None;
+        // Si el Gateway sigue vivo (p. ej. un 401 de REST con el socket
+        // todavía abierto) hay que pedirle que cierre, si no seguiría
+        // conectado en segundo plano sin nadie escuchándolo.
+        if let Some(commands) = self.gateway_commands.take() {
+            let _ = commands.send(crate::discord::gateway::GatewayCommand::Shutdown);
+        }
+        self.member_subscription = None;
+        self.pending_member_subscription = None;
+        self.gateway_session_id.clear();
+        self.connection_steps.clear();
+        self.event_rx = None;
+        self.event_tx = None;
+        self.screen = Screen::Login;
+    }
+
+    /// Discord ya no acepta el token: se borra el guardado y se vuelve al
+    /// login con un aviso. No se lanza el QR solo; la persona elige cómo
+    /// volver a entrar.
+    fn invalidate_session(&mut self, message: String) {
+        log::warn!("La sesión ya no es válida; se borra el token guardado");
+        self.forget_stored_token();
+        self.drop_connection();
+        self.login_error = Some(message);
+        self.auth = AuthStatus::SignedOut;
+    }
+
+    /// Se perdió el Gateway por algo que NO es la sesión (red caída tras
+    /// agotar los reintentos, Discord rechazó la conexión...). Vuelve al
+    /// login, pero conserva el token: "Probar de nuevo" reconecta con él.
+    fn connection_lost(&mut self, message: String) {
+        log::warn!("Se perdió la conexión con Discord: {message}");
+        self.drop_connection();
+        self.auth = AuthStatus::Failed(message);
     }
 
     /// Pasa de la pantalla de QR a la de usuario/contraseña (link "Usar
@@ -1591,6 +1728,23 @@ impl App {
     }
 
     /// Cierra el popup modal actualmente abierto, si hay alguno.
+    /// Encola un diálogo (ver `ui::dialog`). Si ya hay uno con el mismo `id`
+    /// en la cola, se ignora para no apilar avisos repetidos.
+    pub fn open_dialog(&mut self, dialog: crate::ui::dialog::Dialog) {
+        if self.dialogs.iter().any(|d| d.id == dialog.id) {
+            return;
+        }
+        self.dialogs.push_back(dialog);
+        if let Some(ctx) = &self.egui_ctx {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Abre el historial completo de novedades (Ajustes → Cuenta).
+    pub fn open_changelog(&mut self) {
+        self.open_dialog(crate::ui::changelog::dialog(usize::MAX));
+    }
+
     pub fn close_modal(&mut self) {
         self.modal = None;
     }
@@ -2068,6 +2222,11 @@ impl App {
         let pending: Vec<AppEvent> = rx.try_iter().collect();
         for event in pending {
             self.handle_discord_event(event);
+            // Si ese evento tiró la conexión (sesión inválida, Gateway
+            // perdido) lo que queda en la cola es de la conexión muerta.
+            if self.event_rx.is_none() {
+                break;
+            }
         }
 
         if matches!(
@@ -2123,11 +2282,22 @@ impl App {
                 if let Ok(json) = serde_json::to_string(&db) {
                     let _ = web_local_storage_api::set_item("current_user", &json);
                 }
+                self.push_connection_step("Descargando ajustes…".to_owned());
                 if let Some((token, tx)) = self.discord_token.clone().zip(self.event_tx.clone()) {
                     crate::discord::spawn_fetch_user_settings(token, tx);
                 }
             }
+            AppEvent::ConnectionStep(text) => {
+                // Solo importa mientras se ve "Conectando…"; una vez dentro
+                // (o en cualquier reconexión posterior) se descartan.
+                if matches!(self.auth, AuthStatus::Connecting) {
+                    self.push_connection_step(text);
+                }
+            }
             AppEvent::UserSettings(settings) => {
+                if matches!(self.auth, AuthStatus::Connecting) {
+                    self.push_connection_step("Ajustes descargados".to_owned());
+                }
                 // Se aplica una sola vez, apenas llega (justo después del
                 // login): si el usuario cambia el tema a mano desde acá
                 // más tarde, eso pasa por `set_theme_mode` (ver
@@ -2472,6 +2642,12 @@ impl App {
                 }
             }
             AppEvent::Error(message) => {
+                // Un 401 de cualquier pedido REST llega acá envuelto en el
+                // texto del error: es la sesión, no un fallo común.
+                if message.contains(crate::discord::INVALID_SESSION_MESSAGE) {
+                    self.invalidate_session(crate::discord::INVALID_SESSION_MESSAGE.to_owned());
+                    return;
+                }
                 // Si todavía no habíamos llegado a `Connected`, el error es
                 // del login/la conexión inicial y va a la pantalla de
                 // login; si ya estábamos adentro, es solo un toast (por
@@ -2517,6 +2693,8 @@ impl App {
             AppEvent::GatewayReconnected => {
                 self.push_toast(ToastKind::Success, "Discord", "Conexión restablecida");
             }
+            AppEvent::SessionInvalid(message) => self.invalidate_session(message),
+            AppEvent::GatewayLost(message) => self.connection_lost(message),
             AppEvent::GatewayCommands(commands) => {
                 self.gateway_commands = Some(commands);
                 // Conexión nueva: no hereda ninguna suscripción anterior.
@@ -2686,6 +2864,7 @@ impl App {
                 // handler, una vez que el token está confirmado de
                 // verdad.
                 self.auth = AuthStatus::Connecting;
+                self.connection_steps.clear();
                 self.discord_token = Some(token.clone());
                 self.login_email.clear();
                 self.login_password.clear();
@@ -4085,6 +4264,12 @@ impl eframe::App for App {
         // toggle de tema.
         crate::theme::apply(ui.ctx(), &self.palette);
 
+        // Con un diálogo abierto, la app de atrás queda congelada: el fondo
+        // oscuro ya frena los clics, pero el login lee Enter y el texto
+        // directo del teclado. Se quita el foco y se aparta el teclado ANTES
+        // de dibujar cualquier pantalla (el diálogo lo recupera al dibujarse).
+        crate::ui::dialog::begin_frame(ui.ctx(), self);
+
         // eframe limpia el framebuffer de verdad a transparente (no hay
         // `with_transparent(true)` en el viewport, así que ese
         // "transparente" se ve directamente como negro puro). Cualquier
@@ -4182,6 +4367,10 @@ impl eframe::App for App {
         crate::ui::role_popup::show(self, ui);
         crate::ui::profile_popup::show_full(self, ui);
         crate::ui::settings::show(self, ui);
+        // Cola de diálogos (aviso de seguridad, novedades, confirmaciones...):
+        // va al final para quedar por encima de todo, incluida la pantalla de
+        // login (donde se escribe el token).
+        crate::ui::dialog::show(self, ui);
         crate::ui::video_player::show_fullscreen(ui.ctx());
         // Suelta los players de GIF (embeds `gifv`) que ya no se dibujan.
         crate::ui::video_player::end_frame(ui.ctx());

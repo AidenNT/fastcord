@@ -44,6 +44,7 @@ pub enum SettingsTab {
 /// se aplica antes del que viene.
 enum Action {
     Close,
+    OpenChangelog,
     SetMode(ThemeMode),
     SetImageMode(crate::ui::anim::ImageMode),
     SetNotificationSide(NotificationSide),
@@ -220,6 +221,26 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                                             account_sections.as_deref().unwrap_or(&[]),
                                             account_loaded,
                                         );
+                                        ui.add_space(18.0);
+                                        theme::section_title(ui, &palette, "Acerca de");
+                                        theme::text(
+                                            ui,
+                                            format!("eCord v{}", env!("CARGO_PKG_VERSION")),
+                                            theme::regular(12.5),
+                                            palette.dim,
+                                        );
+                                        ui.add_space(8.0);
+                                        if theme::soft_button(
+                                            ui,
+                                            &palette,
+                                            Some(Icon::Sparkles),
+                                            "Ver novedades",
+                                            false,
+                                        )
+                                        .clicked()
+                                        {
+                                            action = Some(Action::OpenChangelog);
+                                        }
                                     }
                                     SettingsTab::Voice => {
                                         if let Some(taken) = voice_settings_view(
@@ -247,6 +268,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     if let Some(action) = action {
         match action {
             Action::Close => app.settings_open = false,
+            Action::OpenChangelog => app.open_changelog(),
             Action::SetMode(mode) => app.set_theme_mode(mode),
             Action::SetImageMode(mode) => app.set_image_mode(mode),
             Action::SetNotificationSide(side) => app.set_notification_side(side),

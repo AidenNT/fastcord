@@ -253,7 +253,7 @@ impl SessionlessClient {
                 let bytes = resp.bytes().await?;
                 let resp_json = parse_error_body(&bytes, status.as_u16(), url)?;
 
-                if resp_json["captcha_sitekey"].is_string() {
+                if resp_json["captcha_key"].is_array() {
                     let captcha = serde_json::from_value::<CaptchaRequiredError>(resp_json)
                         .map_err(|e| Box::new(e) as BoxedError)?;
                     return Err(Box::new(captcha));

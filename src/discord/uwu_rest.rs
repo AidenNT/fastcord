@@ -108,7 +108,16 @@ async fn connected_client(token: &str) -> anyhow::Result<Arc<UwuInner>> {
         None,                 // proxy
     )
     .await
-    .map_err(|e| anyhow::anyhow!("no se pudo validar el token con el REST de uwudev: {e}"))?;
+    .map_err(|e| {
+        // El cliente vendorizado devuelve este texto fijo ante un 401 (o un
+        // token mal formado): eso sí es "sesión inválida". Lo demás (red,
+        // timeout, 5xx...) es un error común y el token sigue valiendo.
+        if e.to_string() == super::VENDOR_INVALID_TOKEN {
+            anyhow::Error::new(super::InvalidSession)
+        } else {
+            anyhow::anyhow!("no se pudo validar el token con el REST de uwudev: {e}")
+        }
+    })?;
 
     let client = Arc::new(inner);
     *guard = Some((token.to_string(), Arc::clone(&client)));
@@ -196,6 +205,14 @@ impl CaptchaClient {
                 Ok(value) => return Ok(value),
                 Err(error) => error,
             };
+            // Un 401 en medio de la sesión: el token fue revocado (cambio de
+            // contraseña, "cerrar sesión en todos lados"...). Se marca con un
+            // error propio para que `App` lo distinga de un fallo común.
+            if error.downcast_ref::<CaptchaRequiredError>().is_none()
+                && error.to_string() == super::VENDOR_INVALID_TOKEN
+            {
+                return Err(Box::new(super::InvalidSession));
+            }
             let challenge = error
                 .downcast_ref::<CaptchaRequiredError>()
                 .and_then(CaptchaChallenge::from_vendor);

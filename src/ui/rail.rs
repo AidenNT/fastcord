@@ -65,98 +65,32 @@ pub fn content(app: &mut App, ui: &mut egui::Ui) {
                 ui.add_space(8.0);
                 divider(ui, &palette);
                 ui.add_space(8.0);
+            });
 
-                let mut clicked_server = None;
-                let mut toggled_folder = None;
+            // Lista de servidores con scroll. Antes todo esto se dibujaba
+            // directo en la columna, sin límite de alto: con muchos
+            // servidores el contenido se salía de `top_height`, estiraba
+            // el panel y empujaba la barra de usuario fuera de pantalla.
+            // El `ScrollArea` se limita al alto que queda bajo el logo
+            // (`auto_shrink` en false = ocupa todo ese alto) y la barra
+            // de scroll va oculta, como en el cliente oficial; la rueda
+            // del mouse y el trackpad siguen funcionando.
+            egui::ScrollArea::vertical()
+                .id_salt("rail_scroll")
+                .auto_shrink([false, false])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        let mut clicked_server = None;
+                        let mut toggled_folder = None;
 
-                for entry in &order {
-                    match entry {
-                        SidebarEntry::Guild(i) => {
-                            let i = *i;
-                            let server = &app.servers[i];
-                            let (rect, resp) =
-                                ui.allocate_exact_size(Vec2::splat(SLOT), Sense::click());
-                            extra::avatar(
-                                ui,
-                                rect.center(),
-                                24.0,
-                                server.icon_url.as_deref(),
-                                server.icon_color,
-                                &server.icon_initial,
-                                &palette,
-                            );
-                            if selected_server == Some(i) {
-                                selected_pill(ui, &palette, rect.center(), SLOT);
-                            }
-                            crate::ui::notifications::paint_badge(
-                                ui.painter(),
-                                rect.right_bottom() - Vec2::new(6.0, 6.0),
-                                app.server_mentions(i),
-                                &palette,
-                                palette.panel,
-                            );
-                            if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                                clicked_server = Some(i);
-                            }
-                            ui.add_space(8.0);
-                        }
-                        SidebarEntry::Folder(folder) => {
-                            let is_open = app.open_guild_folders.contains(&folder.id);
-                            let folder_selected = selected_server
-                                .is_some_and(|i| folder.guild_indices.contains(&i));
-
-                            if !is_open {
-                                let (rect, resp) =
-                                    ui.allocate_exact_size(Vec2::splat(SLOT), Sense::click());
-                                draw_collapsed_folder(ui, rect, folder, &app.servers, &palette);
-                                if folder_selected {
-                                    selected_pill(ui, &palette, rect.center(), SLOT);
-                                }
-                                let folder_mentions: u32 = folder
-                                    .guild_indices
-                                    .iter()
-                                    .map(|&gi| app.server_mentions(gi))
-                                    .sum();
-                                crate::ui::notifications::paint_badge(
-                                    ui.painter(),
-                                    rect.right_bottom() - Vec2::new(6.0, 6.0),
-                                    folder_mentions,
-                                    &palette,
-                                    palette.panel,
-                                );
-                                if resp
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                    .on_hover_text(folder_label(folder))
-                                    .clicked()
-                                {
-                                    toggled_folder = Some(folder.id);
-                                }
-                                ui.add_space(8.0);
-                            } else {
-                                let base_color = folder.color.unwrap_or(palette.accent);
-                                let folder_color = Color32::from_rgba_unmultiplied(
-                                    base_color.r(),
-                                    base_color.g(),
-                                    base_color.b(),
-                                    50,
-                                );
-                                for &i in &folder.guild_indices {
+                        for entry in &order {
+                            match entry {
+                                SidebarEntry::Guild(i) => {
+                                    let i = *i;
                                     let server = &app.servers[i];
                                     let (rect, resp) =
                                         ui.allocate_exact_size(Vec2::splat(SLOT), Sense::click());
-                                    // Fondo agrupador detrás de cada ícono
-                                    // de la carpeta abierta (el mismo
-                                    // color se ve "atravesar" los huecos
-                                    // entre íconos, como en el cliente
-                                    // real).
-                                    ui.painter().rect_filled(
-                                        Rect::from_center_size(
-                                            rect.center(),
-                                            Vec2::new(SLOT, SLOT + 8.0),
-                                        ),
-                                        CornerRadius::same(16),
-                                        folder_color,
-                                    );
                                     extra::avatar(
                                         ui,
                                         rect.center(),
@@ -176,66 +110,150 @@ pub fn content(app: &mut App, ui: &mut egui::Ui) {
                                         &palette,
                                         palette.panel,
                                     );
-                                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
-                                    {
+                                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                                         clicked_server = Some(i);
                                     }
                                     ui.add_space(8.0);
                                 }
+                                SidebarEntry::Folder(folder) => {
+                                    let is_open = app.open_guild_folders.contains(&folder.id);
+                                    let folder_selected = selected_server
+                                        .is_some_and(|i| folder.guild_indices.contains(&i));
 
-                                // Barrita angosta al pie del grupo: click
-                                // para volver a plegar la carpeta.
-                                let (rect, resp) = ui.allocate_exact_size(
-                                    Vec2::new(SLOT, 10.0),
-                                    Sense::click(),
-                                );
-                                ui.painter().rect_filled(
-                                    Rect::from_center_size(rect.center(), Vec2::new(24.0, 6.0)),
-                                    CornerRadius::same(3),
-                                    folder.color.unwrap_or(palette.dim),
-                                );
-                                if resp
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                    .on_hover_text(folder_label(folder))
-                                    .clicked()
-                                {
-                                    toggled_folder = Some(folder.id);
+                                    if !is_open {
+                                        let (rect, resp) =
+                                            ui.allocate_exact_size(Vec2::splat(SLOT), Sense::click());
+                                        draw_collapsed_folder(ui, rect, folder, &app.servers, &palette);
+                                        if folder_selected {
+                                            selected_pill(ui, &palette, rect.center(), SLOT);
+                                        }
+                                        let folder_mentions: u32 = folder
+                                            .guild_indices
+                                            .iter()
+                                            .map(|&gi| app.server_mentions(gi))
+                                            .sum();
+                                        crate::ui::notifications::paint_badge(
+                                            ui.painter(),
+                                            rect.right_bottom() - Vec2::new(6.0, 6.0),
+                                            folder_mentions,
+                                            &palette,
+                                            palette.panel,
+                                        );
+                                        if resp
+                                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                            .on_hover_text(folder_label(folder))
+                                            .clicked()
+                                        {
+                                            toggled_folder = Some(folder.id);
+                                        }
+                                        ui.add_space(8.0);
+                                    } else {
+                                        let base_color = folder.color.unwrap_or(palette.accent);
+                                        let folder_color = Color32::from_rgba_unmultiplied(
+                                            base_color.r(),
+                                            base_color.g(),
+                                            base_color.b(),
+                                            50,
+                                        );
+                                        for &i in &folder.guild_indices {
+                                            let server = &app.servers[i];
+                                            let (rect, resp) =
+                                                ui.allocate_exact_size(Vec2::splat(SLOT), Sense::click());
+                                            // Fondo agrupador detrás de cada ícono
+                                            // de la carpeta abierta (el mismo
+                                            // color se ve "atravesar" los huecos
+                                            // entre íconos, como en el cliente
+                                            // real).
+                                            ui.painter().rect_filled(
+                                                Rect::from_center_size(
+                                                    rect.center(),
+                                                    Vec2::new(SLOT, SLOT + 8.0),
+                                                ),
+                                                CornerRadius::same(16),
+                                                folder_color,
+                                            );
+                                            extra::avatar(
+                                                ui,
+                                                rect.center(),
+                                                24.0,
+                                                server.icon_url.as_deref(),
+                                                server.icon_color,
+                                                &server.icon_initial,
+                                                &palette,
+                                            );
+                                            if selected_server == Some(i) {
+                                                selected_pill(ui, &palette, rect.center(), SLOT);
+                                            }
+                                            crate::ui::notifications::paint_badge(
+                                                ui.painter(),
+                                                rect.right_bottom() - Vec2::new(6.0, 6.0),
+                                                app.server_mentions(i),
+                                                &palette,
+                                                palette.panel,
+                                            );
+                                            if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+                                            {
+                                                clicked_server = Some(i);
+                                            }
+                                            ui.add_space(8.0);
+                                        }
+
+                                        // Barrita angosta al pie del grupo: click
+                                        // para volver a plegar la carpeta.
+                                        let (rect, resp) = ui.allocate_exact_size(
+                                            Vec2::new(SLOT, 10.0),
+                                            Sense::click(),
+                                        );
+                                        ui.painter().rect_filled(
+                                            Rect::from_center_size(rect.center(), Vec2::new(24.0, 6.0)),
+                                            CornerRadius::same(3),
+                                            folder.color.unwrap_or(palette.dim),
+                                        );
+                                        if resp
+                                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                            .on_hover_text(folder_label(folder))
+                                            .clicked()
+                                        {
+                                            toggled_folder = Some(folder.id);
+                                        }
+                                        ui.add_space(8.0);
+                                    }
                                 }
-                                ui.add_space(8.0);
                             }
                         }
-                    }
-                }
 
-                if let Some(i) = clicked_server {
-                    app.open_server(i);
-                }
-                if let Some(id) = toggled_folder {
-                    if !app.open_guild_folders.insert(id) {
-                        app.open_guild_folders.remove(&id);
-                    }
-                }
+                        if let Some(i) = clicked_server {
+                            app.open_server(i);
+                        }
+                        if let Some(id) = toggled_folder {
+                            if !app.open_guild_folders.insert(id) {
+                                app.open_guild_folders.remove(&id);
+                            }
+                        }
 
-                // Todavía no hay flujo real de "crear/unirse a un
-                // servidor"; se muestra el popup modal de la demo (pedido
-                // de "popups" al estilo Fastpotify).
-                if theme::circle_button(
-                    ui,
-                    Icon::Plus,
-                    48.0,
-                    palette.surface,
-                    palette.accent,
-                    palette.text,
-                    "Añadir servidor",
-                )
-                .clicked()
-                {
-                    app.open_modal(
-                        "Crear servidor",
-                        "Crear o unirse a un servidor todavía no está disponible en esta demo.",
-                    );
-                }
-            });
+                        // Todavía no hay flujo real de "crear/unirse a un
+                        // servidor"; se muestra el popup modal de la demo (pedido
+                        // de "popups" al estilo Fastpotify).
+                        if theme::circle_button(
+                            ui,
+                            Icon::Plus,
+                            48.0,
+                            palette.surface,
+                            palette.accent,
+                            palette.text,
+                            "Añadir servidor",
+                        )
+                        .clicked()
+                        {
+                            app.open_modal(
+                                "Crear servidor",
+                                "Crear o unirse a un servidor todavía no está disponible en esta demo.",
+                            );
+                        }
+
+                        ui.add_space(8.0);
+                    });
+                });
         });
 }
 

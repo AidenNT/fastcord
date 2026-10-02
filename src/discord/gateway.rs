@@ -56,8 +56,47 @@ use crate::discord::models::{
 use crate::discord::AppEvent;
 
 const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json&compress=zlib-stream";
-const MOCK_URL_URL: &str = "ws://localhost:5380";
-const USE_MOCK_URL: bool = false;
+
+/// Servidor mock al que apunta el Gateway cuando `use_mock_url()` es true
+/// (por defecto uno local en el puerto 5380). La URL real de Discord se le
+/// pasa en el query param `url`, para que el mock pueda reenviarla o
+/// ignorarla.
+const MOCK_URL_DEFAULT: &str = "ws://localhost:5380";
+/// Variable de entorno que prende el modo mock (`1`, `true`, `yes` u `on`).
+/// Es un flag de runtime, igual que se haría con un `use_insecure_tls`: no
+/// hace falta recompilar para cambiarlo.
+const ENV_USE_MOCK_URL: &str = "ECORD_USE_MOCK_URL";
+/// Variable de entorno opcional para apuntar a otro mock distinto del
+/// de `MOCK_URL_DEFAULT` (por ejemplo `ws://127.0.0.1:9000`).
+const ENV_MOCK_URL: &str = "ECORD_MOCK_URL";
+
+/// ¿Conectar el Gateway al servidor mock en vez de a Discord? Se lee de
+/// `ECORD_USE_MOCK_URL` en cada conexión, así que se puede cambiar entre
+/// reintentos. Apagado por defecto.
+pub fn use_mock_url() -> bool {
+    std::env::var(ENV_USE_MOCK_URL).is_ok_and(|value| {
+        matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    })
+}
+
+/// URL del mock: `ECORD_MOCK_URL` si está puesta y no vacía; si no, el
+/// valor por defecto.
+pub fn mock_url() -> String {
+    std::env::var(ENV_MOCK_URL)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| MOCK_URL_DEFAULT.to_owned())
+}
+
+/// Reescribe `real_url` para que pase por el mock: la URL del mock con la
+/// real en `?url=`.
+fn through_mock(mock: &str, real_url: &str) -> anyhow::Result<String> {
+    let mut url = Url::parse(mock)
+        .map_err(|e| anyhow::anyhow!("URL del mock inválida ({ENV_MOCK_URL}={mock:?}): {e}"))?;
+    url.query_pairs_mut().append_pair("url", real_url);
+    Ok(url.to_string())
+}
 
 
 
@@ -171,6 +210,9 @@ pub enum GatewayCommand {
     /// (`guild:<guild>:<canal>:<usuario>` o `call:<canal>:<usuario>`).
     /// Discord responde con `STREAM_CREATE` + `STREAM_SERVER_UPDATE`.
     StreamWatch { stream_key: String },
+    /// Cerrar esta conexión y terminar `run` sin reintentar (la app volvió
+    /// a la pantalla de login).
+    Shutdown,
     /// Opcode 19 (`STREAM_DELETE`): dejar de ver (o cortar, si es el propio)
     /// el stream `stream_key`.
     StreamDelete { stream_key: String },
@@ -332,9 +374,17 @@ enum Outcome {
     Resume,
     /// Tirar la sesión guardada y mandar un `IDENTIFY` nuevo.
     Reidentify,
-    /// No tiene sentido reintentar (token inválido, versión de protocolo
-    /// rechazada, etc.) — hay que avisarle al usuario y dejar de intentar.
+    /// Discord rechazó el token (cierre 4004): la sesión ya no es válida.
+    /// `run` termina con [`crate::discord::InvalidSession`] para que `App`
+    /// borre el token guardado y pida login de nuevo.
+    InvalidSession,
+    /// No tiene sentido reintentar (versión de protocolo rechazada,
+    /// intents inválidos, etc.) — hay que avisarle al usuario y dejar de
+    /// intentar. El token NO es el problema.
     Fatal,
+    /// La UI pidió cerrar esta conexión (`GatewayCommand::Shutdown`): se
+    /// termina sin avisar de nada.
+    Stop,
 }
 
 /// Códigos de cierre que Discord manda con distinto significado cada uno.
@@ -343,7 +393,8 @@ enum Outcome {
 /// avisarle nunca al usuario que el problema es el token.
 fn outcome_for_close_code(code: u16) -> Outcome {
     match code {
-        4004 | 4010..=4014 => Outcome::Fatal,
+        4004 => Outcome::InvalidSession,
+        4010..=4014 => Outcome::Fatal,
         4003 | 4007 | 4009 => Outcome::Reidentify,
         _ => Outcome::Resume,
     }
@@ -404,6 +455,12 @@ pub async fn run(
         )
         .await;
 
+        // Cierre pedido por la UI (volvió al login): salir en silencio, sin
+        // toasts ni reintentos.
+        if matches!(outcome, Ok(Outcome::Stop)) {
+            return Ok(());
+        }
+
         if established {
             // Esta conexión llegó a andar de verdad (haya durado lo que
             // haya durado) — lo que pasó después no es "no pudimos
@@ -417,12 +474,14 @@ pub async fn run(
                 let _ = tx.send(AppEvent::GatewayReconnected);
                 disconnected_notified = false;
             }
-        } else if !disconnected_notified {
+        } else if !disconnected_notified && !matches!(outcome, Ok(Outcome::InvalidSession)) {
             // Primera vez que esta racha de reconexión falla: avisar. Los
             // siguientes reintentos de la misma racha no vuelven a
             // avisar (ver el comentario de arriba).
             let reason = match &outcome {
                 Ok(Outcome::Fatal) => "Discord rechazó la conexión".to_owned(),
+                // Ya resueltos arriba (no llegan acá); sin texto por si acaso.
+                Ok(Outcome::InvalidSession | Outcome::Stop) => String::new(),
                 Ok(_) => "se cortó la conexión con Discord".to_owned(),
                 Err(e) => format!("se cortó la conexión con Discord ({e})"),
             };
@@ -433,9 +492,13 @@ pub async fn run(
         match outcome {
             Ok(Outcome::Resume) => {}
             Ok(Outcome::Reidentify) => session.clear(),
-            Ok(Outcome::Fatal) => {
-                anyhow::bail!("Discord rechazó la conexión (sesión no recuperable)");
+            Ok(Outcome::InvalidSession) => {
+                return Err(anyhow::Error::new(crate::discord::InvalidSession));
             }
+            Ok(Outcome::Fatal) => {
+                anyhow::bail!("Discord rechazó la conexión (no se puede reintentar)");
+            }
+            Ok(Outcome::Stop) => return Ok(()),
             Err(e) => log::warn!("Gateway: {e}"),
         }
 
@@ -471,12 +534,13 @@ async fn connect_and_run(
     // Un resume_gateway_url de Discord no trae los query params de
     // versión/encoding/compresión — hay que volver a pegárselos.
     let mut url = if url.contains('?') { url } else { format!("{url}/?v=10&encoding=json&compress=zlib-stream") };
-    if USE_MOCK_URL {
-        let mut u = Url::parse(MOCK_URL_URL).unwrap();
-        u.query_pairs_mut().append_pair("url", &url);
-        url = u.to_string();
+    if use_mock_url() {
+        let mock = mock_url();
+        log::warn!("Gateway: modo mock activo ({ENV_USE_MOCK_URL}); conectando a {mock} en vez de Discord");
+        url = through_mock(&mock, &url)?;
     }
 
+    crate::discord::step(tx, "Conectando con el gateway…");
     let mut request = url.into_client_request()?;
     request.headers_mut().extend(fingerprint::discord_gateway_headers(fingerprint));
     let (ws_stream, _) = tokio_tungstenite::connect_async(request).await?;
@@ -558,6 +622,7 @@ async fn connect_and_run(
                         let payload = stream_delete_payload(&stream_key);
                         write.send(Message::Text(payload.into())).await?;
                     }
+                    GatewayCommand::Shutdown => return Ok(Outcome::Stop),
                     GatewayCommand::StreamSetPaused { stream_key, paused } => {
                         let payload = stream_set_paused_payload(&stream_key, paused);
                         write.send(Message::Text(payload.into())).await?;
@@ -598,6 +663,10 @@ async fn connect_and_run(
                 tokio::time::sleep(Duration::from_millis(jitter)).await;
                 heartbeat.reset();
 
+                crate::discord::step(
+                    tx,
+                    if session.can_resume() { "Reanudando la sesión…" } else { "Autenticando con Discord…" },
+                );
                 let hello_payload = if session.can_resume() {
                     build_resume_payload(token, session.session_id.as_deref().unwrap_or_default(), session.sequence.unwrap_or_default())
                 } else {
@@ -630,6 +699,7 @@ async fn connect_and_run(
                     *established = true;
                 }
                 if event_name == "READY" {
+                    crate::discord::step(tx, "Procesando los datos de la cuenta…");
                     // Guardamos `session_id`/`resume_gateway_url` ANTES de
                     // mover `payload.d` a `handle_dispatch` — son justo
                     // los dos campos que hacen falta para poder mandar un
@@ -1279,5 +1349,25 @@ mod merged_members_tests {
             merged_member_roles(&data, Some("me"), false),
             vec![("g1".to_string(), vec!["b".to_string()])]
         );
+    }
+}
+
+
+#[cfg(test)]
+mod mock_url_tests {
+    use super::*;
+
+    #[test]
+    fn through_mock_pasa_la_url_real_en_el_query() {
+        let out = through_mock("ws://localhost:5380", "wss://gateway.discord.gg/?v=10&encoding=json").unwrap();
+        assert!(out.starts_with("ws://localhost:5380/?url="));
+        let parsed = Url::parse(&out).unwrap();
+        let real = parsed.query_pairs().find(|(k, _)| k == "url").map(|(_, v)| v.into_owned());
+        assert_eq!(real.as_deref(), Some("wss://gateway.discord.gg/?v=10&encoding=json"));
+    }
+
+    #[test]
+    fn through_mock_rechaza_una_url_invalida() {
+        assert!(through_mock("no es una url", "wss://gateway.discord.gg/").is_err());
     }
 }

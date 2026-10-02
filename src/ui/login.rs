@@ -72,6 +72,12 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
 
                     match &app.auth {
                         AuthStatus::SignedOut => {
+                            // Motivo por el que se volvió acá (p. ej. la
+                            // sesión guardada ya no era válida).
+                            if let Some(error) = &app.login_error {
+                                theme::text(ui, error, theme::regular(13.0), palette.danger);
+                                ui.add_space(12.0);
+                            }
                             if big_button(ui, &palette, "Iniciar sesión") {
                                 app.start_sign_in();
                             }
@@ -132,12 +138,22 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                         }
                         AuthStatus::Connecting => {
                             spinner_row(ui, &palette, "Conectando con Discord…");
+                            connection_steps(app, ui, &palette);
                         }
                         AuthStatus::Failed(message) => {
                             theme::text(ui, message, theme::regular(13.0), palette.danger);
                             ui.add_space(12.0);
                             if big_button(ui, &palette, "Probar de nuevo") {
                                 app.retry_sign_in();
+                            }
+                            // Con sesión guardada, "Probar de nuevo" reconecta
+                            // con ese token; esto es la salida para entrar con
+                            // otra cuenta.
+                            if app.has_saved_session() {
+                                ui.add_space(14.0);
+                                if text_link(ui, &palette, "Usar otra cuenta") {
+                                    app.forget_saved_session();
+                                }
                             }
                         }
                         AuthStatus::Connected => {
@@ -156,6 +172,24 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 palette.dim,
             );
         });
+}
+
+/// Lista corta de lo que está haciendo la conexión, debajo del spinner:
+/// los pasos ya hechos atenuados y el actual (el último) resaltado.
+fn connection_steps(app: &App, ui: &mut egui::Ui, palette: &crate::ui::theme::Palette) {
+    let steps = &app.connection_steps;
+    if steps.is_empty() {
+        return;
+    }
+    ui.add_space(8.0);
+    let last = steps.len() - 1;
+    for (index, step) in steps.iter().enumerate() {
+        if index == last {
+            theme::text(ui, step, theme::medium(12.5), palette.secondary);
+        } else {
+            theme::text(ui, step, theme::regular(12.0), palette.dim);
+        }
+    }
 }
 
 fn spinner_row(ui: &mut egui::Ui, palette: &crate::ui::theme::Palette, label: &str) {

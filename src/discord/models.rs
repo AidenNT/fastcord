@@ -1766,6 +1766,12 @@ pub struct ModalRequest {
     pub title: String,
     pub custom_id: String,
     pub components: Vec<Component>,
+    /// Nombre de la aplicación (bot) que pidió el formulario, si vino en el
+    /// evento. La UI lo muestra en el encabezado del formulario.
+    pub app_name: Option<String>,
+    /// URL de la foto de la aplicación (ícono de app o, si no tiene, el
+    /// avatar de su usuario bot).
+    pub app_icon_url: Option<String>,
 }
 
 impl ModalRequest {
@@ -1786,9 +1792,29 @@ impl ModalRequest {
                     .collect()
             })
             .unwrap_or_default();
+        // Nombre y foto de la aplicación: viajan en `application` (ícono de
+        // la app) y/o en `application.bot` (usuario bot). Todo opcional.
+        let application = value.get("application");
+        let non_empty = |s: Option<String>| s.filter(|s| !s.trim().is_empty());
+        let bot = application.and_then(|a| a.get("bot"));
+        let app_name = non_empty(text(application.and_then(|a| a.get("name"))))
+            .or_else(|| non_empty(text(bot.and_then(|b| b.get("global_name")))))
+            .or_else(|| non_empty(text(bot.and_then(|b| b.get("username")))));
+        let app_icon_url = non_empty(text(application.and_then(|a| a.get("icon"))))
+            .map(|hash| {
+                format!("https://cdn.discordapp.com/app-icons/{application_id}/{hash}.png?size=128")
+            })
+            .or_else(|| {
+                let bot_id = non_empty(text(bot.and_then(|b| b.get("id"))))?;
+                let hash = non_empty(text(bot.and_then(|b| b.get("avatar"))))?;
+                let ext = if hash.starts_with("a_") { "gif" } else { "png" };
+                Some(format!("https://cdn.discordapp.com/avatars/{bot_id}/{hash}.{ext}?size=128"))
+            });
         Some(Self {
             interaction_id,
             application_id,
+            app_name,
+            app_icon_url,
             channel_id: text(value.get("channel_id")).unwrap_or_default(),
             guild_id: text(value.get("guild_id")),
             title: text(value.get("title")).unwrap_or_else(|| "Formulario".to_string()),
