@@ -107,6 +107,13 @@ pub enum AppEvent {
     /// el pedido falla (cuenta nueva sin blob todavía, error de red) no
     /// se manda nada y el cliente se queda con los defaults locales.
     UserSettings(Box<user_settings::PreloadedUserSettings>),
+    /// `USER_SETTINGS_PROTO_UPDATE` del Gateway: la cuenta cambió sus ajustes
+    /// (típicamente el orden/carpetas de servers) desde otro dispositivo.
+    /// `partial` = solo trae lo que cambió.
+    UserSettingsUpdate {
+        settings: Box<user_settings::PreloadedUserSettings>,
+        partial: bool,
+    },
     /// Mensaje nuevo (server o DM) recibido en vivo.
     MessageCreate(Box<GatewayMessage>),
     /// Mensaje ya existente que cambió (edición, o embeds de un link que
@@ -656,11 +663,22 @@ pub fn spawn_fetch_user_settings(token: String, tx: std::sync::mpsc::Sender<AppE
             return;
         };
         rt.block_on(async move {
-            let Ok(rest) = uwu_rest::UwuRest::for_token(token).await else {
-                return;
-            };
-            if let Ok(settings) = rest.get_user_settings().await {
-                let _ = tx.send(AppEvent::UserSettings(Box::new(settings)));
+            // De estos ajustes sale el ORDEN de la barra de servers: si el
+            // pedido falla una vez (red, rate limit, bootstrap de la
+            // sesión) no se puede quedar sin reintentar, o los servers
+            // salen en el orden crudo del READY para toda la sesión.
+            const DELAYS_SECS: [u64; 5] = [0, 2, 5, 10, 30];
+            for delay in DELAYS_SECS {
+                if delay > 0 {
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                }
+                let Ok(rest) = uwu_rest::UwuRest::for_token(token.clone()).await else {
+                    continue;
+                };
+                if let Ok(settings) = rest.get_user_settings().await {
+                    let _ = tx.send(AppEvent::UserSettings(Box::new(settings)));
+                    return;
+                }
             }
         });
     });

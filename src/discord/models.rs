@@ -239,6 +239,25 @@ pub struct Guild {
     /// `lib::permissions`). `None` si Discord no lo mandó.
     #[serde(default)]
     pub owner_id: Option<String>,
+    /// Formato nuevo del guild en el `READY` de cuentas de usuario: algunos
+    /// datos (entre ellos `owner_id`) vienen dentro de `properties`.
+    #[serde(default)]
+    pub properties: Option<serde_json::Value>,
+}
+
+impl Guild {
+    /// Dueño del server, de `owner_id` o (formato nuevo) de
+    /// `properties.owner_id`. Sin esto el dueño se filtra como un miembro
+    /// cualquiera y se le esconden canales que sí ve.
+    pub fn owner(&self) -> Option<String> {
+        self.owner_id.clone().or_else(|| {
+            self.properties
+                .as_ref()
+                .and_then(|p| p.get("owner_id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
+    }
 }
 
 /// Un bitfield de permisos de Discord llega como string (`"1071698660929"`)

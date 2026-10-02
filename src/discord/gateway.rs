@@ -815,7 +815,22 @@ mod hydrate_tests {
 /// separado y tolerando formas raras: una mala no descarta a las demás.
 /// Si un guild no trae su entrada, simplemente no aparece acá (y sus
 /// canales quedan sin filtrar).
-fn merged_member_roles(data: &serde_json::Value) -> Vec<(String, Vec<String>)> {
+///
+/// `own_id` (el id de la cuenta, si se conoce) sirve para NO tomar los roles
+/// de otro miembro por error: si la entrada trae ids de miembro y ninguno es
+/// el nuestro, se descarta en vez de usar `first()` a ciegas (con roles
+/// ajenos se esconden canales que sí se ven y se muestran otros que no).
+///
+/// `require_own`: solo se acepta un miembro cuyo id sea el propio (sin
+/// `first()` de reserva). Hay que pedirlo para el `READY_SUPPLEMENTAL`: su
+/// `merged_members` NO es "mi miembro" sino los miembros de otras personas
+/// (las que están conectadas a voz en ese server), y tomarlos pisaba los roles
+/// propios correctos del `READY` con los de un desconocido.
+fn merged_member_roles(
+    data: &serde_json::Value,
+    own_id: Option<&str>,
+    require_own: bool,
+) -> Vec<(String, Vec<String>)> {
     use serde_json::Value;
 
     let (Some(guilds), Some(merged)) = (
@@ -831,7 +846,7 @@ fn merged_member_roles(data: &serde_json::Value) -> Vec<(String, Vec<String>)> {
             let guild_id = guild.get("id")?.as_str()?.to_owned();
             // Normalmente `[ {miembro} ]`; por si viniera el miembro suelto.
             let member = match members {
-                Value::Array(list) => list.first()?,
+                Value::Array(list) => own_member(list, own_id, require_own)?,
                 other => other,
             };
             let roles = member
@@ -844,6 +859,42 @@ fn merged_member_roles(data: &serde_json::Value) -> Vec<(String, Vec<String>)> {
         })
         .collect()
 }
+
+/// El miembro propio dentro de la entrada de `merged_members` de un guild.
+/// Con `own_id` se busca por `user_id` (o `user.id`); sin ese dato, o si
+/// ningún miembro de la lista trae id (forma vieja), se usa el primero, salvo
+/// que `require_own` lo prohíba.
+fn own_member<'a>(
+    list: &'a [serde_json::Value],
+    own_id: Option<&str>,
+    require_own: bool,
+) -> Option<&'a serde_json::Value> {
+    let id_of = |m: &serde_json::Value| -> Option<String> {
+        m.get("user_id")
+            .or_else(|| m.pointer("/user/id"))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    };
+    match own_id {
+        Some(own) => {
+            if let Some(found) = list.iter().find(|m| id_of(*m).as_deref() == Some(own)) {
+                return Some(found);
+            }
+            // Hay miembros con id y ninguno es el nuestro: son de otros.
+            if require_own || list.iter().any(|m| id_of(m).is_some()) {
+                return None;
+            }
+            list.first()
+        }
+        None if require_own => None,
+        None => list.first(),
+    }
+}
+
+/// Id de la cuenta logueada, guardado al llegar el `READY` para poder
+/// reconocer el miembro propio en el `READY_SUPPLEMENTAL` (que no trae el
+/// `user`).
+static OWN_USER_ID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 fn handle_dispatch(
     event_name: &str,
@@ -860,11 +911,28 @@ fn handle_dispatch(
             hydrate_deduped_users(&mut data);
             // Roles propios por server, ANTES de que `data` se consuma. Se
             // mandan después del `Ready` (que es el que crea los `Server`).
-            let self_roles = merged_member_roles(&data);
+            let own_id = data.pointer("/user/id").and_then(|v| v.as_str()).map(str::to_owned);
+            if let Ok(mut stored) = OWN_USER_ID.lock() {
+                *stored = own_id.clone();
+            }
+            let self_roles = merged_member_roles(&data, own_id.as_deref(), false);
             let ready: ReadyPayload = serde_json::from_value(data)?;
             let _ = tx.send(AppEvent::Ready(Box::new(ready)));
             for (guild_id, roles) in self_roles {
                 let _ = tx.send(AppEvent::SelfGuildRoles { guild_id, roles });
+            }
+        }
+        // La cuenta cambió sus ajustes (orden/carpetas de servers, tema...)
+        // desde otro dispositivo: `{ settings: { type, proto }, partial }`.
+        // Solo `type == 1` es `PreloadedUserSettings`.
+        "USER_SETTINGS_PROTO_UPDATE" => {
+            let is_preloaded = data.pointer("/settings/type").and_then(|v| v.as_u64()) == Some(1);
+            let proto = data.pointer("/settings/proto").and_then(|v| v.as_str());
+            if let (true, Some(proto)) = (is_preloaded, proto) {
+                if let Ok(settings) = crate::discord::user_settings::decode_base64(proto) {
+                    let partial = data.get("partial").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let _ = tx.send(AppEvent::UserSettingsUpdate { settings: Box::new(settings), partial });
+                }
             }
         }
         "MESSAGE_CREATE" => {
@@ -886,6 +954,20 @@ fn handle_dispatch(
         // (canales, nombre, ícono) ya lo tenemos de `READY` o lo pedimos
         // por REST al abrirlo.
         "GUILD_CREATE" => {
+            // Miembros embebidos (en cuentas de usuario suele venir al menos el
+            // propio): sirven para saber los roles propios de un server que NO
+            // vino en el `READY` (recién unido / "unavailable"); sin ellos ese
+            // server queda sin filtrar y muestra canales que no corresponden.
+            // Se leen uno por uno: un miembro raro no debe tirar el evento.
+            let members: Vec<MemberListMember> = data
+                .get("members")
+                .and_then(Value::as_array)
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|m| serde_json::from_value(m.clone()).ok())
+                        .collect()
+                })
+                .unwrap_or_default();
             let guild: GuildCreatePayload = serde_json::from_value(data)?;
             // Los roles se toman de acá también (no solo del `READY`) por si
             // el guild llegó "unavailable" en el `READY`, sin roles.
@@ -894,6 +976,9 @@ fn handle_dispatch(
                     guild_id: guild.id.clone(),
                     roles: guild.roles,
                 });
+            }
+            if !members.is_empty() {
+                let _ = tx.send(AppEvent::GuildMembers { guild_id: guild.id.clone(), members });
             }
             let _ = tx.send(AppEvent::GuildVoiceStates { guild_id: guild.id, states: guild.voice_states });
         }
@@ -909,9 +994,13 @@ fn handle_dispatch(
         // `merged_presences.friends` es la lista de amigos conectados.
         // (Los que no aparecen están desconectados.)
         "READY_SUPPLEMENTAL" => {
-            // Con `PRIORITIZED_READY_PAYLOAD` los roles propios pueden venir
-            // acá en vez de en el `READY`: se leen de los dos lados.
-            for (guild_id, roles) in merged_member_roles(&data) {
+            // El `merged_members` de ESTE payload son miembros de otras
+            // personas (las que están en voz), no el propio: solo se acepta
+            // una entrada cuyo id sea el nuestro. Antes se tomaba el primer
+            // miembro de cada server y sus roles pisaban los propios del
+            // `READY`, escondiendo canales visibles y mostrando otros que no.
+            let own_id = OWN_USER_ID.lock().ok().and_then(|stored| stored.clone());
+            for (guild_id, roles) in merged_member_roles(&data, own_id.as_deref(), true) {
                 let _ = tx.send(AppEvent::SelfGuildRoles { guild_id, roles });
             }
             let friends: Vec<PresenceEvent> = data
@@ -1138,7 +1227,7 @@ mod merged_members_tests {
             ]
         });
         assert_eq!(
-            merged_member_roles(&data),
+            merged_member_roles(&data, None, false),
             vec![
                 ("g1".to_string(), vec!["r1".to_string(), "r2".to_string()]),
                 ("g2".to_string(), vec![]),
@@ -1148,14 +1237,47 @@ mod merged_members_tests {
 
     #[test]
     fn missing_or_odd_shapes_are_skipped() {
-        assert!(merged_member_roles(&json!({ "guilds": [{ "id": "g" }] })).is_empty());
+        assert!(merged_member_roles(&json!({ "guilds": [{ "id": "g" }] }), None, false).is_empty());
         let data = json!({
             "guilds": [ { "id": "g1" }, { "id": "g2" } ],
             "merged_members": [ [ { "user_id": "me" } ], [ { "roles": ["x"] } ] ]
         });
         assert_eq!(
-            merged_member_roles(&data),
+            merged_member_roles(&data, None, false),
             vec![("g2".to_string(), vec!["x".to_string()])]
+        );
+    }
+
+    #[test]
+    fn supplemental_ignores_members_that_are_not_me() {
+        // Como el `merged_members` del READY_SUPPLEMENTAL: miembros ajenos.
+        let data = json!({
+            "guilds": [ { "id": "g1" }, { "id": "g2" } ],
+            "merged_members": [
+                [ { "user_id": "otro", "roles": ["a"] } ],
+                [ { "user_id": "me", "roles": ["b"] } ]
+            ]
+        });
+        assert_eq!(
+            merged_member_roles(&data, Some("me"), true),
+            vec![("g2".to_string(), vec!["b".to_string()])]
+        );
+        // Sin saber quién soy, con `require_own` no se toma a nadie.
+        assert!(merged_member_roles(&data, None, true).is_empty());
+    }
+
+    #[test]
+    fn picks_own_member_and_never_someone_elses() {
+        let data = json!({
+            "guilds": [ { "id": "g1" }, { "id": "g2" } ],
+            "merged_members": [
+                [ { "user_id": "otro", "roles": ["a"] }, { "user_id": "me", "roles": ["b"] } ],
+                [ { "user_id": "otro", "roles": ["c"] } ]
+            ]
+        });
+        assert_eq!(
+            merged_member_roles(&data, Some("me"), false),
+            vec![("g1".to_string(), vec!["b".to_string()])]
         );
     }
 }

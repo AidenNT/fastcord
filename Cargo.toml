@@ -178,7 +178,7 @@ voice-playback = ["dep:cpal", "dep:alsa", "dep:nnnoiseless"]
 # system_fonts.rs: lee el idioma de la UI de Windows para elegir la variante
 # de fuente CJK correcta.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Globalization"] }
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Globalization", "Win32_UI_WindowsAndMessaging"] }
 
 # --- Compilación del proto de settings de Discord (build.rs) ---
 [build-dependencies]

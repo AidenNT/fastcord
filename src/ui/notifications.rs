@@ -5,18 +5,22 @@
 //! del escritorio (ver `lib::notifications` y `App::notify_incoming`).
 //!
 //! Diseño tomado del overlay de Nullscape: las tarjetas caen desde arriba de la
-//! pantalla con fade-in (ease-out cúbico), se apilan en la esquina superior
-//! derecha y llevan un fondo oscuro teñido con borde de 2px del color del tipo
-//! de aviso (azul = mención/info, verde = éxito, dorado = advertencia).
+//! pantalla con fade-in (ease-out cúbico), se apilan en una esquina superior
+//! (izquierda o derecha, ver `NotificationSide` / `App::notification_side`) y
+//! llevan un fondo oscuro teñido con borde de 2px del color del tipo de aviso
+//! (azul = mención/info, verde = éxito, dorado = advertencia). Las de mención y
+//! DM muestran el avatar de quien escribió a la izquierda del texto.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use egui::{
-    pos2, Align2, Area, Color32, CornerRadius, Frame, Margin, Order, Pos2, Rect, Sense, Stroke, Vec2,
+    pos2, Align2, Area, Color32, CornerRadius, Frame, Margin, Order, Pos2, Rect, Sense, Stroke,
+    UiBuilder, Vec2,
 };
 
-use crate::lib::state::{App, ToastKind};
+use crate::lib::state::{App, NotificationSide, ToastKind};
+use crate::ui::extra;
 use crate::ui::theme::{self, Icon, Palette};
 use crate::ui::topbar;
 
@@ -28,8 +32,13 @@ const TOAST_LIFETIME_SECS: f32 = 5.0;
 const ANIM_MS: f32 = 320.0;
 /// Fade-out al final de la vida de la tarjeta.
 const FADE_OUT_SECS: f32 = 0.3;
-/// Distancia al borde derecho de la ventana.
-const MARGIN_RIGHT: f32 = 16.0;
+/// Distancia al borde (izquierdo o derecho, según el lado elegido) de la
+/// ventana.
+const MARGIN_SIDE: f32 = 16.0;
+/// Diámetro del avatar de las tarjetas de mención/DM.
+const AVATAR_SIZE: f32 = 40.0;
+/// Ancho reservado a la X de cerrar, a la derecha.
+const CLOSE_SLOT: f32 = 30.0;
 /// Distancia al borde de arriba: deja libre la barra superior (con los
 /// botones de minimizar/cerrar de la ventana sin marco).
 const MARGIN_TOP: f32 = topbar::HEIGHT + 12.0;
@@ -111,11 +120,20 @@ enum CardEvent {
     Open,
 }
 
+/// Foto de quien escribió: la imagen si hay URL, y si no (o mientras carga)
+/// un círculo con la inicial.
+struct CardAvatar<'a> {
+    url: Option<&'a str>,
+    initial: &'a str,
+}
+
 struct Card<'a> {
     id: egui::Id,
     tone: Tone,
     title: &'a str,
     body: &'a str,
+    /// `None` en los avisos genéricos (no hay a quién mostrarle la foto).
+    avatar: Option<CardAvatar<'a>>,
     /// Línea chica extra debajo del cuerpo (contador de mensajes).
     extra: Option<String>,
     /// 0 = recién aparece (arriba, transparente), 1 = asentada en su lugar.
@@ -140,11 +158,20 @@ fn fade_out(elapsed: f32, lifetime: f32) -> f32 {
 
 /// Dibuja una tarjeta con la posición animada y devuelve la próxima Y libre
 /// (para apilar la siguiente debajo sin superponerse) y lo que hizo el usuario.
-fn draw_card(ctx: &egui::Context, palette: &Palette, card: &Card, top_y: f32) -> (f32, CardEvent) {
+fn draw_card(
+    ctx: &egui::Context,
+    palette: &Palette,
+    card: &Card,
+    top_y: f32,
+    side: NotificationSide,
+) -> (f32, CardEvent) {
     let colors = card.tone.colors();
     let a = (card.progress * card.fade).clamp(0.0, 1.0);
     let screen = ctx.viewport_rect();
-    let x = (screen.right() - CARD_WIDTH - MARGIN_RIGHT).max(0.0);
+    let x = match side {
+        NotificationSide::Left => screen.left() + MARGIN_SIDE,
+        NotificationSide::Right => (screen.right() - CARD_WIDTH - MARGIN_SIDE).max(0.0),
+    };
     let y = START_Y + (top_y - START_Y) * card.progress;
 
     let mut event = CardEvent::None;
@@ -165,10 +192,29 @@ fn draw_card(ctx: &egui::Context, palette: &Palette, card: &Card, top_y: f32) ->
                 })
                 .show(ui, |ui| {
                     ui.set_width(CARD_WIDTH - 24.0);
-                    ui.horizontal(|ui| {
+                    ui.horizontal_top(|ui| {
+                        let mut text_width = CARD_WIDTH - 24.0 - CLOSE_SLOT;
+                        if let Some(avatar) = &card.avatar {
+                            let (rect, _) = ui.allocate_exact_size(Vec2::splat(AVATAR_SIZE), Sense::hover());
+                            // Ui hijo sin reservar lugar extra: así la foto sigue
+                            // el fade-in/out de la tarjeta (la imagen no usa
+                            // `gamma_multiply`).
+                            let mut avatar_ui = ui.new_child(UiBuilder::new().max_rect(rect));
+                            avatar_ui.set_opacity(a);
+                            extra::avatar(
+                                &mut avatar_ui,
+                                rect.center(),
+                                AVATAR_SIZE / 2.0,
+                                avatar.url,
+                                colors.stroke.gamma_multiply(0.55),
+                                avatar.initial,
+                                palette,
+                            );
+                            text_width -= AVATAR_SIZE + ui.spacing().item_spacing.x;
+                        }
                         ui.vertical(|ui| {
-                            // Deja lugar a la X de la derecha.
-                            ui.set_max_width(CARD_WIDTH - 24.0 - 30.0);
+                            // Deja lugar a la X de la derecha (y al avatar).
+                            ui.set_max_width(text_width);
                             let title = ui
                                 .add(
                                     egui::Label::new(
@@ -223,8 +269,8 @@ fn draw_card(ctx: &egui::Context, palette: &Palette, card: &Card, top_y: f32) ->
     (top_y + resp.response.rect.height() + GAP, event)
 }
 
-/// Pila de tarjetas de la esquina superior derecha: primero las menciones /
-/// DMs (`App::in_app_notifications`, click = abrir la conversación) y debajo
+/// Pila de tarjetas de la esquina superior (izquierda o derecha según
+/// `App::notification_side`): primero las menciones / DMs (`App::in_app_notifications`, click = abrir la conversación) y debajo
 /// los avisos genéricos (`App::toasts`). Se cierran solas a los pocos
 /// segundos, con la X, o al abrir la conversación.
 pub fn show_in_app(app: &mut App, ui: &mut egui::Ui) {
@@ -243,6 +289,7 @@ pub fn show_in_app(app: &mut App, ui: &mut egui::Ui) {
     }
 
     let palette = app.palette;
+    let side = app.notification_side;
     let now = ctx.input(|i| i.time);
     // Instante (reloj de egui) en que cada conversación empezó a mostrarse.
     // Se guarda aparte de `InAppNotification::created` porque ese se
@@ -272,11 +319,12 @@ pub fn show_in_app(app: &mut App, ui: &mut egui::Ui) {
             tone: Tone::Mention,
             title: &n.title,
             body: &n.body,
+            avatar: Some(CardAvatar { url: n.avatar_url.as_deref(), initial: &n.initial }),
             extra: (n.count > 1).then(|| format!("{} mensajes nuevos", n.count)),
             progress,
             fade,
         };
-        let (next_y, event) = draw_card(&ctx, &palette, &card, y);
+        let (next_y, event) = draw_card(&ctx, &palette, &card, y, side);
         y = next_y;
         match event {
             CardEvent::Dismiss => dismiss_notification = Some(i),
@@ -299,11 +347,12 @@ pub fn show_in_app(app: &mut App, ui: &mut egui::Ui) {
             },
             title: &t.title,
             body: &t.message,
+            avatar: None,
             extra: None,
             progress,
             fade,
         };
-        let (next_y, event) = draw_card(&ctx, &palette, &card, y);
+        let (next_y, event) = draw_card(&ctx, &palette, &card, y, side);
         y = next_y;
         if matches!(event, CardEvent::Dismiss) {
             dismiss_toast = Some(i);

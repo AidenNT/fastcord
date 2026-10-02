@@ -100,13 +100,45 @@ impl NotificationTarget {
     }
 }
 
-/// Notificación de mención/DM que se muestra DENTRO de la app (esquina
-/// izquierda) cuando la ventana tiene el foco; con la ventana sin foco se
-/// manda una del escritorio en su lugar. Ver `ui::notifications::show_in_app`
-/// y `App::notify_incoming`.
+/// De qué lado de la ventana se apilan las tarjetas de notificación
+/// (`ui::notifications::show_in_app`). Se elige en Ajustes → Apariencia y se
+/// guarda en `web_local_storage_api` bajo `notification_side`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NotificationSide {
+    Left,
+    #[default]
+    Right,
+}
+
+impl NotificationSide {
+    fn as_str(self) -> &'static str {
+        match self {
+            NotificationSide::Left => "left",
+            NotificationSide::Right => "right",
+        }
+    }
+
+    fn from_str(raw: &str) -> Option<Self> {
+        match raw.trim().trim_matches('"') {
+            "left" => Some(NotificationSide::Left),
+            "right" => Some(NotificationSide::Right),
+            _ => None,
+        }
+    }
+}
+
+/// Notificación de mención/DM que se muestra DENTRO de la app (en el lado
+/// elegido por `NotificationSide`) cuando la ventana tiene el foco; con la
+/// ventana sin foco se manda una del escritorio en su lugar. Ver
+/// `ui::notifications::show_in_app` y `App::notify_incoming`.
 pub struct InAppNotification {
     pub title: String,
     pub body: String,
+    /// Avatar de quien escribió, si tiene uno (si no, la tarjeta dibuja un
+    /// círculo con `initial`).
+    pub avatar_url: Option<String>,
+    /// Inicial del autor para el avatar de reemplazo.
+    pub initial: String,
     pub target: NotificationTarget,
     /// Mensajes de la misma conversación juntados en esta tarjeta.
     pub count: u32,
@@ -410,6 +442,8 @@ pub struct App {
     own_activities: Vec<crate::discord::models::PresenceActivity>,
     /// Tarjetas de notificación dentro de la app, más recientes al final.
     pub in_app_notifications: Vec<InAppNotification>,
+    /// Lado de la ventana donde se apilan esas tarjetas y los avisos.
+    pub notification_side: NotificationSide,
     /// Servers/canales/DMs silenciados y nivel de mensajes (vienen en el
     /// `READY`, ver `lib::notifications::MuteRules`).
     mute_rules: crate::lib::notifications::MuteRules,
@@ -551,6 +585,10 @@ impl Default for App {
                 crate::ui::anim::set_image_mode(crate::ui::anim::ImageMode::from_u8(n));
             }
         }
+        let notification_side = match web_local_storage_api::get_item("notification_side") {
+            Ok(Some(raw)) => NotificationSide::from_str(&raw).unwrap_or_default(),
+            _ => NotificationSide::default(),
+        };
         let custom_themes = match web_local_storage_api::get_item("custom_themes") {
             Ok(Some(json)) => serde_json::from_str::<Vec<ThemeDef>>(&json).unwrap_or_default(),
             _ => Vec::new(),
@@ -610,6 +648,7 @@ impl Default for App {
             custom_statuses: std::collections::HashMap::new(),
             own_activities: Vec::new(),
             in_app_notifications: Vec::new(),
+            notification_side,
             mute_rules: crate::lib::notifications::MuteRules::default(),
             shown_title_count: None,
             modal: None,
@@ -1751,6 +1790,13 @@ impl App {
         let _ = web_local_storage_api::set_item("image_mode", &mode.to_u8().to_string());
     }
 
+    /// Elige de qué lado de la ventana aparecen las notificaciones y lo
+    /// persiste.
+    pub fn set_notification_side(&mut self, side: NotificationSide) {
+        self.notification_side = side;
+        let _ = web_local_storage_api::set_item("notification_side", side.as_str());
+    }
+
     /// Cambia el modo de tema activo (oscuro/claro/wallpaper/uno
     /// guardado), recalcula la paleta ya mismo y lo persiste para la
     /// próxima vez que se abra la app.
@@ -2099,6 +2145,25 @@ impl App {
                     }
                 }
                 self.discord_settings = Some(*settings);
+            }
+            AppEvent::UserSettingsUpdate { settings, partial } => {
+                // Un cambio hecho en otro dispositivo (sobre todo el orden y
+                // las carpetas de servers). `guild_folders` se REEMPLAZA
+                // entero, nunca se mergea: es una lista, y mergear
+                // concatenaría y duplicaría los servers en la barra.
+                let settings = *settings;
+                let mut merged = false;
+                if partial {
+                    if let Some(current) = self.discord_settings.as_mut() {
+                        if settings.guild_folders.is_some() {
+                            current.guild_folders = settings.guild_folders.clone();
+                        }
+                        merged = true;
+                    }
+                }
+                if !merged {
+                    self.discord_settings = Some(settings);
+                }
             }
             AppEvent::Ready(ready) => {
                 self.gateway_session_id = ready.session_id.clone();
@@ -3227,7 +3292,9 @@ impl App {
                     },
                     None => NotificationTarget::Dm { channel_id: msg.channel_id.clone() },
                 };
-                self.push_in_app_notification(title, body, target);
+                let avatar_url = msg.author.avatar_url();
+                let initial = author_initial(&notif::author_name(msg));
+                self.push_in_app_notification(title, body, avatar_url, initial, target);
             }
         } else if policy.desktop {
             notif::send_desktop(title, body);
@@ -3237,7 +3304,14 @@ impl App {
     /// Agrega una tarjeta de notificación dentro de la app. Si ya hay una de
     /// la misma conversación se actualiza (y cuenta cuántos mensajes junta)
     /// en vez de apilar una nueva por cada mensaje.
-    fn push_in_app_notification(&mut self, title: String, body: String, target: NotificationTarget) {
+    fn push_in_app_notification(
+        &mut self,
+        title: String,
+        body: String,
+        avatar_url: Option<String>,
+        initial: String,
+        target: NotificationTarget,
+    ) {
         const MAX_STACK: usize = 4;
         let channel_id = target.channel_id().to_string();
         if let Some(existing) = self
@@ -3247,6 +3321,8 @@ impl App {
         {
             existing.title = title;
             existing.body = body;
+            existing.avatar_url = avatar_url;
+            existing.initial = initial;
             existing.count += 1;
             existing.created = Instant::now();
             return;
@@ -3254,6 +3330,8 @@ impl App {
         self.in_app_notifications.push(InAppNotification {
             title,
             body,
+            avatar_url,
+            initial,
             target,
             count: 1,
             created: Instant::now(),
@@ -4111,4 +4189,13 @@ impl eframe::App for App {
         // saca la ventana de pantalla completa.
         crate::ui::call_view::end_frame(ui.ctx());
     }
+}
+
+/// Primera letra del nombre en mayúscula, para el avatar de reemplazo de las
+/// notificaciones (`?` si el nombre está vacío).
+fn author_initial(name: &str) -> String {
+    name.chars()
+        .find(|c| !c.is_whitespace())
+        .map(|c| c.to_uppercase().collect())
+        .unwrap_or_else(|| "?".to_string())
 }

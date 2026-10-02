@@ -7,6 +7,7 @@ mod discord;
 mod lib;
 mod logging;
 mod paths;
+mod single_instance;
 mod support;
 mod system_fonts;
 mod theme;
@@ -21,6 +22,11 @@ fn main() -> eframe::Result<()> {
         discord::captcha::run_window();
     }
     env_logger::init();
+    // Una sola ventana de ecord: si ya hay una abierta, se le pide que se
+    // muestre y esta instancia se cierra (ver `single_instance`).
+    if single_instance::acquire() == single_instance::Role::Secondary {
+        return Ok(());
+    }
     println!("Hello, world!");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -45,6 +51,8 @@ fn main() -> eframe::Result<()> {
             // Fuentes (Inter + emoji) e íconos Lucide se registran una sola
             // vez acá, contra el contexto real de la ventana.
             ui::theme::install(&cc.egui_ctx);
+            // Desde acá una segunda instancia puede pedirle foco a esta ventana.
+            single_instance::set_context(&cc.egui_ctx);
             Ok(Box::new(App::default()))
         }),
     )

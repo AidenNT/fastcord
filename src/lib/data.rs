@@ -1578,6 +1578,10 @@ impl Server {
         if guild_id.is_empty() {
             return; // server de demo: sin permisos que calcular
         }
+        // Diagnóstico (nivel debug): cuando un canal se ve o se esconde mal,
+        // casi siempre es porque falta algún dato y el cálculo cae a "todo
+        // visible" (fail-open) — esto lo deja en el log.
+        let complete = self.access_ctx.my_roles.is_some() && !self.access_ctx.my_id.is_empty();
         for category in &mut self.categories {
             for channel in &mut category.channels {
                 if channel.is_thread {
@@ -1591,6 +1595,24 @@ impl Server {
                     channel.is_voice,
                 );
             }
+        }
+        if crate::logging::debug_logging_enabled() {
+            let hidden = self
+                .categories
+                .iter()
+                .flat_map(|c| c.channels.iter())
+                .filter(|c| !c.is_thread && !c.access.can_view)
+                .count();
+            crate::logging::debug(
+                "access",
+                format!(
+                    "server {}: datos completos={complete} (roles propios={:?}, dueño conocido={}, roles del server={}) -> {hidden} canales ocultos",
+                    guild_id,
+                    self.access_ctx.my_roles,
+                    self.access_ctx.owner_id.is_some(),
+                    self.roles.len(),
+                ),
+            );
         }
     }
 
@@ -2189,7 +2211,7 @@ impl Server {
             known_users: std::collections::HashMap::new(),
             raw_channels: Vec::new(),
             access_ctx: crate::lib::permissions::AccessContext {
-                owner_id: guild.owner_id.clone(),
+                owner_id: guild.owner(),
                 ..Default::default()
             },
             // Discord no manda emojis "vacíos" en la práctica, pero el

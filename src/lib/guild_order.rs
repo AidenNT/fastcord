@@ -70,10 +70,13 @@ pub fn build_sidebar_order(
 
     if let Some(guild_folders) = guild_folders {
         for folder in &guild_folders.folders {
+            // Un guild que ya se colocó antes (referencia repetida en una
+            // carpeta vieja) no se vuelve a dibujar: saldría duplicado.
             let indices: Vec<usize> = folder
                 .guild_ids
                 .iter()
                 .filter_map(|id| by_id.get(id).copied())
+                .filter(|&i| !placed[i])
                 .collect();
             if indices.is_empty() {
                 // Ningún guild de esta entrada está cargado acá (todos

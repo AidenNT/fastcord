@@ -18,7 +18,7 @@ use egui::{
 
 use crate::discord::voice::{VoiceAudioSourceOptions, VoiceAudioSources};
 use crate::discord::{VoiceAudioSettings, VoiceVolumePercent};
-use crate::lib::state::App;
+use crate::lib::state::{App, NotificationSide};
 use crate::ui::account_settings;
 use crate::ui::theme::{self, Icon, Palette, ThemeDef, ThemeMode};
 
@@ -46,6 +46,7 @@ enum Action {
     Close,
     SetMode(ThemeMode),
     SetImageMode(crate::ui::anim::ImageMode),
+    SetNotificationSide(NotificationSide),
     ImportThemes(String),
     OpenNew,
     OpenEdit(String),
@@ -74,6 +75,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let wallpaper_seed = app.wallpaper_seed();
     let mut editor = app.theme_editor.take();
     let tab = app.settings_tab;
+    let notification_side = app.notification_side;
     let voice_audio = app.voice.audio.clone();
     let voice_audio_sources = app.voice.audio_sources.clone();
     let voice_audio_source_options = app.voice_audio_source_options.clone();
@@ -203,6 +205,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                                         ) {
                                             action = Some(taken);
                                         }
+                                        if let Some(taken) = notification_side_section(ui, &palette, notification_side) {
+                                            action = Some(taken);
+                                        }
                                         if let Some(taken) = image_mode_section(ui, &palette) {
                                             action = Some(taken);
                                         }
@@ -244,6 +249,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             Action::Close => app.settings_open = false,
             Action::SetMode(mode) => app.set_theme_mode(mode),
             Action::SetImageMode(mode) => app.set_image_mode(mode),
+            Action::SetNotificationSide(side) => app.set_notification_side(side),
             Action::ImportThemes(json) => match app.import_themes(&json) {
                 Ok(n) => {
                     // Vacía el cuadro de pegado y avisa.
@@ -281,6 +287,34 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             Action::SetOutputVolume(percent) => app.set_voice_output_volume(percent),
         }
     }
+}
+
+/// De qué lado de la ventana aparecen las notificaciones (menciones, DMs y
+/// avisos) mientras la app está en foco.
+fn notification_side_section(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    current: NotificationSide,
+) -> Option<Action> {
+    let mut action = None;
+    ui.add_space(22.0);
+    theme::text(ui, "Notificaciones", theme::semibold(14.0), palette.text);
+    ui.add_space(4.0);
+    theme::subtle(
+        ui,
+        palette,
+        "Elegí de qué lado de la ventana aparecen las notificaciones (con la foto de quien escribe).",
+    );
+    ui.add_space(10.0);
+    ui.horizontal_wrapped(|ui| {
+        if theme::soft_button(ui, palette, None, "Izquierda", current == NotificationSide::Left).clicked() {
+            action = Some(Action::SetNotificationSide(NotificationSide::Left));
+        }
+        if theme::soft_button(ui, palette, None, "Derecha", current == NotificationSide::Right).clicked() {
+            action = Some(Action::SetNotificationSide(NotificationSide::Right));
+        }
+    });
+    action
 }
 
 /// Modo de imágenes: sirve para comprobar cuánta RAM se va en GIFs y

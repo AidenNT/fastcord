@@ -181,7 +181,6 @@ ecord/
 - [ ] CI with GitHub Actions (build + `clippy` + `fmt`) for Linux, Windows, and macOS
 - [ ] Consistent error handling and logging across `discord::*`
 - [ ] Review memory usage of the GIF cache and message history
-- [ ] Verify license compatibility of everything under `vendor/`
 
 ### ✨ Features — `v0.3`
 - [ ] **Editable Account tab** (`PATCH` to `settings-proto` beyond the theme)
