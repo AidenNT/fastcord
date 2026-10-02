@@ -25,7 +25,22 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             }
 
             let card_width = 440.0;
-            let card_height = 460.0;
+            // Con cuentas guardadas, la tarjeta crece para mostrar el selector
+            // (hasta donde entre en la ventana; después la lista hace scroll).
+            let base_card_height = 460.0;
+            let saved_count = if matches!(app.auth, AuthStatus::SignedOut) {
+                app.accounts.accounts().len()
+            } else {
+                0
+            };
+            let picker_wanted = if saved_count > 0 {
+                44.0 + saved_count as f32 * crate::ui::accounts::ROW_STRIDE
+            } else {
+                0.0
+            };
+            let card_height =
+                (base_card_height + picker_wanted).min((rect.height() - 40.0).max(base_card_height));
+            let picker_list_height = (card_height - base_card_height - 44.0).max(0.0);
             let card = Rect::from_center_size(
                 rect.center() - Vec2::new(0.0, 20.0),
                 Vec2::new(card_width, card_height),
@@ -78,21 +93,31 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                                 theme::text(ui, error, theme::regular(13.0), palette.danger);
                                 ui.add_space(12.0);
                             }
-                            if big_button(ui, &palette, "Iniciar sesión") {
+                            // Cuentas guardadas: elegir con cuál entrar (las que
+                            // tienen la sesión cerrada se marcan como tales).
+                            let has_accounts = !app.accounts.is_empty();
+                            if has_accounts {
+                                crate::ui::accounts::picker(app, ui, &palette, picker_list_height);
+                            }
+                            let sign_in_label =
+                                if has_accounts { "Agregar otra cuenta" } else { "Iniciar sesión" };
+                            if big_button(ui, &palette, sign_in_label) {
                                 app.start_sign_in();
                             }
-                            ui.add_space(10.0);
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(
-                                        "En Discord (celular): tocá tu avatar → Escanear código QR, \
-                                         o el ícono de QR en la pantalla de login.",
+                            if !has_accounts {
+                                ui.add_space(10.0);
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(
+                                            "En Discord (celular): tocá tu avatar → Escanear código QR, \
+                                             o el ícono de QR en la pantalla de login.",
+                                        )
+                                        .font(theme::regular(12.0))
+                                        .color(palette.secondary),
                                     )
-                                    .font(theme::regular(12.0))
-                                    .color(palette.secondary),
-                                )
-                                .wrap(),
-                            );
+                                    .wrap(),
+                                );
+                            }
                             ui.add_space(14.0);
                             if text_link(ui, &palette, "Usar usuario y contraseña") {
                                 app.switch_to_password_form();
@@ -148,17 +173,17 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                             }
                             // Con sesión guardada, "Probar de nuevo" reconecta
                             // con ese token; esto es la salida para entrar con
-                            // otra cuenta.
-                            if app.has_saved_session() {
+                            // otra cuenta (o ver cuáles hay). No borra nada.
+                            if app.has_saved_session() || !app.accounts.is_empty() {
                                 ui.add_space(14.0);
-                                if text_link(ui, &palette, "Usar otra cuenta") {
-                                    app.forget_saved_session();
+                                if text_link(ui, &palette, "Elegir otra cuenta") {
+                                    app.show_account_picker();
                                 }
                             }
                         }
                         AuthStatus::Connected => {
                             if big_button(ui, &palette, "Cerrar sesión") {
-                                app.cancel_sign_in();
+                                app.ask_log_out();
                             }
                         }
                     }

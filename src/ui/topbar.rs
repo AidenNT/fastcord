@@ -17,6 +17,7 @@ pub const HEIGHT: f32 = 52.0;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
+    let reconnecting = app.gateway_disconnected;
 
     egui::Panel::top("app_topbar")
         .exact_size(HEIGHT)
@@ -136,7 +137,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                         );
                     }
 
-                    ui.add_space(8.0);
+                    // Entre las píldoras y los íconos: gira mientras hay
+                    // requests a la API de Discord en vuelo.
+                    ui.add_space(4.0);
+                    activity_spinner(ui, &palette, reconnecting);
+                    ui.add_space(4.0);
                     status_pill(ui, &palette, Icon::Zap, &format!("Conectado como {}", me_name));
                     ui.add_space(6.0);
                     status_pill(
@@ -148,6 +153,61 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 });
             });
         });
+}
+
+/// Cuánto sigue girando el spinner después de la última request (segundos).
+/// Sin esto, una request de unos 50 ms sería un parpadeo apenas visible.
+const ACTIVITY_LINGER: f64 = 0.45;
+
+/// Spinner de la barra: gira mientras haya requests a la API de Discord en
+/// vuelo (`discord::activity`). Siempre reserva su lugar (la caja de un
+/// `icon_button` de 14 px) para que las píldoras de al lado no se corran
+/// cuando aparece o desaparece.
+///
+/// Si el Gateway está cortado (`reconnecting`), el spinner pasa a amarillo con
+/// un "!" en el centro y gira sin parar hasta que se reconecta, haya o no
+/// requests en vuelo.
+fn activity_spinner(ui: &mut egui::Ui, palette: &Palette, reconnecting: bool) {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::hover());
+
+    if reconnecting {
+        if ui.is_rect_visible(rect) {
+            let mut spinner_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(rect)
+                    .layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)),
+            );
+            theme::spinner(&mut spinner_ui, 18.0, palette.warning);
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "!",
+                theme::bold(10.0),
+                palette.warning,
+            );
+        }
+        let _ = response.on_hover_text("Sin conexión con Discord. Reconectando…");
+        return;
+    }
+
+    let now = ui.input(|i| i.time);
+    let id = egui::Id::new("topbar_activity_spinner_until");
+    let mut visible_until = ui.ctx().data(|d| d.get_temp::<f64>(id)).unwrap_or(0.0);
+    if crate::discord::activity::is_busy() {
+        visible_until = now + ACTIVITY_LINGER;
+        ui.ctx().data_mut(|d| d.insert_temp(id, visible_until));
+    }
+    if now >= visible_until || !ui.is_rect_visible(rect) {
+        return;
+    }
+
+    let mut spinner_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)),
+    );
+    theme::spinner(&mut spinner_ui, 16.0, palette.dim);
+    let _ = response.on_hover_text("Comunicándose con Discord…");
 }
 
 fn toggle_maximize(ui: &mut egui::Ui) {

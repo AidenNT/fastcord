@@ -100,6 +100,8 @@ async fn connected_client(token: &str) -> anyhow::Result<Arc<UwuInner>> {
     let fingerprint = shared_fingerprint();
     let build_numbers = BuildNumbers::new(fingerprint.client_build_number as u32, None);
 
+    // Este `connect` también le pega a Discord (bootstrap + validar el token).
+    let _busy = super::activity::begin();
     let inner = UwuInner::connect(
         token.to_string(),
         None,                 // custom_api_version: que lo detecte solo
@@ -201,7 +203,14 @@ impl CaptchaClient {
                 None => props.clone(),
                 Some(solution) => Some(props.clone().unwrap_or_default().with_solved_captcha(solution)),
             };
-            let error = match call(attempt_props).await {
+            // La request cuenta como "en vuelo" (spinner de la barra
+            // superior) solo mientras Discord contesta: la espera a que la
+            // persona resuelva el captcha, más abajo, no.
+            let result = {
+                let _busy = super::activity::begin();
+                call(attempt_props).await
+            };
+            let error = match result {
                 Ok(value) => return Ok(value),
                 Err(error) => error,
             };
@@ -602,6 +611,87 @@ impl UwuRest {
         Ok(resp)
     }
 
+    /// Manda un sticker (sin texto): `POST /channels/{id}/messages` con
+    /// `sticker_ids`. Mismo `Referer` que `send_message`. El
+    /// `MessageBuilder` de arriba no tiene ese campo, así que el cuerpo se
+    /// arma a mano como JSON.
+    pub async fn send_sticker(
+        &self,
+        channel_id: &str,
+        guild_id: Option<&str>,
+        sticker_id: &str,
+        reply_to: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let channel_id_num: u64 = channel_id.parse().map_err(err)?;
+        let guild_id_num: Option<u64> = guild_id
+            .filter(|g| !g.is_empty())
+            .map(str::parse::<u64>)
+            .transpose()
+            .map_err(err)?;
+
+        let path = format!("channels/{channel_id}/messages");
+
+        let referer: Referer = match guild_id_num {
+            Some(guild_id) => GuildChannelReferer {
+                guild_id,
+                channel_id: channel_id_num,
+            }
+            .into(),
+            None => DmChannelReferer {
+                channel_id: channel_id_num,
+            }
+            .into(),
+        };
+
+        let props = RequestPropertiesBuilder::default()
+            .referer::<Referer>(referer)
+            .build()
+            .map_err(err)?;
+
+        let mut body = json!({
+            "content": "",
+            "sticker_ids": [sticker_id],
+            "nonce": Self::interaction_nonce(),
+            "flags": 0,
+        });
+        if let Some(message_id) = reply_to {
+            body["message_reference"] = json!({
+                "message_id": message_id,
+                "channel_id": channel_id,
+            });
+        }
+
+        let _: Value = self
+            .client
+            .post::<Value, Value>(&path, Some(body), Some(props))
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// GIFs del selector: `GET /gifs/search?q=...` (Tenor, a través de
+    /// Discord) o, con `query` vacío, `GET /gifs/trending`. Devuelve el JSON
+    /// tal cual; `ui::compose_menus` se encarga de leerlo (puede ser una
+    /// lista de GIFs o un objeto con `gifs`).
+    pub async fn gifs(&self, query: &str) -> anyhow::Result<Value> {
+        let query = query.trim();
+        let mut params = std::collections::HashMap::new();
+        params.insert("media_format".to_string(), "mp4".to_string());
+        params.insert("provider".to_string(), "tenor".to_string());
+        let path = if query.is_empty() {
+            "gifs/trending"
+        } else {
+            params.insert("q".to_string(), query.to_string());
+            "gifs/search"
+        };
+        let value: Value = self
+            .client
+            .get(path, Some(params), Some(Self::home()))
+            .await
+            .map_err(err)?;
+        Ok(value)
+    }
+
     /// `GET /users/@me/settings-proto/1`: la configuración real de la
     /// cuenta (tema, locale, status, notificaciones, privacidad,
     /// favoritos...) tal cual la ve/sincroniza el cliente oficial,
@@ -730,6 +820,19 @@ impl UwuRest {
         let _: Value = self
             .client
             .post(&path, Some(body), Some(Self::home()))
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// `POST /auth/logout`: invalida el token de esta sesión en Discord (como
+    /// "Cerrar sesión" en el cliente oficial). Sin esto el token seguiría
+    /// valiendo aunque ecord lo borre del disco.
+    pub async fn logout(&self) -> anyhow::Result<()> {
+        let body = json!({ "provider": Value::Null, "voip_provider": Value::Null });
+        let _: Value = self
+            .client
+            .post("auth/logout", Some(body), Some(Self::home()))
             .await
             .map_err(err)?;
         Ok(())

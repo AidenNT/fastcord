@@ -62,6 +62,8 @@ enum Action {
     SetMicrophoneSensitivity(i8),
     SetMicrophoneVolume(u8),
     SetOutputVolume(u8),
+    /// Cambiar de cuenta, agregar otra o cerrar sesión (Ajustes → Cuenta).
+    Account(crate::ui::accounts::AccountAction),
 }
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
@@ -86,6 +88,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let account_loaded = app.discord_settings.is_some();
     let account_sections = (tab == SettingsTab::Account)
         .then(|| account_settings::build(app.me.as_ref(), app.discord_settings.as_ref()));
+
+    // Cuentas guardadas (solo se copian viendo la pestaña Cuenta).
+    let saved_accounts = (tab == SettingsTab::Account).then(|| app.accounts.accounts().to_vec());
+    let current_account_id = app.me.as_ref().map(|me| me.id.clone());
 
     let screen_rect = ui.ctx().viewport_rect();
     let mut action: Option<Action> = None;
@@ -214,7 +220,17 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                                         }
                                     }
                                     SettingsTab::Account => {
-                                        // Solo lectura: no devuelve ninguna `Action`.
+                                        // Cuentas: cambiar, agregar, cerrar sesión.
+                                        if let Some(taken) = crate::ui::accounts::settings_section(
+                                            ui,
+                                            &palette,
+                                            saved_accounts.as_deref().unwrap_or(&[]),
+                                            current_account_id.as_deref(),
+                                        ) {
+                                            action = Some(Action::Account(taken));
+                                        }
+                                        ui.add_space(18.0);
+                                        // Ajustes de la cuenta: solo lectura.
                                         account_settings::view(
                                             ui,
                                             &palette,
@@ -307,6 +323,15 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             Action::SetMicrophoneSensitivity(db) => app.set_voice_microphone_sensitivity(db),
             Action::SetMicrophoneVolume(percent) => app.set_voice_microphone_volume(percent),
             Action::SetOutputVolume(percent) => app.set_voice_output_volume(percent),
+            Action::Account(account_action) => {
+                use crate::ui::accounts::AccountAction;
+                match account_action {
+                    AccountAction::Switch(user_id) => app.switch_account(&user_id),
+                    AccountAction::Add => app.show_account_picker(),
+                    AccountAction::LogOut => app.ask_log_out(),
+                    AccountAction::Remove(user_id) => app.ask_remove_account(&user_id),
+                }
+            }
         }
     }
 }

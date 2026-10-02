@@ -229,6 +229,10 @@ pub struct Guild {
     /// reacciones (`ui::chat::reaction_panel`).
     #[serde(default)]
     pub emojis: Vec<GuildEmoji>,
+    /// Stickers personalizados del server (también vienen en el `READY`),
+    /// para ofrecerlos en la pestaña "Stickers" del selector.
+    #[serde(default)]
+    pub stickers: Vec<StickerItem>,
     /// Roles del server (nombre, color, posición, si están "hoisted").
     /// Sirven para ponerle nombre y color a los grupos de la lista de
     /// miembros (`GUILD_MEMBER_LIST_UPDATE` solo manda el id del rol).
@@ -343,6 +347,11 @@ pub struct Role {
     /// canales que sí se pueden ver).
     #[serde(default, deserialize_with = "de_optional_bits")]
     pub permissions: Option<u64>,
+    /// `true` = cualquiera puede mencionar este rol (`<@&id>`), aunque no
+    /// tenga el permiso de mencionar a todos. Lo usa el menú de menciones
+    /// del compositor para decidir qué roles ofrecer.
+    #[serde(default)]
+    pub mentionable: bool,
 }
 
 /// Un emoji personalizado tal como aparece en `guild.emojis`. A
@@ -1357,6 +1366,17 @@ impl StickerItem {
         let ext = if self.format_type == 4 { "gif" } else { "png" };
         format!(
             "https://cdn.discordapp.com/stickers/{}.{}?size=320",
+            self.id, ext
+        )
+    }
+
+    /// Como [`StickerItem::url`] pero chica (128 px), para las celdas del
+    /// selector de stickers: no hace falta bajar ni decodificar 320 px para
+    /// dibujar una miniatura.
+    pub fn thumb_url(&self) -> String {
+        let ext = if self.format_type == 4 { "gif" } else { "png" };
+        format!(
+            "https://cdn.discordapp.com/stickers/{}.{}?size=128",
             self.id, ext
         )
     }

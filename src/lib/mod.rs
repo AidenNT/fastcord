@@ -1,3 +1,4 @@
+pub mod accounts;
 pub mod data;
 pub mod guild_order;
 pub mod notifications;

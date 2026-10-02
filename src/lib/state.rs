@@ -11,7 +11,6 @@ use crate::discord::{AppEvent, CurrentVoiceConnectionState, VoiceAudioSettings, 
 use crate::lib::data::{demo_activity, demo_friends, demo_servers, ActivityCard, ChatMessage, Friend, NameResolver, Server};
 use crate::theme::{Backdrop, BackdropRuntime, Palette, ThemeDef, ThemeEditor, ThemeMode};
 use crate::ui::settings::SettingsTab;
-use serde::{Deserialize, Serialize};
 use web_local_storage_api;
 
 /// Pantalla completa que se está mostrando.
@@ -23,15 +22,6 @@ pub enum Screen {
     Dm(usize),
     /// Servidor abierto; el índice referencia `App::servers`.
     Server(usize),
-}
-
-/// Lo único que persistimos en `localStorage` entre sesiones: el token de
-/// la cuenta ya logueada, para no tener que escanear el QR cada vez que se
-/// abre la app.
-#[derive(Serialize, Deserialize, Default, Debug)]
-pub struct UserDB {
-    logged_in: bool,
-    token: Option<String>,
 }
 
 /// Estado del flujo de autenticación (login screen). El camino normal es
@@ -327,6 +317,9 @@ pub struct App {
     /// Usuario logueado (viene de `READY`). `None` mientras no haya sesión
     /// real (pantallas demo).
     pub me: Option<User>,
+    /// Cuentas guardadas en este equipo (ver `lib::accounts`): alimentan el
+    /// selector de cuentas del login y de Ajustes → Cuenta.
+    pub accounts: crate::lib::accounts::AccountStore,
     /// Token de la cuenta ya autenticada, para pedidos de REST puntuales
     /// (abrir un DM, traer los canales de un server) que arma `App`
     /// mismo, aparte de la conexión al Gateway.
@@ -398,6 +391,14 @@ pub struct App {
     pub last_history_trim: f64,
     /// Formulario pedido por un bot (tras apretar uno de sus botones).
     pub component_modal: Option<ComponentModal>,
+    /// Botones de bots que ya mandaron su interacción y esperan respuesta:
+    /// se dibujan con un spinner adentro (ver `ui::components`).
+    pub pending_buttons: Vec<crate::lib::data::PendingButton>,
+    /// El Gateway se cortó y `gateway::run` está reintentando: la barra
+    /// superior muestra el spinner amarillo con un "!" hasta que vuelve
+    /// (`GatewayDisconnected` lo prende; `GatewayReconnected` o perder la
+    /// conexión del todo lo apagan).
+    pub gateway_disconnected: bool,
     /// `session_id` del Gateway (del `READY`): las interacciones con
     /// botones de bots lo piden.
     pub gateway_session_id: String,
@@ -583,11 +584,11 @@ pub struct App {
 
 impl Default for App {
     fn default() -> Self {
-        let user_db = match web_local_storage_api::get_item("current_user") {
-            Ok(Some(json)) => serde_json::from_str::<UserDB>(&json).unwrap_or_default(),
-            Ok(None) => UserDB::default(),
-            Err(_) => UserDB::default(),
-        };
+        // Cuentas guardadas (migra la sesión única del formato viejo). Si la
+        // última cuenta usada sigue con sesión se conecta sola; si no, se
+        // muestra el selector de cuentas en la pantalla de login.
+        let accounts = crate::lib::accounts::AccountStore::load();
+        let startup_token = accounts.startup_token();
         let theme_mode = match web_local_storage_api::get_item("theme_mode") {
             Ok(Some(json)) => serde_json::from_str::<ThemeMode>(&json).unwrap_or(ThemeMode::Dark),
             _ => ThemeMode::Dark,
@@ -625,6 +626,7 @@ impl Default for App {
             screen: Screen::Login,
             auth: AuthStatus::SignedOut,
             me: None,
+            accounts,
             discord_token: None,
             discord_settings: None,
             open_guild_folders: std::collections::HashSet::new(),
@@ -647,6 +649,8 @@ impl Default for App {
             thread_panel: None,
             last_history_trim: 0.0,
             component_modal: None,
+            pending_buttons: Vec::new(),
+            gateway_disconnected: false,
             gateway_session_id: String::new(),
             top_search: String::new(),
             toasts: Vec::new(),
@@ -712,15 +716,13 @@ impl Default for App {
         // Si ya había una sesión guardada, nos saltamos el QR y vamos
         // directo al Gateway con ese token.
         let security_dialog = crate::ui::security_warning::detect();
-        if user_db.logged_in {
-            if let Some(token) = user_db.token {
-                if security_dialog.is_some() {
-                    // Modo inseguro (mock / TLS sin verificar): NO se toca la
-                    // red con el token hasta que la persona acepte el aviso.
-                    app.pending_resume_token = Some(token);
-                } else {
-                    app.resume_saved_session(token);
-                }
+        if let Some(token) = startup_token {
+            if security_dialog.is_some() {
+                // Modo inseguro (mock / TLS sin verificar): NO se toca la
+                // red con el token hasta que la persona acepte el aviso.
+                app.pending_resume_token = Some(token);
+            } else {
+                app.resume_saved_session(token);
             }
         }
         // El aviso de seguridad va primero en la cola; después, las novedades
@@ -810,22 +812,200 @@ impl App {
         self.discord_token.is_some()
     }
 
-    /// Descarta la sesión guardada a pedido de la persona ("Usar otra
-    /// cuenta"): borra el token y deja la pantalla de login inicial.
-    pub fn forget_saved_session(&mut self) {
-        self.forget_stored_token();
-        self.drop_connection();
+    /// Vuelve al selector de cuentas ("Elegir otra cuenta", "Agregar cuenta").
+    /// NO borra ningún token: la cuenta que estaba abierta sigue guardada y se
+    /// puede volver a elegir. Corta la conexión actual y limpia sus datos.
+    pub fn show_account_picker(&mut self) {
+        self.settings_open = false;
+        self.reset_session_data();
         self.login_error = None;
         self.auth = AuthStatus::SignedOut;
     }
 
-    /// Borra el token de memoria y de `localStorage`, para que la próxima
-    /// vez que se abra la app no intente entrar con una sesión muerta.
-    fn forget_stored_token(&mut self) {
-        self.discord_token = None;
-        if let Ok(json) = serde_json::to_string(&UserDB::default()) {
-            let _ = web_local_storage_api::set_item("current_user", &json);
+    /// Conecta con el token de una cuenta guardada. Con el aviso de seguridad
+    /// aplicable (modo mock / TLS sin verificar) el token no sale hasta que la
+    /// persona lo acepte, igual que al arrancar.
+    fn connect_saved_token(&mut self, token: String) {
+        if let Some(dialog) = crate::ui::security_warning::detect() {
+            self.pending_resume_token = Some(token);
+            self.open_dialog(dialog);
+        } else {
+            self.resume_saved_session(token);
         }
+    }
+
+    /// Elegir una cuenta del selector. Con token → se conecta; sin token (la
+    /// sesión se cerró o expiró) → se queda en el login avisando que hay que
+    /// iniciar sesión de nuevo (QR o contraseña).
+    pub fn sign_in_saved_account(&mut self, user_id: &str) {
+        let Some(account) = self.accounts.get(user_id).cloned() else {
+            return;
+        };
+        self.login_error = None;
+        match account.token {
+            Some(token) => self.connect_saved_token(token),
+            None => {
+                self.login_error = Some(format!(
+                    "La sesión de {} está cerrada o expiró. Iniciá sesión de nuevo para usarla.",
+                    account.label()
+                ));
+                self.auth = AuthStatus::SignedOut;
+            }
+        }
+    }
+
+    /// Cambiar de cuenta estando adentro (Ajustes → Cuenta): se cierra la
+    /// conexión actual SIN cerrar su sesión y se entra con la otra.
+    pub fn switch_account(&mut self, user_id: &str) {
+        self.settings_open = false;
+        if self.me.as_ref().is_some_and(|me| me.id == user_id) {
+            return;
+        }
+        self.reset_session_data();
+        self.auth = AuthStatus::SignedOut;
+        self.sign_in_saved_account(user_id);
+    }
+
+    /// Pide confirmación para cerrar la sesión de la cuenta abierta.
+    pub fn ask_log_out(&mut self) {
+        use crate::ui::dialog::{Dialog, DialogKind};
+        let name = self
+            .me
+            .as_ref()
+            .map(|me| me.display_name().to_owned())
+            .unwrap_or_else(|| "esta cuenta".to_owned());
+        self.open_dialog(
+            Dialog::confirm(
+                "confirm_logout",
+                DialogKind::Danger,
+                "Cerrar sesión",
+                format!(
+                    "Se cierra la sesión de {name} en este equipo y su token deja de valer \
+                     en Discord. La cuenta queda en la lista: para volver a usarla hay que \
+                     iniciar sesión otra vez (QR o contraseña)."
+                ),
+                "Cerrar sesión",
+            )
+            .on_result(|app, _ctx, result| {
+                if result.is("confirm") {
+                    app.log_out_current();
+                }
+            }),
+        );
+    }
+
+    /// Cierra la sesión de la cuenta abierta: invalida el token en Discord, lo
+    /// borra de este equipo (la cuenta queda en la lista, marcada como "sesión
+    /// cerrada") y vuelve al selector de cuentas.
+    pub fn log_out_current(&mut self) {
+        if let Some(token) = self.discord_token.clone() {
+            self.accounts.sign_out_token(&token);
+            self.accounts.save();
+            crate::discord::spawn_logout(token);
+        }
+        self.settings_open = false;
+        self.reset_session_data();
+        self.login_error = None;
+        self.auth = AuthStatus::SignedOut;
+    }
+
+    /// Pide confirmación para quitar una cuenta de la lista.
+    pub fn ask_remove_account(&mut self, user_id: &str) {
+        use crate::ui::dialog::{Dialog, DialogKind};
+        let Some(account) = self.accounts.get(user_id).cloned() else {
+            return;
+        };
+        let id = account.user_id.clone();
+        self.open_dialog(
+            Dialog::confirm(
+                "confirm_remove_account",
+                DialogKind::Danger,
+                "Quitar cuenta",
+                format!(
+                    "{} se quita de este equipo y, si tenía la sesión abierta, se invalida su \
+                     token en Discord. Para usarla de nuevo hay que agregarla otra vez.",
+                    account.label()
+                ),
+                "Quitar cuenta",
+            )
+            .on_result(move |app, _ctx, result| {
+                if result.is("confirm") {
+                    app.remove_account(&id);
+                }
+            }),
+        );
+    }
+
+    /// Saca una cuenta de la lista (e invalida su token si tenía uno). Si era
+    /// la que estaba abierta, también se cierra la conexión.
+    pub fn remove_account(&mut self, user_id: &str) {
+        let is_current = self.me.as_ref().is_some_and(|me| me.id == user_id);
+        if let Some(token) = self.accounts.remove(user_id) {
+            crate::discord::spawn_logout(token);
+        }
+        self.accounts.save();
+        if is_current {
+            self.settings_open = false;
+            self.reset_session_data();
+            self.login_error = None;
+            self.auth = AuthStatus::SignedOut;
+        }
+    }
+
+    /// Guarda el token de un login recién hecho en la lista de cuentas.
+    fn remember_login(&mut self, token: &str) {
+        self.accounts.upsert_token(token);
+        self.accounts.save();
+    }
+
+    /// Corta la conexión y deja `App` sin ningún dato de la cuenta que estaba
+    /// abierta (amigos, servers, DMs, no leídos, popups...), para que al
+    /// entrar con otra cuenta no se mezcle nada. Las preferencias de la app
+    /// (tema, audio, notificaciones) se conservan.
+    fn reset_session_data(&mut self) {
+        self.drop_connection();
+        self.discord_token = None;
+        self.me = None;
+        self.discord_settings = None;
+        self.open_guild_folders.clear();
+        self.friends.clear();
+        self.dms.clear();
+        self.activity.clear();
+        self.servers.clear();
+        self.current_channel = (0, 0);
+        self.friends_search.clear();
+        self.friends_tab = 0;
+        self.compose_text.clear();
+        self.reply_target = None;
+        self.pending_scroll_anchor = None;
+        self.thread_panel = None;
+        self.component_modal = None;
+        self.top_search.clear();
+        self.unread_mentions.clear();
+        self.guild_mentions.clear();
+        self.acked_messages.clear();
+        self.ack_sent_at.clear();
+        self.pending_mentions.clear();
+        self.presences.clear();
+        self.user_activities.clear();
+        self.custom_statuses.clear();
+        self.own_activities.clear();
+        self.in_app_notifications.clear();
+        self.mute_rules = crate::lib::notifications::MuteRules::default();
+        self.shown_title_count = None;
+        self.modal = None;
+        self.profile_popup = None;
+        self.role_popup = None;
+        self.dm_profile = None;
+        self.profile_full = None;
+        self.watching_stream = None;
+        self.stream_sessions.clear();
+        self.voice_target = None;
+        // El estado de voz es de la cuenta, pero el audio elegido es una
+        // preferencia de la persona: se conserva.
+        let audio = std::mem::take(&mut self.voice.audio);
+        let audio_sources = std::mem::take(&mut self.voice.audio_sources);
+        self.voice = VoiceCache { audio, audio_sources, ..VoiceCache::default() };
     }
 
     /// Corta lo que quede de la conexión actual y vuelve a la pantalla de
@@ -851,6 +1031,8 @@ impl App {
         self.connection_steps.clear();
         self.event_rx = None;
         self.event_tx = None;
+        // Sin conexión que reintentar (vuelve al login): nada que avisar.
+        self.gateway_disconnected = false;
         self.screen = Screen::Login;
     }
 
@@ -858,10 +1040,19 @@ impl App {
     /// login con un aviso. No se lanza el QR solo; la persona elige cómo
     /// volver a entrar.
     fn invalidate_session(&mut self, message: String) {
-        log::warn!("La sesión ya no es válida; se borra el token guardado");
-        self.forget_stored_token();
-        self.drop_connection();
-        self.login_error = Some(message);
+        log::warn!("La sesión ya no es válida; la cuenta queda con la sesión cerrada");
+        let name = self.me.as_ref().map(|me| me.display_name().to_owned());
+        // La cuenta NO se borra de la lista: queda marcada para que el
+        // selector avise que hay que volver a iniciar sesión.
+        if let Some(token) = self.discord_token.clone() {
+            self.accounts.sign_out_token(&token);
+            self.accounts.save();
+        }
+        self.reset_session_data();
+        self.login_error = Some(match name {
+            Some(name) => format!("La sesión de {name} ya no es válida. Iniciá sesión de nuevo."),
+            None => message,
+        });
         self.auth = AuthStatus::SignedOut;
     }
 
@@ -1512,6 +1703,15 @@ impl App {
         let Some((token, tx)) = self.discord_token.clone().zip(self.event_tx.clone()) else {
             return;
         };
+        // Doble clic en un botón que ya está cargando: no se manda la
+        // interacción dos veces.
+        if self
+            .pending_buttons
+            .iter()
+            .any(|p| p.message_id == click.message_id && p.custom_id == click.custom_id)
+        {
+            return;
+        }
         let application_id = click.application_id.clone().unwrap_or_default();
         let Some(ctx) = self.interaction_context(&click.channel_id, &application_id, None) else {
             self.push_toast(
@@ -1521,7 +1721,29 @@ impl App {
             );
             return;
         };
+        // El botón muestra su spinner hasta que el bot conteste (ver
+        // `handle_discord_event`) o venza `tick_pending_buttons`.
+        self.pending_buttons.push(crate::lib::data::PendingButton {
+            message_id: click.message_id.clone(),
+            custom_id: click.custom_id.clone(),
+            since: Instant::now(),
+        });
         crate::discord::spawn_press_button(token, ctx, click.message_id, click.flags, click.custom_id, tx);
+    }
+
+    /// Vence los botones que esperan respuesta hace demasiado y deja la
+    /// lista vigente a mano de la UI de los mensajes. Una vez por frame.
+    fn tick_pending_buttons(&mut self, ctx: &egui::Context) {
+        // Respaldo por si nunca llega `INTERACTION_SUCCESS`/`FAILURE`
+        // (Discord le da 3 s a la app para contestar).
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+        self.pending_buttons.retain(|p| p.since.elapsed() < TIMEOUT);
+        crate::lib::data::publish_pending_buttons(ctx, &self.pending_buttons);
+        if !self.pending_buttons.is_empty() {
+            // El spinner ya pide repintar mientras se ve; esto cubre el caso
+            // en que el mensaje quedó fuera de pantalla, para que igual venza.
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
     }
 
     /// Manda el formulario que pidió un bot. Si algún campo no cumple lo
@@ -2203,6 +2425,9 @@ impl App {
             // Los pedidos de captcha nacen en hilos de fondo: necesitan poder
             // despertar a la UI aunque esté quieta.
             crate::discord::captcha::set_repaint_context(ctx);
+            // Idem para el spinner de la barra superior: las requests REST
+            // empiezan y terminan en hilos de fondo.
+            crate::discord::activity::set_repaint_context(ctx);
         }
         for notice in self.captcha.poll() {
             match notice {
@@ -2274,14 +2499,8 @@ impl App {
             }
             AppEvent::LoggedIn { token } => {
                 self.auth = AuthStatus::Connecting;
-                self.discord_token = Some(token.clone());
-                let db = UserDB {
-                    logged_in: true,
-                    token: Some(token),
-                };
-                if let Ok(json) = serde_json::to_string(&db) {
-                    let _ = web_local_storage_api::set_item("current_user", &json);
-                }
+                self.remember_login(&token);
+                self.discord_token = Some(token);
                 self.push_connection_step("Descargando ajustes…".to_owned());
                 if let Some((token, tx)) = self.discord_token.clone().zip(self.event_tx.clone()) {
                     crate::discord::spawn_fetch_user_settings(token, tx);
@@ -2338,6 +2557,11 @@ impl App {
             AppEvent::Ready(ready) => {
                 self.gateway_session_id = ready.session_id.clone();
                 let display_name = ready.user.display_name().to_string();
+                // Perfil de la cuenta para el selector (nombre, avatar, id).
+                if let Some(token) = self.discord_token.clone() {
+                    self.accounts.attach_profile(&token, &ready.user);
+                    self.accounts.save();
+                }
                 self.me = Some(ready.user);
                 self.friends = ready
                     .relationships
@@ -2393,6 +2617,9 @@ impl App {
             }
             AppEvent::MessageCreate(msg) => self.handle_incoming_message(*msg),
             AppEvent::MessageUpdate(update) => {
+                // Un bot que contesta a un botón editando su propio mensaje
+                // (paginadores, menús...) ya respondió.
+                self.pending_buttons.retain(|p| p.message_id != update.id);
                 if let Some(msg) = self.find_message_mut(&update.channel_id, &update.id) {
                     msg.apply_update(&update);
                 }
@@ -2688,9 +2915,11 @@ impl App {
                     Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
                     None => reason,
                 };
+                self.gateway_disconnected = true;
                 self.push_toast(ToastKind::Warning, "Discord", format!("{reason}. Reconectando…"));
             }
             AppEvent::GatewayReconnected => {
+                self.gateway_disconnected = false;
                 self.push_toast(ToastKind::Success, "Discord", "Conexión restablecida");
             }
             AppEvent::SessionInvalid(message) => self.invalidate_session(message),
@@ -2827,10 +3056,15 @@ impl App {
                 }
             }
             AppEvent::ModalCreate(request) => {
+                self.pending_buttons.clear();
                 self.component_modal = Some(ComponentModal::new(*request));
             }
             AppEvent::InteractionFailed { message } => {
+                self.pending_buttons.clear();
                 self.push_toast(ToastKind::Warning, "No se pudo completar la acción", message);
+            }
+            AppEvent::InteractionSucceeded => {
+                self.pending_buttons.clear();
             }
             AppEvent::ThreadOpened { thread } => {
                 let title = thread.name.clone().unwrap_or_else(|| "Hilo".to_string());
@@ -2865,16 +3099,13 @@ impl App {
                 // verdad.
                 self.auth = AuthStatus::Connecting;
                 self.connection_steps.clear();
+                self.remember_login(&token);
                 self.discord_token = Some(token.clone());
                 self.login_email.clear();
                 self.login_password.clear();
                 self.login_mfa_code.clear();
                 self.login_sms_sent = false;
                 self.pending_mfa = None;
-                let db = UserDB { logged_in: true, token: Some(token.clone()) };
-                if let Ok(json) = serde_json::to_string(&db) {
-                    let _ = web_local_storage_api::set_item("current_user", &json);
-                }
                 if let Some(tx) = self.event_tx.clone() {
                     crate::discord::spawn_gateway_with_token(token, tx);
                 }
@@ -3638,6 +3869,161 @@ impl App {
         }
     }
 
+    /// Arma los candidatos del menú de menciones (`@`) para la consulta que el
+    /// compositor está tipeando ahora (ver `ui::compose_menus`) y los publica.
+    /// No hace nada si no hay una mención en curso.
+    ///
+    /// Orden: primero quienes hablaron hace poco en el canal abierto, después
+    /// la lista de miembros cargada y al final cualquier otro usuario ya visto
+    /// (incluye lo que trajo una búsqueda al Gateway). Dentro de cada grado de
+    /// coincidencia (empieza igual / una palabra empieza igual / contiene) se
+    /// respeta ese orden. En un DM son solo los dos participantes.
+    fn publish_mention_results(&mut self, ctx: &egui::Context) {
+        use crate::ui::compose_menus::{self as menus, MentionCandidate, MentionKind};
+
+        let Some(query) = menus::active_query(ctx) else { return };
+        let needle = menus::fold(&query);
+        let fallback_bg = self.palette.surface_active;
+
+        // (grado de coincidencia, orden de prioridad, candidato)
+        let mut users: Vec<(u8, usize, MentionCandidate)> = Vec::new();
+        let mut checked: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut order = 0usize;
+        let mut add_user = |id: &str, name: &str, avatar_url: Option<&str>, avatar_color: Color32, color: Option<Color32>| {
+            order += 1;
+            if id.is_empty() || name.is_empty() || !checked.insert(id.to_string()) {
+                return;
+            }
+            if let Some(rank) = menus::match_rank(name, &needle) {
+                users.push((
+                    rank,
+                    order,
+                    MentionCandidate {
+                        kind: MentionKind::User,
+                        id: id.to_string(),
+                        name: name.to_string(),
+                        avatar_url: avatar_url.map(str::to_string),
+                        avatar_color,
+                        color,
+                    },
+                ));
+            }
+        };
+
+        let mut roles_out: Vec<MentionCandidate> = Vec::new();
+        let mut special: Vec<MentionCandidate> = Vec::new();
+
+        match self.screen {
+            Screen::Server(index) => {
+                if let Some(server) = self.servers.get(index) {
+                    // 1) Quienes hablaron hace poco en este canal, el más reciente primero.
+                    let (category, channel) = self.current_channel;
+                    if let Some(channel) = server.channel(category, channel) {
+                        for msg in channel.messages.iter().rev() {
+                            add_user(&msg.author_id, &msg.author, msg.avatar_url.as_deref(), msg.avatar_color, msg.author_color);
+                        }
+                    }
+                    // 2) La lista de miembros que ya llegó.
+                    for group in &server.member_groups {
+                        for member in &group.members {
+                            add_user(&member.user_id, &member.name, member.avatar_url.as_deref(), member.avatar_color, member.name_color);
+                        }
+                    }
+                    // 3) Cualquier otro usuario ya visto. Se ordena por nombre para que
+                    //    la lista no cambie de lugar entre frames (un `HashMap` no tiene orden).
+                    let mut known: Vec<(String, &String, Option<&str>)> = server
+                        .known_users
+                        .iter()
+                        .map(|(id, user)| {
+                            let nick = server.member_info.get(id).and_then(|info| info.nick.as_deref());
+                            (nick.unwrap_or(user.name.as_str()).to_string(), id, user.avatar_url.as_deref())
+                        })
+                        .filter(|(name, _, _)| menus::match_rank(name, &needle).is_some())
+                        .collect();
+                    known.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+                    for (name, id, avatar) in known {
+                        add_user(id, &name, avatar, fallback_bg, None);
+                    }
+
+                    // Roles y @everyone / @here: solo si la cuenta puede mencionarlos
+                    // (los roles "mencionables" los puede mencionar cualquiera).
+                    let can_everyone = crate::lib::permissions::can_mention_everyone(
+                        &server.guild_id,
+                        &server.access_ctx,
+                        &server.roles,
+                    );
+                    let mut roles: Vec<&crate::discord::models::Role> = server
+                        .roles
+                        .iter()
+                        .filter(|r| r.id != server.guild_id && !r.name.is_empty() && (r.mentionable || can_everyone))
+                        .collect();
+                    roles.sort_by(|a, b| b.position.cmp(&a.position));
+                    for role in roles {
+                        if menus::match_rank(&role.name, &needle).is_some() {
+                            roles_out.push(MentionCandidate {
+                                kind: MentionKind::Role,
+                                id: role.id.clone(),
+                                name: role.name.clone(),
+                                avatar_url: None,
+                                avatar_color: fallback_bg,
+                                color: (role.color != 0).then(|| {
+                                    Color32::from_rgb((role.color >> 16) as u8, (role.color >> 8) as u8, role.color as u8)
+                                }),
+                            });
+                        }
+                    }
+                    if can_everyone {
+                        for (kind, name) in [(MentionKind::Everyone, "everyone"), (MentionKind::Here, "here")] {
+                            if menus::match_rank(name, &needle).is_some() {
+                                special.push(MentionCandidate {
+                                    kind,
+                                    id: String::new(),
+                                    name: name.to_string(),
+                                    avatar_url: None,
+                                    avatar_color: fallback_bg,
+                                    color: None,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            Screen::Dm(index) => {
+                if let Some(friend) = self.friends.get(index) {
+                    add_user(&friend.user_id, &friend.name, friend.avatar_url.as_deref(), friend.avatar_color, None);
+                }
+                if let Some(me) = self.me.as_ref() {
+                    let avatar = me.avatar_url();
+                    add_user(&me.id, me.display_name(), avatar.as_deref(), fallback_bg, None);
+                }
+            }
+            _ => {}
+        }
+
+        users.sort_by_key(|(rank, order, _)| (*rank, *order));
+        let mut items: Vec<MentionCandidate> =
+            users.into_iter().map(|(_, _, cand)| cand).take(menus::MAX_USERS).collect();
+        items.extend(roles_out.into_iter().take(menus::MAX_ROLES));
+        items.extend(special);
+        menus::publish_results(ctx, query, items);
+    }
+
+    /// Le pide al Gateway los miembros del server abierto cuyo nombre empieza
+    /// con `query` (la respuesta llega como `AppEvent::GuildMembers` y deja a
+    /// esos usuarios disponibles para el menú de menciones). No aplica en DMs.
+    fn search_guild_members(&mut self, query: &str) {
+        let Screen::Server(index) = self.screen else { return };
+        let Some(commands) = self.gateway_commands.clone() else { return };
+        let Some(server) = self.servers.get(index) else { return };
+        if server.guild_id.is_empty() {
+            return;
+        }
+        let _ = commands.send(crate::discord::gateway::GatewayCommand::SearchGuildMembers {
+            guild_id: server.guild_id.clone(),
+            query: query.to_string(),
+        });
+    }
+
     /// Busca un mensaje por `channel_id` + `message_id` en cualquier DM o
     /// canal de server (el mismo recorrido que `handle_incoming_message`,
     /// pero además filtrando por id de mensaje). Se usa para aplicar
@@ -4292,6 +4678,7 @@ impl eframe::App for App {
         // nuevo se avisa dentro de la app o en el escritorio.
         self.window_focused = ui.ctx().input(|i| i.viewport().focused.unwrap_or(true));
         self.poll_discord_events(ui.ctx());
+        self.tick_pending_buttons(ui.ctx());
         self.pump_stream_frames(ui.ctx());
         self.clear_viewed_mentions();
         self.ack_viewed_channel();
@@ -4316,6 +4703,12 @@ impl eframe::App for App {
                 _ => &[],
             };
             crate::ui::markdown::publish_roles(&ctx, roles);
+            // Menú de menciones (`@`) del compositor: candidatos para lo que se
+            // está tipeando y, si hacen falta más, búsqueda en el Gateway.
+            self.publish_mention_results(&ctx);
+            if let Some(query) = crate::ui::compose_menus::take_member_search(&ctx) {
+                self.search_guild_members(&query);
+            }
             if let Some(channel_id) = crate::ui::markdown::take_channel_request(&ctx) {
                 self.open_channel_by_id(&channel_id);
             }

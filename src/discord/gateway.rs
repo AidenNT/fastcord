@@ -198,6 +198,12 @@ pub enum GatewayCommand {
     /// que es la forma de saber cómo se llama cada autor en el server y de
     /// qué color es su rol. La respuesta llega como `GUILD_MEMBERS_CHUNK`.
     RequestGuildMembers { guild_id: String, user_ids: Vec<String> },
+    /// Buscar miembros de `guild_id` cuyo nombre empiece con `query` (opcode 8
+    /// con `query`). Es lo que alimenta el menú de menciones (`@`) del
+    /// compositor cuando el server es grande y la lista de miembros cargada no
+    /// alcanza. La respuesta llega como `GUILD_MEMBERS_CHUNK`, igual que
+    /// `RequestGuildMembers`.
+    SearchGuildMembers { guild_id: String, query: String },
     /// Opcode 4: unirse/salir de un canal de voz (`channel_id: None` para
     /// salir), o cambiar mute/deaf mientras se está adentro.
     UpdateVoiceState {
@@ -256,6 +262,16 @@ fn request_members_payload(guild_id: &str, user_ids: &[String]) -> String {
     serde_json::json!({
         "op": 8,
         "d": { "guild_id": [guild_id], "user_ids": user_ids, "presences": false },
+    })
+    .to_string()
+}
+
+/// Opcode 8 con `query`: "dame los miembros cuyo nombre empiece con esto".
+/// Máximo 10 resultados — alcanza de sobra para el menú de menciones.
+fn search_members_payload(guild_id: &str, query: &str) -> String {
+    serde_json::json!({
+        "op": 8,
+        "d": { "guild_id": [guild_id], "query": query, "limit": 10, "presences": false },
     })
     .to_string()
 }
@@ -594,6 +610,15 @@ async fn connect_and_run(
                         // la próxima vez que cargue mensajes).
                         if *established && !user_ids.is_empty() {
                             let payload = request_members_payload(&guild_id, &user_ids);
+                            write.send(Message::Text(payload.into())).await?;
+                        }
+                    }
+                    GatewayCommand::SearchGuildMembers { guild_id, query } => {
+                        // Igual que `RequestGuildMembers`: sin sesión no hay
+                        // a quién preguntarle, el pedido se descarta.
+                        let query = query.trim();
+                        if *established && !query.is_empty() {
+                            let payload = search_members_payload(&guild_id, query);
                             write.send(Message::Text(payload.into())).await?;
                         }
                     }
@@ -1266,6 +1291,11 @@ fn handle_dispatch(
             if let Some(modal) = super::models::ModalRequest::from_value(&data) {
                 let _ = tx.send(AppEvent::ModalCreate(Box::new(modal)));
             }
+        }
+        // La app contestó bien a la interacción (`{ id, nonce }`): sirve para
+        // apagar el spinner del botón que se apretó.
+        "INTERACTION_SUCCESS" => {
+            let _ = tx.send(AppEvent::InteractionSucceeded);
         }
         // La app no contestó a tiempo (o rechazó la interacción).
         "INTERACTION_FAILURE" => {

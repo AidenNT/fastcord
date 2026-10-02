@@ -14,6 +14,10 @@
 //! Apretar un botón normal NO hace nada acá: [`show`] devuelve un
 //! [`ComponentClick`] y quien lo recibe (ver `App::press_component`) le manda
 //! la interacción a la app dueña. Un botón de link sí actúa solo: abre la URL.
+//!
+//! Mientras la app no contesta, el botón apretado muestra un spinner en lugar
+//! de su contenido (mismo tamaño que antes) y no se puede volver a apretar.
+//! La lista de botones cargando la publica `App` (`data::loading_buttons`).
 
 use egui::{Color32, CornerRadius, Frame, Margin, Sense, Stroke, Vec2};
 
@@ -29,6 +33,8 @@ const BUTTON_HEIGHT: f32 = 32.0;
 const BUTTON_PAD_X: f32 = 14.0;
 const EMOJI_SIZE: f32 = 16.0;
 const EMOJI_GAP: f32 = 6.0;
+/// Diámetro del spinner que reemplaza el contenido de un botón cargando.
+const SPINNER_SIZE: f32 = 18.0;
 /// Lado de la miniatura de una sección V2 y ancho máximo de un contenedor.
 const THUMB_SIDE: f32 = 80.0;
 const CONTAINER_MAX_W: f32 = 480.0;
@@ -44,9 +50,11 @@ pub fn show(ui: &mut egui::Ui, palette: &Palette, msg: &ChatMessage) -> Option<C
     }
     let mut clicked: Option<String> = None;
     let ctx = MentionCtx { mentions: &msg.mentions, channels: None };
+    // Botones de este mensaje que ya mandaron su interacción y esperan al bot.
+    let loading = crate::lib::data::loading_buttons(ui.ctx(), &msg.id);
     ui.add_space(4.0);
     for component in &msg.components {
-        draw(ui, palette, component, &ctx, &mut clicked);
+        draw(ui, palette, component, &ctx, &loading, &mut clicked);
     }
     clicked.map(|custom_id| ComponentClick {
         message_id: msg.id.clone(),
@@ -63,6 +71,7 @@ fn draw(
     palette: &Palette,
     component: &Component,
     ctx: &MentionCtx,
+    loading: &[String],
     clicked: &mut Option<String>,
 ) {
     match component.kind {
@@ -72,12 +81,12 @@ fn draw(
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
                 for child in &component.components {
-                    draw(ui, palette, child, ctx, clicked);
+                    draw(ui, palette, child, ctx, loading, clicked);
                 }
             });
             ui.add_space(2.0);
         }
-        Component::BUTTON => button(ui, palette, component, clicked),
+        Component::BUTTON => button(ui, palette, component, loading, clicked),
         // Menús desplegables: caja apagada con el texto de ayuda.
         3 | 5 | 6 | 7 | 8 => select_placeholder(ui, palette, component),
         // Texto suelto (componentes nuevos): con el markdown de Discord
@@ -97,20 +106,20 @@ fn draw(
                     ui.vertical(|ui| {
                         ui.set_width(text_w);
                         for child in &component.components {
-                            draw(ui, palette, child, ctx, clicked);
+                            draw(ui, palette, child, ctx, loading, clicked);
                         }
                     });
                     ui.add_space(4.0);
-                    draw(ui, palette, thumb, ctx, clicked);
+                    draw(ui, palette, thumb, ctx, loading, clicked);
                 });
             } else {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
                     for child in &component.components {
-                        draw(ui, palette, child, ctx, clicked);
+                        draw(ui, palette, child, ctx, loading, clicked);
                     }
                     if let Some(accessory) = component.accessory.as_deref() {
-                        draw(ui, palette, accessory, ctx, clicked);
+                        draw(ui, palette, accessory, ctx, loading, clicked);
                     }
                 });
             }
@@ -181,7 +190,7 @@ fn draw(
                 .show(ui, |ui| {
                     ui.set_max_width(ui.available_width().min(CONTAINER_MAX_W));
                     for child in &component.components {
-                        draw(ui, palette, child, ctx, clicked);
+                        draw(ui, palette, child, ctx, loading, clicked);
                     }
                 });
             let r = inner.response.rect;
@@ -211,7 +220,13 @@ fn colors(palette: &Palette, style: u8) -> (Color32, Color32, Color32) {
     }
 }
 
-fn button(ui: &mut egui::Ui, palette: &Palette, component: &Component, clicked: &mut Option<String>) {
+fn button(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    component: &Component,
+    loading: &[String],
+    clicked: &mut Option<String>,
+) {
     let (fill, fill_hover, text_color) = colors(palette, component.style);
     let is_link = component.is_link_button();
     let label = component.label.as_deref().unwrap_or("");
@@ -239,9 +254,19 @@ fn button(ui: &mut egui::Ui, palette: &Palette, component: &Component, clicked: 
     }
     let width = width.max(60.0);
 
-    // Un botón deshabilitado, o uno sin `custom_id` ni URL (mal formado), no
-    // reacciona al mouse.
-    let usable = !component.disabled && (is_link && component.url.is_some() || component.custom_id.is_some());
+    // Su interacción ya salió y el bot todavía no contestó: spinner adentro y
+    // sin reaccionar a más clics. (Un botón de link nunca "carga": solo abre
+    // la URL.)
+    let is_loading = !is_link
+        && component
+            .custom_id
+            .as_deref()
+            .is_some_and(|id| loading.iter().any(|l| l == id));
+    // Un botón cargando, deshabilitado, o uno sin `custom_id` ni URL (mal
+    // formado), no reacciona al mouse.
+    let usable = !is_loading
+        && !component.disabled
+        && (is_link && component.url.is_some() || component.custom_id.is_some());
     let sense = if usable { Sense::click() } else { Sense::hover() };
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, BUTTON_HEIGHT), sense);
     response.widget_info(|| {
@@ -251,15 +276,27 @@ fn button(ui: &mut egui::Ui, palette: &Palette, component: &Component, clicked: 
     if ui.is_rect_visible(rect) {
         let mut background = if usable && response.hovered() { fill_hover } else { fill };
         let mut foreground = text_color;
-        if !usable {
+        // Un botón cargando conserva sus colores (no es "deshabilitado").
+        if !usable && !is_loading {
             background = background.gamma_multiply(0.5);
             foreground = foreground.gamma_multiply(0.5);
         }
         ui.painter()
             .rect_filled(rect, CornerRadius::same(theme::RADIUS_SMALL), background);
 
+        // Cargando: el spinner va centrado en lugar del emoji y el texto. El
+        // botón no cambia de tamaño (el chat cachea la altura de las filas).
+        if is_loading {
+            let mut spinner_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(rect)
+                    .layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)),
+            );
+            theme::spinner(&mut spinner_ui, SPINNER_SIZE, foreground);
+        }
+
         let mut x = rect.left() + BUTTON_PAD_X;
-        if let Some(emoji) = emoji.filter(|_| has_emoji) {
+        if let Some(emoji) = emoji.filter(|_| has_emoji && !is_loading) {
             let icon_rect = egui::Rect::from_min_size(
                 egui::pos2(x, rect.center().y - EMOJI_SIZE / 2.0),
                 Vec2::splat(EMOJI_SIZE),
@@ -274,7 +311,7 @@ fn button(ui: &mut egui::Ui, palette: &Palette, component: &Component, clicked: 
             }
             x += EMOJI_SIZE + EMOJI_GAP;
         }
-        if let Some(galley) = galley {
+        if let Some(galley) = galley.filter(|_| !is_loading) {
             let pos = egui::pos2(x, rect.center().y - galley.size().y / 2.0);
             let advance = galley.size().x;
             ui.painter().galley(pos, galley, foreground);

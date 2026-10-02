@@ -19,6 +19,7 @@ use crate::discord::models::{PermissionOverwrite, Role};
 
 pub const ADMINISTRATOR: u64 = 1 << 3;
 pub const VIEW_CHANNEL: u64 = 1 << 10;
+pub const MENTION_EVERYONE: u64 = 1 << 17;
 pub const CONNECT: u64 = 1 << 20;
 
 /// Qué tan accesible es un canal para la cuenta. El `Default` es "visible,
@@ -169,6 +170,24 @@ pub fn channel_access(
     }
 }
 
+/// ¿La cuenta puede mencionar a `@everyone`, `@here` y a cualquier rol (aunque
+/// no sea "mencionable")? Mira solo los permisos base del server (sin los
+/// overwrites del canal). Fail-open como el resto del módulo: si todavía no se
+/// sabe (roles propios o permisos sin cargar), se asume que sí — mostrar de más
+/// en el menú de menciones es mejor que esconderlo.
+pub fn can_mention_everyone(guild_id: &str, ctx: &AccessContext, roles: &[Role]) -> bool {
+    let Some(my_roles) = ctx.my_roles.as_deref() else {
+        return true;
+    };
+    if ctx.my_id.is_empty() || ctx.owner_id.as_deref() == Some(ctx.my_id.as_str()) {
+        return true;
+    }
+    let Some(base) = base_permissions(guild_id, roles, my_roles) else {
+        return true;
+    };
+    base & (ADMINISTRATOR | MENTION_EVERYONE) != 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,6 +289,20 @@ mod tests {
         let overwrites = [ow(GUILD, 0, 0, CONNECT)];
         let a = channel_access(GUILD, &ctx(Some(vec![])), &roles(), &overwrites, false);
         assert!(!a.show_lock());
+    }
+
+    #[test]
+    fn mention_everyone_needs_the_permission() {
+        let roles = [
+            role(GUILD, VIEW_CHANNEL),
+            role("mod", MENTION_EVERYONE),
+            role("admin", ADMINISTRATOR),
+        ];
+        assert!(!can_mention_everyone(GUILD, &ctx(Some(vec![])), &roles));
+        assert!(can_mention_everyone(GUILD, &ctx(Some(vec!["mod"])), &roles));
+        assert!(can_mention_everyone(GUILD, &ctx(Some(vec!["admin"])), &roles));
+        // Datos que faltan: fail-open.
+        assert!(can_mention_everyone(GUILD, &ctx(None), &roles));
     }
 
     #[test]

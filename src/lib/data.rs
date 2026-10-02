@@ -90,6 +90,9 @@ pub struct EmojiGroup {
     pub icon_initial: String,
     pub icon_color: Color32,
     pub emojis: Vec<CustomEmoji>,
+    /// Stickers personalizados del server, para la pestaña "Stickers" del
+    /// selector (ver `ui::compose_menus::show_emoji_picker`).
+    pub stickers: Vec<StickerItem>,
     /// Es el server del canal que se está mirando (no un server "externo").
     /// En un DM ningún grupo es `home`.
     pub home: bool,
@@ -101,10 +104,10 @@ pub struct EmojiGroup {
 }
 
 impl EmojiGroup {
-    /// `None` si el server no tiene ningún emoji personalizado (no tiene
-    /// sentido darle una sección ni un ícono en el picker).
+    /// `None` si el server no tiene ningún emoji ni sticker personalizado (no
+    /// tiene sentido darle una sección ni un ícono en el picker).
     pub fn from_server(server: &Server, home: bool, no_nitro: bool) -> Option<Self> {
-        if server.custom_emojis.is_empty() {
+        if server.custom_emojis.is_empty() && server.custom_stickers.is_empty() {
             return None;
         }
         Some(Self {
@@ -113,6 +116,7 @@ impl EmojiGroup {
             icon_initial: server.icon_initial.clone(),
             icon_color: server.icon_color,
             emojis: server.custom_emojis.clone(),
+            stickers: server.custom_stickers.clone(),
             home,
             no_nitro,
         })
@@ -126,6 +130,13 @@ impl EmojiGroup {
     /// El picker los atenúa y, al clickearlos, avisa en vez de reaccionar.
     pub fn is_locked(&self, emoji: &CustomEmoji) -> bool {
         self.no_nitro && (!self.home || emoji.animated)
+    }
+
+    /// ¿Este sticker pide Nitro y la cuenta no lo tiene? Los stickers de
+    /// OTRO server (o cualquiera, en un DM) necesitan Nitro; los del propio
+    /// server no.
+    pub fn is_sticker_locked(&self) -> bool {
+        self.no_nitro && !self.home
     }
 }
 
@@ -407,6 +418,43 @@ pub struct ComponentClick {
     pub application_id: Option<String>,
     pub flags: u64,
     pub custom_id: String,
+}
+
+/// Un botón de bot al que se le mandó la interacción y que todavía no
+/// contestó: se dibuja con un spinner adentro (`ui::components`) hasta que
+/// llega la respuesta, falla, o vence el respaldo de `App::tick_pending_buttons`.
+#[derive(Clone, Debug)]
+pub struct PendingButton {
+    pub message_id: String,
+    pub custom_id: String,
+    pub since: std::time::Instant,
+}
+
+fn pending_buttons_id() -> egui::Id {
+    egui::Id::new("ecord_pending_buttons")
+}
+
+/// Deja la lista de botones cargando donde la UI de los mensajes la pueda
+/// leer sin pasarla por toda la cadena de funciones del chat (mismo patrón
+/// que `publish_guild_directory`). `App` la publica una vez por frame.
+pub fn publish_pending_buttons(ctx: &egui::Context, pending: &[PendingButton]) {
+    let keys: Vec<(String, String)> = pending
+        .iter()
+        .map(|p| (p.message_id.clone(), p.custom_id.clone()))
+        .collect();
+    ctx.data_mut(|d| d.insert_temp(pending_buttons_id(), std::sync::Arc::new(keys)));
+}
+
+/// `custom_id` de los botones de `message_id` que están cargando ahora.
+pub fn loading_buttons(ctx: &egui::Context, message_id: &str) -> Vec<String> {
+    ctx.data(|d| d.get_temp::<std::sync::Arc<Vec<(String, String)>>>(pending_buttons_id()))
+        .map(|keys| {
+            keys.iter()
+                .filter(|(message, _)| message == message_id)
+                .map(|(_, custom_id)| custom_id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Hilo que nació de un mensaje, tal como se resume debajo de él. El id del
@@ -1523,6 +1571,9 @@ pub struct Server {
     /// reacciones. Vacío en los servers de demo y en cualquier server
     /// real sin emojis subidos.
     pub custom_emojis: Vec<CustomEmoji>,
+    /// Stickers personalizados de este server (pestaña "Stickers" del
+    /// selector). Vacío en los servers de demo y en los reales sin stickers.
+    pub custom_stickers: Vec<StickerItem>,
     /// Apodo y roles de los miembros que ya conocemos, por id de usuario.
     /// Se llena con lo que Discord manda embebido en los mensajes en vivo,
     /// con la lista de miembros y con los `GUILD_MEMBERS_CHUNK` que se piden
@@ -2227,6 +2278,12 @@ impl Server {
                     Some(CustomEmoji { id: e.id.clone(), name, animated: e.animated })
                 })
                 .collect(),
+            custom_stickers: guild
+                .stickers
+                .iter()
+                .filter(|s| !s.id.is_empty() && s.format_type != 3)
+                .cloned()
+                .collect(),
         };
 
         // El `READY` de una cuenta de usuario ya trae el guild completo
@@ -2408,6 +2465,7 @@ pub fn demo_servers() -> Vec<Server> {
             channel_member_list: std::collections::HashMap::new(),
             pending_list_channel: None,
             custom_emojis: Vec::new(),
+            custom_stickers: Vec::new(),
             member_info: std::collections::HashMap::new(),
             requested_members: std::collections::HashSet::new(),
             pending_voice_states: Vec::new(),
@@ -2461,6 +2519,7 @@ fn demo_small_server(initial: &str, name: &str, color: Color32) -> Server {
         channel_member_list: std::collections::HashMap::new(),
         pending_list_channel: None,
         custom_emojis: Vec::new(),
+        custom_stickers: Vec::new(),
         member_info: std::collections::HashMap::new(),
         requested_members: std::collections::HashSet::new(),
         pending_voice_states: Vec::new(),
@@ -2927,6 +2986,7 @@ mod member_list_tests {
             position: 5,
             hoist: true,
             permissions: None,
+            mentionable: false,
         }];
         server
     }
@@ -3051,7 +3111,7 @@ mod chat_names_tests {
     use serde_json::json;
 
     fn role(id: &str, color: u32, position: i64) -> Role {
-        Role { id: id.into(), name: id.into(), color, position, hoist: false, permissions: None }
+        Role { id: id.into(), name: id.into(), color, position, hoist: false, permissions: None, mentionable: false }
     }
 
     fn server() -> Server {

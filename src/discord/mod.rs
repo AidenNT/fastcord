@@ -6,6 +6,7 @@
 //! eventos; `App` los va sacando del receiver una vez por frame
 //! (`App::poll_discord_events`, en `lib/state.rs`) y actualiza su estado.
 
+pub mod activity;
 pub mod gateway;
 pub mod models;
 pub mod remote_auth;
@@ -395,6 +396,9 @@ pub enum AppEvent {
     /// `INTERACTION_FAILURE`, o el `POST /interactions` falló: el botón no
     /// hizo nada. Se avisa con un toast.
     InteractionFailed { message: String },
+    /// `INTERACTION_SUCCESS`: la app contestó bien a la interacción (botón o
+    /// formulario). Apaga el spinner del botón apretado.
+    InteractionSucceeded,
     /// Se pudo crear un hilo desde un mensaje (`spawn_create_thread`); el
     /// panel lo abre enseguida.
     ThreadOpened { thread: ThreadChannel },
@@ -1025,6 +1029,58 @@ pub fn spawn_send_message(
     });
 }
 
+/// Manda un sticker (sin texto) por REST sin bloquear el frame. Llamado
+/// desde `ui::chat::composer` cuando se elige uno en la pestaña "Stickers"
+/// del selector. Si falla se registra y se sigue, como `spawn_send_message`.
+pub fn spawn_send_sticker(
+    token: String,
+    channel_id: String,
+    guild_id: Option<String>,
+    sticker_id: String,
+    reply_to: Option<String>,
+) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            return;
+        };
+        rt.block_on(async move {
+            let Ok(rest) = uwu_rest::UwuRest::for_token(token).await else {
+                return;
+            };
+            if let Err(e) = rest
+                .send_sticker(&channel_id, guild_id.as_deref(), &sticker_id, reply_to.as_deref())
+                .await
+            {
+                log::warn!("No se pudo mandar el sticker: {e}");
+            }
+        });
+    });
+}
+
+/// Pide los GIFs del selector (`query` vacío = los del momento) en un hilo
+/// aparte y le pasa el JSON crudo (o el error ya como texto) a `done`, que
+/// corre en ese mismo hilo. Quien llama guarda el resultado donde la UI lo
+/// pueda leer y pide un repaint (ver `ui::compose_menus`).
+pub fn spawn_fetch_gifs(
+    token: String,
+    query: String,
+    done: impl FnOnce(Result<serde_json::Value, String>) + Send + 'static,
+) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            done(Err("no se pudo crear el runtime".to_string()));
+            return;
+        };
+        let result: Result<serde_json::Value, String> = rt.block_on(async move {
+            let rest = uwu_rest::UwuRest::for_token(token)
+                .await
+                .map_err(|e| e.to_string())?;
+            rest.gifs(&query).await.map_err(|e| e.to_string())
+        });
+        done(result);
+    });
+}
+
 /// Pone o saca la reacción propia (`emoji`) en un mensaje ya mandado,
 /// sin bloquear el frame. Llamado desde `ui::chat` cuando el usuario
 /// clickea una reacción (o el botón de "agregar reacción") en un mensaje
@@ -1082,6 +1138,29 @@ pub fn spawn_ack_message(token: String, channel_id: String, message_id: String) 
             };
             if let Err(e) = rest.ack_message(&channel_id, &message_id).await {
                 log::warn!("No se pudo marcar el canal {channel_id} como leído: {e}");
+            }
+        });
+    });
+}
+
+/// Invalida el token en Discord (`POST /auth/logout`) en un hilo aparte. Se usa
+/// al cerrar sesión o quitar una cuenta. Si falla (sin red, token ya inválido)
+/// solo se registra: el token igual se borra del disco.
+pub fn spawn_logout(token: String) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            return;
+        };
+        rt.block_on(async move {
+            let rest = match uwu_rest::UwuRest::for_token(token).await {
+                Ok(rest) => rest,
+                Err(e) => {
+                    log::warn!("No se pudo invalidar el token en Discord (¿ya era inválido?): {e}");
+                    return;
+                }
+            };
+            if let Err(e) = rest.logout().await {
+                log::warn!("Discord rechazó el cierre de sesión: {e}");
             }
         });
     });

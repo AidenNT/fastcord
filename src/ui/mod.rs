@@ -5,15 +5,18 @@
 pub(crate) use crate::theme;
 
 pub mod account_settings;
+pub mod accounts;
 pub mod anim;
 pub mod call_bar;
 pub mod call_view;
 pub mod changelog;
 pub mod chat;
 pub mod components;
+pub mod compose_menus;
 pub mod dialog;
 pub mod dm;
 pub mod emoji;
+pub mod emoji_catalog;
 pub mod extra;
 pub mod forum;
 pub mod friends_panel;

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use egui::{Area, Color32, CornerRadius, Frame, Margin, Order, ScrollArea, Sense, Stroke, Vec2};
 
 use crate::lib::data::{
-    ChatMessage, ComponentClick, CustomEmoji, EmojiGroup, Forward, ReactionKind, RepliedMessage, ReplyTarget,
+    ChatMessage, ComponentClick, EmojiGroup, Forward, ReactionKind, RepliedMessage, ReplyTarget,
     ThreadCard,
 };
 use crate::ui::emoji as twemoji;
@@ -29,26 +29,6 @@ const AVATAR_GUTTER: f32 = 16.0 + 36.0 + 8.0;
 /// agrega el primero de esta lista que el mensaje todavía no tenga (un
 /// solo click, sin abrir ningún panel).
 const QUICK_REACTIONS: &[&str] = &["👍", "❤️", "😂", "🎉", "😮", "🙏"];
-/// Set más grande para el panel de "más reacciones" (botón "+" de la
-/// barra flotante): además del emoji en sí, cada uno trae un nombre corto
-/// en español para poder buscarlo en el picker (ver `reaction_panel`) —
-/// no hay picker de emoji Unicode completo en esta versión (implicaría
-/// meter una tabla entera), así que es una lista curada más larga que
-/// `QUICK_REACTIONS`.
-const EXTENDED_REACTIONS: &[(&str, &str)] = &[
-    ("👍", "pulgar arriba"), ("👎", "pulgar abajo"), ("❤️", "corazon"),
-    ("🔥", "fuego"), ("🎉", "fiesta"), ("😂", "risa"),
-    ("😮", "sorpresa"), ("😢", "triste"), ("😡", "enojado"),
-    ("🙏", "gracias por favor"), ("👀", "ojos mirando"), ("💯", "cien"),
-    ("🤔", "pensando"), ("😍", "enamorado"), ("🥳", "cumpleaños fiesta"),
-    ("👏", "aplausos"), ("🤝", "trato apreton de manos"), ("✅", "check"),
-    ("❌", "equis"), ("⭐", "estrella"), ("🚀", "cohete"), ("💀", "calavera"),
-    ("😅", "risa nerviosa"), ("😴", "durmiendo"), ("👋", "saludo hola chau"),
-    ("😎", "lentes cool"), ("🤯", "mente explota"), ("🥺", "ojitos"),
-    ("😊", "sonrisa"), ("🙄", "ojos en blanco"), ("😭", "llorando"),
-    ("🤮", "vomito asco"), ("🤡", "payaso"), ("💩", "caca"),
-    ("🎂", "torta cumpleaños"), ("🍺", "cerveza"), ("☕", "cafe"),
-];
 /// Margen máximo (en píxeles, arriba o abajo de una fila) dentro del cual
 /// el mouse todavía cuenta como "sobre" un mensaje aunque ya no esté
 /// literalmente encima de su rect — sirve para no descolgar la barra
@@ -618,7 +598,7 @@ pub fn show(
         }
     }
 
-    composer(
+    nitro_required |= composer(
         ui,
         palette,
         messages,
@@ -628,6 +608,7 @@ pub fn show(
         own_color,
         send_target,
         reply_target,
+        custom_emojis,
     );
 
     if let Some((id, name, owner_id)) = actions.open_thread {
@@ -1335,52 +1316,26 @@ pub(crate) fn preview_text(content: &str) -> String {
     }
 }
 
-/// Id de memoria del texto de búsqueda del picker — solo puede haber un
-/// panel abierto a la vez (ver `reaction_panel_memory_id`), así que un
-/// único id alcanza; no hace falta que sea por-índice de mensaje.
-fn reaction_search_memory_id() -> egui::Id {
-    scoped_id("ecord_chat_reaction_panel_search")
+/// Id del selector de emojis que se abre al reaccionar. Solo puede haber uno
+/// abierto a la vez (ver `reaction_panel_memory_id`), así que un único id por
+/// scope alcanza; no hace falta que sea por-índice de mensaje.
+fn reaction_picker_id() -> egui::Id {
+    scoped_id("ecord_reaction_picker")
 }
 
-/// Limpia todo lo que el panel de reacciones recuerda entre frames
-/// (buscador, salto pendiente y sección activa) — se llama al cerrarlo, así
-/// la próxima vez abre limpio y arriba de todo.
+/// Cierra el selector de reacciones y borra lo que recordaba (buscador,
+/// pestaña, salto pendiente), así la próxima vez abre limpio.
 fn clear_reaction_panel_state(ctx: &egui::Context) {
-    ctx.memory_mut(|m| {
-        m.data.remove::<String>(reaction_search_memory_id());
-        m.data.remove::<usize>(reaction_jump_memory_id());
-        m.data.remove::<usize>(reaction_active_memory_id());
-    });
+    crate::ui::compose_menus::reset_picker(ctx, reaction_picker_id());
 }
 
-/// Sección a la que saltar la próxima vez que se dibuje la lista (la setea
-/// un click en la barra lateral, la consume `reaction_panel`).
-fn reaction_jump_memory_id() -> egui::Id {
-    scoped_id("ecord_chat_reaction_panel_jump")
-}
-
-/// Sección que está arriba de todo en la lista ahora mismo — para resaltar
-/// su ícono en la barra lateral.
-fn reaction_active_memory_id() -> egui::Id {
-    scoped_id("ecord_chat_reaction_panel_active")
-}
-
-/// Marcador de "la sección de emojis Unicode" (la última) en el salto y la
-/// sección activa: los servers usan su índice en `custom_emojis`.
-const UNICODE_SECTION: usize = usize::MAX;
-
-/// Panel flotante para reaccionar: pestañas GIF/Stickers/Emojis arriba
-/// (como el picker completo del cliente real — ver la barra de
-/// composer), buscador debajo, y después, a la izquierda, una barra con el
-/// ícono de cada server (más uno para los emojis Unicode) y, a la derecha,
-/// la lista de emojis en secciones. Clickear el ícono de un server salta a
-/// su sección; mientras se scrollea, el ícono de la sección visible queda
-/// resaltado. Al buscar, la barra muestra solo los servers con resultados.
-/// Acá SOLO "Emojis" hace algo: no se puede reaccionar con un GIF ni un
-/// sticker (tampoco se puede en el cliente real), así que esas dos quedan
-/// apagadas en vez de funcionar. Se abre desde el botón "+" de
-/// `hover_toolbar` y se cierra solo (clickear un emoji, la X, o clickear
-/// en cualquier otro lado).
+/// Selector para reaccionar: el MISMO selector de emojis del compositor
+/// (`compose_menus::show_emoji_picker`) — pestañas GIF/Stickers/Emojis,
+/// buscador, barra lateral de servers, catálogo Unicode completo y vista
+/// previa — pero en modo reacción: GIF y Stickers se ven apagadas porque no
+/// se puede reaccionar con eso (tampoco en el cliente real). Se abre desde el
+/// botón "+" de `hover_toolbar` y se cierra solo (elegir un emoji, Esc, o
+/// clickear en cualquier otro lado).
 fn reaction_panel(
     ui: &mut egui::Ui,
     palette: &Palette,
@@ -1391,393 +1346,52 @@ fn reaction_panel(
     nitro_required: &mut bool,
     custom_emojis: &[EmojiGroup],
 ) {
-    const PANEL_WIDTH: f32 = 330.0;
-    const RAIL_WIDTH: f32 = 32.0;
-    const RAIL_GAP: f32 = 6.0;
-    const LIST_HEIGHT: f32 = 280.0;
-    let pos = egui::pos2(
-        (row_rect.right() - PANEL_WIDTH - 12.0).max(row_rect.left()),
-        row_rect.top() + 20.0,
-    );
+    use crate::ui::compose_menus as menus;
 
-    let search_id = reaction_search_memory_id();
-    let jump_id = reaction_jump_memory_id();
-    let active_id = reaction_active_memory_id();
-    let mut search: String = ui.ctx().memory(|m| m.data.get_temp(search_id).unwrap_or_default());
-    let needle = search.trim().to_lowercase();
-
-    // Lo que hay para mostrar con el filtro actual, calculado ANTES de
-    // dibujar: la barra lateral solo ofrece las secciones que existen.
-    let groups: Vec<(usize, &EmojiGroup, Vec<&CustomEmoji>)> = custom_emojis
-        .iter()
-        .enumerate()
-        .filter_map(|(i, g)| {
-            let filtered: Vec<&CustomEmoji> = g
-                .emojis
-                .iter()
-                .filter(|e| needle.is_empty() || e.name.to_lowercase().contains(needle.as_str()))
-                .collect();
-            if filtered.is_empty() { None } else { Some((i, g, filtered)) }
-        })
-        .collect();
-    let unicode_filtered: Vec<(&str, &str)> = EXTENDED_REACTIONS
-        .iter()
-        .filter(|pair| {
-            let (emoji, name) = **pair;
-            needle.is_empty() || name.contains(needle.as_str()) || emoji == needle.as_str()
-        })
-        .copied()
-        .collect();
-    // Sin ningún emoji de server no hay nada que elegir: el panel queda
-    // como antes, sin barra lateral.
-    let show_rail = !groups.is_empty();
-    let list_width = if show_rail {
-        PANEL_WIDTH - 20.0 - RAIL_WIDTH - RAIL_GAP
-    } else {
-        PANEL_WIDTH - 20.0
+    let ctx = ui.ctx().clone();
+    // Esquina superior derecha del selector, un poco abajo del borde de la
+    // fila (egui lo corre solo si no entra en la pantalla).
+    let anchor = egui::pos2(row_rect.right() - 12.0, row_rect.top() + 20.0);
+    let close = |ctx: &egui::Context| {
+        set_open_reaction_panel(ctx, None);
+        clear_reaction_panel_state(ctx);
     };
-
-    let area_response = Area::new(egui::Id::new(("msg_reaction_panel", scope(), index)))
-        .order(Order::Foreground)
-        .fixed_pos(pos)
-        .show(ui.ctx(), |ui| {
-            Frame::new()
-                .fill(palette.overlay)
-                .stroke(Stroke::new(1.0, palette.outline))
-                .corner_radius(CornerRadius::same(theme::RADIUS + 2))
-                .inner_margin(Margin::same(10))
-                .shadow(egui::epaint::Shadow {
-                    offset: [0, 8],
-                    blur: 20,
-                    spread: 0,
-                    color: palette.shadow,
-                })
-                .show(ui, |ui| {
-                    ui.set_width(PANEL_WIDTH - 20.0);
-                    ui.horizontal(|ui| {
-                        reaction_tab(ui, palette, "GIF", false, false);
-                        ui.add_space(14.0);
-                        reaction_tab(ui, palette, "Stickers", false, false);
-                        ui.add_space(14.0);
-                        reaction_tab(ui, palette, "Emojis", true, true);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if theme::icon_button(ui, Icon::X, 10.0, palette.dim, palette.text, "Cerrar").clicked() {
-                                set_open_reaction_panel(ui.ctx(), None);
-                                clear_reaction_panel_state(ui.ctx());
-                            }
-                        });
-                    });
-                    ui.add_space(8.0);
-
-                    let search_response = ui.add(
-                        egui::TextEdit::singleline(&mut search)
-                            .hint_text("Encontrá el emoji perfecto")
-                            .desired_width(f32::INFINITY),
-                    );
-                    if search_response.changed() {
-                        ui.ctx().memory_mut(|m| m.data.insert_temp(search_id, search.clone()));
-                    }
-                    // El buscador se enfoca solo apenas se abre el panel,
-                    // para poder tipear de una sin tener que clickearlo —
-                    // igual que en el cliente real. `clicked_elsewhere`
-                    // (más abajo) ya se encarga de no robarle el foco a
-                    // otra cosa en los frames siguientes, así que pedirlo
-                    // siempre acá solo importa el primer frame (cuando
-                    // ninguna otra cosa de ESTE panel lo tiene todavía).
-                    // Se pide foco cada frame mientras no lo tenga (no
-                    // solo el primero) — así se puede tipear de una al
-                    // abrir el panel sin clickear el buscador primero,
-                    // igual que en el cliente real, sin depender de
-                    // ninguna API de "¿hay algo más enfocado ahora?" que
-                    // varía de versión a versión de egui.
-                    if !search_response.has_focus() {
-                        search_response.request_focus();
-                    }
-                    ui.add_space(6.0);
-
-                    let mut any_shown = false;
-                    ui.horizontal_top(|ui| {
-                        ui.spacing_mut().item_spacing.x = RAIL_GAP;
-
-                        // ---- Barra lateral: un ícono por server (+ Unicode).
-                        if show_rail {
-                            let active: usize = ui
-                                .ctx()
-                                .memory(|m| m.data.get_temp(active_id))
-                                .unwrap_or_else(|| groups.first().map(|g| g.0).unwrap_or(UNICODE_SECTION));
-                            // Ojo: un `ScrollArea` hereda el layout del `Ui` donde se
-                            // lo pone, y acá el padre es un `horizontal_top`: sin este
-                            // `vertical` los íconos salían uno al lado del otro en vez
-                            // de apilados como en el cliente real.
-                            ui.vertical(|ui| {
-                                ScrollArea::vertical()
-                                    .id_salt("reaction_panel_rail")
-                                    .max_height(LIST_HEIGHT)
-                                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                                    .show(ui, |ui| {
-                                        ui.set_width(RAIL_WIDTH);
-                                        ui.spacing_mut().item_spacing.y = 4.0;
-                                        for (i, group, _) in &groups {
-                                            if reaction_rail_button(ui, palette, Some(*group), *i == active).clicked() {
-                                                ui.ctx().memory_mut(|m| {
-                                                    m.data.insert_temp(jump_id, *i);
-                                                    m.data.insert_temp(active_id, *i);
-                                                });
-                                            }
-                                        }
-                                        if !unicode_filtered.is_empty()
-                                            && reaction_rail_button(ui, palette, None, active == UNICODE_SECTION).clicked()
-                                        {
-                                            ui.ctx().memory_mut(|m| {
-                                                m.data.insert_temp(jump_id, UNICODE_SECTION);
-                                                m.data.insert_temp(active_id, UNICODE_SECTION);
-                                            });
-                                        }
-                                    });
-                            });
-                        }
-
-                        // ---- Lista de emojis, una sección por server.
-                        ui.vertical(|ui| {
-                            ui.set_width(list_width);
-                            ScrollArea::vertical()
-                                .id_salt("reaction_panel_list")
-                                .max_height(LIST_HEIGHT)
-                                .auto_shrink([false, true])
-                                .show(ui, |ui| {
-                                    let jump: Option<usize> = ui.ctx().memory(|m| m.data.get_temp(jump_id));
-                                    let clip_top = ui.clip_rect().top();
-                                    // Sección "activa" = la última cuyo título ya
-                                    // llegó al borde de arriba de la lista.
-                                    let mut spy = groups.first().map(|g| g.0).unwrap_or(UNICODE_SECTION);
-
-                                    for (i, group, filtered) in &groups {
-                                        any_shown = true;
-                                        let header = theme::text(ui, group.name.to_uppercase(), theme::semibold(10.5), palette.dim);
-                                        if jump == Some(*i) {
-                                            ui.scroll_to_rect(header.rect, Some(egui::Align::TOP));
-                                        }
-                                        if header.rect.top() <= clip_top + 6.0 {
-                                            spy = *i;
-                                        }
-                                        ui.add_space(4.0);
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
-                                            for emoji in filtered {
-                                                let locked = group.is_locked(emoji);
-                                                if emoji_grid_button_custom(ui, palette, emoji, locked).clicked() {
-                                                    if locked {
-                                                        // Sin Nitro no se reacciona: se
-                                                        // avisa con un popup (ver
-                                                        // `ChatEvent::NitroRequired`).
-                                                        *nitro_required = true;
-                                                    } else {
-                                                        *toggled_reaction = Some((
-                                                            index,
-                                                            ReactionKind::Custom {
-                                                                id: emoji.id.clone(),
-                                                                name: emoji.name.clone(),
-                                                                animated: emoji.animated,
-                                                            },
-                                                        ));
-                                                    }
-                                                    set_open_reaction_panel(ui.ctx(), None);
-                                                    clear_reaction_panel_state(ui.ctx());
-                                                }
-                                            }
-                                        });
-                                        ui.add_space(8.0);
-                                    }
-
-                                    if !unicode_filtered.is_empty() {
-                                        any_shown = true;
-                                        let header = theme::text(ui, "EMOJIS", theme::semibold(10.5), palette.dim);
-                                        if jump == Some(UNICODE_SECTION) {
-                                            ui.scroll_to_rect(header.rect, Some(egui::Align::TOP));
-                                        }
-                                        if header.rect.top() <= clip_top + 6.0 {
-                                            spy = UNICODE_SECTION;
-                                        }
-                                        ui.add_space(4.0);
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
-                                            for (emoji, name) in &unicode_filtered {
-                                                if emoji_grid_button(ui, palette, emoji, name).clicked() {
-                                                    *toggled_reaction = Some((index, ReactionKind::Unicode((*emoji).to_string())));
-                                                    set_open_reaction_panel(ui.ctx(), None);
-                                                    clear_reaction_panel_state(ui.ctx());
-                                                }
-                                            }
-                                        });
-                                    }
-
-                                    if jump.is_some() {
-                                        // El salto ya se pidió: se consume, y el
-                                        // resaltado lo dejó puesto el click (no
-                                        // lo pisa el `spy` de este frame, que
-                                        // todavía ve la lista sin mover).
-                                        ui.ctx().memory_mut(|m| m.data.remove::<usize>(jump_id));
-                                        ui.ctx().request_repaint();
-                                    } else {
-                                        ui.ctx().memory_mut(|m| m.data.insert_temp(active_id, spy));
-                                    }
-
-                                    if !any_shown {
-                                        ui.add_space(12.0);
-                                        ui.horizontal(|ui| {
-                                            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-                                                ui.set_width(ui.available_width());
-                                                theme::text(ui, "No se encontró ningún emoji", theme::regular(12.0), palette.dim);
-                                            });
-                                        });
-                                    }
-                                });
-                        });
-                    });
-                });
-        })
-        .response;
-
-    // Cualquier click que no haya caído adentro del panel lo cierra —
-    // salvo el click que lo abrió, que ni siquiera llega acá (ver el
-    // comentario de `open_panel_index` en `show`).
-    if area_response.clicked_elsewhere() {
-        set_open_reaction_panel(ui.ctx(), None);
-        clear_reaction_panel_state(ui.ctx());
+    match menus::show_emoji_picker(
+        &ctx,
+        palette,
+        reaction_picker_id(),
+        anchor,
+        custom_emojis,
+        menus::PickerMode::React,
+        None,
+    ) {
+        menus::PickerResult::Pending => {}
+        menus::PickerResult::Closed => close(&ctx),
+        menus::PickerResult::Unicode(emoji) => {
+            *toggled_reaction = Some((index, ReactionKind::Unicode(emoji)));
+            close(&ctx);
+        }
+        menus::PickerResult::Custom(emoji) => {
+            *toggled_reaction = Some((
+                index,
+                ReactionKind::Custom {
+                    id: emoji.id.clone(),
+                    name: emoji.name.clone(),
+                    animated: emoji.animated,
+                },
+            ));
+            close(&ctx);
+        }
+        menus::PickerResult::Locked => {
+            // Sin Nitro no se reacciona: se avisa con un popup (ver
+            // `ChatEvent::NitroRequired`).
+            *nitro_required = true;
+            close(&ctx);
+        }
+        // En modo reacción las pestañas GIF y Stickers están apagadas: estos
+        // resultados no pueden llegar.
+        menus::PickerResult::Sticker(_) | menus::PickerResult::Gif(_) => {}
     }
-}
-
-/// Un ícono de la barra lateral del picker de reacciones: el del server
-/// (`Some`) o, para saltar a los emojis Unicode, uno genérico (`None`).
-/// `active` = es la sección que se está viendo ahora.
-fn reaction_rail_button(ui: &mut egui::Ui, palette: &Palette, group: Option<&EmojiGroup>, active: bool) -> egui::Response {
-    let side = 32.0_f32;
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(side), Sense::click());
-    let label = group.map(|g| g.name.as_str()).unwrap_or("Emojis");
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label));
-    if ui.is_rect_visible(rect) {
-        if active || response.hovered() {
-            let fill = if active { palette.surface_active } else { palette.surface_hover };
-            ui.painter().rect_filled(rect, CornerRadius::same(8), fill);
-        }
-        match group {
-            Some(g) => extra::avatar(ui, rect.center(), 12.0, g.icon_url.as_deref(), g.icon_color, &g.icon_initial, palette),
-            None => theme::paint_icon(ui, Icon::Sparkles, rect, 18.0, if active { palette.text } else { palette.dim }),
-        }
-    }
-    response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(label)
-}
-
-/// Una pestaña de la fila GIF/Stickers/Emojis de arriba del panel. Acá
-/// SOLO "Emojis" (`enabled: true`) hace algo — GIF y Stickers se dibujan
-/// apagadas (texto atenuado, sin cursor de mano ni click) para que el
-/// panel se vea como el picker completo del cliente real sin prometer
-/// una función que no existe: no se puede reaccionar con un GIF ni un
-/// sticker, ni en este cliente ni en el real.
-fn reaction_tab(ui: &mut egui::Ui, palette: &Palette, label: &str, active: bool, enabled: bool) {
-    let color = if active {
-        palette.text
-    } else if enabled {
-        palette.dim
-    } else {
-        palette.dim.gamma_multiply(0.45)
-    };
-    let font = if active { theme::semibold(12.0) } else { theme::regular(12.0) };
-    let response = theme::text(ui, label, font, color);
-    if active {
-        let rect = response.rect;
-        let line_y = rect.bottom() + 3.0;
-        ui.painter().line_segment(
-            [egui::pos2(rect.left(), line_y), egui::pos2(rect.right(), line_y)],
-            Stroke::new(2.0, palette.accent),
-        );
-    } else if !enabled {
-        response.on_hover_text("No se puede reaccionar con esto");
-    }
-}
-
-fn emoji_grid_button(ui: &mut egui::Ui, palette: &Palette, emoji: &str, name: &str) -> egui::Response {
-    // Emoji a color (Twemoji); solo si la imagen no se puede cargar se cae al
-    // glifo monocromático de la fuente (camino de más abajo).
-    let icon_size = 20.0_f32;
-    if twemoji::probe(ui.ctx(), emoji, icon_size) != twemoji::State::Failed {
-        let (rect, response) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
-        response.widget_info(|| {
-            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), name)
-        });
-        if ui.is_rect_visible(rect) {
-            if response.hovered() {
-                ui.painter().rect_filled(rect, theme::RADIUS_SMALL as f32, palette.surface_hover);
-            }
-            twemoji::paint(ui, egui::Rect::from_center_size(rect.center(), Vec2::splat(icon_size)), emoji);
-        }
-        return response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(name);
-    }
-    let font = theme::regular(17.0);
-    let galley = ui.painter().layout_no_wrap(emoji.to_string(), font, palette.text);
-    let side = 28.0_f32;
-    let size = Vec2::new(side.max(galley.size().x + 6.0), side.max(galley.size().y + 6.0));
-    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), name)
-    });
-    if ui.is_rect_visible(rect) {
-        if response.hovered() {
-            ui.painter().rect_filled(rect, theme::RADIUS_SMALL as f32, palette.surface_hover);
-        }
-        let pos = rect.center() - galley.size() / 2.0;
-        ui.painter().galley(pos, galley, palette.text);
-    }
-    response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(name)
-}
-
-/// Igual que `emoji_grid_button`, pero para un emoji personalizado del
-/// server: en vez de dibujar un carácter Unicode, pide el ícono real al
-/// CDN de Discord (mismo patrón que `reaction_pill_custom`, con un
-/// cuadradito de relleno mientras carga o si falla, para no dejar un
-/// hueco vacío en el grid).
-///
-/// `locked` = hace falta Nitro y la cuenta no lo tiene: el emoji se dibuja
-/// atenuado y con un candadito, como el cliente real. Igual se puede
-/// clickear (quien llama decide qué hacer — ver `reaction_panel`).
-fn emoji_grid_button_custom(ui: &mut egui::Ui, palette: &Palette, emoji: &CustomEmoji, locked: bool) -> egui::Response {
-    let side = 28.0_f32;
-    let icon_size = 20.0_f32;
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(side), Sense::click());
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), &emoji.name)
-    });
-    if ui.is_rect_visible(rect) {
-        if response.hovered() {
-            ui.painter().rect_filled(rect, theme::RADIUS_SMALL as f32, palette.surface_hover);
-        }
-        let icon_rect = egui::Rect::from_center_size(rect.center(), Vec2::splat(icon_size));
-        let mut image = egui::Image::new(crate::ui::anim::source(ui.ctx(), &emoji.url()))
-            .fit_to_exact_size(Vec2::splat(icon_size))
-            .show_loading_spinner(false);
-        if locked {
-            image = image.tint(Color32::from_white_alpha(90));
-        }
-        match image.load_for_size(ui.ctx(), Vec2::splat(icon_size)) {
-            Ok(egui::load::TexturePoll::Ready { .. }) => image.paint_at(ui, icon_rect),
-            _ => {
-                ui.painter().rect_filled(icon_rect, 3.0, palette.surface_hover);
-            }
-        }
-        if locked {
-            let badge = egui::Rect::from_center_size(rect.right_bottom() - Vec2::splat(6.0), Vec2::splat(11.0));
-            ui.painter().circle_filled(badge.center(), 6.5, palette.overlay);
-            theme::paint_icon(ui, Icon::Lock, badge, 9.0, palette.text);
-        }
-    }
-    let hover = if locked {
-        format!(":{}: — requiere Nitro", emoji.name)
-    } else {
-        format!(":{}:", emoji.name)
-    };
-    response
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(hover)
 }
 
 /// Fila de reacciones ya puestas debajo del contenido: una "pill" por
@@ -2014,7 +1628,31 @@ fn composer(
     own_color: Color32,
     send_target: Option<(String, String, Option<String>)>,
     reply_target: &mut Option<ReplyTarget>,
-) {
+    custom_emojis: &[EmojiGroup],
+) -> bool {
+    use crate::ui::compose_menus as menus;
+
+    // Se pone en `true` si se clickeó en el selector un emoji bloqueado (falta
+    // Nitro): quien llama (`show`) lo convierte en `ChatEvent::NitroRequired`.
+    let mut nitro_required = false;
+    let ctx = ui.ctx().clone();
+
+    // Ids de memoria (por scope: el chat principal y el panel de un hilo
+    // pueden estar a la vez en pantalla, cada uno con su propio compositor).
+    let text_id = scoped_id("ecord_composer_text");
+    let menu_state_id = scoped_id("ecord_composer_mention_state");
+    let mentions_id = scoped_id("ecord_composer_mentions");
+    let customs_id = scoped_id("ecord_composer_customs");
+    let picker_open_id = scoped_id("ecord_composer_emoji_open");
+    let picker_id = scoped_id("ecord_composer_emoji_picker");
+    let mention_menu_id = scoped_id("ecord_composer_mention_menu");
+
+    // Si el selector de emojis estaba abierto, leído UNA sola vez al principio
+    // del frame: el click del botón que lo abre/cierra queda guardado para el
+    // próximo frame (mismo motivo que `open_panel_index` en `show`: si no, el
+    // propio click de apertura contaría como "click afuera" y lo cerraría).
+    let picker_open: bool = ctx.memory(|m| m.data.get_temp(picker_open_id).unwrap_or(false));
+
     if let Some(reply) = reply_target.clone() {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -2041,18 +1679,64 @@ fn composer(
         });
     }
 
+    // ---- Menú de menciones, parte 1: las teclas.
+    // Se procesan ANTES de dibujar el `TextEdit`, que si no se quedaría con
+    // las flechas (mover el cursor) y con Tab. Usa el texto y el cursor del
+    // frame anterior, que son lo que el usuario estaba viendo.
+    let mut menu = menus::MentionMenuState::load(&ctx, menu_state_id);
+    let focused_before = ctx.memory(|m| m.has_focus(text_id));
+    let mention_before = if focused_before {
+        menus::caret_index(&ctx, text_id).and_then(|caret| menus::active_mention(compose_text, caret))
+    } else {
+        None
+    };
+    let mut key_accept: Option<usize> = None;
+    if let Some(m) = mention_before.as_ref() {
+        if menu.query != m.query {
+            menu.query = m.query.clone();
+            menu.selected = 0;
+        }
+        if menu.dismissed_start != Some(m.start) {
+            if let Some(results) = menus::results_for(&ctx, &m.query) {
+                let n = results.items.len();
+                if n > 0 {
+                    ctx.input_mut(|i| {
+                        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                            menu.selected = (menu.selected + 1) % n;
+                        }
+                        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                            menu.selected = (menu.selected + n - 1) % n;
+                        }
+                        // Enter y Tab eligen la fila resaltada (en vez de mandar el
+                        // mensaje / saltar de foco).
+                        if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
+                            || i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                        {
+                            key_accept = Some(menu.selected.min(n - 1));
+                        }
+                        if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+                            menu.dismissed_start = Some(m.start);
+                        }
+                    });
+                }
+            }
+        }
+    }
+
     ui.add_space(6.0);
+    // Rect del campo (marco incluido), para anclar los menús flotantes.
+    let mut composer_rect = egui::Rect::NOTHING;
     ui.horizontal(|ui| {
         ui.add_space(16.0);
-        Frame::new()
+        let framed = Frame::new()
             .fill(palette.surface)
             .corner_radius(CornerRadius::same(theme::RADIUS + 2))
             .inner_margin(Margin::symmetric(12, 8))
             .show(ui, |ui| {
                 // `available_width` ya descuenta el margen interno de ambos lados
-                    // del Frame: restar 16 deja 16px a la derecha (igual que a la
-                    // izquierda); con 32 quedaban 32px y el campo se veía corrido.
-                    ui.set_width(ui.available_width() - 16.0);
+                // del Frame: restar 16 deja 16px a la derecha (igual que a la
+                // izquierda); con 32 quedaban 32px y el campo se veía corrido.
+                ui.set_width(ui.available_width() - 16.0);
                 ui.horizontal(|ui| {
                     theme::icon(ui, Icon::CirclePlus, 16.0, palette.dim);
 
@@ -2064,51 +1748,57 @@ fn composer(
                     // libre para agregar una línea nueva de verdad, como
                     // en el cliente real: sin esto la barra era
                     // `singleline` y no había forma de escribir un bloque
-                    // de código o una lista de varias líneas — el
-                    // markdown multilínea nunca llegaba a mandarse porque
-                    // no se podía ni escribir.
-                    let response = ui.add(
-                        egui::TextEdit::multiline(compose_text)
-                            .hint_text(placeholder)
-                            .frame(egui::Frame::NONE)
-                            .desired_width(text_width)
-                            .desired_rows(1)
-                            .return_key(Some(egui::KeyboardShortcut::new(
-                                egui::Modifiers::SHIFT,
-                                egui::Key::Enter,
-                            ))),
-                    );
+                    // de código o una lista de varias líneas.
+                    //
+                    // El `id` explícito hace falta para poder leer/mover el
+                    // cursor (menciones y emojis se insertan donde está).
+                    let response = ui
+                        .add(
+                            egui::TextEdit::multiline(compose_text)
+                                .id(text_id)
+                                .hint_text(placeholder)
+                                .frame(egui::Frame::NONE)
+                                .desired_width(text_width)
+                                .desired_rows(1)
+                                .return_key(Some(egui::KeyboardShortcut::new(
+                                    egui::Modifiers::SHIFT,
+                                    egui::Key::Enter,
+                                ))),
+                        );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // TODO: no hay íconos de "gif" / "sticker" en el set
-                        // de Lucide que trae tu theme; Sparkles como
-                        // placeholder para "emoji/reacciones".
-                        theme::icon(ui, Icon::Sparkles, 15.0, palette.dim);
+                        // Botón de emojis: abre/cierra el selector (se dibuja
+                        // más abajo, anclado a este campo).
+                        let tint = if picker_open { palette.text } else { palette.dim };
+                        if theme::icon_button(ui, Icon::Smile, 17.0, tint, palette.text, "Emojis").clicked() {
+                            ctx.memory_mut(|m| m.data.insert_temp(picker_open_id, !picker_open));
+                            if picker_open {
+                                menus::reset_picker(&ctx, picker_id);
+                            }
+                        }
                     });
 
                     // Como el `return_key` de arriba es Shift+Enter, un
                     // Enter suelto ya NO se consume como salto de línea
                     // adentro del `TextEdit` — sigue disponible acá para
                     // detectarlo nosotros y mandar el mensaje, sin que el
-                    // widget haya perdido el foco (a diferencia de la
-                    // versión `singleline` vieja, que se basaba en
-                    // `lost_focus`: un `multiline` no pierde el foco solo
-                    // por apretar Enter).
+                    // widget haya perdido el foco. (Si el menú de menciones
+                    // estaba abierto, ya se llevó ese Enter más arriba.)
                     let enter_pressed = response.has_focus()
                         && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
                     if enter_pressed && !compose_text.trim().is_empty() {
-                        let content = compose_text.trim().to_string();
+                        // `:nombre:` -> `<:nombre:id>` para los emojis personalizados.
+                        let picked = menus::take_customs(&ctx, customs_id);
+                        let content = menus::expand_shortcodes(compose_text.trim(), &picked, custom_emojis);
                         let mut echo = ChatMessage::own(own_author, "ahora", &content, own_color);
+                        // Para que el eco local muestre `@Nombre` y no `<@id>`.
+                        echo.mentions = menus::take_remembered(&ctx, mentions_id, &content);
                         // Si hay una respuesta en curso, el eco local ya
                         // muestra el banner citado de una — no hace falta
                         // esperar a que el Gateway devuelva el
-                        // `MESSAGE_CREATE` real para que aparezca (eso
-                        // tardaría un toque y se sentiría como que "no
-                        // funcionó"). Usa directamente el autor/preview
-                        // que ya se armaron al apretar "Responder" (ver
-                        // `hover_toolbar`), sin depender de tener un
-                        // `message_id` real: en un eco de demo/local esto
-                        // sigue mostrando el banner igual, aunque no haya
-                        // nada real a qué referenciar por REST.
+                        // `MESSAGE_CREATE` real para que aparezca. Usa
+                        // directamente el autor/preview que ya se armaron al
+                        // apretar "Responder" (ver `hover_toolbar`), sin
+                        // depender de tener un `message_id` real.
                         if let Some(reply) = reply_target.as_ref() {
                             echo.replied_to = Some(RepliedMessage {
                                 author: reply.author.clone(),
@@ -2134,11 +1824,172 @@ fn composer(
                         // lo retiene mágicamente frame a frame después de
                         // vaciar el texto por fuera del widget — lo
                         // reafirmamos para que se pueda seguir tipeando
-                        // sin tener que volver a clickear la barra, como
-                        // en el cliente real.
+                        // sin tener que volver a clickear la barra.
                         response.request_focus();
                     }
                 });
             });
+        composer_rect = framed.response.rect;
     });
+
+    // ---- Menú de menciones, parte 2: dibujarlo y aplicar la elección.
+    // Con el texto y el cursor YA actualizados por el `TextEdit` de este frame.
+    let focused = ctx.memory(|m| m.has_focus(text_id));
+    let mention = if focused {
+        menus::caret_index(&ctx, text_id).and_then(|caret| menus::active_mention(compose_text, caret))
+    } else {
+        None
+    };
+    // `App::ui` lee esto en el próximo frame para armar los candidatos.
+    menus::set_active_query(&ctx, mention.as_ref().map(|m| m.query.as_str()));
+    if mention.is_none() {
+        menu.dismissed_start = None;
+    }
+    let mut pointer_accept: Option<usize> = None;
+    if let Some(m) = mention.as_ref() {
+        if menu.query != m.query {
+            menu.query = m.query.clone();
+            menu.selected = 0;
+        }
+        if menu.dismissed_start != Some(m.start) {
+            match menus::results_for(&ctx, &m.query) {
+                Some(results) => {
+                    let local_users = results.items.iter().filter(|c| c.kind == menus::MentionKind::User).count();
+                    menus::drive_member_search(&ctx, &m.query, local_users);
+                    if !results.items.is_empty() {
+                        menu.selected = menu.selected.min(results.items.len() - 1);
+                        let outcome = menus::show_mention_menu(
+                            &ctx,
+                            palette,
+                            mention_menu_id,
+                            egui::pos2(composer_rect.left(), composer_rect.top() - 6.0),
+                            composer_rect.width().clamp(260.0, 480.0),
+                            &m.query,
+                            &results.items,
+                            menu.selected,
+                        );
+                        // El resaltado sigue al mouse solo cuando se mueve, para
+                        // no pelearse con las flechas.
+                        if let Some(hovered) = outcome.hovered {
+                            if ctx.input(|i| i.pointer.delta() != egui::Vec2::ZERO) {
+                                menu.selected = hovered;
+                            }
+                        }
+                        pointer_accept = outcome.pressed;
+                    }
+                }
+                // Todavía no llegaron los candidatos de esta consulta (se arman
+                // en `App::ui`, un frame después).
+                None => ctx.request_repaint_after(Duration::from_millis(50)),
+            }
+        }
+    }
+
+    let chosen = match (key_accept, pointer_accept) {
+        (Some(index), _) => mention_before.as_ref().map(|m| (m, index)),
+        (None, Some(index)) => mention.as_ref().map(|m| (m, index)),
+        (None, None) => None,
+    };
+    if let Some((m, index)) = chosen {
+        if let Some(results) = menus::results_for(&ctx, &m.query) {
+            if let Some(cand) = results.items.get(index) {
+                let insertion = format!("{} ", cand.token());
+                menus::replace_chars(compose_text, m.start, m.end, &insertion);
+                menus::set_caret(&ctx, text_id, m.start + insertion.chars().count());
+                if cand.kind == menus::MentionKind::User {
+                    menus::remember_user(&ctx, mentions_id, &cand.id, &cand.name);
+                }
+                // Apretar en el menú le quitó el foco al campo: se lo devolvemos.
+                ctx.memory_mut(|mem| mem.request_focus(text_id));
+                menus::set_active_query(&ctx, None);
+                menu = menus::MentionMenuState::default();
+            }
+        }
+    }
+    menu.store(&ctx, menu_state_id);
+
+    // ---- Selector de emojis.
+    if picker_open {
+        let anchor = egui::pos2(composer_rect.right(), composer_rect.top() - 8.0);
+        let close = |ctx: &egui::Context| {
+            ctx.memory_mut(|m| m.data.insert_temp(picker_open_id, false));
+            menus::reset_picker(ctx, picker_id);
+        };
+        // Inserta `insertion` donde está el cursor (o al final si nunca se
+        // enfocó el campo) y le devuelve el foco.
+        let insert = |text: &mut String, insertion: &str| {
+            let len = text.chars().count();
+            let caret = menus::caret_index(&ctx, text_id).unwrap_or(len).min(len);
+            menus::replace_chars(text, caret, caret, insertion);
+            menus::set_caret(&ctx, text_id, caret + insertion.chars().count());
+            ctx.memory_mut(|mem| mem.request_focus(text_id));
+        };
+        // El token solo hace falta para pedir GIFs (pestaña "GIF"): en el chat
+        // de demo (`send_target` vacío) esa pestaña no tiene qué mostrar.
+        let token = send_target.as_ref().map(|(token, _, _)| token.as_str());
+        match menus::show_emoji_picker(
+            &ctx,
+            palette,
+            picker_id,
+            anchor,
+            custom_emojis,
+            menus::PickerMode::Compose,
+            token,
+        ) {
+            menus::PickerResult::Pending => {}
+            menus::PickerResult::Closed => close(&ctx),
+            menus::PickerResult::Unicode(emoji) => {
+                insert(compose_text, &emoji);
+                close(&ctx);
+            }
+            menus::PickerResult::Custom(emoji) => {
+                // Se escribe `:nombre:` (legible en el campo) y recién al mandar
+                // se convierte en `<:nombre:id>` (ver `expand_shortcodes`).
+                menus::remember_custom(&ctx, customs_id, &emoji);
+                insert(compose_text, &format!(":{}: ", emoji.name));
+                close(&ctx);
+            }
+            menus::PickerResult::Locked => {
+                // Sin Nitro no se puede usar: se avisa con el popup de siempre.
+                nitro_required = true;
+                close(&ctx);
+            }
+            menus::PickerResult::Sticker(sticker) => {
+                // Un sticker se manda solo, sin texto. Si había una respuesta
+                // en curso, el sticker la contesta.
+                if let Some((token, channel_id, guild_id)) = send_target.clone() {
+                    let reply_to = reply_target
+                        .take()
+                        .map(|r| r.message_id)
+                        .filter(|id| !id.is_empty());
+                    crate::discord::spawn_send_sticker(token, channel_id, guild_id, sticker.id.clone(), reply_to);
+                }
+                close(&ctx);
+            }
+            menus::PickerResult::Gif(url) => {
+                // Un GIF se manda como mensaje con su link (Discord lo
+                // convierte en el GIF), igual que mandar un texto.
+                let mut echo = ChatMessage::own(own_author, "ahora", &url, own_color);
+                if let Some(reply) = reply_target.as_ref() {
+                    echo.replied_to = Some(RepliedMessage {
+                        author: reply.author.clone(),
+                        preview: reply.preview.clone(),
+                        deleted: false,
+                        ..Default::default()
+                    });
+                }
+                messages.push(echo);
+                let reply_to = reply_target
+                    .take()
+                    .map(|r| r.message_id)
+                    .filter(|id| !id.is_empty());
+                if let Some((token, channel_id, guild_id)) = send_target.clone() {
+                    crate::discord::spawn_send_message(token, channel_id, guild_id, url, reply_to);
+                }
+                close(&ctx);
+            }
+        }
+    }
+
+    nitro_required
 }
