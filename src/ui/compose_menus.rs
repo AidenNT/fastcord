@@ -599,6 +599,9 @@ pub enum PickerResult {
 
 /// Cuánto tiene que quedarse quieto el buscador antes de pedir GIFs.
 const GIF_DEBOUNCE_SECS: f64 = 0.35;
+/// Cuánto tiene que quedarse el mouse sobre un GIF antes de animarlo. Sin esto,
+/// pasar el mouse por la grilla decodifica (todos los cuadros) cada GIF que se roza.
+const GIF_HOVER_DELAY_SECS: f64 = 0.25;
 
 /// Un GIF de la lista que devuelve Discord (Tenor).
 #[derive(Clone)]
@@ -821,6 +824,13 @@ fn drive_gif_search(ctx: &Context, id: Id, token: &str, typed: &str) -> Option<S
 /// Borra lo que el selector recuerda entre frames (buscador y salto pendiente):
 /// se llama al cerrarlo, así la próxima vez abre limpio.
 pub fn reset_picker(ctx: &Context, id: Id) {
+    // Las miniaturas del selector de GIFs se sueltan al cerrar.
+    crate::ui::gif_thumbs::release();
+    crate::ui::anim::release_hover(ctx);
+    // Devuelve al sistema lo que quedó libre (en ESTE hilo, que es el que
+    // reservó casi todo) y, un rato después, recorta heaps nativos y working set.
+    crate::support::mem_report::release_free_memory();
+    crate::support::mem_report::trim_native_later();
     ctx.memory_mut(|m| {
         m.data.remove::<String>(id.with("search"));
         m.data.remove::<usize>(id.with("jump"));
@@ -1843,6 +1853,11 @@ fn gif_tile(ui: &mut Ui, ctx: &Context, palette: &Palette, gif: &GifEntry, size:
     });
     let star_hovered = star.as_ref().is_some_and(|s| s.hovered());
     let hovered = response.hovered() || star_hovered;
+    // Lado mayor de la miniatura: lo que de verdad se dibuja (px físicos), no
+    // un 360 fijo (en una pantalla 1x la celda mide ~180 px).
+    let thumb_px = (size.x.max(size.y) * ctx.pixels_per_point()).ceil().clamp(96.0, 360.0) as u32;
+    let hover_key = response.id.with("hover_since");
+    let now = ctx.input(|i| i.time);
 
     if ui.is_rect_visible(rect) {
         ui.painter().rect_filled(rect, CornerRadius::same(8), palette.surface);
@@ -1851,27 +1866,41 @@ fn gif_tile(ui: &mut Ui, ctx: &Context, palette: &Palette, gif: &GifEntry, size:
             // hay imagen de portada, solo el video al pasar el mouse.
             theme::paint_icon(ui, Icon::CirclePlay, rect, 28.0, palette.dim);
         } else {
-            let still = egui::Image::new(crate::ui::anim::plain(&gif.preview))
-                .fit_to_exact_size(size)
-                .show_loading_spinner(false);
-            // Si todavía no llegó (descargando o decodificando) hay que pedir
-            // otro repaint nosotros: si no, la celda queda vacía hasta que el
-            // mouse la toque y fuerce un frame.
-            match still.load_for_size(ctx, size) {
-                Ok(egui::load::TexturePoll::Ready { .. }) => still.paint_at(ui, rect),
-                Ok(_) => ctx.request_repaint_after(std::time::Duration::from_millis(80)),
-                Err(_) => {}
+            // Miniatura propia (primer cuadro, reducida): no depende de los
+            // loaders de `egui`, así `anim::maintain` no la borra (ver
+            // `ui::gif_thumbs`). Si el `preview` no se puede decodificar
+            // (p. ej. es un mp4) se prueba con el GIF.
+            use crate::ui::gif_thumbs::{self, Thumb};
+            let mut thumb = gif_thumbs::get(ctx, &gif.preview, thumb_px);
+            if thumb == Thumb::Failed && !gif.gif.is_empty() && gif.gif != gif.preview && !is_video_url(&gif.gif) {
+                thumb = gif_thumbs::get(ctx, &gif.gif, thumb_px);
+            }
+            match thumb {
+                Thumb::Ready(tid) => {
+                    egui::Image::new(egui::load::SizedTexture::new(tid, size))
+                        .corner_radius(CornerRadius::same(8))
+                        .paint_at(ui, rect);
+                }
+                Thumb::Pending => {}
+                Thumb::Failed => theme::paint_icon(ui, Icon::CirclePlay, rect, 28.0, palette.dim),
             }
         }
         if hovered {
-            if !gif.gif.is_empty() {
-                let animated = egui::Image::new(crate::ui::anim::source(ctx, &gif.gif))
-                    .fit_to_exact_size(size)
-                    .show_loading_spinner(false);
-                match animated.load_for_size(ctx, size) {
-                    Ok(egui::load::TexturePoll::Ready { .. }) => animated.paint_at(ui, rect),
-                    Ok(_) => ctx.request_repaint_after(std::time::Duration::from_millis(80)),
-                    Err(_) => {}
+            let since = ctx.data_mut(|d| *d.get_temp_mut_or_insert_with(hover_key, || now));
+            if now - since < GIF_HOVER_DELAY_SECS {
+                ctx.request_repaint_after(std::time::Duration::from_millis(60));
+            } else if !gif.gif.is_empty() {
+                // Solo se dibuja cuando la animación propia está lista. Mientras
+                // tanto NO se le pasa la URL a `egui`: su loader de GIF decodifica
+                // todos los cuadros a tamaño completo y los cachea (hasta 96 MB).
+                let source = crate::ui::anim::source_hover(ctx, &gif.gif, thumb_px);
+                if matches!(source, egui::ImageSource::Texture(_)) {
+                    egui::Image::new(source)
+                        .fit_to_exact_size(size)
+                        .show_loading_spinner(false)
+                        .paint_at(ui, rect);
+                } else {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(80));
                 }
             } else if !gif.src.is_empty() {
                 crate::ui::video_player::show_looping(ui, &gif.src, rect, 8);
@@ -1891,6 +1920,9 @@ fn gif_tile(ui: &mut Ui, ctx: &Context, palette: &Palette, gif: &GifEntry, size:
             };
             paint_star(ui.painter(), star_rect.center(), 8.0, favorite, color);
         }
+    }
+    if !hovered {
+        ctx.data_mut(|d| d.remove::<f64>(hover_key));
     }
     let star_clicked = star.as_ref().is_some_and(|s| s.clicked());
     let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);

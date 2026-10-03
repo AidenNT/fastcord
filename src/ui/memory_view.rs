@@ -15,6 +15,8 @@ const C_DISCORD: Color32 = Color32::from_rgb(0x58, 0x65, 0xf2);
 const C_DECODED: Color32 = Color32::from_rgb(0x2e, 0xc4, 0xb6);
 const C_DOWNLOADED: Color32 = Color32::from_rgb(0xf5, 0xa5, 0x24);
 const C_GPU: Color32 = Color32::from_rgb(0xb3, 0x7f, 0xfe);
+const C_VIDEO: Color32 = Color32::from_rgb(0xed, 0x4d, 0x7a);
+const C_NATIVE: Color32 = Color32::from_rgb(0x9a, 0xa5, 0xb8);
 const C_DISK: Color32 = Color32::from_rgb(0x4d, 0x9d, 0xff);
 
 /// Una fila: nombre a la izquierda, tamaño a la derecha y una barrita debajo.
@@ -80,6 +82,133 @@ pub fn view(ui: &mut egui::Ui, palette: &Palette, r: &MemoryReport) {
                    librerías y fragmentación del allocator. Es lo que queda de la RAM \
                    total al restar todo lo demás.",
         },
+    );
+
+    // «Funcionamiento» se parte en lo que se puede separar: el heap de Rust que
+    // no está clasificado en otra fila y lo que vive FUERA del heap de Rust
+    // (ffmpeg, drivers de video, librerías).
+    let measured_heap = (r.discord.total() + r.images_decoded + r.images_downloaded + r.video.rust_heap()) as u64;
+    let heap_other = (r.heap as u64).saturating_sub(measured_heap);
+    let outside_heap = if r.resident.is_some() { (r.total as u64).saturating_sub(r.heap as u64) } else { 0 };
+    row(
+        ui,
+        palette,
+        Row {
+            label: "Heap de Rust sin clasificar",
+            bytes: heap_other,
+            of: r.base as u64,
+            color: C_BASE,
+            indent: 18.0,
+            percent: false,
+            hint: "Memoria pedida por el programa (interfaz, fuentes, colas, buffers de audio, \
+                   hilos...) que no entra en ninguna otra fila.",
+        },
+    );
+    row(
+        ui,
+        palette,
+        Row {
+            label: "Fuera del heap de Rust (ffmpeg, drivers, librerías)",
+            bytes: outside_heap,
+            of: r.base as u64,
+            color: C_BASE,
+            indent: 18.0,
+            percent: false,
+            hint: "Memoria que NO pide Rust: la que reserva ffmpeg por su cuenta al decodificar \
+                   video y audio, el driver de la GPU, las DLL y el sistema.",
+        },
+    );
+
+    // «Fuera del heap», desglosado página por página (solo Windows).
+    let n = &r.native;
+    if !n.is_empty() && outside_heap > 0 {
+        let of = outside_heap.max(1);
+        let heap_native = n.private.saturating_sub(r.heap) as u64;
+        let mut detail = |label: &str, bytes: u64, hint: &str, indent: f32| {
+            row(
+                ui,
+                palette,
+                Row { label, bytes, of, color: C_NATIVE, indent, percent: false, hint },
+            );
+        };
+        detail(
+            "Heap nativo y fragmentación (malloc de ffmpeg y drivers)",
+            heap_native,
+            "Memoria privada que no es del heap de Rust: lo que ffmpeg pide con su propio malloc \
+             al decodificar, lo que piden los drivers y la que mimalloc retiene sin usar.",
+            36.0,
+        );
+        detail(
+            "Memoria mapeada (GPU compartida, archivos)",
+            n.mapped as u64,
+            "Secciones compartidas y archivos mapeados. Los drivers de la GPU suelen reservar \
+             aquí la memoria de texturas y buffers.",
+            36.0,
+        );
+        detail(
+            "Programa (ecord.exe)",
+            n.groups[0] as u64,
+            "Código y datos del propio ejecutable.",
+            36.0,
+        );
+        detail(
+            "ffmpeg (DLL)",
+            n.groups[1] as u64,
+            "Código y tablas de avcodec, avformat, swscale y compañía.",
+            36.0,
+        );
+        detail(
+            "Drivers de GPU y DirectX (DLL)",
+            n.groups[2] as u64,
+            "Controladores de NVIDIA, AMD o Intel y las librerías de DirectX/OpenGL.",
+            36.0,
+        );
+        detail(
+            "Windows y otras librerías (DLL)",
+            n.groups[3] as u64,
+            "El sistema, el runtime de C y todo lo demás.",
+            36.0,
+        );
+        for (name, bytes) in n.top.iter().filter(|(_, b)| *b > 0) {
+            detail(name, *bytes as u64, "", 54.0);
+        }
+    }
+
+    let v = &r.video;
+    row(
+        ui,
+        palette,
+        Row {
+            label: "Video y GIFs en mp4 (medido)",
+            bytes: v.rust_heap() as u64,
+            of: total,
+            color: C_VIDEO,
+            indent: 0.0,
+            percent: true,
+            hint: "Lo que guardan los reproductores dentro del heap de Rust: cuadros ya \
+                   convertidos, paquetes por decodificar y la caché de bucle de los GIFs.",
+        },
+    );
+    for (label, bytes, hint) in [
+        ("Cuadros convertidos en cola", v.frames, "Cuadros RGBA listos para mostrar (~8 MB cada uno en 1080p)."),
+        ("Paquetes en cola", v.packets, "Video y audio comprimidos que ya se leyeron y esperan al decodificador."),
+        ("Caché de bucle de GIFs", v.loop_cache, "Paquetes que se guardan para repetir un GIF sin volver a la red."),
+    ] {
+        row(
+            ui,
+            palette,
+            Row { label, bytes: bytes as u64, of: v.rust_heap().max(1) as u64, color: C_VIDEO, indent: 18.0, percent: false, hint },
+        );
+    }
+    note(
+        ui,
+        palette,
+        &format!(
+            "Reproductores abiertos: {}  ·  memoria propia de ffmpeg (estimada, dentro de \
+             «Fuera del heap»): {}",
+            v.engines,
+            fmt_bytes(v.native_estimate),
+        ),
     );
 
     let d = &r.discord;
@@ -180,12 +309,26 @@ pub fn view(ui: &mut egui::Ui, palette: &Palette, r: &MemoryReport) {
         palette,
         Row {
             label: "Fuentes, íconos e imágenes",
-            bytes: gpu.saturating_sub(r.animations as u64),
+            bytes: gpu.saturating_sub(r.animations as u64 + r.gif_thumbs as u64),
             of: gpu,
             color: C_GPU,
             indent: 18.0,
             percent: false,
             hint: "",
+        },
+    );
+
+    row(
+        ui,
+        palette,
+        Row {
+            label: "Miniaturas del selector de GIFs",
+            bytes: r.gif_thumbs as u64,
+            of: gpu,
+            color: C_GPU,
+            indent: 18.0,
+            percent: false,
+            hint: "Primer cuadro reducido de cada GIF de la grilla. Se sueltan al cerrar el selector.",
         },
     );
 
@@ -237,6 +380,20 @@ pub fn view(ui: &mut egui::Ui, palette: &Palette, r: &MemoryReport) {
             indent: 0.0,
             percent: false,
             hint: "Audios de las alertas, volcados del programa para que ffmpeg los pueda abrir.",
+        },
+    );
+    row(
+        ui,
+        palette,
+        Row {
+            label: "GIFs en mp4 (videos cortos)",
+            bytes: disk.video,
+            of: disk_total,
+            color: C_DISK,
+            indent: 0.0,
+            percent: false,
+            hint: "mp4 de los GIFs de Tenor/Giphy bajados una sola vez para repetirlos sin red. \
+                   Los viejos se borran solos.",
         },
     );
     ui.add_space(4.0);

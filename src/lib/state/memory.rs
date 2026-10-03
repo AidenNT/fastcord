@@ -59,6 +59,12 @@ pub struct MemoryReport {
     pub animations: usize,
     /// Todas las texturas de `egui` (GPU).
     pub gpu_total: usize,
+    /// Reproductores de video / GIF en mp4 (`egui_video::Engine`).
+    pub video: egui_video::EngineMem,
+    /// Texturas de las miniaturas del selector de GIFs (GPU).
+    pub gif_thumbs: usize,
+    /// De qué está hecha la RAM que no es heap de Rust (solo Windows).
+    pub native: mem_report::NativeBreakdown,
     pub disk: DiskStats,
 }
 
@@ -140,7 +146,8 @@ impl App {
         let total = resident.unwrap_or(heap);
         let discord = self.discord_memory();
         let images = crate::ui::anim::mem_stats(ctx);
-        let measured = discord.total() + images.decoded + images.downloaded;
+        let video = egui_video::video_mem_stats();
+        let measured = discord.total() + images.decoded + images.downloaded + video.rust_heap();
         MemoryReport {
             resident,
             heap,
@@ -151,6 +158,9 @@ impl App {
             images_downloaded: images.downloaded,
             animations: images.animations,
             gpu_total: mem_report::gpu_texture_bytes(ctx),
+            video,
+            gif_thumbs: crate::ui::gif_thumbs::bytes(),
+            native: mem_report::native_breakdown().unwrap_or_default(),
             disk: mem_report::disk_stats(),
         }
     }

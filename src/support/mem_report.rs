@@ -78,6 +78,82 @@ pub fn release_free_memory() {
     unsafe { libmimalloc_sys::mi_collect(true) };
 }
 
+/// Compacta los heaps de Windows del proceso (`HeapCompact`). `mimalloc` solo
+/// maneja lo que pide Rust; el `malloc` de ffmpeg y de los drivers vive en los
+/// heaps nativos y, tras cerrar un video, queda fragmentado y sin devolver.
+/// Esto no libera nada que siga en uso: solo junta bloques libres contiguos y
+/// le da al sistema las páginas vacías. Se hace en un hilo aparte porque con
+/// heaps grandes puede tardar unos milisegundos.
+#[cfg(all(windows, target_pointer_width = "64"))]
+fn compact_native_heaps_now() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetProcessHeaps(count: u32, heaps: *mut isize) -> u32;
+        fn HeapCompact(heap: isize, flags: u32) -> usize;
+    }
+    let mut heaps = [0isize; 64];
+    let n = unsafe { GetProcessHeaps(heaps.len() as u32, heaps.as_mut_ptr()) } as usize;
+    for &heap in &heaps[..n.min(heaps.len())] {
+        unsafe { HeapCompact(heap, 0) };
+    }
+}
+
+/// Saca del working set las páginas que el proceso no está usando
+/// (`EmptyWorkingSet`). No libera nada: las páginas vuelven solas, desde el
+/// archivo de paginación o a cero, si algo las toca. Sin esto Windows deja en
+/// el working set lo que mimalloc, los drivers de GPU y ffmpeg ya soltaron, y
+/// el número que se ve (Administrador de tareas, esta pestaña) no baja nunca.
+#[cfg(all(windows, target_pointer_width = "64"))]
+fn trim_working_set_now() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn K32EmptyWorkingSet(process: isize) -> i32;
+    }
+    unsafe { K32EmptyWorkingSet(GetCurrentProcess()) };
+}
+
+#[cfg(not(all(windows, target_pointer_width = "64")))]
+fn compact_native_heaps_now() {}
+#[cfg(not(all(windows, target_pointer_width = "64")))]
+fn trim_working_set_now() {}
+
+/// Compacta los heaps nativos en un hilo aparte.
+pub fn compact_native_heaps() {
+    use std::sync::atomic::AtomicBool;
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    if RUNNING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let spawned = std::thread::Builder::new().name("ecord-heap-compact".into()).spawn(|| {
+        compact_native_heaps_now();
+        RUNNING.store(false, Ordering::Release);
+    });
+    if spawned.is_err() {
+        RUNNING.store(false, Ordering::Release);
+    }
+}
+
+/// Para después de cerrar algo pesado (el selector de GIFs): espera a que el
+/// frame siguiente suelte las texturas de la GPU, compacta los heaps nativos y
+/// recorta el working set. A lo sumo uno a la vez; no toca la UI.
+pub fn trim_native_later() {
+    use std::sync::atomic::AtomicBool;
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    if RUNNING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let spawned = std::thread::Builder::new().name("ecord-mem-trim".into()).spawn(|| {
+        std::thread::sleep(Duration::from_millis(1500));
+        compact_native_heaps_now();
+        trim_working_set_now();
+        RUNNING.store(false, Ordering::Release);
+    });
+    if spawned.is_err() {
+        RUNNING.store(false, Ordering::Release);
+    }
+}
+
 /// Como [`release_free_memory`], pero a lo sumo una vez cada 20 s.
 pub fn release_free_memory_periodic() {
     use std::sync::OnceLock;
@@ -87,6 +163,7 @@ pub fn release_free_memory_periodic() {
     if now - LAST_SECS.load(Ordering::Relaxed) >= 20 {
         LAST_SECS.store(now, Ordering::Relaxed);
         release_free_memory();
+        compact_native_heaps();
     }
 }
 
@@ -212,13 +289,15 @@ pub struct DiskStats {
     pub json: u64,
     /// Audios de las alertas sonoras.
     pub sounds: u64,
+    /// mp4 de los GIFs ya bajados (`ui::video_player::local_video`).
+    pub video: u64,
     /// `false` mientras el primer escaneo no terminó.
     pub scanned: bool,
 }
 
 impl DiskStats {
     pub fn total(&self) -> u64 {
-        self.images + self.json + self.sounds
+        self.images + self.json + self.sounds + self.video
     }
 }
 
@@ -243,7 +322,8 @@ pub fn disk_stats() -> DiskStats {
                 .unwrap_or((0, 0));
             let (json, _) = crate::paths::json_cache_dir().map(|d| dir_size(&d)).unwrap_or((0, 0));
             let (sounds, _) = crate::paths::sound_cache_dir().map(|d| dir_size(&d)).unwrap_or((0, 0));
-            let stats = DiskStats { images, image_files, json, sounds, scanned: true };
+            let (video, _) = crate::paths::video_cache_dir().map(|d| dir_size(&d)).unwrap_or((0, 0));
+            let stats = DiskStats { images, image_files, json, sounds, video, scanned: true };
             *DISK.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), stats));
             DISK_SCANNING.store(false, Ordering::Release);
         });
@@ -266,6 +346,223 @@ fn dir_size(dir: &Path) -> (u64, usize) {
         }
     }
     (total, files)
+}
+
+// ---------------------------------------------------------------------
+// Desglose de la RAM que NO es heap de Rust (Windows)
+// ---------------------------------------------------------------------
+
+/// A qué pertenece la RAM residente del proceso, página por página.
+///
+/// Se arma con `QueryWorkingSet` (qué páginas están en RAM) cruzado con
+/// `VirtualQuery` (de qué tipo es cada región) y la lista de módulos (a qué
+/// DLL pertenece cada página de código/datos). Todos los números son bytes
+/// residentes, o sea lo mismo que cuenta el working set.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NativeBreakdown {
+    /// Memoria privada (`MEM_PRIVATE`): heap de Rust + heaps nativos (el
+    /// `malloc` de ffmpeg y de los drivers) + pilas de los hilos.
+    pub private: usize,
+    /// Memoria mapeada (`MEM_MAPPED`): archivos mapeados y secciones
+    /// compartidas; los drivers de GPU suelen usarla.
+    pub mapped: usize,
+    /// Código y datos de ejecutables y DLL (`MEM_IMAGE`).
+    pub image: usize,
+    /// De `image`: `[programa, ffmpeg, drivers de GPU y DirectX, Windows y otras]`.
+    pub groups: [usize; 4],
+    /// Las DLL que más RAM ocupan (nombre, bytes).
+    pub top: [(&'static str, usize); 6],
+}
+
+impl NativeBreakdown {
+    pub fn is_empty(&self) -> bool {
+        self.private + self.mapped + self.image == 0
+    }
+}
+
+/// Nombres de DLL internados: son pocos y se repiten en cada medición, así
+/// que se guardan una vez y se pasan como `&'static str` (el informe es `Copy`).
+#[cfg(all(windows, target_pointer_width = "64"))]
+fn intern(name: &str) -> &'static str {
+    static NAMES: Mutex<Option<HashMap<String, &'static str>>> = Mutex::new(None);
+    let mut guard = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    if let Some(s) = map.get(name) {
+        return s;
+    }
+    let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+    map.insert(name.to_string(), leaked);
+    leaked
+}
+
+#[cfg(all(windows, target_pointer_width = "64"))]
+pub fn native_breakdown() -> Option<NativeBreakdown> {
+    use std::mem::{size_of, zeroed};
+
+    #[repr(C)]
+    struct MemInfo {
+        base_address: usize,
+        allocation_base: usize,
+        allocation_protect: u32,
+        partition_id: u16,
+        region_size: usize,
+        state: u32,
+        protect: u32,
+        kind: u32,
+    }
+    #[repr(C)]
+    struct ModInfo {
+        base: usize,
+        size: u32,
+        entry: usize,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn VirtualQuery(address: usize, info: *mut MemInfo, len: usize) -> usize;
+        fn K32QueryWorkingSet(process: isize, info: *mut usize, cb: u32) -> i32;
+        fn K32EnumProcessModules(process: isize, modules: *mut isize, cb: u32, needed: *mut u32) -> i32;
+        fn K32GetModuleInformation(process: isize, module: isize, info: *mut ModInfo, cb: u32) -> i32;
+        fn K32GetModuleBaseNameW(process: isize, module: isize, name: *mut u16, size: u32) -> u32;
+    }
+
+    const MEM_COMMIT: u32 = 0x1000;
+    const MEM_PRIVATE: u32 = 0x2_0000;
+    const MEM_MAPPED: u32 = 0x4_0000;
+    const MEM_IMAGE: u32 = 0x100_0000;
+    const PAGE: usize = 4096;
+
+    let process = unsafe { GetCurrentProcess() };
+
+    // 1. Regiones comprometidas: (inicio, fin, tipo), ya ordenadas.
+    let mut regions: Vec<(usize, usize, u32)> = Vec::new();
+    let mut addr = 0usize;
+    loop {
+        let mut info: MemInfo = unsafe { zeroed() };
+        let got = unsafe { VirtualQuery(addr, &mut info, size_of::<MemInfo>()) };
+        if got == 0 {
+            break;
+        }
+        let end = info.base_address.saturating_add(info.region_size);
+        if info.state == MEM_COMMIT {
+            regions.push((info.base_address, end, info.kind));
+        }
+        if end <= addr {
+            break;
+        }
+        addr = end;
+    }
+
+    // 2. Módulos cargados (el primero es el ejecutable): (base, fin, nombre).
+    let mut handles = vec![0isize; 1024];
+    let mut needed = 0u32;
+    let ok = unsafe {
+        K32EnumProcessModules(process, handles.as_mut_ptr(), (handles.len() * size_of::<isize>()) as u32, &mut needed)
+    };
+    if ok == 0 {
+        return None;
+    }
+    let count = (needed as usize / size_of::<isize>()).min(handles.len());
+    let mut modules: Vec<(usize, usize, String)> = Vec::with_capacity(count);
+    for &h in &handles[..count] {
+        let mut mi = ModInfo { base: 0, size: 0, entry: 0 };
+        if unsafe { K32GetModuleInformation(process, h, &mut mi, size_of::<ModInfo>() as u32) } == 0 {
+            continue;
+        }
+        let mut name = [0u16; 260];
+        let len = unsafe { K32GetModuleBaseNameW(process, h, name.as_mut_ptr(), name.len() as u32) } as usize;
+        let name = String::from_utf16_lossy(&name[..len.min(name.len())]);
+        modules.push((mi.base, mi.base + mi.size as usize, name));
+    }
+    let exe_name = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()))
+        .unwrap_or_default();
+    modules.sort_by_key(|m| m.0);
+
+    // 3. Páginas residentes. El primer `usize` es la cantidad de entradas y
+    //    cada entrada trae el número de página en los bits altos.
+    let mut buf: Vec<usize> = vec![0; (1 << 18) + 1];
+    let mut tries = 0;
+    loop {
+        let ok = unsafe { K32QueryWorkingSet(process, buf.as_mut_ptr(), (buf.len() * size_of::<usize>()) as u32) };
+        if ok != 0 {
+            break;
+        }
+        let needed = buf[0];
+        if tries >= 4 || needed == 0 {
+            return None;
+        }
+        buf.resize(needed + 16_384 + 1, 0);
+        tries += 1;
+    }
+    let entries = buf[0].min(buf.len() - 1);
+
+    let mut out = NativeBreakdown::default();
+    let mut per_module: Vec<usize> = vec![0; modules.len()];
+    for &entry in &buf[1..=entries] {
+        let page_addr = (entry >> 12) << 12;
+        let idx = regions.partition_point(|r| r.1 <= page_addr);
+        let Some(&(start, _, kind)) = regions.get(idx) else { continue };
+        if start > page_addr {
+            continue;
+        }
+        match kind {
+            MEM_PRIVATE => out.private += PAGE,
+            MEM_MAPPED => out.mapped += PAGE,
+            MEM_IMAGE => {
+                out.image += PAGE;
+                let m = modules.partition_point(|m| m.1 <= page_addr);
+                match modules.get(m) {
+                    Some(module) if module.0 <= page_addr => per_module[m] += PAGE,
+                    _ => out.groups[3] += PAGE,
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // 4. Agrupar las DLL.
+    let mut ranked: Vec<(usize, &str)> = Vec::new();
+    for (i, module) in modules.iter().enumerate() {
+        let bytes = per_module[i];
+        if bytes == 0 {
+            continue;
+        }
+        let lower = module.2.to_ascii_lowercase();
+        let group = if lower == exe_name {
+            0
+        } else if ["avcodec", "avformat", "avutil", "swscale", "swresample", "avfilter", "avdevice", "postproc"]
+            .iter()
+            .any(|p| lower.starts_with(p))
+        {
+            1
+        } else if [
+            "nvoglv", "nvwgf", "nvd3d", "nvldumd", "nvapi", "nvcuda", "nvml", "nvdxgd", "igd", "ig9", "ig75", "igc",
+            "intel", "amdvlk", "atiu", "aticfx", "atig", "amdxx", "amdxc", "amdihk", "amd_ags", "d3d", "dxgi",
+            "dxcore", "dxil", "opengl32", "vulkan", "vk_swiftshader", "libegl", "libglesv2", "dcomp", "d2d1", "dwrite",
+        ]
+        .iter()
+        .any(|p| lower.contains(p))
+        {
+            2
+        } else {
+            3
+        };
+        out.groups[group] += bytes;
+        ranked.push((bytes, module.2.as_str()));
+    }
+    ranked.sort_by(|a, b| b.0.cmp(&a.0));
+    for (slot, (bytes, name)) in out.top.iter_mut().zip(ranked) {
+        *slot = (intern(name), bytes);
+    }
+    Some(out)
+}
+
+#[cfg(not(all(windows, target_pointer_width = "64")))]
+pub fn native_breakdown() -> Option<NativeBreakdown> {
+    None
 }
 
 // ---------------------------------------------------------------------

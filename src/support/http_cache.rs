@@ -38,7 +38,7 @@ const DISK_MAX_TOTAL: u64 = 512 * 1024 * 1024;
 /// Archivos más grandes que esto no se guardan en disco.
 const MAX_ITEM: usize = 32 * 1024 * 1024;
 /// Bytes en RAM (además de lo que decodifica `egui`).
-const MEM_BUDGET: usize = 24 * 1024 * 1024;
+const MEM_BUDGET: usize = 32 * 1024 * 1024;
 /// Descargas simultáneas.
 const MAX_INFLIGHT: usize = 8;
 /// Cuánto esperar antes de reintentar una URL que falló.

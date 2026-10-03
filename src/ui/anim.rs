@@ -59,6 +59,8 @@ const UNUSED_TTL: f64 = 12.0;
 /// Lo mismo para banners, decoraciones y efectos de perfil (solo se ven con la
 /// tarjeta abierta).
 const PROFILE_TTL: f64 = 4.0;
+/// Lo mismo para los GIF que se animan al pasar el mouse por el selector.
+const HOVER_TTL: f64 = 3.0;
 /// Tope global de memoria de todos los gifs decodificados.
 const TOTAL_BUDGET: usize = 64 * 1024 * 1024;
 
@@ -229,7 +231,9 @@ pub fn fit_cdn_size(url: &str, px: u32) -> String {
 
 /// Tope de imágenes YA decodificadas que guarda `egui` (su loader las cachea
 /// sin límite: un avatar por cada persona que se vio, banners, etc.).
-const DECODED_BUDGET: usize = 32 * 1024 * 1024;
+const DECODED_BUDGET: usize = 48 * 1024 * 1024;
+/// Tope duro que NO se salta ni con el selector de GIFs abierto.
+const DECODED_HARD_CAP: usize = 96 * 1024 * 1024;
 /// Cada cuánto se revisa (segundos de la UI).
 const MAINTAIN_EVERY: f64 = 1.5;
 
@@ -258,10 +262,16 @@ pub fn mem_stats(ctx: &Context) -> MemStats {
 
 /// Lo decodificado a partir de lo cual, al cambiar de canal/pantalla, se suelta
 /// todo (ver [`on_view_change`]).
-const SWITCH_RELEASE_THRESHOLD: usize = 12 * 1024 * 1024;
+const SWITCH_RELEASE_THRESHOLD: usize = 8 * 1024 * 1024;
+/// Segundos que se espera, tras el ÚLTIMO cambio de chat, para devolver la memoria
+/// al sistema: el chat nuevo ya cargó sus mensajes e imágenes y lo que quedó
+/// libre (buffers de decodificación, el chat anterior) se puede recortar.
+const SETTLE_RELEASE_AFTER: f64 = 2.0;
 
 thread_local! {
     static LAST_VIEW: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+    /// Instante (UI) en que toca devolver memoria al sistema; `INFINITY` = nada pendiente.
+    static RELEASE_AT: std::cell::Cell<f64> = const { std::cell::Cell::new(f64::INFINITY) };
 }
 
 /// Hay que llamarla cada frame con una clave que identifique el chat que se
@@ -275,6 +285,15 @@ pub fn on_view_change(ctx: &Context, key: u64) {
     if LAST_VIEW.with(|v| v.replace(key)) == key {
         return;
     }
+    let now = ctx.input(|i| i.time);
+    if crate::ui::gif_thumbs::active(now) {
+        return;
+    }
+    // Cada chat que se abre deja memoria libre pero retenida (allocator, heaps
+    // nativos, working set) y la RAM sube chat tras chat. Se recorta una vez que
+    // el chat nuevo se asentó; cambiar de chat seguido solo reinicia la espera.
+    RELEASE_AT.with(|t| t.set(now + SETTLE_RELEASE_AFTER));
+    ctx.request_repaint_after(Duration::from_secs_f64(SETTLE_RELEASE_AFTER + 0.1));
     if mem_stats(ctx).decoded <= SWITCH_RELEASE_THRESHOLD {
         return;
     }
@@ -293,11 +312,33 @@ pub fn on_view_change(ctx: &Context, key: u64) {
 /// solo, desde los bytes o el disco).
 pub fn maintain(ctx: &Context) {
     let now = ctx.input(|i| i.time);
+    // Recorte pendiente tras un cambio de chat (ver `on_view_change`). Va antes
+    // del límite de 1,5 s para no retrasarse. Corre en el hilo de la UI: es el
+    // que reservó casi todo y `mi_collect` solo recoge el heap del hilo que lo llama.
+    if RELEASE_AT.with(|t| now >= t.get()) {
+        RELEASE_AT.with(|t| t.set(f64::INFINITY));
+        crate::support::mem_report::release_free_memory();
+        crate::support::mem_report::trim_native_later();
+    }
     if LAST_MAINTAIN.with(|t| now - t.get()) < MAINTAIN_EVERY {
         return;
     }
     LAST_MAINTAIN.with(|t| t.set(now));
-    if mem_stats(ctx).decoded <= DECODED_BUDGET {
+    // `gc` solo corría desde `source_impl`, o sea mientras se DIBUJABA algún
+    // GIF animado: al sacar el mouse de la grilla (o cerrar el selector) nadie
+    // lo llamaba más y las animaciones decodificadas quedaban para siempre.
+    let has_anims = ANIMS.with_borrow_mut(|cache| {
+        gc(ctx, cache, now);
+        cache.map.values().any(|e| matches!(e.stage, Stage::Ready(_)))
+    });
+    if has_anims {
+        // Si la app queda quieta no hay frames: se pide uno para que venzan.
+        ctx.request_repaint_after(Duration::from_secs(6));
+    }
+    // Con el selector de GIFs abierto no se suelta nada: borraría de golpe
+    // todas las miniaturas y animaciones de la grilla (parpadeo).
+    let decoded = mem_stats(ctx).decoded;
+    if decoded <= DECODED_BUDGET || (crate::ui::gif_thumbs::active(now) && decoded <= DECODED_HARD_CAP) {
         return;
     }
     let loaders = ctx.loaders();
@@ -347,6 +388,38 @@ pub fn source_sized(ctx: &Context, url: &str, max_side: u32) -> ImageSource<'sta
         return plain(url);
     }
     source_impl(ctx, url, Mode { apng: false, max_side: max_side.clamp(32, MAX_SIDE), max_frames: MAX_FRAMES, budget: FRAME_BUDGET_BYTES, ttl: UNUSED_TTL }, None)
+}
+
+/// GIF de la grilla del selector, solo mientras el mouse está encima: pocos
+/// cuadros, chicos y con tope bajo de memoria, y se sueltan a los pocos
+/// segundos. Devuelve `ImageSource::Texture` solo cuando la animación está
+/// lista; mientras tanto devuelve la URL, y quien llama NO debe pasársela a
+/// `egui` (su loader de GIF decodifica todos los cuadros a tamaño completo).
+pub fn source_hover(ctx: &Context, url: &str, max_side: u32) -> ImageSource<'static> {
+    if image_mode() != ImageMode::Normal || !is_gif_url(url) {
+        return plain(url);
+    }
+    let max_side = max_side.clamp(96, 360);
+    source_impl(
+        ctx,
+        url,
+        Mode { apng: false, max_side, max_frames: 120, budget: 8 * 1024 * 1024, ttl: HOVER_TTL },
+        None,
+    )
+}
+
+/// Suelta ya las animaciones del selector de GIFs (las de `source_hover`), con
+/// sus texturas y los bytes que `egui` guardó. Se llama al cerrar el selector.
+pub fn release_hover(ctx: &Context) {
+    ANIMS.with_borrow_mut(|cache| {
+        cache.map.retain(|url, e| {
+            let keep = e.ttl != HOVER_TTL;
+            if !keep {
+                ctx.forget_image(url);
+            }
+            keep
+        });
+    });
 }
 
 /// Banner de perfil (GIF animado): cuadros al ancho en que se muestra, pocos

@@ -429,15 +429,16 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
 
     // El frame sobresale de la tarjeta: se le reserva ese espacio para que no
     // se corte contra el borde de la ventana.
+    let target_w = fit_card_width(view.frame.as_ref(), CARD_WIDTH, screen.width(), SCREEN_MARGIN);
     let (pad_top, pad_bottom, pad_side) = match &view.frame {
-        Some(f) => frame_padding(f, CARD_WIDTH.min(screen.width() - SCREEN_MARGIN * 2.0)),
+        Some(f) => frame_padding(f, target_w),
         None => (0.0, 0.0, 0.0),
     };
     let usable = Rect::from_min_max(
         screen.min + vec2(pad_side, pad_top),
         screen.max - vec2(pad_side, pad_bottom),
     );
-    let card_w = CARD_WIDTH.min(usable.width() - SCREEN_MARGIN * 2.0);
+    let card_w = target_w.min(usable.width() - SCREEN_MARGIN * 2.0).max(120.0);
     let max_h = (usable.height() - SCREEN_MARGIN * 2.0).max(240.0);
     // El alto real recién se conoce después de dibujar: se recuerda el del
     // frame anterior para ubicar la tarjeta sin que se salga de la pantalla.
@@ -1418,6 +1419,21 @@ fn frame_shapes(ctx: &egui::Context, frame: &ProfileFrame, card: Rect) -> (Vec<S
         Some(w) => canvas.width() / w,
         None => scale,
     };
+    // El lienzo (tarjeta + `overflow_*`) es, por definición, lo más ancho que
+    // puede ser el arte. Si el borde no abarca todo el lienzo (su PNG es más
+    // angosto), `px` sale demasiado grande y las capas sueltas (el arco de
+    // arriba, el adorno de abajo) se dibujan MÁS GRANDES que el espacio que se
+    // les reservó: tapan la parte de arriba de la tarjeta y se pasan del borde
+    // de la ventana. Se acota `px` para que la capa más ancha entre justo.
+    let widest = frame
+        .layers
+        .iter()
+        .zip(&loaded)
+        .filter(|(l, _)| l.kind != FrameLayerKind::Border && !l.responsive)
+        .filter_map(|(_, t)| t.map(|(_, size)| size.x))
+        .fold(0.0_f32, f32::max);
+    let px = if widest > 0.0 { px.min(canvas.width() / widest) } else { px };
+    debug_frame(frame, card, canvas, scale, px, &loaded);
     // Píxeles de la imagen por px del arte (1.0 si el PNG es de tamaño de diseño).
     let src_per_art = match border_w {
         Some(w) if art_canvas_w > 0.0 => w / art_canvas_w,
@@ -1462,6 +1478,59 @@ fn frame_shapes(ctx: &egui::Context, frame: &ProfileFrame, card: Rect) -> (Vec<S
         }
     }
     (back, front)
+}
+
+/// Con `ECORD_DEBUG_FRAME=1` imprime (una vez por frame de arte) los números
+/// con los que se arma el marco, para poder ajustarlo mirando el arte real.
+fn debug_frame(frame: &ProfileFrame, card: Rect, canvas: Rect, scale: f32, px: f32, loaded: &[Option<(TextureId, Vec2)>]) {
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+    thread_local! {
+        static SEEN: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    }
+    if std::env::var_os("ECORD_DEBUG_FRAME").is_none() {
+        return;
+    }
+    if !SEEN.with_borrow_mut(|s| s.insert(frame.sku_id.clone())) {
+        return;
+    }
+    eprintln!(
+        "[frame {}] inner_width={} overflow top/bottom/h={}/{}/{} card={:?} canvas={:?} scale={:.3} px={:.3}",
+        frame.sku_id,
+        frame.inner_width,
+        frame.overflow_top,
+        frame.overflow_bottom,
+        frame.overflow_horizontal,
+        card.size(),
+        canvas.size(),
+        scale,
+        px
+    );
+    for (layer, tex) in frame.layers.iter().zip(loaded) {
+        eprintln!(
+            "  capa {} kind={:?} order={:?} anchor={:?} responsive={} png={:?}",
+            layer.id,
+            layer.kind,
+            layer.order,
+            layer.anchor,
+            layer.responsive,
+            tex.map(|(_, s)| s)
+        );
+    }
+}
+
+/// Ancho de tarjeta con el que el marco COMPLETO (tarjeta + lo que sobresale a
+/// cada lado) entra en `screen_w`. Antes el espacio lateral se calculaba con
+/// el ancho máximo de tarjeta y no se achicaba junto con ella.
+fn fit_card_width(frame: Option<&ProfileFrame>, max_card: f32, screen_w: f32, margin: f32) -> f32 {
+    let avail = (screen_w - margin * 2.0).max(120.0);
+    match frame {
+        Some(f) if f.inner_width > 0.0 => {
+            let total = 1.0 + 2.0 * f.overflow_horizontal / f.inner_width;
+            max_card.min(avail / total).max(120.0)
+        }
+        _ => max_card.min(avail),
+    }
 }
 
 fn full_uv() -> Rect {

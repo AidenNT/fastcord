@@ -43,7 +43,7 @@ mod subtitle;
 
 /// Motor de reproducción nuevo (sin tirones): ver `engine.rs`.
 pub mod engine;
-pub use engine::{Engine, EngineStatus};
+pub use engine::{mem_stats as video_mem_stats, Engine, EngineMem, EngineStatus};
 
 #[cfg(feature = "from_bytes")]
 use tempfile::NamedTempFile;
