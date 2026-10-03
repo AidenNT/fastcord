@@ -76,12 +76,116 @@ const SKIP_BEFORE_TARGET_MS: i64 = 300;
 const FRAME_SLACK_MS: i64 = 4;
 /// Máximo de bytes de paquetes que se guardan para repetir un video en bucle
 /// sin volver a la red.
-const LOOP_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+const LOOP_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// Tope blando de bytes de paquetes (comprimidos) en cola, sumando TODOS los
+/// reproductores. Los paquetes los reserva ffmpeg con su propio malloc (no el
+/// de Rust), así que a 4K / bitrates altos 300 paquetes pueden ser decenas de MB.
+const PKT_BYTES_SOFT: usize = 48 * 1024 * 1024;
+/// Aunque se pase del tope, se sigue leyendo hasta tener al menos esto en cola
+/// de video (~2 s), para no dejar sin datos al decoder ni al audio.
+const V_MIN_BUFFERED: usize = 60;
+/// Hilos máximos del decoder. Con `thread_count = 0` (automático) ffmpeg usa
+/// uno por núcleo (hasta 16) y CADA hilo de frame-threading retiene un cuadro
+/// YUV completo en vuelo: en 1080p son ~3 MB por hilo, en 4K ~12 MB.
+const MAX_DECODE_THREADS: usize = 3;
 /// Alto máximo del cuadro ya convertido (si el video es más grande se reduce
 /// al convertirlo).
 const MAX_FRAME_HEIGHT: u32 = 1080;
 
 const UNSET: i64 = i64::MIN;
+
+// ---------------------------------------------------------------------
+// Medición de memoria (para Ajustes → Memoria)
+// ---------------------------------------------------------------------
+
+/// Bytes de paquetes (comprimidos) esperando a ser decodificados.
+static PKT_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Paquetes guardados para repetir un GIF en bucle sin volver a la red.
+static LOOP_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Cuadros RGBA ya convertidos que todavía no llegaron a la textura.
+static FRAME_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Estimación de lo que ffmpeg reserva por su cuenta (fuera del heap de Rust).
+static NATIVE_EST: AtomicUsize = AtomicUsize::new(0);
+static ENGINES: AtomicUsize = AtomicUsize::new(0);
+
+/// Lo que ocupan ahora todos los reproductores, por partes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EngineMem {
+    /// Reproductores abiertos (videos y GIFs en bucle).
+    pub engines: usize,
+    /// Paquetes comprimidos en cola (heap de Rust).
+    pub packets: usize,
+    /// Caché de bucle de los GIFs (heap de Rust).
+    pub loop_cache: usize,
+    /// Cuadros convertidos en cola, ~8 MB cada uno en 1080p (heap de Rust).
+    pub frames: usize,
+    /// Memoria propia de ffmpeg (decoder, hilos, scaler): ESTIMADA, no
+    /// pasa por el contador del heap de Rust.
+    pub native_estimate: usize,
+}
+
+impl EngineMem {
+    /// Lo medido dentro del heap de Rust.
+    pub fn rust_heap(&self) -> usize {
+        self.packets + self.loop_cache + self.frames
+    }
+}
+
+pub fn mem_stats() -> EngineMem {
+    EngineMem {
+        engines: ENGINES.load(Ordering::Relaxed),
+        packets: PKT_BYTES.load(Ordering::Relaxed),
+        loop_cache: LOOP_BYTES.load(Ordering::Relaxed),
+        frames: FRAME_BYTES.load(Ordering::Relaxed),
+        native_estimate: NATIVE_EST.load(Ordering::Relaxed),
+    }
+}
+
+/// Un paquete que se cuenta mientras está vivo (también si se descarta sin
+/// llegar al decoder porque el reproductor se cerró).
+struct Counted {
+    pkt: ffmpeg::Packet,
+    bytes: usize,
+}
+
+impl Counted {
+    fn new(pkt: ffmpeg::Packet) -> Self {
+        let bytes = pkt.size();
+        PKT_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        Self { pkt, bytes }
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        PKT_BYTES.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+/// Un cuadro RGBA que se cuenta mientras está vivo.
+struct Tracked {
+    image: ColorImage,
+    bytes: usize,
+}
+
+impl Tracked {
+    fn new(image: ColorImage) -> Self {
+        let bytes = image.pixels.len() * 4;
+        FRAME_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        Self { image, bytes }
+    }
+
+    /// Entrega la imagen (el conteo se descuenta al soltar `self`).
+    fn into_image(mut self) -> ColorImage {
+        std::mem::take(&mut self.image)
+    }
+}
+
+impl Drop for Tracked {
+    fn drop(&mut self) {
+        FRAME_BYTES.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
 
 // ---------------------------------------------------------------------
 // Tipos compartidos entre hilos
@@ -115,13 +219,13 @@ struct Shared {
 }
 
 enum Pkt {
-    Data(ffmpeg::Packet, u64),
+    Data(Counted, u64),
     Flush(u64),
     Eof(u64),
 }
 
 enum VMsg {
-    Frame { epoch: u64, pts_ms: i64, image: ColorImage },
+    Frame { epoch: u64, pts_ms: i64, image: Tracked },
     Eof(u64),
 }
 
@@ -390,6 +494,11 @@ struct Setup {
     height: u32,
 }
 
+/// Hilos que usa el decoder de video cuando se pide multihilo.
+fn decode_threads() -> usize {
+    std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, MAX_DECODE_THREADS)
+}
+
 fn open_all(url: &String, audio_rate: Option<u32>, frame_threads: bool) -> anyhow::Result<Setup> {
     let ictx = ffmpeg::format::input(url)?;
 
@@ -402,11 +511,12 @@ fn open_all(url: &String, audio_rate: Option<u32>, frame_threads: bool) -> anyho
         )
     };
     if frame_threads {
-        // Decodificación multihilo (cuadros + rebanadas). 0 = automático.
+        // Decodificación multihilo (cuadros + rebanadas), acotada a
+        // `MAX_DECODE_THREADS` para no multiplicar los cuadros en vuelo.
         // Va ANTES de abrir el decoder. Para los GIF/embeds cortos no se usa.
         unsafe {
             let p = v_ctx.as_mut_ptr();
-            (*p).thread_count = 0;
+            (*p).thread_count = decode_threads() as i32;
             (*p).thread_type = 3; // FF_THREAD_FRAME | FF_THREAD_SLICE
         }
     }
@@ -450,8 +560,16 @@ fn open_all(url: &String, audio_rate: Option<u32>, frame_threads: bool) -> anyho
 struct LoopCache {
     pkts: Vec<(bool, ffmpeg::Packet)>,
     bytes: usize,
+    /// Lo que este caché suma a `LOOP_BYTES` (se descuenta al soltarlo).
+    counted: usize,
     complete: bool,
     overflow: bool,
+}
+
+impl Drop for LoopCache {
+    fn drop(&mut self) {
+        LOOP_BYTES.fetch_sub(self.counted, Ordering::Relaxed);
+    }
 }
 
 fn route(
@@ -464,10 +582,10 @@ fn route(
 ) -> bool {
     if is_video {
         shared.v_q.fetch_add(1, Ordering::Relaxed);
-        vp_tx.send(Pkt::Data(pkt, epoch)).is_ok()
+        vp_tx.send(Pkt::Data(Counted::new(pkt), epoch)).is_ok()
     } else {
         shared.a_q.fetch_add(1, Ordering::Relaxed);
-        ap_tx.send(Pkt::Data(pkt, epoch)).is_ok()
+        ap_tx.send(Pkt::Data(Counted::new(pkt), epoch)).is_ok()
     }
 }
 
@@ -571,7 +689,8 @@ fn demux_main(
         let aq = shared.a_q.load(Ordering::Relaxed);
         let v_full = vq >= V_CAP;
         let a_full = a_index.is_none() || aq >= A_CAP;
-        if (v_full && a_full) || vq >= V_HARD || aq >= A_HARD {
+        let over_budget = vq >= V_MIN_BUFFERED && PKT_BYTES.load(Ordering::Relaxed) >= PKT_BYTES_SOFT;
+        if (v_full && a_full) || vq >= V_HARD || aq >= A_HARD || over_budget {
             std::thread::sleep(Duration::from_millis(5));
             continue;
         }
@@ -600,9 +719,13 @@ fn demux_main(
                             if cache.bytes > LOOP_CACHE_MAX_BYTES {
                                 cache.pkts.clear();
                                 cache.pkts.shrink_to_fit();
+                                LOOP_BYTES.fetch_sub(cache.counted, Ordering::Relaxed);
+                                cache.counted = 0;
                                 cache.overflow = true;
                                 cache_on = false;
                             } else {
+                                LOOP_BYTES.fetch_add(packet.size(), Ordering::Relaxed);
+                                cache.counted += packet.size();
                                 cache.pkts.push((is_v, packet.clone()));
                             }
                         }
@@ -674,7 +797,7 @@ fn video_thread(
                 if epoch != shared.epoch.load(Ordering::Acquire) {
                     continue;
                 }
-                if dec.0.send_packet(&pkt).is_err() {
+                if dec.0.send_packet(&pkt.pkt).is_err() {
                     continue;
                 }
                 drain_video(&mut dec, tb, epoch, &tx, &shared, &ctx, &mut scaler);
@@ -729,7 +852,7 @@ fn drain_video(
         }
 
         let Some(image) = scaler.convert(&frame, MAX_FRAME_HEIGHT) else { continue };
-        if !push_msg(tx, VMsg::Frame { epoch, pts_ms, image }, shared, epoch) {
+        if !push_msg(tx, VMsg::Frame { epoch, pts_ms, image: Tracked::new(image) }, shared, epoch) {
             return false;
         }
         ctx.request_repaint();
@@ -757,7 +880,7 @@ fn audio_thread(
                 if epoch != shared.epoch.load(Ordering::Acquire) {
                     continue;
                 }
-                if dec.0.send_packet(&pkt).is_err() {
+                if dec.0.send_packet(&pkt.pkt).is_err() {
                     continue;
                 }
                 drain_audio(&mut dec, &mut resampler, tb, in_rate, epoch, &feed, &shared, &mut next_pts_ms);
@@ -894,7 +1017,9 @@ pub struct Engine {
     tex_opts: TextureOptions,
     info: Option<Info>,
     failed: Option<String>,
-    pending: VecDeque<(i64, ColorImage)>,
+    pending: VecDeque<(i64, Tracked)>,
+    /// Lo que se estimó de memoria nativa de ffmpeg para este reproductor.
+    native_est: usize,
     sys: SysClock,
     use_audio_clock: bool,
     audio_capable: bool,
@@ -923,6 +1048,7 @@ impl Engine {
     ///   memoria si el video es corto, así no vuelve a la red).
     pub fn open(ctx: &egui::Context, url: &str, audio: Option<&AudioDevice>, looping: bool) -> Engine {
         raise_timer_resolution();
+        ENGINES.fetch_add(1, Ordering::Relaxed);
 
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
@@ -968,6 +1094,7 @@ impl Engine {
             info: None,
             failed: None,
             pending: VecDeque::new(),
+            native_est: 0,
             sys: SysClock::default(),
             use_audio_clock: false,
             audio_capable: false,
@@ -1223,6 +1350,18 @@ impl Engine {
                 Some(Ok(info)) => {
                     self.audio_capable = info.has_audio && self.feed.is_some();
                     self.use_audio_clock = self.audio_capable;
+                    // Estimación de la memoria que ffmpeg reserva por su cuenta:
+                    // los cuadros YUV 4:2:0 (1.5 B/px) que el decoder tiene en
+                    // vuelo (uno por hilo de decodificación + referencias) y
+                    // el cuadro RGBA de salida del scaler.
+                    let threads = if self.looping { 1 } else { decode_threads() };
+                    let px = (info.width as usize) * (info.height as usize);
+                    let out_px = {
+                        let (w, h) = fit_dims(info.width.max(2), info.height.max(2), MAX_FRAME_HEIGHT);
+                        (w as usize) * (h as usize)
+                    };
+                    self.native_est = px * 3 / 2 * (threads + 6) + out_px * 4;
+                    NATIVE_EST.fetch_add(self.native_est, Ordering::Relaxed);
                     self.info = Some(info);
                     self.apply_gain();
                     if !self.paused {
@@ -1284,7 +1423,7 @@ impl Engine {
                     } else if !self.has_frame {
                         // Mientras tanto, mostrar el primer cuadro como portada.
                         if let Some((_, img)) = self.pending.pop_front() {
-                            self.present(img);
+                            self.present(img.into_image());
                         }
                     }
                 }
@@ -1298,7 +1437,7 @@ impl Engine {
                 chosen = self.pending.pop_front();
             }
             if let Some((_, img)) = chosen {
-                self.present(img);
+                self.present(img.into_image());
             }
         }
 
@@ -1332,6 +1471,8 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        ENGINES.fetch_sub(1, Ordering::Relaxed);
+        NATIVE_EST.fetch_sub(self.native_est, Ordering::Relaxed);
         self.shared.stop.store(true, Ordering::Relaxed);
         if let Some(f) = &self.feed {
             f.set_paused(true);
