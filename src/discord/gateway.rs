@@ -671,7 +671,10 @@ async fn connect_and_run(
             _ => continue,
         };
 
-        let payload: GatewayPayload = serde_json::from_str(&text)?;
+        let mut payload: GatewayPayload = serde_json::from_str(&text)?;
+        // `payload.d` ya tiene su propia copia del JSON: soltar el texto
+        // completo antes de procesar, así no coexisten dos copias.
+        drop(text);
         if let Some(s) = payload.s {
             session.sequence = Some(s);
         }
@@ -682,7 +685,7 @@ async fn connect_and_run(
             // Discord) y mandamos RESUME o IDENTIFY según haya o no
             // sesión guardada.
             10 => {
-                let interval_ms = payload.d["heartbeat_interval"].as_u64().unwrap_or(41250);
+                let interval_ms = payload.data()["heartbeat_interval"].as_u64().unwrap_or(41250);
                 let jitter = rand::thread_rng().gen_range(0..=interval_ms);
                 heartbeat = tokio::time::interval(Duration::from_millis(interval_ms));
                 tokio::time::sleep(Duration::from_millis(jitter)).await;
@@ -723,15 +726,29 @@ async fn connect_and_run(
                     // única confirmación de que la sesión quedó viva.
                     *established = true;
                 }
+                // `GUILD_CREATE` llega uno por server (100+ de golpe tras el
+                // `READY`): se parsea directo a structs tipados desde el
+                // texto, sin árbol `Value` ni clones por miembro.
+                if event_name == "GUILD_CREATE" {
+                    if let Some(raw) = payload.d.as_deref() {
+                        if let Err(e) = handle_guild_create(raw.get(), tx) {
+                            log::warn!("No se pudo procesar el evento {event_name}: {e}");
+                        }
+                    }
+                    continue;
+                }
+                let data = payload.data();
+                // El texto crudo ya no hace falta (en el `READY` pesa MBs).
+                payload.d = None;
                 if event_name == "READY" {
                     crate::discord::step(tx, "Procesando los datos de la cuenta…");
                     // Guardamos `session_id`/`resume_gateway_url` ANTES de
                     // mover `payload.d` a `handle_dispatch` — son justo
                     // los dos campos que hacen falta para poder mandar un
                     // RESUME la próxima vez que se corte la conexión.
-                    session.session_id = payload.d.get("session_id").and_then(Value::as_str).map(str::to_owned);
+                    session.session_id = data.get("session_id").and_then(Value::as_str).map(str::to_owned);
                     session.resume_url =
-                        payload.d.get("resume_gateway_url").and_then(Value::as_str).map(str::to_owned);
+                        data.get("resume_gateway_url").and_then(Value::as_str).map(str::to_owned);
                 }
                 // Diagnóstico ANTES de mover `payload.d` a `handle_dispatch`
                 // (que lo consume): si falla el parseo, mostrar qué claves
@@ -742,10 +759,10 @@ async fn connect_and_run(
                 // session_id/resume_url más arriba: no vale la pena para
                 // cada `MESSAGE_CREATE`).
                 let debug_keys = (event_name == "READY")
-                    .then(|| payload.d.as_object())
+                    .then(|| data.as_object())
                     .flatten()
                     .map(|obj| obj.keys().cloned().collect::<Vec<_>>().join(", "));
-                if let Err(e) = handle_dispatch(event_name, payload.d, tx) {
+                if let Err(e) = handle_dispatch(event_name, data, tx) {
                     log::warn!("No se pudo procesar el evento {event_name}: {e}");
                     if event_name == "READY" {
                         let keys = debug_keys.unwrap_or_else(|| "(no era un objeto JSON)".to_owned());
@@ -777,7 +794,7 @@ async fn connect_and_run(
             // La sesión ya no es válida; `d` dice si vale la pena
             // reintentar con RESUME o si hay que arrancar de cero.
             9 => {
-                let resumable = payload.d.as_bool().unwrap_or(false);
+                let resumable = payload.data().as_bool().unwrap_or(false);
                 return Ok(if resumable { Outcome::Resume } else { Outcome::Reidentify });
             }
             _ => {}
@@ -986,6 +1003,43 @@ fn own_member<'a>(
     }
 }
 
+/// Discord manda un `GUILD_CREATE` por cada guild después del `READY` (es
+/// como se completan los servers que en el `READY` venían "unavailable", y de
+/// paso trae la foto inicial de voz). Del guild solo se usan `voice_states`,
+/// `roles` y los miembros embebidos; el resto (canales, nombre, ícono,
+/// emojis...) ya lo tenemos de `READY` o lo pedimos por REST al abrirlo, y
+/// serde lo salta sin reservar memoria.
+///
+/// Los miembros embebidos (en cuentas de usuario suele venir al menos el
+/// propio) sirven para saber los roles propios de un server que NO vino en el
+/// `READY` (recién unido / "unavailable"); sin ellos ese server queda sin
+/// filtrar y muestra canales que no corresponden.
+fn handle_guild_create(
+    raw: &str,
+    tx: &std::sync::mpsc::Sender<AppEvent>,
+) -> anyhow::Result<()> {
+    let guild: GuildCreatePayload = serde_json::from_str(raw)?;
+    // Los roles se toman de acá también (no solo del `READY`) por si el guild
+    // llegó "unavailable" en el `READY`, sin roles.
+    if !guild.roles.is_empty() {
+        let _ = tx.send(AppEvent::GuildRoles {
+            guild_id: guild.id.clone(),
+            roles: guild.roles,
+        });
+    }
+    if !guild.members.is_empty() {
+        let _ = tx.send(AppEvent::GuildMembers {
+            guild_id: guild.id.clone(),
+            members: guild.members,
+        });
+    }
+    let _ = tx.send(AppEvent::GuildVoiceStates {
+        guild_id: guild.id,
+        states: guild.voice_states,
+    });
+    Ok(())
+}
+
 /// Id de la cuenta logueada, guardado al llegar el `READY` para poder
 /// reconocer el miembro propio en el `READY_SUPPLEMENTAL` (que no trae el
 /// `user`).
@@ -1029,6 +1083,14 @@ fn handle_dispatch(
                     let _ = tx.send(AppEvent::UserSettingsUpdate { settings: Box::new(settings), partial });
                 }
             }
+            // Tipo 2 = `FrecencyUserSettings` (favoritos y frecency).
+            let is_frecency = data.pointer("/settings/type").and_then(|v| v.as_u64()) == Some(2);
+            if let (true, Some(proto)) = (is_frecency, proto) {
+                if let Ok(settings) = crate::discord::frecency::decode_base64(proto) {
+                    let partial = data.get("partial").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let _ = tx.send(AppEvent::FrecencyUpdate { settings: Box::new(settings), partial });
+                }
+            }
         }
         "MESSAGE_CREATE" => {
             let message: GatewayMessage = serde_json::from_value(data)?;
@@ -1042,41 +1104,8 @@ fn handle_dispatch(
             let update: MessageUpdate = serde_json::from_value(data)?;
             let _ = tx.send(AppEvent::MessageUpdate(Box::new(update)));
         }
-        // Discord manda un `GUILD_CREATE` por cada guild después del
-        // `READY` (es como se completan los servers que en el `READY`
-        // venían "unavailable", y de paso trae la foto inicial de voz).
-        // Ignoramos todo lo que no sea `voice_states`: el resto del guild
-        // (canales, nombre, ícono) ya lo tenemos de `READY` o lo pedimos
-        // por REST al abrirlo.
-        "GUILD_CREATE" => {
-            // Miembros embebidos (en cuentas de usuario suele venir al menos el
-            // propio): sirven para saber los roles propios de un server que NO
-            // vino en el `READY` (recién unido / "unavailable"); sin ellos ese
-            // server queda sin filtrar y muestra canales que no corresponden.
-            // Se leen uno por uno: un miembro raro no debe tirar el evento.
-            let members: Vec<MemberListMember> = data
-                .get("members")
-                .and_then(Value::as_array)
-                .map(|list| {
-                    list.iter()
-                        .filter_map(|m| serde_json::from_value(m.clone()).ok())
-                        .collect()
-                })
-                .unwrap_or_default();
-            let guild: GuildCreatePayload = serde_json::from_value(data)?;
-            // Los roles se toman de acá también (no solo del `READY`) por si
-            // el guild llegó "unavailable" en el `READY`, sin roles.
-            if !guild.roles.is_empty() {
-                let _ = tx.send(AppEvent::GuildRoles {
-                    guild_id: guild.id.clone(),
-                    roles: guild.roles,
-                });
-            }
-            if !members.is_empty() {
-                let _ = tx.send(AppEvent::GuildMembers { guild_id: guild.id.clone(), members });
-            }
-            let _ = tx.send(AppEvent::GuildVoiceStates { guild_id: guild.id, states: guild.voice_states });
-        }
+        // `GUILD_CREATE` no pasa por acá: `connect_and_run` lo intercepta y lo
+        // parsea con `handle_guild_create`, sin armar un árbol `Value`.
         // Alguien cambió su estado (en línea / ausente / no molestar /
         // desconectado) o su actividad. Con `guild_id` es la presencia de un
         // miembro de ese server; sin él, la de un amigo.

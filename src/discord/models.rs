@@ -1028,6 +1028,26 @@ pub struct GuildCreatePayload {
     pub voice_states: Vec<VoiceState>,
     #[serde(default)]
     pub roles: Vec<Role>,
+    /// Miembros embebidos (en cuentas de usuario suele venir al menos el
+    /// propio). Se leen uno por uno: un miembro raro se descarta en vez de
+    /// tirar el evento entero.
+    #[serde(default, deserialize_with = "lenient_members")]
+    pub members: Vec<MemberListMember>,
+}
+
+/// `members` de un `GUILD_CREATE`, descartando los que no se puedan leer.
+/// Cada miembro se guarda como texto crudo y se parsea aparte, así un error
+/// en uno no invalida a los demás ni hace falta un árbol `Value`.
+fn lenient_members<'de, D>(deserializer: D) -> Result<Vec<MemberListMember>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Option<Vec<Box<serde_json::value::RawValue>>> = Option::deserialize(deserializer)?;
+    Ok(raw
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|member| serde_json::from_str(member.get()).ok())
+        .collect())
 }
 
 /// Emoji de una reacción (o de un `MESSAGE_REACTION_ADD/REMOVE`). Discord
@@ -1932,12 +1952,27 @@ pub fn parse_read_state(raw: &serde_json::Value) -> Vec<ReadStateEntry> {
 #[derive(Debug, Deserialize)]
 pub struct GatewayPayload {
     pub op: u8,
+    /// El `d` del payload como texto JSON sin parsear: los eventos pesados
+    /// (`GUILD_CREATE`) se leen directo a structs tipados desde acá, sin
+    /// pasar por un árbol `Value` que ocupa varias veces el tamaño del JSON.
+    /// Para el resto, ver [`GatewayPayload::data`].
     #[serde(default)]
-    pub d: serde_json::Value,
+    pub d: Option<Box<serde_json::value::RawValue>>,
     #[serde(default)]
     pub t: Option<String>,
     #[serde(default)]
     pub s: Option<u64>,
+}
+
+impl GatewayPayload {
+    /// `d` como árbol `Value` (`Null` si falta o no es JSON válido). Solo
+    /// para payloads chicos o que de todos modos hay que recorrer a mano.
+    pub fn data(&self) -> serde_json::Value {
+        self.d
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw.get()).ok())
+            .unwrap_or(serde_json::Value::Null)
+    }
 }
 
 // ---------------------------------------------------------------------

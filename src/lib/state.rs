@@ -13,6 +13,10 @@ use crate::theme::{Backdrop, BackdropRuntime, Palette, ThemeDef, ThemeEditor, Th
 use crate::ui::settings::SettingsTab;
 use web_local_storage_api;
 
+// Informe de memoria (Ajustes → Memoria): hijo de este módulo para poder leer
+// los campos privados de `App`. Ver `lib/state/memory.rs`.
+pub mod memory;
+
 /// Pantalla completa que se está mostrando.
 pub enum Screen {
     Login,
@@ -479,6 +483,11 @@ pub struct App {
     pub custom_themes: Vec<ThemeDef>,
     /// Si el panel de ajustes (`ui::settings`) está abierto.
     pub settings_open: bool,
+    /// "Usar nueva interfaz" (Ajustes → Apariencia): la barra de llamada va a
+    /// todo el ancho abajo de la ventana (`ui::call_bar::show_bottom`) en vez
+    /// de la tarjeta chica del panel izquierdo. Se persiste solo; ver
+    /// `set_new_call_ui`.
+    pub new_call_ui: bool,
     /// Editor de temas abierto dentro del panel de ajustes ("Crear
     /// tema"/"Editar tema"), si hay uno.
     pub theme_editor: Option<ThemeEditor>,
@@ -622,6 +631,11 @@ impl Default for App {
             _ => VoiceAudioSources::default(),
         };
 
+        let new_call_ui = matches!(
+            web_local_storage_api::get_item("new_call_ui"),
+            Ok(Some(ref raw)) if raw == "1"
+        );
+
         let mut app = Self {
             screen: Screen::Login,
             auth: AuthStatus::SignedOut,
@@ -707,6 +721,7 @@ impl Default for App {
             stream_sessions: std::collections::HashMap::new(),
             watching_stream: None,
             egui_ctx: None,
+            new_call_ui,
         };
         // Con el modo ya cargado, calculamos la paleta que corresponde
         // (y, si es `Wallpaper`, arrancamos el hilo que lo vigila) antes
@@ -728,6 +743,7 @@ impl Default for App {
         // El aviso de seguridad va primero en la cola; después, las novedades
         // si es la primera vez que se abre esta versión.
         if let Some(dialog) = security_dialog {
+            crate::ui::security_warning::play_alert();
             app.dialogs.push_back(dialog);
         }
         crate::ui::changelog::queue_if_new(&mut app);
@@ -828,6 +844,11 @@ impl App {
     fn connect_saved_token(&mut self, token: String) {
         if let Some(dialog) = crate::ui::security_warning::detect() {
             self.pending_resume_token = Some(token);
+            // Solo suena si el diálogo realmente se va a mostrar (si ya hay
+            // uno abierto, `open_dialog` lo ignora).
+            if !self.dialogs.iter().any(|d| d.id == dialog.id) {
+                crate::ui::security_warning::play_alert();
+            }
             self.open_dialog(dialog);
         } else {
             self.resume_saved_session(token);
@@ -963,6 +984,13 @@ impl App {
     /// entrar con otra cuenta no se mezcle nada. Las preferencias de la app
     /// (tema, audio, notificaciones) se conservan.
     fn reset_session_data(&mut self) {
+        // Favoritos/frecency son de la cuenta: lo que quedó sin mandar sale
+        // ahora con el token de ESA cuenta (en un hilo, sin esperar) y recién
+        // después se olvida todo, así no se mezcla con la próxima cuenta.
+        if let Some(token) = self.discord_token.as_deref() {
+            crate::discord::frecency::tick(token, true);
+        }
+        crate::discord::frecency::reset();
         self.drop_connection();
         self.discord_token = None;
         self.me = None;
@@ -1526,7 +1554,7 @@ impl App {
         let Screen::Server(server_index) = self.screen else { return };
         let Some(server) = self.servers.get_mut(server_index) else { return };
         let Some(ch) = server.channel_mut(category, channel) else { return };
-        if ch.is_voice || ch.loaded {
+        if ch.loaded {
             return;
         }
         let Some(channel_id) = ch.channel_id.clone() else { return };
@@ -2166,6 +2194,45 @@ impl App {
         let _ = web_local_storage_api::set_item("image_mode", &mode.to_u8().to_string());
     }
 
+    /// Activa/desactiva la barra de llamada nueva (a todo el ancho, abajo) y lo
+    /// persiste.
+    pub fn set_new_call_ui(&mut self, enabled: bool) {
+        self.new_call_ui = enabled;
+        let _ = web_local_storage_api::set_item("new_call_ui", if enabled { "1" } else { "0" });
+    }
+
+    /// Lleva a la pantalla de la llamada en curso: el canal de voz del server
+    /// o el DM. Botón de "ir a la llamada" de la barra nueva.
+    pub fn go_to_voice_call(&mut self) {
+        let Some(target) = self.voice_target.as_ref() else { return };
+        let channel_id = target.channel_id.to_string();
+        let guild_id = match target.scope {
+            crate::discord::VoiceScope::Guild(guild_id) => Some(guild_id.to_string()),
+            crate::discord::VoiceScope::Private(_) => None,
+        };
+        match guild_id {
+            Some(guild_id) => {
+                let Some(index) = self.servers.iter().position(|s| s.guild_id == guild_id) else {
+                    return;
+                };
+                if !matches!(self.screen, Screen::Server(current) if current == index) {
+                    self.open_server(index);
+                }
+                self.open_channel_by_id(&channel_id);
+            }
+            None => {
+                let Some(index) = self
+                    .friends
+                    .iter()
+                    .position(|f| f.dm_channel_id.as_deref() == Some(channel_id.as_str()))
+                else {
+                    return;
+                };
+                self.open_dm(index);
+            }
+        }
+    }
+
     /// Elige de qué lado de la ventana aparecen las notificaciones y lo
     /// persiste.
     pub fn set_notification_side(&mut self, side: NotificationSide) {
@@ -2443,6 +2510,15 @@ impl App {
         }
         crate::lib::data::publish_guild_directory(ctx, &self.servers);
         self.flush_member_subscription(ctx);
+        // Favoritos/frecency: manda lo pendiente cuando toca (o ya, si la
+        // ventana perdió el foco: cerrar la app no avisa). Si queda algo sin
+        // mandar, se pide un repaint para que el temporizador siga corriendo
+        // aunque la UI esté quieta.
+        if let Some(token) = self.discord_token.as_deref()
+            && crate::discord::frecency::tick(token, !self.window_focused)
+        {
+            ctx.request_repaint_after(std::time::Duration::from_secs(5));
+        }
         let Some(rx) = &self.event_rx else { return };
         let pending: Vec<AppEvent> = rx.try_iter().collect();
         for event in pending {
@@ -2503,6 +2579,7 @@ impl App {
                 self.discord_token = Some(token);
                 self.push_connection_step("Descargando ajustes…".to_owned());
                 if let Some((token, tx)) = self.discord_token.clone().zip(self.event_tx.clone()) {
+                    crate::discord::spawn_fetch_frecency_settings(token.clone(), tx.clone());
                     crate::discord::spawn_fetch_user_settings(token, tx);
                 }
             }
@@ -2534,6 +2611,12 @@ impl App {
                     }
                 }
                 self.discord_settings = Some(*settings);
+            }
+            AppEvent::FrecencySettings(settings) => {
+                crate::discord::frecency::ingest_initial(*settings);
+            }
+            AppEvent::FrecencyUpdate { settings, partial } => {
+                crate::discord::frecency::ingest_update(*settings, partial);
             }
             AppEvent::UserSettingsUpdate { settings, partial } => {
                 // Un cambio hecho en otro dispositivo (sobre todo el orden y
@@ -4645,6 +4728,9 @@ impl eframe::App for App {
     /// cada pantalla recibe `ui: &mut egui::Ui` y arma sus paneles con
     /// `egui::Panel::left/right(...).show(ui, ...)` en cascada.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Devuelve al sistema la memoria libre del allocator (cada ~20 s).
+        crate::support::mem_report::release_free_memory_periodic();
+
         // Reaplica el estilo cada frame (barato) para poder alternar
         // Palette::dark()/light() en caliente si más adelante agregás un
         // toggle de tema.
@@ -4693,6 +4779,16 @@ impl eframe::App for App {
         self.poll_wallpaper_updates();
         // Recorta las imágenes decodificadas si se pasan de su tope.
         crate::ui::anim::maintain(ui.ctx());
+        // Al cambiar de chat, suelta las imágenes decodificadas del anterior.
+        let view_key = match self.screen {
+            Screen::Dm(i) => 2 + ((i as u64) << 8),
+            Screen::Server(i) => {
+                let (c, h) = self.current_channel;
+                3 + ((i as u64) << 8) + ((c as u64) << 24) + ((h as u64) << 40)
+            }
+            _ => 1,
+        };
+        crate::ui::anim::on_view_change(ui.ctx(), view_key);
         self.trim_inactive_history(ui.ctx().input(|i| i.time));
         // Roles del server abierto para las menciones `@rol` del chat, y
         // clics en menciones de canal/rol (ver `ui::markdown`).
@@ -4739,6 +4835,13 @@ impl eframe::App for App {
         // centrada de inicio de sesión.
         if !matches!(self.screen, Screen::Login) {
             crate::ui::topbar::show(self, ui);
+        }
+
+        // Barra de llamada nueva: a todo el ancho, abajo. Va ANTES de las
+        // pantallas para que su panel reserve el borde inferior y los paneles
+        // laterales y el central se repartan lo que queda.
+        if self.new_call_ui && self.voice_target.is_some() && !matches!(self.screen, Screen::Login) {
+            crate::ui::call_bar::show_bottom(self, ui);
         }
 
         match self.screen {

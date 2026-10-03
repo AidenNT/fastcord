@@ -734,6 +734,45 @@ impl UwuRest {
         Ok(())
     }
 
+    /// `GET /users/@me/settings-proto/2`: favoritos y frecency de la cuenta
+    /// (`FrecencyUserSettings`, ver `discord::frecency`). Una cuenta que
+    /// nunca guardó nada puede devolver el blob vacío: eso decodifica a un
+    /// proto sin campos, no es un error.
+    pub async fn get_frecency_settings(
+        &self,
+    ) -> anyhow::Result<crate::discord::user_settings::FrecencyUserSettings> {
+        #[derive(serde::Deserialize)]
+        struct SettingsProtoResponse {
+            #[serde(default)]
+            settings: String,
+        }
+
+        let value: Value = self
+            .client
+            .get("users/@me/settings-proto/2", None, Some(Self::home()))
+            .await
+            .map_err(err)?;
+        let resp: SettingsProtoResponse = serde_json::from_value(value).map_err(err)?;
+        crate::discord::frecency::decode_base64(&resp.settings)
+    }
+
+    /// `PATCH /users/@me/settings-proto/2`. Discord REEMPLAZA cada campo de
+    /// primer nivel que viene en `settings` (los que no vienen quedan como
+    /// estaban), así que cada campo tiene que ir completo: ver
+    /// `discord::frecency`, que es quien arma estos parciales.
+    pub async fn patch_frecency_settings(
+        &self,
+        settings: &crate::discord::user_settings::FrecencyUserSettings,
+    ) -> anyhow::Result<()> {
+        let body = json!({ "settings": crate::discord::frecency::encode_base64(settings) });
+        let _: Value = self
+            .client
+            .patch("users/@me/settings-proto/2", Some(body), Some(Self::home()))
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
+
     pub async fn get_user(&self, user_id: &str) -> anyhow::Result<User> {
         /*let path = format!("users/{user_id}/profile?with_mutual_guilds=false&with_mutual_friends=false&with_mutual_friends_count=false");
         let value: Value = self

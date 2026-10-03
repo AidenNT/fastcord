@@ -19,8 +19,8 @@
 //! Las funciones puras (parseo de la mención, reemplazo de texto, `:nombre:` →
 //! `<:nombre:id>`) tienen tests al final del archivo.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use egui::{
@@ -28,6 +28,7 @@ use egui::{
     ScrollArea, Sense, Stroke, Ui, Vec2,
 };
 
+use crate::discord::frecency;
 use crate::discord::models::StickerItem;
 use crate::lib::data::{CustomEmoji, EmojiGroup};
 use crate::ui::emoji as twemoji;
@@ -609,8 +610,87 @@ struct GifEntry {
     preview: String,
     /// El GIF animado (se usa solo mientras el mouse está encima).
     gif: String,
+    /// El mismo GIF como video (`.mp4`), si Discord lo manda. Los favoritos
+    /// que guardó el cliente oficial vienen solo así.
+    src: String,
     width: f32,
     height: f32,
+}
+
+/// Qué hizo el usuario en la grilla de GIFs.
+enum GifAction {
+    /// Mandar el GIF (su link).
+    Send(String),
+    /// Marcar o desmarcar como favorito.
+    ToggleFavorite(GifEntry),
+}
+
+/// Imagen quieta y GIF animado de los GIFs que ya pasaron por la grilla en
+/// esta sesión, por link. Un favorito guardado como video (los que marca el
+/// cliente oficial) no trae imagen: si ese GIF ya se vio en tendencias o en
+/// una búsqueda, se usa esa imagen de portada.
+static SEEN_GIF_MEDIA: Mutex<Option<HashMap<String, (String, String)>>> = Mutex::new(None);
+
+fn remember_gif_media(url: &str, preview: &str, gif: &str) {
+    if let Ok(mut guard) = SEEN_GIF_MEDIA.lock() {
+        let map = guard.get_or_insert_with(HashMap::new);
+        if map.len() > 2000 {
+            map.clear();
+        }
+        map.insert(url.to_string(), (preview.to_string(), gif.to_string()));
+    }
+}
+
+fn known_gif_media(url: &str) -> Option<(String, String)> {
+    let guard = SEEN_GIF_MEDIA.lock().ok()?;
+    guard.as_ref()?.get(url).cloned()
+}
+
+fn is_video_url(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
+    path.ends_with(".mp4") || path.ends_with(".webm") || path.ends_with(".mov")
+}
+
+/// El GIF de la grilla como favorito de la cuenta. Se guarda el GIF animado
+/// (formato IMAGE) cuando hay uno: se ve igual acá y en el cliente oficial, y
+/// no hace falta un reproductor de video para la grilla. Si no hay, el video.
+fn favorite_from_entry(entry: &GifEntry) -> frecency::FavoriteGif {
+    let (src, video) = if !entry.gif.is_empty() && !is_video_url(&entry.gif) {
+        (entry.gif.clone(), false)
+    } else if !entry.src.is_empty() {
+        (entry.src.clone(), true)
+    } else {
+        (entry.gif.clone(), is_video_url(&entry.gif))
+    };
+    frecency::FavoriteGif {
+        url: entry.url.clone(),
+        src,
+        width: entry.width.round().max(0.0) as u32,
+        height: entry.height.round().max(0.0) as u32,
+        video,
+        order: 0,
+    }
+}
+
+/// Un favorito de la cuenta como celda de la grilla.
+fn entry_from_favorite(fav: &frecency::FavoriteGif) -> GifEntry {
+    let (preview, gif, src) = if !fav.video {
+        (fav.src.clone(), fav.src.clone(), String::new())
+    } else {
+        match known_gif_media(&fav.url) {
+            Some((preview, gif)) => (preview, gif, fav.src.clone()),
+            None => (String::new(), String::new(), fav.src.clone()),
+        }
+    };
+    GifEntry {
+        title: String::new(),
+        url: fav.url.clone(),
+        preview,
+        gif,
+        src,
+        width: fav.width as f32,
+        height: fav.height as f32,
+    }
 }
 
 enum GifLoad {
@@ -663,6 +743,7 @@ fn parse_gifs(value: &serde_json::Value) -> Vec<GifEntry> {
             let number = |key: &str| g.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
             let url = text("url");
             let gif = text("gif_src");
+            let src = text("src");
             let preview = {
                 let p = text("preview");
                 if p.is_empty() { gif.clone() } else { p }
@@ -670,7 +751,8 @@ fn parse_gifs(value: &serde_json::Value) -> Vec<GifEntry> {
             if url.is_empty() || preview.is_empty() {
                 return None;
             }
-            Some(GifEntry { title: text("title"), url, preview, gif, width: number("width"), height: number("height") })
+            remember_gif_media(&url, &preview, &gif);
+            Some(GifEntry { title: text("title"), url, preview, gif, src, width: number("width"), height: number("height") })
         })
         .collect()
 }
@@ -826,6 +908,25 @@ pub fn show_emoji_picker(
         })
         .collect();
 
+    // Favoritos y más usados de la cuenta (en modo reacción, las reacciones
+    // más usadas). Van arriba de todo, con su ícono en la barra lateral.
+    let favorite_keys = frecency::favorite_emojis();
+    let favs = Favs::from_keys(&favorite_keys);
+    let frecent_keys = if mode == PickerMode::React {
+        frecency::top_reactions(FRECENT_EMOJIS)
+    } else {
+        frecency::top_emojis(FRECENT_EMOJIS)
+    };
+    let favorite_slots = resolve_emoji_keys(&favorite_keys, custom_emojis, needle.as_str());
+    let frecent_slots = resolve_emoji_keys(&frecent_keys, custom_emojis, needle.as_str());
+    let specials: Vec<(&str, &str, &[Slot])> = [
+        ("Favoritos", "⭐", favorite_slots.as_slice()),
+        ("Más usados", "🕒", frecent_slots.as_slice()),
+    ]
+    .into_iter()
+    .filter(|(_, _, slots)| !slots.is_empty())
+    .collect();
+
     let mut result = PickerResult::Pending;
     let mut hover: Option<Hover> = None;
     let area = Area::new(id)
@@ -917,6 +1018,28 @@ pub fn show_emoji_picker(
                                             ui.set_width(RAIL_WIDTH);
                                             ui.spacing_mut().item_spacing.y = 4.0;
                                             let mut section = 0usize;
+                                            for (title, icon, _) in &specials {
+                                                let clicked = rail_cell(ui, palette, title, section == active, |ui, rect| {
+                                                    let icon_rect = Rect::from_center_size(rect.center(), Vec2::splat(22.0));
+                                                    if twemoji::paint(ui, icon_rect, icon) == twemoji::State::Failed {
+                                                        ui.painter().text(
+                                                            rect.center(),
+                                                            Align2::CENTER_CENTER,
+                                                            *icon,
+                                                            theme::regular(18.0),
+                                                            palette.dim,
+                                                        );
+                                                    }
+                                                })
+                                                .clicked();
+                                                if clicked {
+                                                    ctx.memory_mut(|m| {
+                                                        m.data.insert_temp(jump_id, section);
+                                                        m.data.insert_temp(active_id, section);
+                                                    });
+                                                }
+                                                section += 1;
+                                            }
                                             for (group, _) in &servers {
                                                 let clicked = rail_cell(ui, palette, &group.name, section == active, |ui, rect| {
                                                     extra::avatar(
@@ -981,6 +1104,19 @@ pub fn show_emoji_picker(
                                             let mut spy = 0usize;
                                             let mut section = 0usize;
 
+                                            for (title, _, slots) in &specials {
+                                                let header = section_header(ui, palette, &title.to_uppercase(), slots.len());
+                                                if jump == Some(section) {
+                                                    ui.scroll_to_rect(header.rect, Some(Align::TOP));
+                                                }
+                                                if header.rect.top() <= clip_top + 8.0 {
+                                                    spy = section;
+                                                }
+                                                draw_slots(ui, palette, slots, &favs, &mut hover, &mut result);
+                                                ui.add_space(10.0);
+                                                section += 1;
+                                            }
+
                                             for (group, emojis) in &servers {
                                                 let header = section_header(ui, palette, &group.name.to_uppercase(), emojis.len());
                                                 if jump == Some(section) {
@@ -989,23 +1125,11 @@ pub fn show_emoji_picker(
                                                 if header.rect.top() <= clip_top + 8.0 {
                                                     spy = section;
                                                 }
-                                                ui.horizontal_wrapped(|ui| {
-                                                    ui.spacing_mut().item_spacing = Vec2::new(2.0, 2.0);
-                                                    for emoji in emojis {
-                                                        let locked = group.is_locked(emoji);
-                                                        let response = custom_cell(ui, palette, emoji, locked);
-                                                        if response.hovered() {
-                                                            hover = Some(Hover::Custom { emoji: (*emoji).clone(), locked });
-                                                        }
-                                                        if response.clicked() {
-                                                            result = if locked {
-                                                                PickerResult::Locked
-                                                            } else {
-                                                                PickerResult::Custom((*emoji).clone())
-                                                            };
-                                                        }
-                                                    }
-                                                });
+                                                let slots: Vec<Slot> = emojis
+                                                    .iter()
+                                                    .map(|emoji| Slot::Custom { emoji, locked: group.is_locked(emoji) })
+                                                    .collect();
+                                                draw_slots(ui, palette, &slots, &favs, &mut hover, &mut result);
                                                 ui.add_space(10.0);
                                                 section += 1;
                                             }
@@ -1019,19 +1143,14 @@ pub fn show_emoji_picker(
                                                 if header.rect.top() <= clip_top + 8.0 {
                                                     spy = section;
                                                 }
-                                                ui.horizontal_wrapped(|ui| {
-                                                    ui.spacing_mut().item_spacing = Vec2::new(2.0, 2.0);
-                                                    for &(emoji, keywords) in list {
-                                                        let name = keywords.split(' ').next().unwrap_or("");
-                                                        let response = unicode_cell(ui, palette, emoji, name);
-                                                        if response.hovered() {
-                                                            hover = Some(Hover::Unicode { emoji, name });
-                                                        }
-                                                        if response.clicked() {
-                                                            result = PickerResult::Unicode(emoji.to_string());
-                                                        }
-                                                    }
-                                                });
+                                                let slots: Vec<Slot> = list
+                                                    .iter()
+                                                    .map(|&(emoji, keywords)| Slot::Unicode {
+                                                        emoji,
+                                                        name: keywords.split(' ').next().unwrap_or(""),
+                                                    })
+                                                    .collect();
+                                                draw_slots(ui, palette, &slots, &favs, &mut hover, &mut result);
                                                 ui.add_space(10.0);
                                                 section += 1;
                                             }
@@ -1072,6 +1191,8 @@ pub fn show_emoji_picker(
                     }
                 });
         });
+
+    record_pick(&result, mode);
 
     if matches!(result, PickerResult::Pending) {
         let escape = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
@@ -1126,6 +1247,195 @@ fn picker_tab(ui: &mut Ui, palette: &Palette, label: &str, active: bool, enabled
     }
 }
 
+// ---------------------------------------------------------------------
+// Favoritos y "más usados" (ver `discord::frecency`)
+// ---------------------------------------------------------------------
+
+const GOLD: Color32 = Color32::from_rgb(250, 204, 21);
+
+/// Cuántos emojis/stickers entran en la sección "Más usados".
+const FRECENT_EMOJIS: usize = 42;
+const FRECENT_STICKERS: usize = 24;
+
+/// Una celda de emoji ya resuelta (de favoritos o de más usados).
+enum Slot<'a> {
+    Custom { emoji: &'a CustomEmoji, locked: bool },
+    Unicode { emoji: &'static str, name: &'static str },
+}
+
+/// Los emojis favoritos de la cuenta, para marcarlos con la estrellita:
+/// los personalizados por id y los Unicode por el emoji mismo.
+struct Favs {
+    custom: HashSet<String>,
+    unicode: HashSet<&'static str>,
+}
+
+impl Favs {
+    fn from_keys(keys: &[String]) -> Self {
+        let mut favs = Favs { custom: HashSet::new(), unicode: HashSet::new() };
+        for key in keys {
+            if key.bytes().all(|b| b.is_ascii_digit()) {
+                favs.custom.insert(key.clone());
+            } else if let Some(emoji) = frecency::unicode_for_emoji_key(key) {
+                favs.unicode.insert(emoji);
+            }
+        }
+        favs
+    }
+}
+
+/// Emoji Unicode del catálogo → sus palabras clave (la primera es su nombre).
+fn catalog_keywords() -> &'static HashMap<&'static str, &'static str> {
+    static MAP: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut map = HashMap::new();
+        for (_, _, list) in CATEGORIES {
+            for (emoji, keywords) in list.iter() {
+                map.insert(*emoji, *keywords);
+            }
+        }
+        map
+    })
+}
+
+/// Pasa las claves del proto (id de emoji personalizado o nombre de Discord)
+/// a celdas dibujables, respetando el buscador. Lo que no se puede mostrar
+/// (un emoji de un server donde ya no estás, un Unicode que el catálogo no
+/// tiene) se omite.
+fn resolve_emoji_keys<'a>(keys: &[String], groups: &'a [EmojiGroup], needle: &str) -> Vec<Slot<'a>> {
+    keys.iter()
+        .filter_map(|key| {
+            if key.bytes().all(|b| b.is_ascii_digit()) {
+                let (group, emoji) = groups
+                    .iter()
+                    .find_map(|g| g.emojis.iter().find(|e| &e.id == key).map(|e| (g, e)))?;
+                if !needle.is_empty() && !fold(&emoji.name).contains(needle) {
+                    return None;
+                }
+                Some(Slot::Custom { emoji, locked: group.is_locked(emoji) })
+            } else {
+                let emoji = frecency::unicode_for_emoji_key(key)?;
+                let keywords = *catalog_keywords().get(emoji)?;
+                if !needle.is_empty() && !keywords.contains(needle) && emoji != needle {
+                    return None;
+                }
+                Some(Slot::Unicode { emoji, name: keywords.split(' ').next().unwrap_or("") })
+            }
+        })
+        .collect()
+}
+
+/// Estrella de 5 puntas. Rellena es un abanico de triángulos desde el centro
+/// (una estrella se ve entera desde su centro, así que no hace falta
+/// triangular nada más).
+fn paint_star(painter: &egui::Painter, center: Pos2, radius: f32, filled: bool, color: Color32) {
+    let inner = radius * 0.42;
+    let points: Vec<Pos2> = (0..10)
+        .map(|i| {
+            let angle = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::PI / 5.0;
+            let r = if i % 2 == 0 { radius } else { inner };
+            Pos2::new(center.x + r * angle.cos(), center.y + r * angle.sin())
+        })
+        .collect();
+    if filled {
+        let mut mesh = egui::epaint::Mesh::default();
+        mesh.colored_vertex(center, color);
+        for p in &points {
+            mesh.colored_vertex(*p, color);
+        }
+        for i in 0..10u32 {
+            mesh.add_triangle(0, 1 + i, 1 + (i + 1) % 10);
+        }
+        painter.add(egui::Shape::mesh(mesh));
+    } else {
+        painter.add(egui::Shape::closed_line(points, Stroke::new(1.4, color)));
+    }
+}
+
+/// Estrellita en la esquina de una celda marcada como favorita.
+fn favorite_badge(ui: &Ui, cell: Rect) {
+    if ui.is_rect_visible(cell) {
+        paint_star(ui.painter(), Pos2::new(cell.right() - 7.0, cell.top() + 7.0), 4.5, true, GOLD);
+    }
+}
+
+/// Dibuja una tanda de emojis ya resueltos en una grilla que se acomoda sola.
+/// Click: elegir. Click derecho: marcar/desmarcar favorito.
+fn draw_slots(
+    ui: &mut Ui,
+    palette: &Palette,
+    slots: &[Slot],
+    favs: &Favs,
+    hover: &mut Option<Hover>,
+    result: &mut PickerResult,
+) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(2.0, 2.0);
+        for slot in slots {
+            match slot {
+                Slot::Custom { emoji, locked } => {
+                    let response = custom_cell(ui, palette, emoji, *locked);
+                    if response.hovered() {
+                        *hover = Some(Hover::Custom { emoji: (*emoji).clone(), locked: *locked });
+                    }
+                    if favs.custom.contains(&emoji.id) {
+                        favorite_badge(ui, response.rect);
+                    }
+                    if response.secondary_clicked() {
+                        frecency::toggle_favorite_emoji(&emoji.id);
+                    }
+                    if response.clicked() {
+                        *result = if *locked { PickerResult::Locked } else { PickerResult::Custom((*emoji).clone()) };
+                    }
+                }
+                Slot::Unicode { emoji, name } => {
+                    let response = unicode_cell(ui, palette, emoji, name);
+                    if response.hovered() {
+                        *hover = Some(Hover::Unicode { emoji: *emoji, name: *name });
+                    }
+                    if favs.unicode.contains(emoji) {
+                        favorite_badge(ui, response.rect);
+                    }
+                    if response.secondary_clicked()
+                        && let Some(key) = frecency::emoji_key_for_unicode(emoji)
+                    {
+                        frecency::toggle_favorite_emoji(&key);
+                    }
+                    if response.clicked() {
+                        *result = PickerResult::Unicode((*emoji).to_string());
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Suma a "más usados" lo que se acaba de elegir: emojis y stickers del
+/// compositor, o reacciones si el selector se abrió para reaccionar.
+fn record_pick(result: &PickerResult, mode: PickerMode) {
+    let record = |key: &str| {
+        if mode == PickerMode::React {
+            frecency::record_reaction_use(key);
+        } else {
+            frecency::record_emoji_use(key);
+        }
+    };
+    match result {
+        PickerResult::Unicode(emoji) => {
+            if let Some(key) = frecency::emoji_key_for_unicode(emoji) {
+                record(&key);
+            }
+        }
+        PickerResult::Custom(emoji) => record(&emoji.id),
+        PickerResult::Sticker(sticker) => {
+            if let Ok(id) = sticker.id.parse::<u64>() {
+                frecency::record_sticker_use(id);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Un texto centrado que ocupa todo el alto del cuerpo (estados vacíos).
 fn centered_note(ui: &mut Ui, palette: &Palette, height: f32, text: &str) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
@@ -1135,7 +1445,8 @@ fn centered_note(ui: &mut Ui, palette: &Palette, height: f32, text: &str) {
 
 /// Pestaña "Stickers": igual que la de emojis (barra lateral con un ícono por
 /// server + secciones en una grilla), pero con los stickers de cada server.
-/// Devuelve lo que se eligió, si algo.
+/// Arriba van "Favoritos" y "Más usados" (click derecho en un sticker lo
+/// marca o desmarca como favorito). Devuelve lo que se eligió, si algo.
 fn stickers_body(
     ui: &mut Ui,
     ctx: &Context,
@@ -1164,7 +1475,26 @@ fn stickers_body(
         })
         .collect();
 
-    if sections.is_empty() {
+    // Favoritos y más usados de la cuenta, buscados por id entre los stickers
+    // de tus servers (uno de un server donde ya no estás no se puede mostrar).
+    let resolve = |ids: Vec<u64>| -> Vec<(&EmojiGroup, &StickerItem)> {
+        ids.into_iter()
+            .filter_map(|sticker_id| find_sticker(groups, sticker_id))
+            .filter(|(_, s)| needle.is_empty() || fold(&s.name).contains(needle))
+            .collect()
+    };
+    let favorite_ids = frecency::favorite_stickers();
+    let favorite_set: HashSet<String> = favorite_ids.iter().map(|sticker_id| sticker_id.to_string()).collect();
+    let specials: Vec<(&str, &str, Vec<(&EmojiGroup, &StickerItem)>)> = vec![
+        ("Favoritos", "⭐", resolve(favorite_ids)),
+        ("Más usados", "🕒", resolve(frecency::top_stickers(FRECENT_STICKERS))),
+    ]
+    .into_iter()
+    .filter(|(_, _, list)| !list.is_empty())
+    .collect();
+    let offset = specials.len();
+
+    if sections.is_empty() && specials.is_empty() {
         let message = if needle.is_empty() {
             "Tus servidores no tienen stickers"
         } else {
@@ -1174,11 +1504,37 @@ fn stickers_body(
         return None;
     }
 
+    // Dibuja una tanda de stickers; click elige, click derecho es favorito.
+    let draw_stickers = |ui: &mut Ui, list: &[(&EmojiGroup, &StickerItem)], picked: &mut Option<PickerResult>| {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::splat(4.0);
+            for (group, sticker) in list {
+                let locked = group.is_sticker_locked();
+                let response = sticker_cell(ui, palette, sticker, locked);
+                if favorite_set.contains(&sticker.id) {
+                    favorite_badge(ui, response.rect);
+                }
+                if response.secondary_clicked()
+                    && let Ok(sticker_id) = sticker.id.parse::<u64>()
+                {
+                    frecency::toggle_favorite_sticker(sticker_id);
+                }
+                if response.clicked() {
+                    *picked = Some(if locked {
+                        PickerResult::Locked
+                    } else {
+                        PickerResult::Sticker((*sticker).clone())
+                    });
+                }
+            }
+        });
+    };
+
     let mut picked: Option<PickerResult> = None;
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = GAP;
 
-        // ---- Barra lateral: un ícono por server.
+        // ---- Barra lateral: favoritos / más usados y un ícono por server.
         let active: usize = ctx.memory(|m| m.data.get_temp(active_id)).unwrap_or(0);
         ui.vertical(|ui| {
             ScrollArea::vertical()
@@ -1188,7 +1544,29 @@ fn stickers_body(
                 .show(ui, |ui| {
                     ui.set_width(RAIL_WIDTH);
                     ui.spacing_mut().item_spacing.y = 4.0;
-                    for (section, (group, _)) in sections.iter().enumerate() {
+                    for (section, (title, icon, _)) in specials.iter().enumerate() {
+                        let clicked = rail_cell(ui, palette, title, section == active, |ui, rect| {
+                            let icon_rect = Rect::from_center_size(rect.center(), Vec2::splat(22.0));
+                            if twemoji::paint(ui, icon_rect, icon) == twemoji::State::Failed {
+                                ui.painter().text(
+                                    rect.center(),
+                                    Align2::CENTER_CENTER,
+                                    *icon,
+                                    theme::regular(18.0),
+                                    palette.dim,
+                                );
+                            }
+                        })
+                        .clicked();
+                        if clicked {
+                            ctx.memory_mut(|m| {
+                                m.data.insert_temp(jump_id, section);
+                                m.data.insert_temp(active_id, section);
+                            });
+                        }
+                    }
+                    for (index, (group, _)) in sections.iter().enumerate() {
+                        let section = offset + index;
                         let clicked = rail_cell(ui, palette, &group.name, section == active, |ui, rect| {
                             extra::avatar(
                                 ui,
@@ -1211,7 +1589,7 @@ fn stickers_body(
                 });
         });
 
-        // ---- Lista: una sección por server.
+        // ---- Lista: favoritos / más usados y una sección por server.
         ui.vertical(|ui| {
             ui.set_width(list_width);
             ScrollArea::vertical()
@@ -1222,7 +1600,19 @@ fn stickers_body(
                     let jump: Option<usize> = ctx.memory(|m| m.data.get_temp(jump_id));
                     let clip_top = ui.clip_rect().top();
                     let mut spy = 0usize;
-                    for (section, (group, stickers)) in sections.iter().enumerate() {
+                    for (section, (title, _, list)) in specials.iter().enumerate() {
+                        let header = section_header(ui, palette, &title.to_uppercase(), list.len());
+                        if jump == Some(section) {
+                            ui.scroll_to_rect(header.rect, Some(Align::TOP));
+                        }
+                        if header.rect.top() <= clip_top + 8.0 {
+                            spy = section;
+                        }
+                        draw_stickers(ui, list.as_slice(), &mut picked);
+                        ui.add_space(10.0);
+                    }
+                    for (index, (group, stickers)) in sections.iter().enumerate() {
+                        let section = offset + index;
                         let header = section_header(ui, palette, &group.name.to_uppercase(), stickers.len());
                         if jump == Some(section) {
                             ui.scroll_to_rect(header.rect, Some(Align::TOP));
@@ -1230,19 +1620,8 @@ fn stickers_body(
                         if header.rect.top() <= clip_top + 8.0 {
                             spy = section;
                         }
-                        let locked = group.is_sticker_locked();
-                        ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing = Vec2::splat(4.0);
-                            for sticker in stickers {
-                                if sticker_cell(ui, palette, sticker, locked).clicked() {
-                                    picked = Some(if locked {
-                                        PickerResult::Locked
-                                    } else {
-                                        PickerResult::Sticker((*sticker).clone())
-                                    });
-                                }
-                            }
-                        });
+                        let list: Vec<(&EmojiGroup, &StickerItem)> = stickers.iter().map(|s| (*group, *s)).collect();
+                        draw_stickers(ui, list.as_slice(), &mut picked);
                         ui.add_space(10.0);
                     }
                     if jump.is_some() {
@@ -1255,6 +1634,14 @@ fn stickers_body(
         });
     });
     picked
+}
+
+/// El sticker `id` (y el server al que pertenece) entre los de tus servers.
+fn find_sticker(groups: &[EmojiGroup], id: u64) -> Option<(&EmojiGroup, &StickerItem)> {
+    let wanted = id.to_string();
+    groups
+        .iter()
+        .find_map(|g| g.stickers.iter().find(|s| s.id == wanted).map(|s| (g, s)))
 }
 
 /// Una celda de sticker. Solo pide la imagen si está a la vista. Atenuada y
@@ -1289,15 +1676,17 @@ fn sticker_cell(ui: &mut Ui, palette: &Palette, sticker: &StickerItem, locked: b
     let hint = if locked {
         format!("{} — requiere Nitro", sticker.name)
     } else {
-        sticker.name.clone()
+        format!("{} · click derecho: favorito", sticker.name)
     };
     response
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .on_hover_text(hint)
 }
 
-/// Pestaña "GIF": GIFs del momento o los de la búsqueda, en dos columnas.
-/// Elegir uno devuelve su link (se manda como mensaje).
+/// Pestaña "GIF": con el buscador vacío, tus favoritos y los GIFs del
+/// momento; con algo escrito, los de la búsqueda. Dos columnas. Elegir uno
+/// devuelve su link (se manda como mensaje); la estrella de cada GIF lo marca
+/// o desmarca como favorito de la cuenta.
 fn gif_body(
     ui: &mut Ui,
     ctx: &Context,
@@ -1329,27 +1718,77 @@ fn gif_body(
         found.unwrap_or(View::Failed)
     };
 
-    let mut picked: Option<String> = None;
-    match view {
-        View::Loading => centered_note(ui, palette, height, "Cargando GIFs…"),
-        View::Failed => centered_note(ui, palette, height, "No se pudieron cargar los GIFs"),
-        View::Entries(list) if list.is_empty() => centered_note(ui, palette, height, "No se encontró ningún GIF"),
-        View::Entries(list) => {
-            ScrollArea::vertical()
-                .id_salt(id.with("gif_list"))
-                .max_height(height)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    picked = gif_grid(ui, ctx, palette, &list);
-                });
+    // Los favoritos van primero, solo con el buscador vacío.
+    let favorites: Vec<GifEntry> = if typed.trim().is_empty() {
+        frecency::favorite_gifs().iter().map(entry_from_favorite).collect()
+    } else {
+        Vec::new()
+    };
+
+    if favorites.is_empty() {
+        match &view {
+            View::Loading => {
+                centered_note(ui, palette, height, "Cargando GIFs…");
+                return None;
+            }
+            View::Failed => {
+                centered_note(ui, palette, height, "No se pudieron cargar los GIFs");
+                return None;
+            }
+            View::Entries(list) if list.is_empty() => {
+                centered_note(ui, palette, height, "No se encontró ningún GIF");
+                return None;
+            }
+            View::Entries(_) => {}
         }
     }
-    picked.map(PickerResult::Gif)
+
+    let mut action: Option<GifAction> = None;
+    ScrollArea::vertical()
+        .id_salt(id.with("gif_list"))
+        .max_height(height)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let inline_note = |ui: &mut Ui, text: &str| {
+                ui.add_space(14.0);
+                ui.vertical_centered(|ui| {
+                    theme::text(ui, text, theme::regular(13.0), palette.dim);
+                });
+            };
+            if !favorites.is_empty() {
+                section_header(ui, palette, "FAVORITOS", favorites.len());
+                action = gif_grid(ui, ctx, palette, &favorites);
+                ui.add_space(10.0);
+            }
+            match &view {
+                View::Loading => inline_note(ui, "Cargando GIFs…"),
+                View::Failed => inline_note(ui, "No se pudieron cargar los GIFs"),
+                View::Entries(list) if list.is_empty() => inline_note(ui, "No se encontró ningún GIF"),
+                View::Entries(list) => {
+                    if !favorites.is_empty() {
+                        section_header(ui, palette, "TENDENCIA", list.len());
+                    }
+                    if let Some(picked) = gif_grid(ui, ctx, palette, list) {
+                        action = Some(picked);
+                    }
+                }
+            }
+        });
+
+    match action {
+        Some(GifAction::Send(url)) => Some(PickerResult::Gif(url)),
+        Some(GifAction::ToggleFavorite(entry)) => {
+            frecency::toggle_favorite_gif(&favorite_from_entry(&entry));
+            ctx.request_repaint();
+            None
+        }
+        None => None,
+    }
 }
 
 /// La grilla de GIFs en dos columnas: cada GIF va a la columna más baja, con
 /// el alto que le toca por su proporción (acotado), como en el cliente real.
-fn gif_grid(ui: &mut Ui, ctx: &Context, palette: &Palette, entries: &[GifEntry]) -> Option<String> {
+fn gif_grid(ui: &mut Ui, ctx: &Context, palette: &Palette, entries: &[GifEntry]) -> Option<GifAction> {
     const GAP: f32 = 6.0;
     let column_width = ((ui.available_width() - GAP) / 2.0).floor().max(60.0);
 
@@ -1363,15 +1802,18 @@ fn gif_grid(ui: &mut Ui, ctx: &Context, palette: &Palette, entries: &[GifEntry])
         heights[target] += h + GAP;
     }
 
-    let mut picked: Option<String> = None;
+    let mut picked: Option<GifAction> = None;
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing = Vec2::new(GAP, GAP);
         for column in &columns {
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = GAP;
                 for (gif, h) in column {
-                    if gif_tile(ui, ctx, palette, gif, Vec2::new(column_width, *h)).clicked() {
-                        picked = Some(gif.url.clone());
+                    let (response, star_clicked) = gif_tile(ui, ctx, palette, gif, Vec2::new(column_width, *h));
+                    if star_clicked {
+                        picked = Some(GifAction::ToggleFavorite(GifEntry::clone(gif)));
+                    } else if response.clicked() {
+                        picked = Some(GifAction::Send(gif.url.clone()));
                     }
                 }
             });
@@ -1381,35 +1823,76 @@ fn gif_grid(ui: &mut Ui, ctx: &Context, palette: &Palette, entries: &[GifEntry])
 }
 
 /// Un GIF de la grilla: la imagen quieta (liviana) y, solo mientras el mouse
-/// está encima, el GIF animado.
-fn gif_tile(ui: &mut Ui, ctx: &Context, palette: &Palette, gif: &GifEntry, size: Vec2) -> Response {
+/// está encima, el GIF animado (o, si solo hay video, el video). Arriba a la
+/// derecha, la estrella de favorito. Devuelve la celda y si se clickeó la
+/// estrella.
+fn gif_tile(ui: &mut Ui, ctx: &Context, palette: &Palette, gif: &GifEntry, size: Vec2) -> (Response, bool) {
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), &gif.title));
+
+    // La estrella va ENCIMA del GIF: se registra después de la celda, así es
+    // ella (y no la celda) la que recibe el click. Solo existe cuando los
+    // favoritos de la cuenta ya se bajaron (si no, no se podrían guardar).
+    let star_rect = Rect::from_min_size(Pos2::new(rect.right() - 30.0, rect.top() + 6.0), Vec2::splat(24.0));
+    let can_favorite = frecency::is_loaded() && !(gif.gif.is_empty() && gif.src.is_empty());
+    let favorite = can_favorite && frecency::is_favorite_gif(&gif.url);
+    let star = can_favorite.then(|| {
+        ui.interact(star_rect, response.id.with("favorite"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(if favorite { "Quitar de favoritos" } else { "Agregar a favoritos" })
+    });
+    let star_hovered = star.as_ref().is_some_and(|s| s.hovered());
+    let hovered = response.hovered() || star_hovered;
+
     if ui.is_rect_visible(rect) {
         ui.painter().rect_filled(rect, CornerRadius::same(8), palette.surface);
-        let still = egui::Image::new(crate::ui::anim::plain(&gif.preview))
-            .fit_to_exact_size(size)
-            .show_loading_spinner(false);
-        if let Ok(egui::load::TexturePoll::Ready { .. }) = still.load_for_size(ctx, size) {
-            still.paint_at(ui, rect);
-        }
-        if response.hovered() && !gif.gif.is_empty() {
-            let animated = egui::Image::new(crate::ui::anim::source(ctx, &gif.gif))
+        if gif.preview.is_empty() {
+            // Favorito guardado como video y nunca visto en esta sesión: no
+            // hay imagen de portada, solo el video al pasar el mouse.
+            theme::paint_icon(ui, Icon::CirclePlay, rect, 28.0, palette.dim);
+        } else {
+            let still = egui::Image::new(crate::ui::anim::plain(&gif.preview))
                 .fit_to_exact_size(size)
                 .show_loading_spinner(false);
-            if let Ok(egui::load::TexturePoll::Ready { .. }) = animated.load_for_size(ctx, size) {
-                animated.paint_at(ui, rect);
+            if let Ok(egui::load::TexturePoll::Ready { .. }) = still.load_for_size(ctx, size) {
+                still.paint_at(ui, rect);
+            }
+        }
+        if hovered {
+            if !gif.gif.is_empty() {
+                let animated = egui::Image::new(crate::ui::anim::source(ctx, &gif.gif))
+                    .fit_to_exact_size(size)
+                    .show_loading_spinner(false);
+                if let Ok(egui::load::TexturePoll::Ready { .. }) = animated.load_for_size(ctx, size) {
+                    animated.paint_at(ui, rect);
+                }
+            } else if !gif.src.is_empty() {
+                crate::ui::video_player::show_looping(ui, &gif.src, rect, 8);
             }
             ui.painter()
                 .rect_stroke(rect, 8.0, Stroke::new(2.0, palette.accent), egui::StrokeKind::Inside);
         }
+        if can_favorite && (hovered || favorite) {
+            let bg = if star_hovered { palette.overlay } else { palette.overlay.gamma_multiply(0.8) };
+            ui.painter().circle_filled(star_rect.center(), 12.0, bg);
+            let color = if favorite {
+                GOLD
+            } else if star_hovered {
+                palette.text
+            } else {
+                palette.dim
+            };
+            paint_star(ui.painter(), star_rect.center(), 8.0, favorite, color);
+        }
     }
+    let star_clicked = star.as_ref().is_some_and(|s| s.clicked());
     let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
-    if gif.title.is_empty() {
+    let response = if gif.title.is_empty() || star_hovered {
         response
     } else {
         response.on_hover_text(gif.title.as_str())
-    }
+    };
+    (response, star_clicked)
 }
 
 /// Título de sección con la cantidad de emojis a la derecha.
@@ -1467,7 +1950,7 @@ fn picker_footer(ui: &mut Ui, ctx: &Context, palette: &Palette, hover: Option<&H
             if twemoji::paint(ui, icon_rect, emoji) == twemoji::State::Failed {
                 painter.text(icon_rect.center(), Align2::CENTER_CENTER, *emoji, theme::regular(28.0), palette.text);
             }
-            two_lines(&format!(":{name}:"), "Click para agregar al mensaje");
+            two_lines(&format!(":{name}:"), "Click: agregar · Click derecho: favorito");
         }
         Some(Hover::Custom { emoji, locked }) => {
             let mut image = egui::Image::new(crate::ui::anim::source(ctx, &emoji.url()))
@@ -1479,7 +1962,7 @@ fn picker_footer(ui: &mut Ui, ctx: &Context, palette: &Palette, hover: Option<&H
             if let Ok(egui::load::TexturePoll::Ready { .. }) = image.load_for_size(ctx, Vec2::splat(36.0)) {
                 image.paint_at(ui, icon_rect);
             }
-            let sub = if *locked { "Requiere Nitro" } else { "Click para agregar al mensaje" };
+            let sub = if *locked { "Requiere Nitro" } else { "Click: agregar · Click derecho: favorito" };
             two_lines(&format!(":{}:", emoji.name), sub);
         }
     }

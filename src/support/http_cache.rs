@@ -38,7 +38,7 @@ const DISK_MAX_TOTAL: u64 = 512 * 1024 * 1024;
 /// Archivos más grandes que esto no se guardan en disco.
 const MAX_ITEM: usize = 32 * 1024 * 1024;
 /// Bytes en RAM (además de lo que decodifica `egui`).
-const MEM_BUDGET: usize = 40 * 1024 * 1024;
+const MEM_BUDGET: usize = 24 * 1024 * 1024;
 /// Descargas simultáneas.
 const MAX_INFLIGHT: usize = 8;
 /// Cuánto esperar antes de reintentar una URL que falló.
@@ -203,6 +203,14 @@ fn fetch(
 ) -> Result<(Arc<[u8]>, Option<String>), (String, bool)> {
     let path = dir.map(|d| file_for(d, url));
     if let Some((body, mime)) = path.as_deref().and_then(|p| read_disk(p, DISK_TTL)) {
+        // Un archivo grande que quedó en disco de antes de que existiera
+        // `shrink_if_huge`: se achica una vez y se reescribe ya chico.
+        if let Some((small, small_mime)) = shrink_if_huge(&body, mime.as_deref()) {
+            if let Some(p) = path.as_deref() {
+                write_disk(p, &small_mime, &small);
+            }
+            return Ok((Arc::from(small), Some(small_mime)));
+        }
         return Ok((body, mime));
     }
     let resp = client.get(url).send().map_err(|e| (e.to_string(), false))?;
@@ -219,13 +227,76 @@ fn fetch(
         .map(|v| v.split(';').next().unwrap_or(v).trim().to_ascii_lowercase());
     let data = resp.bytes().map_err(|e| (e.to_string(), false))?;
     let mime = pick_mime(header_mime, &data);
-    let body: Arc<[u8]> = Arc::from(&data[..]);
+    let (body, mime): (Arc<[u8]>, Option<String>) = match shrink_if_huge(&data, mime.as_deref()) {
+        Some((small, small_mime)) => (Arc::from(small), Some(small_mime)),
+        None => (Arc::from(&data[..]), mime),
+    };
     if let Some(path) = path {
         if body.len() <= MAX_ITEM {
             write_disk(&path, mime.as_deref().unwrap_or(""), &body);
         }
     }
     Ok((body, mime))
+}
+
+/// Lado mayor (px) a partir del cual una imagen fija se reduce al bajarla.
+///
+/// `egui_extras` decodifica a tamaño completo y deja el resultado en RAM como
+/// RGBA: una foto de 4000x3000 ocupa 48 MB aunque se dibuje a 400 px. Nada en
+/// la UI se muestra a más de unos 800 px físicos (el visor a pantalla completa
+/// es lo único que se ve algo más blando).
+const MAX_STATIC_SIDE: u32 = 1024;
+/// Más píxeles que esto no se decodifican acá (evita una asignación enorme).
+const MAX_DECODE_PIXELS: u64 = 120_000_000;
+
+/// Si `data` es una imagen FIJA (PNG/JPEG/WebP) con un lado mayor a
+/// [`MAX_STATIC_SIDE`], la reduce y devuelve los bytes nuevos con su mime. Los
+/// GIF, APNG, WebP animados y SVG no se tocan (`ui::anim` necesita los bytes
+/// originales para animarlos), ni lo que ya es chico: en ese caso es solo
+/// mirar el encabezado. Corre en el hilo de descarga, nunca en el de la UI.
+fn shrink_if_huge(data: &[u8], mime: Option<&str>) -> Option<(Vec<u8>, String)> {
+    use image::imageops::FilterType;
+    use std::io::Cursor;
+
+    let mime = mime?;
+    if !matches!(mime, "image/png" | "image/jpeg" | "image/webp") {
+        return None;
+    }
+    // APNG: el chunk `acTL` va antes del primer `IDAT`.
+    if mime == "image/png" && data.get(..4096.min(data.len()))?.windows(4).any(|w| w == b"acTL") {
+        return None;
+    }
+    // WebP animado: bit de animación en las banderas del chunk `VP8X`.
+    if mime == "image/webp" && data.len() > 21 && &data[12..16] == b"VP8X" && data[20] & 0x02 != 0 {
+        return None;
+    }
+    let (w, h) = image::ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    if w.max(h) <= MAX_STATIC_SIDE || (w as u64) * (h as u64) > MAX_DECODE_PIXELS {
+        return None;
+    }
+    // Un formato corrupto o un bug del decodificador no debe dejar la
+    // descarga colgada (el contador de descargas en curso no se liberaría).
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let img = image::load_from_memory(data).ok()?;
+        let small = img.resize(MAX_STATIC_SIDE, MAX_STATIC_SIDE, FilterType::Triangle);
+        let mut out = Vec::new();
+        if mime == "image/jpeg" {
+            let rgb = small.to_rgb8();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 88)
+                .encode(rgb.as_raw(), rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8)
+                .ok()?;
+            Some((out, "image/jpeg".to_string()))
+        } else {
+            small.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png).ok()?;
+            Some((out, "image/png".to_string()))
+        }
+    }))
+    .ok()
+    .flatten()
 }
 
 /// El `Content-Type` manda si es de imagen; si falta o es genérico, se mira la
@@ -343,5 +414,35 @@ pub fn json_write(key: &str, value: &serde_json::Value) {
     let Some(dir) = crate::paths::json_cache_dir() else { return };
     if let Ok(body) = serde_json::to_vec(value) {
         write_disk(&file_for(&dir, key), "", &body);
+    }
+}
+
+#[cfg(test)]
+mod shrink_tests {
+    use super::{shrink_if_huge, MAX_STATIC_SIDE};
+    use std::io::Cursor;
+
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(w, h, image::Rgba([10, 20, 30, 255]));
+        let mut out = Vec::new();
+        img.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png).unwrap();
+        out
+    }
+
+    #[test]
+    fn shrinks_big_static_images_keeping_aspect() {
+        let (bytes, mime) = shrink_if_huge(&png(2048, 512), Some("image/png")).unwrap();
+        assert_eq!(mime, "image/png");
+        let (w, h) = image::load_from_memory(&bytes).map(|i| (i.width(), i.height())).unwrap();
+        assert_eq!(w, MAX_STATIC_SIDE);
+        assert_eq!(h, MAX_STATIC_SIDE / 4);
+    }
+
+    #[test]
+    fn leaves_small_gif_svg_and_unknown_alone() {
+        assert!(shrink_if_huge(&png(200, 200), Some("image/png")).is_none());
+        assert!(shrink_if_huge(&png(2048, 512), Some("image/gif")).is_none());
+        assert!(shrink_if_huge(&png(2048, 512), Some("image/svg+xml")).is_none());
+        assert!(shrink_if_huge(&png(2048, 512), None).is_none());
     }
 }

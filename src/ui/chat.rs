@@ -29,6 +29,27 @@ const AVATAR_GUTTER: f32 = 16.0 + 36.0 + 8.0;
 /// agrega el primero de esta lista que el mensaje todavía no tenga (un
 /// solo click, sin abrir ningún panel).
 const QUICK_REACTIONS: &[&str] = &["👍", "❤️", "😂", "🎉", "😮", "🙏"];
+
+/// Las reacciones del botón de reacción rápida: primero las que más usa la
+/// cuenta (frecency de reacciones, ver `discord::frecency`), completadas con
+/// las de siempre hasta llegar a `QUICK_REACTIONS.len()`.
+fn quick_reactions() -> Vec<String> {
+    use crate::discord::frecency;
+    let mut list: Vec<String> = frecency::top_reactions(QUICK_REACTIONS.len())
+        .iter()
+        .filter_map(|key| frecency::unicode_for_emoji_key(key))
+        .map(str::to_owned)
+        .collect();
+    for default in QUICK_REACTIONS {
+        if list.len() >= QUICK_REACTIONS.len() {
+            break;
+        }
+        if !list.iter().any(|e| e == default) {
+            list.push((*default).to_string());
+        }
+    }
+    list
+}
 /// Margen máximo (en píxeles, arriba o abajo de una fila) dentro del cual
 /// el mouse todavía cuenta como "sobre" un mensaje aunque ya no esté
 /// literalmente encima de su rect — sirve para no descolgar la barra
@@ -1283,11 +1304,15 @@ fn hover_toolbar(
                         }
 
                         if theme::icon_button(ui, Icon::Sparkles, 14.0, palette.dim, palette.text, "Reacción rápida").clicked() {
-                            if let Some(next_emoji) = QUICK_REACTIONS.iter().find(|e| {
-                                let candidate = ReactionKind::Unicode((**e).to_string());
+                            let quick = quick_reactions();
+                            if let Some(next_emoji) = quick.iter().find(|e| {
+                                let candidate = ReactionKind::Unicode((*e).clone());
                                 !msg.reactions.iter().any(|r| r.emoji == candidate)
                             }) {
-                                *toggled_reaction = Some((index, ReactionKind::Unicode(next_emoji.to_string())));
+                                if let Some(key) = crate::discord::frecency::emoji_key_for_unicode(next_emoji) {
+                                    crate::discord::frecency::record_reaction_use(&key);
+                                }
+                                *toggled_reaction = Some((index, ReactionKind::Unicode(next_emoji.clone())));
                             }
                         }
 

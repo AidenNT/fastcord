@@ -38,6 +38,12 @@ pub fn json_cache_dir() -> Option<PathBuf> {
     cache_dir().map(|dir| dir.join("json"))
 }
 
+/// Audios de las alertas sonoras volcados desde el binario para que ffmpeg los
+/// pueda abrir por ruta (`support::sound_alerts`). Se regeneran solos.
+pub fn sound_cache_dir() -> Option<PathBuf> {
+    cache_dir().map(|dir| dir.join("sounds"))
+}
+
 /// Cookie jar de Discord (JSON de `cookie_store`).
 pub fn discord_cookie_file() -> Option<PathBuf> {
     state_dir().map(|dir| dir.join("discord_cookies.json"))

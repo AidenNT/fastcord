@@ -86,6 +86,12 @@ pub fn detect() -> Option<Dialog> {
     )
 }
 
+/// Suena la alerta (`assets/sounds/alert.mp3`) al mostrarse el aviso. No
+/// bloquea la UI y, si el audio falla, el diálogo se ve igual.
+pub fn play_alert() {
+    crate::support::sound_alerts::play(crate::support::sound_alerts::SoundAlert::SecurityWarning);
+}
+
 /// Recorta `text` a `max` caracteres añadiendo `…` (sin partir un carácter
 /// multibyte).
 fn shorten(text: &str, max: usize) -> String {

@@ -24,6 +24,7 @@ pub mod home;
 pub mod login;
 pub mod markdown;
 pub mod media;
+pub mod memory_view;
 pub mod nav;
 pub mod notifications;
 pub mod overlay;

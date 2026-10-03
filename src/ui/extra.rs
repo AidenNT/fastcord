@@ -77,14 +77,22 @@ pub fn avatar(
     // `.png` del mismo avatar) y no gasta RAM en cuadros. Los grandes (la
     // tarjeta de perfil) se animan siempre.
     let rect = Rect::from_center_size(center, size);
-    let source = if !ui.is_rect_visible(rect) {
-        crate::ui::anim::plain(url)
-    } else if radius >= 32.0 || ui.rect_contains_pointer(rect) {
+    // Fuera de pantalla no se descarga ni se decodifica nada: las listas de
+    // amigos/miembros dibujan filas que nadie ve, y cada avatar decodificado
+    // queda en RAM. Al scrollear hasta la fila aparece el círculo y enseguida
+    // la imagen.
+    if !ui.is_rect_visible(rect) {
+        avatar_circle(ui, center, radius, bg, initial, palette);
+        return;
+    }
+    let source = if radius >= 32.0 || ui.rect_contains_pointer(rect) {
         // Cuadros al doble de resolución del avatar (pantallas HiDPI).
         let px = (size.x * ui.ctx().pixels_per_point() * 1.5).ceil() as u32;
         crate::ui::anim::source_sized(ui.ctx(), url, px)
     } else {
-        crate::ui::anim::plain(&crate::ui::anim::static_url(url))
+        // Imagen fija: se pide al CDN del tamaño en que se dibuja.
+        let px = (size.x * ui.ctx().pixels_per_point()).ceil() as u32;
+        crate::ui::anim::plain(&crate::ui::anim::fit_cdn_size(&crate::ui::anim::static_url(url), px))
     };
     let image = egui::Image::new(source)
         .corner_radius(CornerRadius::same(radius.min(255.0) as u8))

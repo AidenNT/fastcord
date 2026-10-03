@@ -22,9 +22,17 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     nav::show(app, ui);
     // Con un hilo abierto, su panel ocupa el lugar de la lista de miembros
     // (como en el cliente real).
+    //
+    // En un canal de voz no hay lista de miembros (la de activos): los
+    // integrantes ya se ven en la propia vista de la llamada, y a la derecha
+    // queda solo el chat de voz (`voice_channel_view`).
+    let (cat, chan) = app.current_channel;
+    let in_voice_channel = app.servers[index]
+        .channel(cat, chan)
+        .is_some_and(|c| c.is_voice);
     if app.thread_panel.is_some() {
         thread_side_panel(app, ui, index);
-    } else {
+    } else if !in_voice_channel {
         member_list_panel(app, ui, index);
     }
     central_panel(app, ui, index);
@@ -564,88 +572,7 @@ fn central_panel(app: &mut App, ui: &mut egui::Ui, server_index: usize) {
                 }
             }
 
-            let own_name = app
-                .me
-                .as_ref()
-                .map(|m| m.display_name().to_string())
-                .unwrap_or_else(|| "Aiden".to_string());
-            let send_target = app.current_send_target();
-            // Para resolver menciones de canal (`<#id>`) dentro de los
-            // mensajes de este server. Se arma una sola vez por frame acá
-            // (no por mensaje) porque es la misma lista para todo el
-            // canal.
-            let channel_names: std::collections::HashMap<String, String> = app.servers[server_index]
-                .categories
-                .iter()
-                .flat_map(|cat| cat.channels.iter())
-                .filter_map(|c| c.channel_id.clone().map(|id| (id, c.name.clone())))
-                .collect();
-            // Emojis personalizados para el picker de reacciones: primero
-            // los de ESTE server y después los de todos los demás en los
-            // que estás (una sección por server, con su ícono en la barra
-            // lateral del picker, como el cliente real). Se copian antes
-            // del préstamo mutable de `channel_mut` de acá abajo.
-            // Los de OTROS servers y los animados hacen falta Nitro: si
-            // sabemos que la cuenta no lo tiene, quedan bloqueados (ver
-            // `EmojiGroup::is_locked`).
-            let nitro_missing = app.has_nitro() == Some(false);
-            let custom_emojis: Vec<crate::lib::data::EmojiGroup> = {
-                let mut groups: Vec<crate::lib::data::EmojiGroup> = Vec::new();
-                groups.extend(crate::lib::data::EmojiGroup::from_server(&app.servers[server_index], true, nitro_missing));
-                groups.extend(
-                    app.servers
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| *i != server_index)
-                        .filter_map(|(_, s)| crate::lib::data::EmojiGroup::from_server(s, false, nitro_missing)),
-                );
-                groups
-            };
-
-            if let Some(channel) = app.servers[server_index].channel_mut(cat, chan) {
-                let loading = channel.loading;
-                let loading_more = channel.loading_more;
-                let has_more = channel.has_more;
-                let event = crate::ui::chat::show(
-                    ui,
-                    &palette,
-                    &mut channel.messages,
-                    &mut app.compose_text,
-                    &format!("Enviar mensaje a #{}", channel_name),
-                    &own_name,
-                    palette.accent,
-                    send_target,
-                    Some(&channel_names),
-                    &mut app.reply_target,
-                    &custom_emojis,
-                    loading,
-                    loading_more,
-                    has_more,
-                    &mut app.pending_scroll_anchor,
-                );
-                match event {
-                    crate::ui::chat::ChatEvent::ForwardRequested => {
-                        app.push_toast(
-                            crate::lib::state::ToastKind::Info,
-                            "Reenviar mensaje",
-                            "Todavía no se puede elegir un canal o DM destino en esta versión.",
-                        );
-                    }
-                    crate::ui::chat::ChatEvent::LoadMoreRequested => app.load_more_messages(),
-                    crate::ui::chat::ChatEvent::OpenThread { id, name, owner_id } => {
-                        app.open_thread_panel(&id, &name, owner_id)
-                    }
-                    crate::ui::chat::ChatEvent::CreateThread { channel_id, message_id, name } => {
-                        app.create_thread_from_message(&channel_id, &message_id, &name)
-                    }
-                    crate::ui::chat::ChatEvent::Component(click) => app.press_component(click),
-                    crate::ui::chat::ChatEvent::NitroRequired => app.open_modal(
-                        "Necesitás Discord Nitro",
-                        "Para reaccionar con emojis animados o de otros servidores hace falta Discord Nitro, y tu cuenta no lo tiene. Podés usar los estáticos de este servidor y los Unicode.",
-                    ),
-                    crate::ui::chat::ChatEvent::None => {}
-                }
-            }
+            channel_chat(app, ui, &palette, server_index, cat, chan, &channel_name);
         });
 }
 
@@ -672,8 +599,105 @@ fn forum_channel_view(
     }
 }
 
+/// Chat de texto de un canal del server (lista de mensajes + barra para
+/// escribir). Lo usan los canales de texto y el panel de chat de la vista
+/// de llamada de los canales de voz.
+fn channel_chat(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    server_index: usize,
+    cat: usize,
+    chan: usize,
+    channel_name: &str,
+) {
+    let own_name = app
+        .me
+        .as_ref()
+        .map(|m| m.display_name().to_string())
+        .unwrap_or_else(|| "Aiden".to_string());
+    let send_target = app.current_send_target();
+    // Para resolver menciones de canal (`<#id>`) dentro de los
+    // mensajes de este server. Se arma una sola vez por frame acá
+    // (no por mensaje) porque es la misma lista para todo el
+    // canal.
+    let channel_names: std::collections::HashMap<String, String> = app.servers[server_index]
+        .categories
+        .iter()
+        .flat_map(|cat| cat.channels.iter())
+        .filter_map(|c| c.channel_id.clone().map(|id| (id, c.name.clone())))
+        .collect();
+    // Emojis personalizados para el picker de reacciones: primero
+    // los de ESTE server y después los de todos los demás en los
+    // que estás (una sección por server, con su ícono en la barra
+    // lateral del picker, como el cliente real). Se copian antes
+    // del préstamo mutable de `channel_mut` de acá abajo.
+    // Los de OTROS servers y los animados hacen falta Nitro: si
+    // sabemos que la cuenta no lo tiene, quedan bloqueados (ver
+    // `EmojiGroup::is_locked`).
+    let nitro_missing = app.has_nitro() == Some(false);
+    let custom_emojis: Vec<crate::lib::data::EmojiGroup> = {
+        let mut groups: Vec<crate::lib::data::EmojiGroup> = Vec::new();
+        groups.extend(crate::lib::data::EmojiGroup::from_server(&app.servers[server_index], true, nitro_missing));
+        groups.extend(
+            app.servers
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != server_index)
+                .filter_map(|(_, s)| crate::lib::data::EmojiGroup::from_server(s, false, nitro_missing)),
+        );
+        groups
+    };
+
+    if let Some(channel) = app.servers[server_index].channel_mut(cat, chan) {
+        let loading = channel.loading;
+        let loading_more = channel.loading_more;
+        let has_more = channel.has_more;
+        let event = crate::ui::chat::show(
+            ui,
+            palette,
+            &mut channel.messages,
+            &mut app.compose_text,
+            &format!("Enviar mensaje a #{}", channel_name),
+            &own_name,
+            palette.accent,
+            send_target,
+            Some(&channel_names),
+            &mut app.reply_target,
+            &custom_emojis,
+            loading,
+            loading_more,
+            has_more,
+            &mut app.pending_scroll_anchor,
+        );
+        match event {
+            crate::ui::chat::ChatEvent::ForwardRequested => {
+                app.push_toast(
+                    crate::lib::state::ToastKind::Info,
+                    "Reenviar mensaje",
+                    "Todavía no se puede elegir un canal o DM destino en esta versión.",
+                );
+            }
+            crate::ui::chat::ChatEvent::LoadMoreRequested => app.load_more_messages(),
+            crate::ui::chat::ChatEvent::OpenThread { id, name, owner_id } => {
+                app.open_thread_panel(&id, &name, owner_id)
+            }
+            crate::ui::chat::ChatEvent::CreateThread { channel_id, message_id, name } => {
+                app.create_thread_from_message(&channel_id, &message_id, &name)
+            }
+            crate::ui::chat::ChatEvent::Component(click) => app.press_component(click),
+            crate::ui::chat::ChatEvent::NitroRequired => app.open_modal(
+                "Necesitás Discord Nitro",
+                "Para reaccionar con emojis animados o de otros servidores hace falta Discord Nitro, y tu cuenta no lo tiene. Podés usar los estáticos de este servidor y los Unicode.",
+            ),
+            crate::ui::chat::ChatEvent::None => {}
+        }
+    }
+}
+
 /// Vista central de un canal de voz (con o sin integrantes). El dibujo vive
-/// en `ui::call_view`; acá solo se delega.
+/// en `ui::call_view`; a la derecha va el chat de texto del canal (se puede
+/// ocultar y volver a mostrar).
 fn voice_channel_view(
     app: &mut App,
     ui: &mut egui::Ui,
@@ -683,7 +707,55 @@ fn voice_channel_view(
     chan: usize,
     channel_name: &str,
 ) {
+    let real = !app.servers[server_index].guild_id.is_empty();
+    let chat_id = egui::Id::new("voice_chat_open");
+    let mut open = ui.ctx().data(|d| d.get_temp::<bool>(chat_id)).unwrap_or(true);
+
+    if real && open {
+        let mut close = false;
+        egui::Panel::right("voice_chat_panel")
+            .exact_size(380.0)
+            .resizable(false)
+            .frame(Frame::new().fill(palette.window).inner_margin(Margin::same(0)))
+            .show(ui, |ui| {
+                let rect = ui.max_rect();
+                ui.painter()
+                    .vline(rect.left(), rect.y_range(), Stroke::new(1.0, palette.outline));
+                Frame::new().inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        theme::text(ui, "Chat de voz", theme::semibold(14.0), palette.text);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::icon_button(ui, Icon::X, 14.0, palette.dim, palette.text, "Ocultar chat")
+                                .clicked()
+                            {
+                                close = true;
+                            }
+                        });
+                    });
+                });
+                ui.painter()
+                    .hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0, palette.outline));
+                channel_chat(app, ui, palette, server_index, cat, chan, channel_name);
+            });
+        if close {
+            open = false;
+        }
+    }
+
     crate::ui::call_view::show(app, ui, palette, server_index, cat, chan, channel_name);
+
+    if real && !open {
+        let rect = ui.max_rect();
+        egui::Area::new(egui::Id::new("voice_chat_show"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(rect.right() - 140.0, rect.top() + 10.0))
+            .show(ui.ctx(), |ui| {
+                if theme::pill_button(ui, palette, "Mostrar chat", false).clicked() {
+                    open = true;
+                }
+            });
+    }
+    ui.ctx().data_mut(|d| d.insert_temp(chat_id, open));
 }
 
 fn current_channel_name(server: &Server, cat: usize, chan: usize) -> String {

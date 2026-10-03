@@ -19,10 +19,31 @@ use skrifa::MetadataProvider as _;
 use skrifa::raw::TableProvider as _;
 
 /// Registered font name, file bytes, and face index.
+///
+/// `bytes` is a read-only memory map of the font file that is never
+/// unmapped (see [`map_static`]): the OS pages in only the parts of a font
+/// that are actually drawn, instead of the whole file (a CJK `.ttc` is tens
+/// of MB) living in the heap for the life of the process.
 pub struct Fallback {
     pub name: String,
-    pub bytes: Vec<u8>,
+    pub bytes: &'static [u8],
     pub index: u32,
+}
+
+/// Maps a font file read-only and leaks the mapping so its bytes are
+/// `'static`, which is what `egui::FontData::from_static` takes.
+///
+/// The few fallback faces live as long as the process, and each file is
+/// mapped at most once per run, so the leak is bounded and intended.
+///
+/// Safety: the mapping is read-only. A font file rewritten underneath it
+/// would fault, which is the same bet `probe_file` and every font
+/// enumerator on the platform makes.
+fn map_static(path: &Path) -> std::io::Result<&'static [u8]> {
+    let file = std::fs::File::open(path)?;
+    let map = unsafe { memmap2::Mmap::map(&file)? };
+    let leaked: &'static memmap2::Mmap = Box::leak(Box::new(map));
+    Ok(&**leaked)
 }
 
 /// Scripts Inter does not cover, with a probe character and family-name hint.
@@ -119,7 +140,7 @@ fn find_family(wanted: &[&str]) -> Option<Fallback> {
         walk_fonts(&dir, 0, &mut |path| rank_family(path, wanted, &mut best));
     }
     let (_, path, index) = best?;
-    let bytes = std::fs::read(&path).ok()?;
+    let bytes = map_static(&path).ok()?;
     log::debug!("playlist face: {} (face {index})", path.display());
     Some(Fallback {
         name: "pledit".to_string(),
@@ -232,6 +253,9 @@ fn scan() -> Vec<Fallback> {
     // that chose it.
     let mut fonts: Vec<Fallback> = Vec::new();
     let mut taken: Vec<(PathBuf, u32)> = Vec::new();
+    // Han, kana and hangul usually pick different faces of the same `.ttc`:
+    // map the file once and share it between them.
+    let mut mapped: BTreeMap<PathBuf, &'static [u8]> = BTreeMap::new();
     for (script, _, _) in FALLBACK_SCRIPTS {
         let Some(candidate) = best.get(script) else {
             log::debug!("no fallback face covers {script}");
@@ -240,12 +264,18 @@ fn scan() -> Vec<Fallback> {
         if taken.contains(&(candidate.path.clone(), candidate.index)) {
             continue;
         }
-        let bytes = match std::fs::read(&candidate.path) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                log::warn!("cannot read {}: {error}", candidate.path.display());
-                continue;
-            }
+        let bytes = match mapped.get(&candidate.path) {
+            Some(bytes) => *bytes,
+            None => match map_static(&candidate.path) {
+                Ok(bytes) => {
+                    mapped.insert(candidate.path.clone(), bytes);
+                    bytes
+                }
+                Err(error) => {
+                    log::warn!("cannot map {}: {error}", candidate.path.display());
+                    continue;
+                }
+            },
         };
         log::debug!(
             "{script} fallback: {} (face {})",

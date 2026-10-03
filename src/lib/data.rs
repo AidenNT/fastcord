@@ -1484,14 +1484,13 @@ impl Channel {
             name: name.to_string(),
             messages: Vec::new(),
             channel_id: Some(id),
-            // Un canal de voz no tiene historial que pedir: lo damos por
-            // "cargado" de entrada para que `App::open_channel` no
-            // dispare un pedido de mensajes que no existe. Con un foro
-            // pasa lo mismo.
-            loaded: is_voice || is_forum,
+            // Un canal de voz tiene su propio chat de texto (el panel de
+            // la vista de la llamada), así que pide historial como un canal
+            // de texto. Un foro no: sus "mensajes" son los posts.
+            loaded: is_forum,
             loading: false,
             loading_more: false,
-            has_more: !is_voice && !is_forum,
+            has_more: !is_forum,
             is_voice,
             voice_members: Vec::new(),
             overwrites: Vec::new(),
@@ -1718,11 +1717,19 @@ impl Server {
     /// "lazy guilds" (`GUILD_MEMBER_LIST_UPDATE`), que no está implementado
     /// todavía en `discord::gateway`.
     pub fn apply_channels(&mut self, channels: Vec<crate::discord::models::Channel>) {
-        use std::collections::HashMap;
-
         // Copia cruda para poder rearmar todo cuando llegue un
         // `CHANNEL_CREATE/UPDATE/DELETE` (ver `upsert_channel`).
         self.raw_channels = channels.clone();
+        self.rebuild_channels(channels);
+    }
+
+    /// Rearma `categories` desde la lista plana de canales SIN volver a
+    /// guardarla en `raw_channels` (`apply_channels` ya lo hizo, o quien llama
+    /// la sacó de ahí). Así `upsert_channel`/`remove_channel` clonan la lista
+    /// una vez por evento en vez de dos.
+    fn rebuild_channels(&mut self, channels: Vec<crate::discord::models::Channel>) {
+        use std::collections::HashMap;
+
         // Lo que ya había: se rearma desde cero, pero mensajes, conectados
         // a voz, posts de foro y posts abiertos se conservan (ver más abajo).
         let previous = std::mem::take(&mut self.categories);
@@ -1847,7 +1854,7 @@ impl Server {
             None => self.raw_channels.push(channel),
         }
         let raw = self.raw_channels.clone();
-        self.apply_channels(raw);
+        self.rebuild_channels(raw);
     }
 
     /// `CHANNEL_DELETE`.
@@ -1857,7 +1864,7 @@ impl Server {
         }
         self.raw_channels.retain(|c| c.id != channel_id);
         let raw = self.raw_channels.clone();
-        self.apply_channels(raw);
+        self.rebuild_channels(raw);
     }
 
     /// `(categoría, canal)` del canal con ese id real de Discord, si existe

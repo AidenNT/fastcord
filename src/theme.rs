@@ -329,11 +329,12 @@ fn install_fonts(ctx: &egui::Context) {
     // Add installed fallbacks for scripts Inter does not cover. Keep them after
     // Inter and the emoji font to preserve Latin shapes and color emoji.
     for font in crate::system_fonts::fallbacks() {
-        // Reuse cached font bytes to avoid copying large collections whenever
-        // epaint rebuilds the glyph atlas.
-        let mut data = FontData::from_static(&font.bytes);
+        // The bytes are a memory map of the font file (see
+        // `system_fonts::map_static`), so nothing is copied here and only the
+        // pages epaint actually touches become resident.
+        let mut data = FontData::from_static(font.bytes);
         data.index = font.index;
-        let offset = fallback_baseline_y_offset(&font.bytes, font.index);
+        let offset = fallback_baseline_y_offset(font.bytes, font.index);
         if offset.abs() > 0.001 {
             data.tweak.y_offset_factor = offset;
         }
@@ -478,6 +479,10 @@ pub enum Icon {
     VolumeX,
     Watch,
     X,
+    // Barra de llamada nueva (`ui::call_bar::show_bottom`).
+    MessageCircle,
+    SquareArrowUp,
+    Video,
     Zap,
 }
 
@@ -572,6 +577,9 @@ const ICONS: &[(Icon, &str, &[u8])] = icons! {
     VolumeX => "volume-x",
     Watch => "watch",
     X => "x",
+    MessageCircle => "message-circle",
+    SquareArrowUp => "square-arrow-up",
+    Video => "video",
     Zap => "zap",
 };
 

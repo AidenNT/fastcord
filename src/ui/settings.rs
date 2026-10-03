@@ -35,6 +35,8 @@ pub enum SettingsTab {
     /// Ajustes de la cuenta (`PreloadedUserSettings`) en SOLO LECTURA: no
     /// tiene ninguna `Action`, ver `ui::account_settings`.
     Account,
+    /// Contador de memoria (RAM, GPU y caché en disco), ver `ui::memory_view`.
+    Memory,
 }
 
 /// Todo lo que puede pasar en un frame del panel: un solo clic a la vez,
@@ -48,6 +50,7 @@ enum Action {
     SetMode(ThemeMode),
     SetImageMode(crate::ui::anim::ImageMode),
     SetNotificationSide(NotificationSide),
+    SetNewCallUi(bool),
     ImportThemes(String),
     OpenNew,
     OpenEdit(String),
@@ -79,6 +82,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let mut editor = app.theme_editor.take();
     let tab = app.settings_tab;
     let notification_side = app.notification_side;
+    let new_call_ui = app.new_call_ui;
     let voice_audio = app.voice.audio.clone();
     let voice_audio_sources = app.voice.audio_sources.clone();
     let voice_audio_source_options = app.voice_audio_source_options.clone();
@@ -92,6 +96,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     // Cuentas guardadas (solo se copian viendo la pestaña Cuenta).
     let saved_accounts = (tab == SettingsTab::Account).then(|| app.accounts.accounts().to_vec());
     let current_account_id = app.me.as_ref().map(|me| me.id.clone());
+
+    // Pestaña Memoria: estimar el tamaño de los datos recorre todos los
+    // mensajes, así que solo se calcula si la pestaña se está viendo (y como
+    // mucho una vez por segundo, ver `App::memory_report_cached`).
+    let memory_report = (tab == SettingsTab::Memory).then(|| app.memory_report_cached(ui.ctx()));
 
     let screen_rect = ui.ctx().viewport_rect();
     let mut action: Option<Action> = None;
@@ -189,6 +198,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                             {
                                 action = Some(Action::SetTab(SettingsTab::Voice));
                             }
+                            if theme::soft_button(ui, &palette, None, "Memoria", tab == SettingsTab::Memory)
+                                .clicked()
+                            {
+                                action = Some(Action::SetTab(SettingsTab::Memory));
+                            }
                         });
                         ui.add_space(14.0);
                     }
@@ -216,6 +230,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                                             action = Some(taken);
                                         }
                                         if let Some(taken) = image_mode_section(ui, &palette) {
+                                            action = Some(taken);
+                                        }
+                                        if let Some(taken) = new_call_ui_section(ui, &palette, new_call_ui) {
                                             action = Some(taken);
                                         }
                                     }
@@ -269,6 +286,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                                             action = Some(taken);
                                         }
                                     }
+                                    SettingsTab::Memory => {
+                                        if let Some(report) = memory_report.as_ref() {
+                                            crate::ui::memory_view::view(ui, &palette, report);
+                                        }
+                                    }
                                 }
                             }
                         });
@@ -288,6 +310,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             Action::SetMode(mode) => app.set_theme_mode(mode),
             Action::SetImageMode(mode) => app.set_image_mode(mode),
             Action::SetNotificationSide(side) => app.set_notification_side(side),
+            Action::SetNewCallUi(enabled) => app.set_new_call_ui(enabled),
             Action::ImportThemes(json) => match app.import_themes(&json) {
                 Ok(n) => {
                     // Vacía el cuadro de pegado y avisa.
@@ -361,6 +384,26 @@ fn notification_side_section(
             action = Some(Action::SetNotificationSide(NotificationSide::Right));
         }
     });
+    action
+}
+
+/// Interruptor de la barra de llamada nueva (a todo el ancho, abajo de la
+/// ventana, como en el cliente oficial). Apagado por default.
+fn new_call_ui_section(ui: &mut egui::Ui, palette: &Palette, enabled: bool) -> Option<Action> {
+    let mut action = None;
+    ui.add_space(22.0);
+    theme::text(ui, "Barra de llamada", theme::semibold(14.0), palette.text);
+    ui.add_space(4.0);
+    theme::subtle(
+        ui,
+        palette,
+        "Muestra los controles de la llamada en una barra a todo el ancho, abajo de la ventana, \
+         en vez de la tarjeta chica del panel izquierdo.",
+    );
+    ui.add_space(10.0);
+    if theme::soft_button(ui, palette, None, "Usar nueva interfaz", enabled).clicked() {
+        action = Some(Action::SetNewCallUi(!enabled));
+    }
     action
 }
 

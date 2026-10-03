@@ -14,6 +14,7 @@ pub mod rest;
 pub mod fingerprint;
 pub mod password_auth;
 pub mod captcha;
+pub mod frecency;
 pub mod user_settings;
 pub mod uwu_rest;
 pub mod voice;
@@ -155,6 +156,16 @@ pub enum AppEvent {
     /// `partial` = solo trae lo que cambió.
     UserSettingsUpdate {
         settings: Box<user_settings::PreloadedUserSettings>,
+        partial: bool,
+    },
+    /// `FrecencyUserSettings` de la cuenta (GIFs/stickers/emojis favoritos y
+    /// frecency), traído de `GET /users/@me/settings-proto/2` después de
+    /// loguearse. Ver `discord::frecency`.
+    FrecencySettings(Box<user_settings::FrecencyUserSettings>),
+    /// `USER_SETTINGS_PROTO_UPDATE` de tipo 2: favoritos/frecency cambiados
+    /// desde otro dispositivo (o el eco de nuestro propio guardado).
+    FrecencyUpdate {
+        settings: Box<user_settings::FrecencyUserSettings>,
         partial: bool,
     },
     /// Mensaje nuevo (server o DM) recibido en vivo.
@@ -734,6 +745,33 @@ pub fn spawn_fetch_user_settings(token: String, tx: std::sync::mpsc::Sender<AppE
                 };
                 if let Ok(settings) = rest.get_user_settings().await {
                     let _ = tx.send(AppEvent::UserSettings(Box::new(settings)));
+                    return;
+                }
+            }
+        });
+    });
+}
+
+/// Trae los favoritos y la frecency de la cuenta (`settings-proto/2`) y los
+/// manda como `AppEvent::FrecencySettings`. Mientras no llegue, el selector
+/// de emojis/GIFs funciona igual pero no deja marcar favoritos (ver
+/// `frecency::is_loaded`), así que se reintenta como los ajustes generales.
+pub fn spawn_fetch_frecency_settings(token: String, tx: std::sync::mpsc::Sender<AppEvent>) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            return;
+        };
+        rt.block_on(async move {
+            const DELAYS_SECS: [u64; 5] = [0, 3, 8, 20, 60];
+            for delay in DELAYS_SECS {
+                if delay > 0 {
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                }
+                let Ok(rest) = uwu_rest::UwuRest::for_token(token.clone()).await else {
+                    continue;
+                };
+                if let Ok(settings) = rest.get_frecency_settings().await {
+                    let _ = tx.send(AppEvent::FrecencySettings(Box::new(settings)));
                     return;
                 }
             }

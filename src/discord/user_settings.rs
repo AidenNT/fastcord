@@ -20,6 +20,7 @@ pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/discord_protos.discord_users.v1.rs"));
 }
 
+pub use proto::FrecencyUserSettings;
 pub use proto::PreloadedUserSettings;
 
 /// Decodifica los bytes crudos del proto (ya sin el base64 del JSON de

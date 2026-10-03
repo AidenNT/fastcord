@@ -82,6 +82,13 @@ pub struct VoiceCache {
     pub audio_sources: VoiceAudioSources,
 }
 
+impl VoiceCache {
+    /// Cantidad de participantes de voz en cache (sin exponer `VoiceState`).
+    pub(crate) fn participant_count(&self) -> usize {
+        self.states.len()
+    }
+}
+
 impl App {
     /// Punto de entrada desde `lib::state::handle_discord_event`: aplica a
     /// `self.voice` (participantes por canal, quién habla) los eventos "de

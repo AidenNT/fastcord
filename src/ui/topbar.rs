@@ -150,6 +150,27 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                         Icon::Sparkles,
                         &format!("eCord {}", env!("CARGO_PKG_VERSION")),
                     );
+
+                    // Contador de RAM: un click abre Ajustes → Memoria con el
+                    // detalle. Solo se dibuja si entra sin pisar el buscador
+                    // (con la ventana angosta no hay lugar). No fuerza
+                    // repintados: se actualiza cuando la UI se repinta sola.
+                    if ui.available_width() > 150.0 {
+                        ui.add_space(6.0);
+                        let label = format!(
+                            "RAM {}",
+                            crate::support::mem_report::fmt_bytes(
+                                crate::support::mem_report::resident_now()
+                            )
+                        );
+                        let pill = status_pill_impl(ui, &palette, Icon::Laptop, &label, true)
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text("Memoria RAM que usa eCord. Click para ver el detalle.");
+                        if pill.clicked() {
+                            app.settings_tab = crate::ui::settings::SettingsTab::Memory;
+                            app.settings_open = true;
+                        }
+                    }
                 });
             });
         });
@@ -219,6 +240,18 @@ fn toggle_maximize(ui: &mut egui::Ui) {
 /// Una "píldora" de estado, como "Update to 0.8.0" / "Playing on
 /// DESKTOP-x" en la barra de referencia.
 fn status_pill(ui: &mut egui::Ui, palette: &Palette, icon: Icon, label: &str) {
+    let _ = status_pill_impl(ui, palette, icon, label, false);
+}
+
+/// Lo mismo que [`status_pill`] pero devuelve la `Response` y, con
+/// `clickable`, reacciona al hover y al click (la píldora de RAM).
+fn status_pill_impl(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    icon: Icon,
+    label: &str,
+    clickable: bool,
+) -> egui::Response {
     let font = theme::medium(11.5);
     let galley = ui
         .painter()
@@ -229,8 +262,10 @@ fn status_pill(ui: &mut egui::Ui, palette: &Palette, icon: Icon, label: &str) {
         galley.size().x + icon_w + padding.x * 2.0 + 4.0,
         galley.size().y + padding.y * 2.0,
     );
-    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-    ui.painter().rect_filled(rect, rect.height() / 2.0, palette.surface);
+    let sense = if clickable { Sense::click() } else { Sense::hover() };
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+    let fill = if clickable && response.hovered() { palette.surface_hover } else { palette.surface };
+    ui.painter().rect_filled(rect, rect.height() / 2.0, fill);
     let icon_rect = egui::Rect::from_center_size(
         rect.left_center() + Vec2::new(padding.x + icon_w / 2.0, 0.0),
         Vec2::splat(icon_w),
@@ -241,4 +276,5 @@ fn status_pill(ui: &mut egui::Ui, palette: &Palette, icon: Icon, label: &str) {
         galley,
         palette.secondary,
     );
+    response
 }

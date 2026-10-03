@@ -15,6 +15,13 @@ mod ui;
 
 use lib::state::App;
 
+// Ver el comentario de `mimalloc` en Cargo.toml: baja el RSS tras los picos de
+// parseo del gateway porque devuelve las páginas libres al sistema. Sigue
+// siendo mimalloc; `CountingAlloc` solo lo envuelve para llevar la cuenta de
+// los bytes de heap vivos (contador de memoria, ver `support::mem_report`).
+#[global_allocator]
+static GLOBAL: support::mem_report::CountingAlloc = support::mem_report::CountingAlloc;
+
 fn main() -> eframe::Result<()> {
     // Este mismo ejecutable también es la ventana del captcha de hCaptcha
     // (ver `discord::captcha`): en ese caso no se arranca eframe.

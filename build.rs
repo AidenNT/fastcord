@@ -15,7 +15,12 @@
 
 fn main() {
     let proto_file = "proto/discord_user_settings.proto";
+    // Favoritos y frecency (`FrecencyUserSettings`, settings-proto tipo 2).
+    // Mismo paquete que el anterior, así que prost los deja en el mismo
+    // archivo generado y `user_settings::proto` los expone a los dos.
+    let frecency_file = "proto/discord_frecency_settings.proto";
     println!("cargo:rerun-if-changed={proto_file}");
+    println!("cargo:rerun-if-changed={frecency_file}");
 
     let protoc_path = protoc_bin_vendored::protoc_bin_path()
         .expect("no se pudo ubicar el protoc vendorizado (protoc-bin-vendored)");
@@ -27,6 +32,6 @@ fn main() {
     }
 
     prost_build::Config::new()
-        .compile_protos(&[proto_file], &["proto/"])
-        .expect("no se pudo compilar proto/discord_user_settings.proto");
+        .compile_protos(&[proto_file, frecency_file], &["proto/"])
+        .expect("no se pudieron compilar los .proto de settings de Discord");
 }

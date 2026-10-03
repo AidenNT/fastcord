@@ -26,7 +26,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     // arriba y la barra de usuario solo mientras estás en una llamada —
     // hay que restarle su alto acá también, si no el contenido de arriba
     // queda tapado por ella en vez de encogerse para hacerle lugar.
-    let call_bar_height = if app.voice_target.is_some() { call_bar::HEIGHT } else { 0.0 };
+    let call_bar_height =
+        if app.voice_target.is_some() && !app.new_call_ui { call_bar::HEIGHT } else { 0.0 };
 
     egui::Panel::left("nav_panel")
         .exact_size(total_width)

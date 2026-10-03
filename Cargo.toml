@@ -9,7 +9,18 @@ rust-version = "1.88"
 [dependencies]
 web-local-storage-api = "0.0.0"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `raw_value`: gateway.rs/models.rs guardan el `d` de cada payload como texto
+# (`RawValue`) y lo parsean directo a structs tipados, sin armar un árbol
+# `Value` gigante para los `GUILD_CREATE`.
+serde_json = { version = "1", features = ["raw_value"] }
+# main.rs: allocator global. El de Windows (y el de glibc con tokio
+# multihilo) casi nunca devuelve al sistema la memoria que un pico de parseo
+# (READY/GUILD_CREATE de 100+ servers) dejó liberada: el RSS se queda en el
+# pico. mimalloc la devuelve.
+mimalloc = "0.1"
+# support::mem_report: `mi_collect` para que mimalloc devuelva
+# al sistema las páginas libres (baja el "Funcionamiento" con muchos servers).
+libmimalloc-sys = { version = "0.1", features = ["extended"] }
 
 eframe = { version = "0.36", default-features = false, features = ["accesskit", "glow", "default_fonts", "links", "wayland", "x11", "persistence"] }
 egui = "0.36"
@@ -116,6 +127,11 @@ prost = "0.13"
 # etc.) — prost-build genera esos campos como `::prost_types::Timestamp`,
 # así que esta dependencia tiene que estar en runtime, no solo en build.rs.
 prost-types = "0.13"
+
+# --- Favoritos y frecency (src/discord/frecency.rs) ---
+# Los emojis Unicode se guardan en la cuenta por su nombre de Discord
+# (`joy`, `skull_crossbones`); esta crate da el mapeo emoji <-> shortcode.
+emojis = "0.6"
 
 # --- Reproductor de video embebido (ui/video_player.rs) ---
 # Fork vendorizado de egui-video, portado a egui 0.36 (el original y el fork

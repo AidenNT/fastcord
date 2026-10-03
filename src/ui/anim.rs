@@ -60,7 +60,7 @@ const UNUSED_TTL: f64 = 12.0;
 /// tarjeta abierta).
 const PROFILE_TTL: f64 = 4.0;
 /// Tope global de memoria de todos los gifs decodificados.
-const TOTAL_BUDGET: usize = 96 * 1024 * 1024;
+const TOTAL_BUDGET: usize = 64 * 1024 * 1024;
 
 static DECODING: AtomicUsize = AtomicUsize::new(0);
 
@@ -197,13 +197,39 @@ pub fn static_url(url: &str) -> String {
     }
 }
 
+/// Pide al CDN de Discord una imagen del tamaño que de verdad se dibuja.
+///
+/// `egui_extras` decodifica a tamaño completo (no reduce al dibujar), así que
+/// un avatar de 28 px pedido con `?size=128` ocupa 64 KB decodificados en vez
+/// de 16 KB, multiplicado por cada persona de las listas. Solo achica: si la
+/// URL no es del CDN, no trae `size=` o ya pide algo igual o menor, queda
+/// como estaba. `px` son píxeles físicos; se redondea a la potencia de dos
+/// siguiente (el CDN solo acepta potencias de dos) con mínimo 32.
+pub fn fit_cdn_size(url: &str, px: u32) -> String {
+    if !url.contains("cdn.discordapp.com") {
+        return url.to_string();
+    }
+    let Some(start) = url.find("size=").map(|i| i + 5) else {
+        return url.to_string();
+    };
+    let digits = url[start..].bytes().take_while(u8::is_ascii_digit).count();
+    let Ok(current) = url[start..start + digits].parse::<u32>() else {
+        return url.to_string();
+    };
+    let wanted = px.max(1).next_power_of_two().clamp(32, 4096);
+    if wanted >= current {
+        return url.to_string();
+    }
+    format!("{}{wanted}{}", &url[..start], &url[start + digits..])
+}
+
 // ---------------------------------------------------------------------
 // Memoria de imágenes: medición y recorte
 // ---------------------------------------------------------------------
 
 /// Tope de imágenes YA decodificadas que guarda `egui` (su loader las cachea
 /// sin límite: un avatar por cada persona que se vio, banners, etc.).
-const DECODED_BUDGET: usize = 48 * 1024 * 1024;
+const DECODED_BUDGET: usize = 32 * 1024 * 1024;
 /// Cada cuánto se revisa (segundos de la UI).
 const MAINTAIN_EVERY: f64 = 1.5;
 
@@ -228,6 +254,38 @@ pub fn mem_stats(ctx: &Context) -> MemStats {
     let decoded = loaders.image.lock().iter().map(|l| l.byte_size()).sum();
     let animations = ANIMS.with_borrow(|c| c.map.values().map(Entry::bytes).sum());
     MemStats { downloaded, decoded, animations }
+}
+
+/// Lo decodificado a partir de lo cual, al cambiar de canal/pantalla, se suelta
+/// todo (ver [`on_view_change`]).
+const SWITCH_RELEASE_THRESHOLD: usize = 12 * 1024 * 1024;
+
+thread_local! {
+    static LAST_VIEW: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+}
+
+/// Hay que llamarla cada frame con una clave que identifique el chat que se
+/// está mirando. Al cambiar de canal las imágenes decodificadas del anterior
+/// ya no se dibujan pero `egui` las conserva hasta el tope de
+/// `DECODED_BUDGET`; si pasan de `SWITCH_RELEASE_THRESHOLD` se sueltan en ese
+/// momento (las que se sigan viendo se vuelven a decodificar solas desde los
+/// bytes en RAM o el disco). Así cada canal visitado no suma su parte a la
+/// memoria hasta llegar al tope.
+pub fn on_view_change(ctx: &Context, key: u64) {
+    if LAST_VIEW.with(|v| v.replace(key)) == key {
+        return;
+    }
+    if mem_stats(ctx).decoded <= SWITCH_RELEASE_THRESHOLD {
+        return;
+    }
+    let loaders = ctx.loaders();
+    for l in loaders.image.lock().iter() {
+        l.forget_all();
+    }
+    for l in loaders.texture.lock().iter() {
+        l.forget_all();
+    }
+    ctx.request_repaint();
 }
 
 /// Se llama en cada frame; cada pocos segundos, si lo decodificado pasa de
@@ -601,5 +659,28 @@ mod tests {
         assert_eq!(fit(100, 50, 640), (100, 50));
         assert_eq!(fit(1280, 640, 640), (640, 320));
         assert_eq!(fit(320, 1280, 640), (160, 640));
+    }
+}
+
+#[cfg(test)]
+mod fit_cdn_size_tests {
+    use super::fit_cdn_size;
+
+    #[test]
+    fn shrinks_to_the_next_power_of_two() {
+        let u = "https://cdn.discordapp.com/avatars/1/h.png?size=128";
+        assert_eq!(fit_cdn_size(u, 40), "https://cdn.discordapp.com/avatars/1/h.png?size=64");
+        assert_eq!(fit_cdn_size(u, 20), "https://cdn.discordapp.com/avatars/1/h.png?size=32");
+    }
+
+    #[test]
+    fn never_grows_or_touches_other_hosts() {
+        let u = "https://cdn.discordapp.com/avatars/1/h.png?size=128";
+        assert_eq!(fit_cdn_size(u, 100), u);
+        assert_eq!(fit_cdn_size(u, 500), u);
+        let other = "https://example.com/a.png?size=128";
+        assert_eq!(fit_cdn_size(other, 20), other);
+        let none = "https://cdn.discordapp.com/avatars/1/h.png";
+        assert_eq!(fit_cdn_size(none, 20), none);
     }
 }
