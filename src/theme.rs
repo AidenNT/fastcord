@@ -484,6 +484,11 @@ pub enum Icon {
     SquareArrowUp,
     Video,
     Zap,
+    // Visor multimedia (`ui::media_viewer`).
+    ZoomIn,
+    ZoomOut,
+    Download,
+    Forward,
 }
 
 const ICONS: &[(Icon, &str, &[u8])] = icons! {
@@ -581,6 +586,10 @@ const ICONS: &[(Icon, &str, &[u8])] = icons! {
     SquareArrowUp => "square-arrow-up",
     Video => "video",
     Zap => "zap",
+    ZoomIn => "zoom-in",
+    ZoomOut => "zoom-out",
+    Download => "download",
+    Forward => "forward",
 };
 
 impl Icon {

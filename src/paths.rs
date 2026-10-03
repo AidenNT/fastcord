@@ -28,6 +28,12 @@ fn cache_dir() -> Option<PathBuf> {
     ProjectDirs::from("", "", APP_NAME).map(|dirs| dirs.cache_dir().to_path_buf())
 }
 
+/// Videos cortos (GIFs de Tenor/Giphy en mp4) ya bajados, listos para que
+/// ffmpeg los abra desde disco (`ui::video_player::local_video`).
+pub fn video_cache_dir() -> Option<PathBuf> {
+    cache_dir().map(|dir| dir.join("video"))
+}
+
 /// Imágenes/bytes bajados por HTTP (`support::http_cache`).
 pub fn http_cache_dir() -> Option<PathBuf> {
     cache_dir().map(|dir| dir.join("http"))

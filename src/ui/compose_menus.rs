@@ -1854,8 +1854,13 @@ fn gif_tile(ui: &mut Ui, ctx: &Context, palette: &Palette, gif: &GifEntry, size:
             let still = egui::Image::new(crate::ui::anim::plain(&gif.preview))
                 .fit_to_exact_size(size)
                 .show_loading_spinner(false);
-            if let Ok(egui::load::TexturePoll::Ready { .. }) = still.load_for_size(ctx, size) {
-                still.paint_at(ui, rect);
+            // Si todavía no llegó (descargando o decodificando) hay que pedir
+            // otro repaint nosotros: si no, la celda queda vacía hasta que el
+            // mouse la toque y fuerce un frame.
+            match still.load_for_size(ctx, size) {
+                Ok(egui::load::TexturePoll::Ready { .. }) => still.paint_at(ui, rect),
+                Ok(_) => ctx.request_repaint_after(std::time::Duration::from_millis(80)),
+                Err(_) => {}
             }
         }
         if hovered {
@@ -1863,8 +1868,10 @@ fn gif_tile(ui: &mut Ui, ctx: &Context, palette: &Palette, gif: &GifEntry, size:
                 let animated = egui::Image::new(crate::ui::anim::source(ctx, &gif.gif))
                     .fit_to_exact_size(size)
                     .show_loading_spinner(false);
-                if let Ok(egui::load::TexturePoll::Ready { .. }) = animated.load_for_size(ctx, size) {
-                    animated.paint_at(ui, rect);
+                match animated.load_for_size(ctx, size) {
+                    Ok(egui::load::TexturePoll::Ready { .. }) => animated.paint_at(ui, rect),
+                    Ok(_) => ctx.request_repaint_after(std::time::Duration::from_millis(80)),
+                    Err(_) => {}
                 }
             } else if !gif.src.is_empty() {
                 crate::ui::video_player::show_looping(ui, &gif.src, rect, 8);

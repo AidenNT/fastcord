@@ -103,14 +103,14 @@ pub fn show_attachments(ui: &mut Ui, palette: &Palette, attachments: &[Attachmen
         0 => {}
         1 => {
             ui.add_space(4.0);
-            attachment_image(ui, palette, images[0], Vec2::new(max_w, MEDIA_MAX_H));
+            attachment_image(ui, palette, images[0], Vec2::new(max_w, MEDIA_MAX_H), &images, 0);
         }
         _ => {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::splat(4.0);
-                for att in &images {
-                    attachment_image(ui, palette, att, Vec2::splat(GRID_MAX.min(max_w)));
+                for (i, att) in images.iter().enumerate() {
+                    attachment_image(ui, palette, att, Vec2::splat(GRID_MAX.min(max_w)), &images, i);
                 }
             });
         }
@@ -262,11 +262,18 @@ pub fn component_media(
         },
     );
     if response.clicked() {
-        open(ui, &media.url);
+        crate::ui::media_viewer::open_single(ui.ctx(), &media.url, "", media.width, media.height);
     }
 }
 
-fn attachment_image(ui: &mut Ui, palette: &Palette, att: &Attachment, max: Vec2) {
+fn attachment_image(
+    ui: &mut Ui,
+    palette: &Palette,
+    att: &Attachment,
+    max: Vec2,
+    gallery: &[&Attachment],
+    index: usize,
+) {
     // Spoiler: mientras no se lo clickee, solo se dibuja una tapa del
     // mismo tamaño que tendría la imagen (no se pide nada a la red).
     if att.is_spoiler() {
@@ -299,7 +306,8 @@ fn attachment_image(ui: &mut Ui, palette: &Palette, att: &Attachment, max: Vec2)
         },
     );
     if response.clicked() {
-        open(ui, &att.url);
+        // Visor multimedia con todas las imágenes del mensaje.
+        crate::ui::media_viewer::open_attachments(ui.ctx(), gallery, index);
     }
 }
 
@@ -316,7 +324,7 @@ fn attachment_video(ui: &mut Ui, palette: &Palette, att: &Attachment, max: Vec2)
     // queda el recuadro con el nombre del archivo — el click para
     // reproducir acá sigue funcionando igual, con o sin portada.
     let poster_url = resolve_url(url, Some(size), "jpeg");
-    let showing_poster = video_player::show(ui, url, rect, |ui| {
+    let showing_poster = video_player::show(ui, palette, url, rect, |ui| {
         paint_remote_image(ui, palette, rect, &poster_url, MEDIA_RADIUS, att.filename.as_str());
         paint_play(ui, rect);
     });
@@ -411,7 +419,7 @@ fn embed_image(ui: &mut Ui, palette: &Palette, e: &Embed) {
         },
     );
     if response.clicked() {
-        open(ui, e.url.as_deref().unwrap_or(m.url.as_str()));
+        crate::ui::media_viewer::open_single(ui.ctx(), &m.url, "", m.width, m.height);
     }
 }
 
@@ -455,7 +463,19 @@ fn embed_gifv(ui: &mut Ui, palette: &Palette, e: &Embed) {
         paint_badge(ui, response.rect, "GIF");
     }
     if response.clicked() {
-        open(ui, e.url.as_deref().unwrap_or(m.url.as_str()));
+        let link = e.url.as_deref().unwrap_or(m.url.as_str());
+        match e.video.as_ref().filter(|v| v.has_url()) {
+            // Visor multimedia con el mp4 en bucle.
+            Some(video) => crate::ui::media_viewer::open_video_gif(
+                ui.ctx(),
+                &m.url,
+                &video.url,
+                link,
+                m.width,
+                m.height,
+            ),
+            None => crate::ui::media_viewer::open_single(ui.ctx(), &m.url, "", m.width, m.height),
+        }
     }
 }
 

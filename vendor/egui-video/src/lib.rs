@@ -41,6 +41,10 @@ use std::sync::mpsc;
 
 mod subtitle;
 
+/// Motor de reproducción nuevo (sin tirones): ver `engine.rs`.
+pub mod engine;
+pub use engine::{Engine, EngineStatus};
+
 #[cfg(feature = "from_bytes")]
 use tempfile::NamedTempFile;
 
@@ -79,26 +83,29 @@ impl AudioDevice {
         let _ = self.stream.play();
     }
 
-    fn run<T>(callback: Arc<Mutex<AudioDeviceCallback>>, device: &cpal::Device, config: cpal::StreamConfig) -> Result<cpal::Stream, cpal::Error>
+    /// Abre el stream de salida para el formato `T` del dispositivo. El audio
+    /// siempre se mezcla en `f32` estéreo; `convert` lo pasa al formato de
+    /// muestra de la salida y el callback lo reparte entre los `channels` del
+    /// dispositivo (mono, estéreo, 5.1...).
+    fn run<T>(
+        callback: Arc<Mutex<AudioDeviceCallback>>,
+        device: &cpal::Device,
+        config: cpal::StreamConfig,
+        convert: fn(f32) -> T,
+    ) -> Result<cpal::Stream, cpal::Error>
     where
-        T: cpal::SizedSample + cpal::FromSample<f32> + std::iter::Sum<f32>,
+        T: cpal::SizedSample + Copy + 'static,
     {
+        let channels = usize::from(config.channels.max(1));
         let err_fn = |err| eprintln!("an error occurred on stream: {}", err);
         device.build_output_stream(
             config,
             move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-                Self::write_data(callback.clone(), data)
+                callback.lock().callback(data, channels, convert)
             },
             err_fn,
             None,
         )
-    }
-
-    fn write_data<T>(callback: Arc<Mutex<AudioDeviceCallback>>, output: &mut [T])
-    where
-        T: cpal::Sample + cpal::FromSample<f32> + std::iter::Sum<f32>,
-    {
-        callback.lock().callback(output);
     }
 
     /// Create a new [`AudioDevice`]. An [`AudioDevice`] is required for using audio.
@@ -111,8 +118,12 @@ impl AudioDevice {
         let sample_rate = config.sample_rate();
         let config_uw: cpal::StreamConfig = config.into();
         let stream = match sample_format {
-            cpal::SampleFormat::F32 => Self::run::<f32>(callback.clone(), &device, config_uw),
-            // TODO: add more formats (to_stream fn supports more), and don't panic, return an error
+            cpal::SampleFormat::F32 => Self::run::<f32>(callback.clone(), &device, config_uw, f32_to_f32),
+            cpal::SampleFormat::F64 => Self::run::<f64>(callback.clone(), &device, config_uw, f32_to_f64),
+            cpal::SampleFormat::I16 => Self::run::<i16>(callback.clone(), &device, config_uw, f32_to_i16),
+            cpal::SampleFormat::I32 => Self::run::<i32>(callback.clone(), &device, config_uw, f32_to_i32),
+            cpal::SampleFormat::U16 => Self::run::<u16>(callback.clone(), &device, config_uw, f32_to_u16),
+            // TODO: don't panic, return an error
             sample_format => panic!("Unsupported sample format '{sample_format}'"),
         }.unwrap();
         AudioDevice {
@@ -1042,7 +1053,8 @@ impl Player {
                 audio_decoder.format(),
                 audio_decoder.ch_layout(),
                 audio_decoder.rate(),
-                audio_device.get_sample_format().to_ffmpeg_sample(),
+                // Siempre f32: el callback de la salida convierte al formato del dispositivo.
+                FfmpegAudioFormat::F32(FfmpegAudioFormatType::Packed),
                 ChannelLayout::STEREO,
                 audio_device.get_sample_rate(),
             )?;
@@ -1055,6 +1067,7 @@ impl Player {
                     sample_consumer: audio_sample_consumer,
                     audio_volume: self.options.audio_volume.clone(),
                     chunks: None,
+                    closed: false,
                 });
 
             audio_device
@@ -1620,6 +1633,12 @@ impl Streamer for AudioStreamer {
     fn process_frame(&mut self, frame: Self::Frame) -> Result<Self::ProcessedFrame> {
         let mut resampled_frame = ffmpeg::frame::Audio::empty();
         self.resampler.run(&frame, &mut resampled_frame)?;
+        // Al convertir de frecuencia el resampler puede devolver 0 muestras (las
+        // guarda para el próximo frame); con 0 muestras `data[0]` puede ser nulo y
+        // `packed` armaría un slice inválido.
+        if resampled_frame.samples() == 0 {
+            return Ok(());
+        }
         let audio_samples = if resampled_frame.is_packed() {
             packed(&resampled_frame)
         } else {
@@ -1723,6 +1742,7 @@ impl Streamer for SubtitleStreamer {
 
 type FfmpegAudioFormat = ffmpeg::format::Sample;
 type FfmpegAudioFormatType = ffmpeg::format::sample::Type;
+#[allow(dead_code)]
 trait AsFfmpegSample {
     fn to_ffmpeg_sample(&self) -> FfmpegAudioFormat;
 }
@@ -1750,6 +1770,11 @@ impl AsFfmpegSample for cpal::SampleFormat {
 pub struct AudioDeviceCallback {
     sample_streams: Vec<AudioSampleStream>,
     seeking: Option<Shared<bool>>,
+    /// Fuentes del motor nuevo (`engine::Engine`): buffers de estéreo `f32`
+    /// que se mezclan acá y de los que sale el reloj del video.
+    feeds: Vec<Arc<engine::AudioFeed>>,
+    /// Mezcla temporal de `feeds` (se reutiliza entre callbacks).
+    scratch: Vec<f32>,
 }
 
 struct ChunkSampler {
@@ -1783,14 +1808,25 @@ struct AudioSampleStream {
     sample_consumer: AudioSampleConsumer,
     audio_volume: Shared<f32>,
     chunks: Option<ChunkSampler>,
+    /// El `Player` que alimentaba este stream ya no existe (se soltó el emisor).
+    /// Cuando termina de sonar lo que le quedaba, el callback lo descarta: antes
+    /// cada video reproducido dejaba un stream muerto para siempre y el callback
+    /// recorría todos por cada muestra.
+    closed: bool,
 }
 
 impl AudioSampleStream {
+    /// ¿Ya no va a sonar nada más de este stream?
+    fn is_done(&self) -> bool {
+        self.closed && self.chunks.as_ref().map_or(true, |chunks| chunks.finished())
+    }
+
     fn get_sample(&mut self) -> f32 {
         if self.chunks.is_none() || self.chunks.as_ref().unwrap().finished() {
             match self.sample_consumer.try_recv() {
                 Ok(result) => self.chunks = Some(ChunkSampler::new(result)),
-                Err(_) => (),
+                Err(mpsc::TryRecvError::Disconnected) => self.closed = true,
+                Err(mpsc::TryRecvError::Empty) => (),
             }
         }
         if self.chunks.is_some() {
@@ -1802,10 +1838,13 @@ impl AudioSampleStream {
 }
 
 impl AudioDeviceCallback {
-    fn callback<T>(&mut self, output: &mut [T])
-    where
-        T: cpal::Sample + cpal::FromSample<f32> + std::iter::Sum<f32>,
-    {
+    /// Llena `output` (`channels` muestras por cuadro). Cada stream trae estéreo
+    /// intercalado (`L R L R...`); se mezclan en `f32`, se limitan a `-1..=1`
+    /// (con varios players sumados antes se pasaba de rango y distorsionaba) y
+    /// se reparten entre los canales del dispositivo: mono = promedio de L y R,
+    /// estéreo tal cual, y en dispositivos de más canales L y R van a los dos
+    /// primeros y el resto queda en silencio.
+    fn callback<T: Copy>(&mut self, output: &mut [T], channels: usize, convert: fn(f32) -> T) {
         if self.seeking.is_some() && self.seeking.as_ref().unwrap().get() {
             for stream in self.sample_streams.iter() {
                 // clear until there's nothing left
@@ -1816,16 +1855,66 @@ impl AudioDeviceCallback {
             self.seeking.as_ref().unwrap().set(false);
         }
 
-        for x in output.iter_mut() {
-            *x = self
-                .sample_streams
-                .iter_mut()
-                .map(|s| {
-                    s.get_sample() * s.audio_volume.get()
-                })
-                .sum()
+        let channels = channels.max(1);
+
+        // Fuentes del motor nuevo: se mezclan primero en `scratch` (estéreo
+        // intercalado) y de ahí se suman cuadro a cuadro más abajo.
+        let have_feeds = !self.feeds.is_empty();
+        if have_feeds {
+            let frames = output.len().div_ceil(channels);
+            self.scratch.clear();
+            self.scratch.resize(frames * 2, 0.0);
+            for feed in self.feeds.iter() {
+                feed.mix_into(&mut self.scratch);
+            }
+            // Si el `Engine` ya se soltó (solo queda esta referencia), afuera.
+            self.feeds.retain(|f| Arc::strong_count(f) > 1);
         }
+
+        for (index, frame) in output.chunks_mut(channels).enumerate() {
+            let (mut left, mut right) = (0.0_f32, 0.0_f32);
+            if have_feeds {
+                left += self.scratch.get(index * 2).copied().unwrap_or(0.0);
+                right += self.scratch.get(index * 2 + 1).copied().unwrap_or(0.0);
+            }
+            for stream in self.sample_streams.iter_mut() {
+                let volume = stream.audio_volume.get();
+                left += stream.get_sample() * volume;
+                right += stream.get_sample() * volume;
+            }
+            let (left, right) = (left.clamp(-1.0, 1.0), right.clamp(-1.0, 1.0));
+            for (ch, slot) in frame.iter_mut().enumerate() {
+                let value = match (channels, ch) {
+                    (1, _) => (left + right) * 0.5,
+                    (_, 0) => left,
+                    (_, 1) => right,
+                    _ => 0.0,
+                };
+                *slot = convert(value);
+            }
+        }
+        self.sample_streams.retain(|stream| !stream.is_done());
     }
+}
+
+fn f32_to_f32(sample: f32) -> f32 {
+    sample
+}
+
+fn f32_to_f64(sample: f32) -> f64 {
+    f64::from(sample)
+}
+
+fn f32_to_i16(sample: f32) -> i16 {
+    (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16
+}
+
+fn f32_to_i32(sample: f32) -> i32 {
+    (f64::from(sample.clamp(-1.0, 1.0)) * f64::from(i32::MAX)).round() as i32
+}
+
+fn f32_to_u16(sample: f32) -> u16 {
+    ((sample.clamp(-1.0, 1.0) + 1.0) * 0.5 * f32::from(u16::MAX)).round() as u16
 }
 
 #[inline]

@@ -366,7 +366,7 @@ fn write_disk(path: &Path, mime: &str, body: &[u8]) {
 }
 
 /// Borra lo vencido y, si todavía pasa de `max_total`, lo más viejo primero.
-fn prune(dir: &Path, ttl: Duration, max_total: u64) {
+pub(crate) fn prune(dir: &Path, ttl: Duration, max_total: u64) {
     let Ok(read) = std::fs::read_dir(dir) else { return };
     let now = SystemTime::now();
     let mut files: Vec<(PathBuf, SystemTime, u64)> = Vec::new();

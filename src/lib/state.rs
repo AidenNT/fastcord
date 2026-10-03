@@ -4867,6 +4867,8 @@ impl eframe::App for App {
         // va al final para quedar por encima de todo, incluida la pantalla de
         // login (donde se escribe el token).
         crate::ui::dialog::show(self, ui);
+        // Visor multimedia (imágenes/GIFs a pantalla completa).
+        crate::ui::media_viewer::show(self, ui);
         crate::ui::video_player::show_fullscreen(ui.ctx());
         // Suelta los players de GIF (embeds `gifv`) que ya no se dibujan.
         crate::ui::video_player::end_frame(ui.ctx());
