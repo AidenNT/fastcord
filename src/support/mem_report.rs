@@ -748,7 +748,7 @@ heap_struct!(crate::lib::data::ForumPost { id, title, author, preview, thumbnail
 heap_struct!(crate::lib::data::ChannelCategory { name, channels });
 heap_struct!(crate::lib::data::Member { name, avatar_url, user_id, subtitle });
 heap_struct!(crate::lib::data::MemberGroup { name, members });
-heap_struct!(crate::lib::data::Server { name, icon_initial, icon_url, guild_id, topic, categories, member_groups, roles, member_lists, active_member_list, channel_member_list, pending_list_channel, custom_emojis, custom_stickers, member_info, requested_members, pending_voice_states, known_users, access_ctx, raw_channels });
+heap_struct!(crate::lib::data::Server { name, icon_initial, icon_url, banner_url, guild_id, topic, categories, member_groups, roles, member_lists, active_member_list, channel_member_list, pending_list_channel, custom_emojis, custom_stickers, member_info, requested_members, pending_voice_states, known_users, access_ctx, raw_channels });
 heap_struct!(crate::lib::data::MemberInfo { nick, roles });
 heap_struct!(crate::lib::data::KnownUser { name, avatar_url });
 heap_struct!(crate::lib::data::MemberListState { items });

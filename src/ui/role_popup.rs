@@ -85,7 +85,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             Frame::new()
                 .fill(palette.overlay)
                 .stroke(Stroke::new(1.0, palette.outline))
-                .corner_radius(CornerRadius::same(theme::RADIUS + 2))
+                .corner_radius(CornerRadius::same(theme::radius() + 2))
                 .inner_margin(Margin::same(12))
                 .shadow(egui::epaint::Shadow { offset: [0, 8], blur: 24, spread: 0, color: palette.shadow })
                 .show(ui, |ui| {

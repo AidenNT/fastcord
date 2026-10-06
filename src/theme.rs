@@ -13,7 +13,7 @@
 //! No se puede compilar de forma standalone sin esas piezas: pegalo en tu
 //! proyecto real, donde ya existen.
 
-use egui::{Color32, CornerRadius, Response, Sense, Stroke, Vec2};
+use egui::{Color32, CornerRadius, Frame, Margin, Response, Sense, Stroke, Vec2};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -46,46 +46,74 @@ impl Palette {
     pub fn dark() -> Self {
         Self {
             dark: true,
-            window: Color32::from_rgb(0x0f, 0x11, 0x14),
-            panel: Color32::from_rgb(0x15, 0x18, 0x1c),
-            surface: Color32::from_rgb(0x1d, 0x21, 0x27),
-            surface_hover: Color32::from_rgb(0x26, 0x2b, 0x33),
-            surface_active: Color32::from_rgb(0x2f, 0x35, 0x3f),
-            outline: Color32::from_rgb(0x2a, 0x30, 0x38),
-            text: Color32::from_rgb(0xf2, 0xf4, 0xf6),
-            secondary: Color32::from_rgb(0xa9, 0xb1, 0xbc),
-            dim: Color32::from_rgb(0x6e, 0x77, 0x84),
-            accent: Color32::from_rgb(0x1e, 0xd7, 0x60),
-            accent_hover: Color32::from_rgb(0x3c, 0xe8, 0x7a),
-            on_accent: Color32::from_rgb(0x0a, 0x14, 0x0e),
-            danger: Color32::from_rgb(0xf5, 0x71, 0x7f),
-            warning: Color32::from_rgb(0xf2, 0xb8, 0x5c),
-            overlay: Color32::from_rgb(0x22, 0x27, 0x2e),
-            shadow: Color32::from_black_alpha(140),
-            window_solid: Color32::from_rgb(0x0f, 0x11, 0x14),
+            window: Color32::from_rgb(0x0e, 0x0f, 0x14),
+            panel: Color32::from_rgb(0x14, 0x16, 0x1d),
+            surface: Color32::from_rgb(0x1b, 0x1e, 0x27),
+            surface_hover: Color32::from_rgb(0x24, 0x28, 0x36),
+            surface_active: Color32::from_rgb(0x2d, 0x32, 0x43),
+            outline: Color32::from_rgb(0x26, 0x2a, 0x38),
+            text: Color32::from_rgb(0xee, 0xf0, 0xf6),
+            secondary: Color32::from_rgb(0xa6, 0xad, 0xc0),
+            dim: Color32::from_rgb(0x6b, 0x73, 0x89),
+            accent: Color32::from_rgb(0x7c, 0x8c, 0xff),
+            accent_hover: Color32::from_rgb(0x96, 0xa3, 0xff),
+            on_accent: Color32::from_rgb(0x0b, 0x0d, 0x1a),
+            danger: Color32::from_rgb(0xff, 0x7a, 0x8a),
+            warning: Color32::from_rgb(0xf4, 0xbf, 0x75),
+            overlay: Color32::from_rgb(0x1a, 0x1d, 0x27),
+            shadow: Color32::from_black_alpha(120),
+            window_solid: Color32::from_rgb(0x0e, 0x0f, 0x14),
+        }
+    }
+
+    /// Paleta "CreArts": grises tipo Discord clásico con acento azul violáceo.
+    /// Colores tomados de la captura de referencia (fondo #36393f, tarjetas
+    /// #2f3237, fila activa #4b4e52, acento #6675fb). Pensada para la
+    /// interfaz nueva (`Usar nueva interfaz`), donde las tarjetas son MÁS
+    /// OSCURAS que el fondo de la ventana.
+    pub fn crearts() -> Self {
+        Self {
+            dark: true,
+            window: Color32::from_rgb(0x36, 0x39, 0x3f),
+            panel: Color32::from_rgb(0x2f, 0x32, 0x37),
+            surface: Color32::from_rgb(0x36, 0x39, 0x3f),
+            surface_hover: Color32::from_rgb(0x3f, 0x42, 0x49),
+            surface_active: Color32::from_rgb(0x4b, 0x4e, 0x52),
+            outline: Color32::from_rgb(0x3f, 0x42, 0x49),
+            text: Color32::from_rgb(0xff, 0xff, 0xff),
+            secondary: Color32::from_rgb(0xa0, 0xa2, 0xa7),
+            dim: Color32::from_rgb(0x7d, 0x80, 0x86),
+            accent: Color32::from_rgb(0x66, 0x75, 0xfb),
+            accent_hover: Color32::from_rgb(0x7f, 0x8c, 0xfc),
+            on_accent: Color32::from_rgb(0xff, 0xff, 0xff),
+            danger: Color32::from_rgb(0xed, 0x42, 0x45),
+            warning: Color32::from_rgb(0xf0, 0xb2, 0x32),
+            overlay: Color32::from_rgb(0x2b, 0x2d, 0x31),
+            shadow: Color32::from_black_alpha(120),
+            window_solid: Color32::from_rgb(0x36, 0x39, 0x3f),
         }
     }
 
     pub fn light() -> Self {
         Self {
             dark: false,
-            window: Color32::from_rgb(0xf8, 0xf9, 0xfb),
+            window: Color32::from_rgb(0xf4, 0xf5, 0xfa),
             panel: Color32::from_rgb(0xff, 0xff, 0xff),
-            surface: Color32::from_rgb(0xee, 0xf0, 0xf3),
-            surface_hover: Color32::from_rgb(0xe3, 0xe6, 0xeb),
-            surface_active: Color32::from_rgb(0xd7, 0xdb, 0xe1),
-            outline: Color32::from_rgb(0xdd, 0xe1, 0xe6),
-            text: Color32::from_rgb(0x14, 0x17, 0x1a),
-            secondary: Color32::from_rgb(0x53, 0x5b, 0x66),
-            dim: Color32::from_rgb(0x8b, 0x93, 0x9e),
-            accent: Color32::from_rgb(0x15, 0xa6, 0x4a),
-            accent_hover: Color32::from_rgb(0x12, 0x8f, 0x40),
-            on_accent: Color32::WHITE,
-            danger: Color32::from_rgb(0xd6, 0x3b, 0x4c),
+            surface: Color32::from_rgb(0xec, 0xee, 0xf6),
+            surface_hover: Color32::from_rgb(0xe1, 0xe4, 0xf0),
+            surface_active: Color32::from_rgb(0xd4, 0xd8, 0xe8),
+            outline: Color32::from_rgb(0xdf, 0xe2, 0xee),
+            text: Color32::from_rgb(0x16, 0x18, 0x24),
+            secondary: Color32::from_rgb(0x57, 0x5d, 0x73),
+            dim: Color32::from_rgb(0x8d, 0x93, 0xa8),
+            accent: Color32::from_rgb(0x5b, 0x6c, 0xf0),
+            accent_hover: Color32::from_rgb(0x4a, 0x5a, 0xd8),
+            on_accent: Color32::from_rgb(0xff, 0xff, 0xff),
+            danger: Color32::from_rgb(0xd8, 0x40, 0x5a),
             warning: Color32::from_rgb(0xb8, 0x7a, 0x14),
             overlay: Color32::from_rgb(0xff, 0xff, 0xff),
             shadow: Color32::from_black_alpha(50),
-            window_solid: Color32::from_rgb(0xf8, 0xf9, 0xfb),
+            window_solid: Color32::from_rgb(0xf4, 0xf5, 0xfa),
         }
     }
 
@@ -110,8 +138,128 @@ impl Palette {
     }
 }
 
-pub const RADIUS: u8 = 8;
-pub const RADIUS_SMALL: u8 = 4;
+static MODERN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Activa o desactiva la interfaz nueva: las barras flotantes (llamada y
+/// usuario). El diseño suave de base (paleta, radios, espaciado) está siempre
+/// activo. Es un global porque lo leen varias vistas que solo reciben `&Palette`.
+pub fn set_modern(on: bool) {
+    MODERN.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `true` con la interfaz nueva (barras flotantes) activada.
+pub fn is_modern() -> bool {
+    MODERN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Radio estándar de tarjetas y campos.
+pub fn radius() -> u8 {
+    12
+}
+
+/// Radio chico de chips y botones.
+pub fn radius_small() -> u8 {
+    6
+}
+
+/// Radio de las tarjetas flotantes de la interfaz nueva.
+pub const CARD_RADIUS: u8 = 18;
+
+/// Hueco entre tarjetas/píldoras de la interfaz nueva.
+pub const GAP: i8 = 16;
+
+/// Alto de las píldoras flotantes de arriba (buscador, pestañas, íconos).
+pub const PILL_H: f32 = 46.0;
+
+/// Radio de esas píldoras.
+pub const PILL_RADIUS: u8 = 18;
+
+/// Color "hundido" para campos de búsqueda dentro de una tarjeta (#212327
+/// con la paleta CreArts).
+pub fn inset(palette: &Palette) -> Color32 {
+    mix(palette.panel, Color32::BLACK, 0.30)
+}
+
+/// Color de la barra de título fina de la interfaz nueva.
+pub fn titlebar_color(palette: &Palette) -> Color32 {
+    mix(palette.window_solid, Color32::BLACK, 0.28)
+}
+
+/// Marco de una píldora flotante (buscador, pestañas, íconos de arriba).
+pub fn pill_frame(palette: &Palette) -> Frame {
+    Frame::new()
+        .fill(palette.panel)
+        .stroke(Stroke::new(1.0, palette.outline))
+        .corner_radius(CornerRadius::same(PILL_RADIUS))
+}
+
+/// Mezcla `a` hacia `b` en `t` (0..=1).
+pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let ch = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgba_unmultiplied(
+        ch(a.r(), b.r()),
+        ch(a.g(), b.g()),
+        ch(a.b(), b.b()),
+        ch(a.a(), b.a()),
+    )
+}
+
+/// Marco de un panel de la interfaz nueva: una tarjeta redondeada que flota
+/// sobre el fondo de la ventana, con aire alrededor (`left`/`right` son los
+/// huecos laterales; arriba y abajo son fijos). Con la interfaz clásica
+/// devuelve `classic` sin tocar, así cada vista elige su marco original.
+pub fn card_frame(palette: &Palette, classic: Frame, inner: i8, left: i8, right: i8) -> Frame {
+    if !is_modern() {
+        return classic;
+    }
+    // Interfaz nueva: todas las tarjetas se separan GAP entre sí (GAP/2 de
+    // cada lado) y el hueco con arriba lo pone la fila de píldoras
+    // (`ui::topbar::show_row`); los argumentos `left`/`right` de la clásica
+    // se ignoran para que el espaciado sea parejo en todas las pantallas.
+    let _ = (left, right);
+    Frame::new()
+        .fill(palette.panel)
+        .stroke(Stroke::new(1.0, palette.outline))
+        .corner_radius(CornerRadius::same(CARD_RADIUS))
+        .outer_margin(Margin { left: GAP / 2, right: GAP / 2, top: 0, bottom: GAP })
+        .inner_margin(Margin::same(inner))
+}
+
+/// Fondo de una fila de lista sin seleccionar ni hover: el de la ventana en
+/// la interfaz clásica y el de la tarjeta (`panel`) en la nueva.
+pub fn row_bg(palette: &Palette) -> Color32 {
+    if is_modern() { palette.panel } else { palette.window }
+}
+
+/// Relleno de una fila de lista (canal, DM, pestaña): en la interfaz nueva
+/// la fila seleccionada se tiñe con el acento y el hover es más suave.
+pub fn row_fill(palette: &Palette, selected: bool, hovered: bool) -> Color32 {
+    if is_modern() {
+        if selected {
+            palette.surface_active
+        } else if hovered {
+            palette.surface_hover
+        } else {
+            palette.panel
+        }
+    } else if selected || hovered {
+        palette.surface_hover
+    } else {
+        palette.window
+    }
+}
+
+/// Borde del encabezado de cada pantalla: la nueva no lo lleva (las
+/// tarjetas ya delimitan cada zona).
+pub fn header_stroke(palette: &Palette) -> Stroke {
+    if is_modern() {
+        Stroke::NONE
+    } else {
+        Stroke::new(1.0, palette.outline)
+    }
+}
+
 pub const ROW_HEIGHT: f32 = 56.0;
 pub const COMPACT_ROW_HEIGHT: f32 = 48.0;
 /// The compact track list: one line, no cover.
@@ -169,6 +317,7 @@ pub fn install(ctx: &egui::Context) {
 /// Applies the palette to egui's own widgets so dialogs, menus, and text
 /// fields agree with the custom views.
 pub fn apply(ctx: &egui::Context, palette: &Palette) {
+    let modern = true;
     let mut style = (*ctx.global_style()).clone();
     let visuals = &mut style.visuals;
     *visuals = if palette.dark {
@@ -185,24 +334,24 @@ pub fn apply(ctx: &egui::Context, palette: &Palette) {
     visuals.override_text_color = Some(palette.text);
     visuals.weak_text_color = Some(palette.secondary);
     visuals.hyperlink_color = palette.text;
-    visuals.selection.bg_fill = palette.accent.gamma_multiply(0.35);
+    visuals.selection.bg_fill = palette.accent.gamma_multiply(if modern { 0.28 } else { 0.35 });
     visuals.selection.stroke = Stroke::new(1.0, palette.accent);
     visuals.window_stroke = Stroke::new(1.0, palette.outline);
-    visuals.window_corner_radius = CornerRadius::same(RADIUS + 2);
-    visuals.menu_corner_radius = CornerRadius::same(RADIUS);
+    visuals.window_corner_radius = CornerRadius::same(radius() + if modern { 6 } else { 2 });
+    visuals.menu_corner_radius = CornerRadius::same(radius());
     visuals.window_shadow = egui::epaint::Shadow {
-        offset: [0, 6],
-        blur: 24,
+        offset: if modern { [0, 12] } else { [0, 6] },
+        blur: if modern { 40 } else { 24 },
         spread: 0,
         color: palette.shadow,
     };
     visuals.popup_shadow = egui::epaint::Shadow {
-        offset: [0, 4],
-        blur: 16,
+        offset: if modern { [0, 8] } else { [0, 4] },
+        blur: if modern { 28 } else { 16 },
         spread: 0,
         color: palette.shadow,
     };
-    let corner = CornerRadius::same(RADIUS_SMALL + 2);
+    let corner = CornerRadius::same(radius_small() + if modern { 4 } else { 2 });
     for widget in [
         &mut visuals.widgets.inactive,
         &mut visuals.widgets.hovered,
@@ -220,6 +369,9 @@ pub fn apply(ctx: &egui::Context, palette: &Palette) {
     visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, palette.text);
     visuals.widgets.inactive.bg_fill = palette.surface;
     visuals.widgets.inactive.weak_bg_fill = palette.surface;
+    if modern {
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, palette.outline);
+    }
     visuals.widgets.hovered.bg_fill = palette.surface_hover;
     visuals.widgets.hovered.weak_bg_fill = palette.surface_hover;
     visuals.widgets.active.bg_fill = palette.surface_active;
@@ -235,17 +387,17 @@ pub fn apply(ctx: &egui::Context, palette: &Palette) {
     use egui::{FontId, TextStyle};
     style.text_styles = [
         (TextStyle::Small, FontId::new(11.5, Proportional)),
-        (TextStyle::Body, FontId::new(14.0, Proportional)),
-        (TextStyle::Button, FontId::new(14.0, Proportional)),
-        (TextStyle::Heading, FontId::new(22.0, Proportional)),
+        (TextStyle::Body, FontId::new(if modern { 14.5 } else { 14.0 }, Proportional)),
+        (TextStyle::Button, FontId::new(if modern { 14.5 } else { 14.0 }, Proportional)),
+        (TextStyle::Heading, FontId::new(if modern { 24.0 } else { 22.0 }, Proportional)),
         (TextStyle::Monospace, FontId::new(13.0, Monospace)),
     ]
     .into();
-    style.spacing.item_spacing = Vec2::new(8.0, 6.0);
-    style.spacing.button_padding = Vec2::new(12.0, 6.0);
-    style.spacing.interact_size = Vec2::new(40.0, 28.0);
-    style.spacing.menu_margin = egui::Margin::same(6);
-    style.spacing.window_margin = egui::Margin::same(16);
+    style.spacing.item_spacing = if modern { Vec2::new(10.0, 8.0) } else { Vec2::new(8.0, 6.0) };
+    style.spacing.button_padding = if modern { Vec2::new(14.0, 7.0) } else { Vec2::new(12.0, 6.0) };
+    style.spacing.interact_size = if modern { Vec2::new(40.0, 32.0) } else { Vec2::new(40.0, 28.0) };
+    style.spacing.menu_margin = egui::Margin::same(if modern { 8 } else { 6 });
+    style.spacing.window_margin = egui::Margin::same(if modern { 20 } else { 16 });
     style.spacing.scroll = egui::style::ScrollStyle {
         bar_width: 8.0,
         floating_width: 6.0,
@@ -263,7 +415,7 @@ pub fn apply(ctx: &egui::Context, palette: &Palette) {
     };
     style.interaction.selectable_labels = false;
     style.interaction.tooltip_delay = 0.4;
-    style.animation_time = 0.12;
+    style.animation_time = if modern { 0.16 } else { 0.12 };
     style.url_in_tooltip = false;
     ctx.set_global_style(style);
 }
@@ -386,6 +538,7 @@ pub enum Icon {
     ArrowRight,
     AudioLines,
     BadgeCheck,
+    Bell,
     Bookmark,
     BookmarkFilled,
     Car,
@@ -496,6 +649,7 @@ const ICONS: &[(Icon, &str, &[u8])] = icons! {
     ArrowRight => "arrow-right",
     AudioLines => "audio-lines",
     BadgeCheck => "badge-check",
+    Bell => "bell",
     Bookmark => "bookmark",
     BookmarkFilled => "bookmark-filled",
     Car => "car",
@@ -975,6 +1129,9 @@ pub enum ThemeMode {
     /// actual del sistema operativo (ver `sample_wallpaper_color_from_path`
     /// y `App::start_wallpaper_watch`).
     Wallpaper,
+    /// Paleta "CreArts" (grises tipo Discord + acento violáceo), pensada para
+    /// la interfaz nueva. Ver [`Palette::crearts`].
+    CreArts,
     /// Nombre de un tema guardado en `App::custom_themes`.
     Custom(String),
 }

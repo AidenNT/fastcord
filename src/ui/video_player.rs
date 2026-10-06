@@ -269,6 +269,12 @@ fn fit_rect(container: Rect, size: Vec2) -> Rect {
 /// con la cruz de la esquina (`Icon::Shrink`), doble click o `Esc`.
 /// Atajos mientras está a pantalla completa: `Espacio` play/pausa, `←`/`→`
 /// ∓5 s, `↑`/`↓` volumen, `M` silencio.
+/// ¿Hay un video en pantalla completa? (sus atajos —Espacio, M, flechas—
+/// solo andan sin nada enfocado, así que ahí no se redirige lo tipeado).
+pub fn is_fullscreen() -> bool {
+    STATE.with_borrow(|st| st.fullscreen.is_some())
+}
+
 pub fn show_fullscreen(ctx: &egui::Context) {
     STATE.with_borrow_mut(|st| {
         let Some(url) = st.fullscreen.as_ref().map(|f| f.url.clone()) else {

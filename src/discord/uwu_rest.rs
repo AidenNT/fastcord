@@ -46,6 +46,9 @@ use super::models::{
 
 /// Cuántos mensajes se piden por página (igual que en `rest.rs`).
 pub const MESSAGES_PAGE_SIZE: u8 = 20;
+/// Tamaño de la ventana de mensajes cuando se salta a uno puntual
+/// (`around`) y de cada página hacia abajo (`after`).
+pub const MESSAGES_WINDOW_SIZE: u8 = 30;
 
 /// Cuántos posts de foro se piden por página.
 pub const FORUM_PAGE_SIZE: u8 = 25;
@@ -356,6 +359,52 @@ impl UwuRest {
         serde_json::from_value(value).map_err(err)
     }
 
+    /// Mensajes ALREDEDOR de `around_message_id` (`?limit=30&around=<id>`):
+    /// la mitad anteriores y la mitad posteriores, con el propio mensaje en
+    /// el medio. Es lo que se usa para saltar a un mensaje puntual (una
+    /// respuesta citada, el último leído de un canal reciente...) sin
+    /// tener que bajar todo el historial. Como el resto de los pedidos de
+    /// mensajes, llegan del más nuevo al más viejo.
+    pub async fn channel_messages_around(
+        &self,
+        channel_id: &str,
+        limit: u8,
+        around_message_id: &str,
+    ) -> anyhow::Result<Vec<GatewayMessage>> {
+        let mut query = HashMap::new();
+        query.insert("limit".to_string(), limit.to_string());
+        query.insert("around".to_string(), around_message_id.to_string());
+        let path = format!("channels/{channel_id}/messages");
+        let value: Value = self
+            .client
+            .get(&path, Some(query), Some(Self::home()))
+            .await
+            .map_err(err)?;
+        serde_json::from_value(value).map_err(err)
+    }
+
+    /// La página de mensajes POSTERIOR a `after_message_id`
+    /// (`?limit=30&after=<id>`): sirve para seguir bajando cuando la
+    /// ventana cargada no llega hasta el mensaje más nuevo del canal (después
+    /// de un salto con `around`).
+    pub async fn channel_messages_after(
+        &self,
+        channel_id: &str,
+        limit: u8,
+        after_message_id: &str,
+    ) -> anyhow::Result<Vec<GatewayMessage>> {
+        let mut query = HashMap::new();
+        query.insert("limit".to_string(), limit.to_string());
+        query.insert("after".to_string(), after_message_id.to_string());
+        let path = format!("channels/{channel_id}/messages");
+        let value: Value = self
+            .client
+            .get(&path, Some(query), Some(Self::home()))
+            .await
+            .map_err(err)?;
+        serde_json::from_value(value).map_err(err)
+    }
+
     /// Una página de posts de un foro (`GET /channels/{id}/threads/search`,
     /// el mismo endpoint que usa el cliente oficial). `by_creation` ordena
     /// por fecha de creación; si no, por actividad reciente. Cada hilo y
@@ -471,6 +520,46 @@ impl UwuRest {
         if let Some(guild_id) = &ctx.guild_id {
             body["guild_id"] = json!(guild_id);
         }
+        let _: Value = self
+            .client
+            .post("interactions", Some(body), Some(Self::home()))
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// `GET /guilds/{id}/application-command-index` (o `/channels/{id}/...`
+    /// en un DM): los comandos de aplicación que esta cuenta puede usar ahí.
+    pub async fn application_command_index(
+        &self,
+        channel_id: &str,
+        guild_id: Option<&str>,
+    ) -> anyhow::Result<super::slash::CommandIndex> {
+        let path = match guild_id {
+            Some(guild_id) => format!("guilds/{guild_id}/application-command-index"),
+            None => format!("channels/{channel_id}/application-command-index"),
+        };
+        let value: Value = self.client.get(&path, None, Some(Self::home())).await.map_err(err)?;
+        Ok(super::slash::parse_index(&value))
+    }
+
+    /// Ejecuta un slash command (`POST /interactions`, tipo 2). `options` ya
+    /// viene armado (ver `slash::build_options`).
+    pub async fn run_slash_command(
+        &self,
+        ctx: &super::InteractionContext,
+        command: &super::slash::AppCommand,
+        options: Vec<Value>,
+    ) -> anyhow::Result<()> {
+        let body = super::slash::interaction_body(
+            command,
+            options,
+            &ctx.channel_id,
+            ctx.guild_id.as_deref(),
+            &ctx.session_id,
+            &Self::interaction_nonce(),
+        )
+        .map_err(err)?;
         let _: Value = self
             .client
             .post("interactions", Some(body), Some(Self::home()))
@@ -771,6 +860,24 @@ impl UwuRest {
             .await
             .map_err(err)?;
         Ok(())
+    }
+
+    /// `GET /users/@me/affinities/users`: con quién interactuás más (puntaje
+    /// relativo por usuario). Ver `discord::affinities`.
+    pub async fn get_user_affinities(&self) -> anyhow::Result<Value> {
+        self.client
+            .get("users/@me/affinities/users", None, Some(Self::home()))
+            .await
+            .map_err(err)
+    }
+
+    /// `GET /users/@me/affinities/guilds`: qué servers usás más (puntaje
+    /// relativo por server). Ver `discord::affinities`.
+    pub async fn get_guild_affinities(&self) -> anyhow::Result<Value> {
+        self.client
+            .get("users/@me/affinities/guilds", None, Some(Self::home()))
+            .await
+            .map_err(err)
     }
 
     pub async fn get_user(&self, user_id: &str) -> anyhow::Result<User> {

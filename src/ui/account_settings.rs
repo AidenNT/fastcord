@@ -581,7 +581,7 @@ pub fn view(ui: &mut egui::Ui, palette: &Palette, sections: &[Section], settings
     // Aviso de solo lectura, arriba de todo.
     Frame::new()
         .fill(palette.surface)
-        .corner_radius(CornerRadius::same(theme::RADIUS))
+        .corner_radius(CornerRadius::same(theme::radius()))
         .inner_margin(Margin::symmetric(12, 10))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -611,7 +611,7 @@ pub fn view(ui: &mut egui::Ui, palette: &Palette, sections: &[Section], settings
         ui.add_space(8.0);
         Frame::new()
             .fill(palette.surface)
-            .corner_radius(CornerRadius::same(theme::RADIUS))
+            .corner_radius(CornerRadius::same(theme::radius()))
             .inner_margin(Margin::symmetric(14, 8))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());

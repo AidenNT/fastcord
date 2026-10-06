@@ -451,7 +451,7 @@ pub fn show_mention_menu(
             Frame::new()
                 .fill(palette.overlay)
                 .stroke(Stroke::new(1.0, palette.outline))
-                .corner_radius(CornerRadius::same(theme::RADIUS + 2))
+                .corner_radius(CornerRadius::same(theme::radius() + 2))
                 .inner_margin(Margin::same(8))
                 .shadow(egui::epaint::Shadow {
                     offset: [0, 8],
@@ -947,7 +947,7 @@ pub fn show_emoji_picker(
             Frame::new()
                 .fill(palette.overlay)
                 .stroke(Stroke::new(1.0, palette.outline))
-                .corner_radius(CornerRadius::same(theme::RADIUS + 6))
+                .corner_radius(CornerRadius::same(theme::radius() + 6))
                 .inner_margin(Margin::same(10))
                 .shadow(egui::epaint::Shadow {
                     offset: [0, 12],

@@ -32,7 +32,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, palette: &Palette, channel_id: &st
         ui.add_space(24.0);
         Frame::new()
             .fill(palette.surface)
-            .corner_radius(CornerRadius::same(theme::RADIUS))
+            .corner_radius(CornerRadius::same(theme::radius()))
             .inner_margin(Margin::same(10))
             .show(ui, |ui| {
                 // `Frame::show` hereda el layout del contenedor (acá, el

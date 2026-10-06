@@ -643,7 +643,7 @@ fn draw_card(
     action: &mut Option<Action>,
     panel: bool,
 ) -> Rect {
-    let radius: u8 = theme::RADIUS + 6;
+    let radius: u8 = theme::radius() + 6;
     // Ids distintos para la tarjeta del panel y la flotante: pueden estar
     // abiertas a la vez.
     let sfx = if panel { "panel" } else { "popup" };

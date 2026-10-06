@@ -113,12 +113,21 @@ fn thread_side_panel(app: &mut App, ui: &mut egui::Ui, server_index: usize) {
     egui::Panel::right("thread_panel")
         .exact_size(420.0)
         .resizable(false)
-        .frame(Frame::new().fill(palette.window).inner_margin(Margin::same(0)))
+        .frame(theme::card_frame(
+            &palette,
+            Frame::new().fill(palette.window).inner_margin(Margin::same(0)),
+            4,
+            5,
+            10,
+        ))
         .show(ui, |ui| {
-            // Línea que separa el panel del chat.
+            // Línea que separa el panel del chat (la interfaz nueva ya lo
+            // separa con el hueco entre tarjetas).
             let rect = ui.max_rect();
-            ui.painter()
-                .vline(rect.left(), rect.y_range(), Stroke::new(1.0, palette.outline));
+            if !theme::is_modern() {
+                ui.painter()
+                    .vline(rect.left(), rect.y_range(), Stroke::new(1.0, palette.outline));
+            }
 
             Frame::new().inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -164,7 +173,11 @@ fn thread_side_panel(app: &mut App, ui: &mut egui::Ui, server_index: usize) {
                         // Los hilos son cortos: no se pide historial más viejo.
                         false,
                         false,
+                        // Ni hay ventana "en el medio" que seguir bajando.
+                        false,
+                        false,
                         &mut panel.scroll_anchor,
+                        &mut None,
                     )
                 });
             }
@@ -189,6 +202,8 @@ fn thread_side_panel(app: &mut App, ui: &mut egui::Ui, server_index: usize) {
             "Para reaccionar con emojis animados o de otros servidores hace falta Discord Nitro, y tu cuenta no lo tiene. Podés usar los estáticos de este servidor y los Unicode.",
         ),
         crate::ui::chat::ChatEvent::LoadMoreRequested
+        | crate::ui::chat::ChatEvent::LoadNewerRequested
+        | crate::ui::chat::ChatEvent::JumpToMessage { .. }
         | crate::ui::chat::ChatEvent::CreateThread { .. }
         | crate::ui::chat::ChatEvent::None => {}
     }
@@ -200,13 +215,31 @@ fn thread_side_panel(app: &mut App, ui: &mut egui::Ui, server_index: usize) {
 /// se dibuja como columna dentro del panel de navegación combinado
 /// (`ui::nav`).
 pub fn channel_list_content(app: &mut App, ui: &mut egui::Ui, server_index: usize) {
+    channel_list_content_ex(app, ui, server_index, None);
+}
+
+/// Alto del banner del server (interfaz nueva) cuando el server tiene uno.
+pub const BANNER_HEIGHT: f32 = 150.0;
+/// Alto del encabezado con solo el nombre, para servers sin banner.
+pub const NAME_HEADER_HEIGHT: f32 = 56.0;
+
+/// Igual que [`channel_list_content`]. Con `header_pad = Some(alto)` el
+/// encabezado (nombre del server) NO se dibuja acá: lo pinta quien llama
+/// encima de la lista (el banner de `ui::nav`) y la lista deja ese alto libre
+/// arriba, así al scrollear las filas pasan por debajo del banner.
+pub fn channel_list_content_ex(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    server_index: usize,
+    header_pad: Option<f32>,
+) {
     let palette = app.palette;
     let current_channel = app.current_channel;
 
-    {
+    if header_pad.is_none() {
         let server = &app.servers[server_index];
         Frame::new()
-            .stroke(egui::Stroke::new(1.0, palette.outline))
+            .stroke(theme::header_stroke(&palette))
             .inner_margin(Margin::symmetric(12, 12))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -235,7 +268,7 @@ pub fn channel_list_content(app: &mut App, ui: &mut egui::Ui, server_index: usiz
         .id_salt("channel_scroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.add_space(8.0);
+            ui.add_space(header_pad.unwrap_or(0.0) + 8.0);
             let server = &app.servers[server_index];
             for (cat_idx, category) in server.categories.iter().enumerate() {
                 // Categoría cuyos canales no se pueden ver (con tu rol
@@ -288,6 +321,80 @@ pub fn channel_list_content(app: &mut App, ui: &mut egui::Ui, server_index: usiz
     }
 }
 
+/// Banner del server arriba de la lista de canales (interfaz nueva): la
+/// imagen del banner recortada para cubrir el rect, con el nombre del server
+/// y la flechita encima. Sin banner queda un encabezado liso del color del
+/// server. Se pinta DESPUÉS de la lista, que pasa por debajo.
+pub fn paint_server_banner(ui: &mut egui::Ui, palette: &Palette, server: &Server, rect: egui::Rect) {
+    let radius = CornerRadius::same(theme::CARD_RADIUS);
+    let fill = theme::mix(server.icon_color, palette.panel, 0.55);
+    ui.painter().rect_filled(rect, radius, fill);
+
+    let has_image = server.banner_url.is_some();
+    if let Some(url) = server.banner_url.as_ref() {
+        let image = egui::Image::new(crate::ui::anim::plain(url))
+            .corner_radius(radius)
+            .show_loading_spinner(false);
+        // Hasta que la imagen carga no se sabe su proporción: se ve el color liso.
+        let uv = match image.load_for_size(ui.ctx(), rect.size()) {
+            Ok(egui::load::TexturePoll::Ready { texture }) => Some(cover_uv(texture.size, rect.size())),
+            _ => None,
+        };
+        if let Some(uv) = uv {
+            image.uv(uv).paint_at(ui, rect);
+        }
+    }
+    ui.painter()
+        .rect_stroke(rect, radius, Stroke::new(1.0, palette.outline), egui::StrokeKind::Inside);
+
+    // Nombre + flechita: sobre la imagen van en una cinta oscura para que se
+    // lean con cualquier banner.
+    let chip_h = 30.0;
+    let chip_y = if has_image { 10.0 } else { ((rect.height() - chip_h) / 2.0).max(0.0) };
+    let chip = egui::Rect::from_min_size(
+        rect.min + Vec2::new(10.0, chip_y),
+        Vec2::new((rect.width() - 20.0).max(40.0), chip_h),
+    );
+    let text_color = if has_image { egui::Color32::WHITE } else { palette.text };
+    if has_image {
+        ui.painter().rect_filled(chip, CornerRadius::same(12), egui::Color32::from_black_alpha(120));
+    }
+    let name = if server.name.chars().count() > 26 {
+        server.name.chars().take(25).collect::<String>() + "…"
+    } else {
+        server.name.clone()
+    };
+    ui.painter().text(
+        chip.left_center() + Vec2::new(10.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        name,
+        theme::bold(15.0),
+        text_color,
+    );
+    let chevron = egui::Rect::from_center_size(chip.right_center() - Vec2::new(16.0, 0.0), Vec2::splat(13.0));
+    theme::paint_icon(ui, Icon::ChevronDown, chevron, 13.0, text_color);
+}
+
+/// Región (en UV) de una textura de tamaño `tex` que hay que mostrar para que
+/// llene `target` sin deformarse, recortando parejo lo que sobra.
+fn cover_uv(tex: Vec2, target: Vec2) -> egui::Rect {
+    let full = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+    if tex.x <= 0.0 || tex.y <= 0.0 || target.x <= 0.0 || target.y <= 0.0 {
+        return full;
+    }
+    let tex_ratio = tex.x / tex.y;
+    let target_ratio = target.x / target.y;
+    if tex_ratio > target_ratio {
+        let w = target_ratio / tex_ratio;
+        let x0 = (1.0 - w) / 2.0;
+        egui::Rect::from_min_max(egui::pos2(x0, 0.0), egui::pos2(x0 + w, 1.0))
+    } else {
+        let h = tex_ratio / target_ratio;
+        let y0 = (1.0 - h) / 2.0;
+        egui::Rect::from_min_max(egui::pos2(0.0, y0), egui::pos2(1.0, y0 + h))
+    }
+}
+
 /// Fila de un canal de voz: mismo look que `channel_row` pero con un
 /// parlante en vez del `#` de texto (como en el cliente real).
 fn voice_channel_row(
@@ -302,12 +409,8 @@ fn voice_channel_row(
     ui.horizontal(|ui| {
         ui.add_space(8.0);
         let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::click());
-        let bg = if selected || resp.hovered() {
-            palette.surface_hover
-        } else {
-            palette.window
-        };
-        ui.painter().rect_filled(rect, CornerRadius::same(theme::RADIUS_SMALL + 2), bg);
+        let bg = theme::row_fill(palette, selected, resp.hovered());
+        ui.painter().rect_filled(rect, CornerRadius::same(theme::radius_small() + 2), bg);
         let icon_color = if selected { palette.text } else { palette.dim };
         let icon_rect = egui::Rect::from_center_size(rect.left_center() + Vec2::new(18.0, 0.0), Vec2::splat(14.0));
         theme::paint_icon(ui, Icon::Volume2, icon_rect, 14.0, icon_color);
@@ -406,12 +509,8 @@ fn channel_row(ui: &mut egui::Ui, palette: &Palette, name: &str, selected: bool,
     ui.horizontal(|ui| {
         ui.add_space(8.0);
         let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::click());
-        let bg = if selected || resp.hovered() {
-            palette.surface_hover
-        } else {
-            palette.window
-        };
-        ui.painter().rect_filled(rect, CornerRadius::same(theme::RADIUS_SMALL + 2), bg);
+        let bg = theme::row_fill(palette, selected, resp.hovered());
+        ui.painter().rect_filled(rect, CornerRadius::same(theme::radius_small() + 2), bg);
         let color = if selected { palette.text } else { palette.secondary };
         ui.painter().text(
             rect.left_center() + Vec2::new(10.0, 0.0),
@@ -444,7 +543,13 @@ fn member_list_panel(app: &App, ui: &mut egui::Ui, server_index: usize) {
     egui::Panel::right("member_list")
         .exact_size(260.0)
         .resizable(false)
-        .frame(Frame::new().fill(palette.panel).inner_margin(Margin::same(16)))
+        .frame(theme::card_frame(
+            &palette,
+            Frame::new().fill(palette.panel).inner_margin(Margin::same(16)),
+            14,
+            5,
+            10,
+        ))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 theme::icon(ui, Icon::Users, 13.0, palette.accent);
@@ -533,8 +638,19 @@ fn member_initial(name: &str) -> String {
 
 fn central_panel(app: &mut App, ui: &mut egui::Ui, server_index: usize) {
     let palette = app.palette;
+    // A la derecha del chat hay otra tarjeta (miembros o hilo) salvo en un
+    // canal de voz sin hilo abierto: ahí el borde de la ventana queda a 10.
+    let (cat0, chan0) = app.current_channel;
+    let in_voice = app.servers[server_index].channel(cat0, chan0).is_some_and(|c| c.is_voice);
+    let right_gap = if app.thread_panel.is_some() || !in_voice { 5 } else { 10 };
     egui::CentralPanel::default()
-        .frame(Frame::new().fill(palette.window).inner_margin(Margin::same(0)))
+        .frame(theme::card_frame(
+            &palette,
+            Frame::new().fill(palette.window).inner_margin(Margin::same(0)),
+            6,
+            5,
+            right_gap,
+        ))
         .show(ui, |ui| {
             let (cat, chan) = app.current_channel;
             let channel_name = current_channel_name(&app.servers[server_index], cat, chan);
@@ -542,7 +658,9 @@ fn central_panel(app: &mut App, ui: &mut egui::Ui, server_index: usize) {
                 .channel(cat, chan)
                 .map(|c| (c.is_voice, c.is_forum, c.is_thread))
                 .unwrap_or((false, false, false));
-            server_top_bar(ui, &palette, &channel_name, &app.servers[server_index].topic, is_voice);
+            if !theme::is_modern() {
+                server_top_bar(ui, &palette, &channel_name, &app.servers[server_index].topic, is_voice);
+            }
 
             if is_voice {
                 voice_channel_view(app, ui, &palette, server_index, cat, chan, &channel_name);
@@ -653,6 +771,9 @@ fn channel_chat(
         let loading = channel.loading;
         let loading_more = channel.loading_more;
         let has_more = channel.has_more;
+        let has_newer = channel.has_newer;
+        let loading_newer = channel.loading_newer;
+        let viewed_channel_id = channel.channel_id.clone().unwrap_or_default();
         let event = crate::ui::chat::show(
             ui,
             palette,
@@ -668,7 +789,10 @@ fn channel_chat(
             loading,
             loading_more,
             has_more,
+            has_newer,
+            loading_newer,
             &mut app.pending_scroll_anchor,
+            &mut app.pending_jump,
         );
         match event {
             crate::ui::chat::ChatEvent::ForwardRequested => {
@@ -679,6 +803,10 @@ fn channel_chat(
                 );
             }
             crate::ui::chat::ChatEvent::LoadMoreRequested => app.load_more_messages(),
+            crate::ui::chat::ChatEvent::LoadNewerRequested => app.load_newer_messages(),
+            crate::ui::chat::ChatEvent::JumpToMessage { message_id } => {
+                app.jump_to_message(&viewed_channel_id, &message_id)
+            }
             crate::ui::chat::ChatEvent::OpenThread { id, name, owner_id } => {
                 app.open_thread_panel(&id, &name, owner_id)
             }
@@ -716,7 +844,11 @@ fn voice_channel_view(
         egui::Panel::right("voice_chat_panel")
             .exact_size(380.0)
             .resizable(false)
-            .frame(Frame::new().fill(palette.window).inner_margin(Margin::same(0)))
+            .frame(
+                Frame::new()
+                    .fill(if theme::is_modern() { palette.panel } else { palette.window })
+                    .inner_margin(Margin::same(0)),
+            )
             .show(ui, |ui| {
                 let rect = ui.max_rect();
                 ui.painter()
@@ -767,7 +899,7 @@ fn current_channel_name(server: &Server, cat: usize, chan: usize) -> String {
 
 fn server_top_bar(ui: &mut egui::Ui, palette: &Palette, channel_name: &str, topic: &str, is_voice: bool) {
     Frame::new()
-        .stroke(egui::Stroke::new(1.0, palette.outline))
+        .stroke(theme::header_stroke(palette))
         .inner_margin(Margin::symmetric(16, 10))
         .show(ui, |ui| {
             ui.horizontal(|ui| {

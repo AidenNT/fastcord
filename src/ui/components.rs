@@ -181,7 +181,7 @@ fn draw(
         // Contenedor: caja con la barra de color a la izquierda (el
         // `accent_color`), como un embed.
         17 => {
-            let radius = theme::RADIUS_SMALL;
+            let radius = theme::radius_small();
             let bar_color = component.accent_color.map(rgb_from_int).unwrap_or(palette.outline);
             let inner = Frame::new()
                 .fill(palette.surface)
@@ -282,7 +282,7 @@ fn button(
             foreground = foreground.gamma_multiply(0.5);
         }
         ui.painter()
-            .rect_filled(rect, CornerRadius::same(theme::RADIUS_SMALL), background);
+            .rect_filled(rect, CornerRadius::same(theme::radius_small()), background);
 
         // Cargando: el spinner va centrado en lugar del emoji y el texto. El
         // botón no cambia de tamaño (el chat cachea la altura de las filas).
@@ -370,7 +370,7 @@ fn select_placeholder(ui: &mut egui::Ui, palette: &Palette, component: &Componen
     Frame::new()
         .fill(palette.surface)
         .stroke(Stroke::new(1.0, palette.outline))
-        .corner_radius(CornerRadius::same(theme::RADIUS_SMALL))
+        .corner_radius(CornerRadius::same(theme::radius_small()))
         .inner_margin(Margin::symmetric(10, 7))
         .show(ui, |ui| {
             ui.set_width(220.0);

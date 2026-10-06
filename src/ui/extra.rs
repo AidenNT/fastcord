@@ -15,6 +15,8 @@ use crate::ui::theme::{self, Palette};
 /// reusamos los que más se parecen.
 pub fn status_color(status: Status, palette: &Palette) -> Color32 {
     match status {
+        // Interfaz nueva: verde de presencia, como en Discord.
+        Status::Online if theme::is_modern() => Color32::from_rgb(0x37, 0xa6, 0x62),
         Status::Online => palette.accent,
         Status::Idle => palette.warning,
         Status::Dnd => palette.danger,
@@ -59,9 +61,53 @@ pub fn avatar(
     initial: &str,
     palette: &Palette,
 ) {
+    avatar_rounded(ui, center, radius, radius, avatar_url, bg, initial, palette);
+}
+
+/// Placeholder cuadrado redondeado (íconos de servidor de la interfaz nueva).
+fn avatar_square(
+    ui: &mut egui::Ui,
+    center: Pos2,
+    radius: f32,
+    corner: f32,
+    bg: Color32,
+    initial: &str,
+    palette: &Palette,
+) {
+    let rect = Rect::from_center_size(center, Vec2::splat(radius * 2.0));
+    ui.painter().rect_filled(rect, CornerRadius::same(corner.min(255.0) as u8), bg);
+    ui.painter().text(
+        center,
+        egui::Align2::CENTER_CENTER,
+        initial,
+        theme::semibold(radius * 0.9),
+        palette.text,
+    );
+}
+
+/// Igual que [`avatar`] pero con esquinas de radio `corner`: con
+/// `corner == radius` es un círculo; con uno menor, un cuadrado redondeado
+/// (el ícono de servidor de la interfaz nueva).
+pub fn avatar_rounded(
+    ui: &mut egui::Ui,
+    center: Pos2,
+    radius: f32,
+    corner: f32,
+    avatar_url: Option<&str>,
+    bg: Color32,
+    initial: &str,
+    palette: &Palette,
+) {
+    let placeholder = |ui: &mut egui::Ui| {
+        if corner >= radius {
+            avatar_circle(ui, center, radius, bg, initial, palette);
+        } else {
+            avatar_square(ui, center, radius, corner, bg, initial, palette);
+        }
+    };
     let Some(url) = avatar_url.filter(|u| !u.is_empty() && !crate::ui::anim::hide_profile_images()) else {
         // Sin URL: el círculo de color + inicial es el resultado final.
-        avatar_circle(ui, center, radius, bg, initial, palette);
+        placeholder(ui);
         return;
     };
 
@@ -82,7 +128,7 @@ pub fn avatar(
     // queda en RAM. Al scrollear hasta la fila aparece el círculo y enseguida
     // la imagen.
     if !ui.is_rect_visible(rect) {
-        avatar_circle(ui, center, radius, bg, initial, palette);
+        placeholder(ui);
         return;
     }
     let source = if radius >= 32.0 || ui.rect_contains_pointer(rect) {
@@ -95,7 +141,7 @@ pub fn avatar(
         crate::ui::anim::plain(&crate::ui::anim::fit_cdn_size(&crate::ui::anim::static_url(url), px))
     };
     let image = egui::Image::new(source)
-        .corner_radius(CornerRadius::same(radius.min(255.0) as u8))
+        .corner_radius(CornerRadius::same(corner.min(255.0) as u8))
         .fit_to_exact_size(size)
         // Sin spinner: el círculo de abajo ya hace de placeholder mientras
         // carga.
@@ -116,7 +162,7 @@ pub fn avatar(
             ui.put(Rect::from_center_size(center, size), image);
         }
         _ => {
-            avatar_circle(ui, center, radius, bg, initial, palette);
+            placeholder(ui);
         }
     }
 }

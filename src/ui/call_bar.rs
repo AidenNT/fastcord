@@ -68,7 +68,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, width: f32) {
                 Frame::new()
                     .fill(extra::blend(palette.surface, palette.accent, 0.10))
                     .stroke(Stroke::new(1.0, extra::blend(palette.outline, palette.accent, 0.3)))
-                    .corner_radius(CornerRadius::same(theme::RADIUS + 2))
+                    .corner_radius(CornerRadius::same(theme::radius() + 2))
                     .inner_margin(Margin::symmetric(10, 0))
                     .show(ui, |ui| {
                         ui.set_width((width - SIDE_MARGIN * 2.0).max(0.0));
@@ -181,7 +181,10 @@ pub const BOTTOM_HEIGHT: f32 = 64.0;
 const BOTTOM_AVATAR: f32 = 32.0;
 const BOTTOM_ICON: f32 = 18.0;
 const BOX_BUTTON: Vec2 = Vec2::new(56.0, 36.0);
-const BUTTON_RADIUS: u8 = 10;
+/// Radio de botones y píldoras: más redondo en la interfaz nueva.
+fn button_radius() -> u8 {
+    if theme::is_modern() { 14 } else { 10 }
+}
 /// Máximo de caracteres del nombre del canal en la píldora (con la ventana
 /// angosta, un nombre largo empujaría los botones fuera de la barra).
 const MAX_CHANNEL_CHARS: usize = 22;
@@ -221,16 +224,41 @@ pub fn show_bottom(app: &mut App, ui: &mut egui::Ui) {
     let mut settings_clicked = false;
     let mut goto_clicked = false;
 
-    egui::Panel::bottom("call_bar_bottom")
-        .exact_size(BOTTOM_HEIGHT)
-        .resizable(false)
-        .frame(
+    // Interfaz nueva: la barra flota como una tarjeta redondeada con aire
+    // alrededor, hermana de la barra de usuario del panel izquierdo (mismo
+    // fondo, mismo borde teñido con el acento).
+    let modern = theme::is_modern();
+    let (panel_height, panel_frame) = if modern {
+        (
+            BOTTOM_HEIGHT + 16.0,
+            Frame::new()
+                .fill(palette.window)
+                .inner_margin(Margin::symmetric(26, 8)),
+        )
+    } else {
+        (
+            BOTTOM_HEIGHT,
             Frame::new()
                 .fill(palette.window)
                 .stroke(Stroke::new(1.0, palette.outline))
                 .inner_margin(Margin::symmetric(16, 0)),
         )
+    };
+    egui::Panel::bottom("call_bar_bottom")
+        .exact_size(panel_height)
+        .resizable(false)
+        .frame(panel_frame)
         .show(ui, |ui| {
+            if modern {
+                let card = ui.max_rect().expand2(Vec2::new(16.0, 0.0));
+                ui.painter().rect(
+                    card,
+                    CornerRadius::same(22),
+                    extra::blend(palette.panel, palette.accent, 0.08),
+                    Stroke::new(1.0, extra::blend(palette.outline, palette.accent, 0.35)),
+                    egui::StrokeKind::Inside,
+                );
+            }
             ui.spacing_mut().item_spacing.x = 8.0;
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                 // --- Izquierda: quién soy + estado de la conexión ---
@@ -340,7 +368,7 @@ fn status_pill(
     Frame::new()
         .fill(palette.panel)
         .stroke(Stroke::new(1.0, palette.outline))
-        .corner_radius(CornerRadius::same(BUTTON_RADIUS))
+        .corner_radius(CornerRadius::same(button_radius()))
         .inner_margin(Margin::symmetric(12, 8))
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
@@ -393,7 +421,7 @@ fn box_button(
     if ui.is_rect_visible(rect) {
         let fill = if enabled && response.hovered() { palette.surface_hover } else { palette.surface };
         let tint = if enabled { palette.text } else { palette.dim };
-        ui.painter().rect_filled(rect, CornerRadius::same(BUTTON_RADIUS), fill);
+        ui.painter().rect_filled(rect, CornerRadius::same(button_radius()), fill);
         theme::paint_icon(ui, icon, rect, BOTTOM_ICON, tint);
     }
     let response = if enabled {
@@ -423,7 +451,7 @@ fn disconnect_button(ui: &mut egui::Ui, palette: &crate::ui::theme::Palette) -> 
         } else {
             palette.danger
         };
-        ui.painter().rect_filled(rect, CornerRadius::same(BUTTON_RADIUS), fill);
+        ui.painter().rect_filled(rect, CornerRadius::same(button_radius()), fill);
         let icon_rect = egui::Rect::from_center_size(
             egui::pos2(rect.left() + pad_x + icon_size / 2.0, rect.center().y),
             Vec2::splat(icon_size),

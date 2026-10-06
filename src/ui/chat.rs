@@ -16,9 +16,12 @@ use crate::ui::markdown::MentionCtx;
 use crate::ui::theme::{self, Icon, Palette};
 
 const COMPOSER_HEIGHT: f32 = 64.0;
-/// Alto del banner "Respondiendo a..." que aparece arriba del composer
-/// mientras hay una respuesta en curso (ver `composer`).
-const REPLY_BANNER_HEIGHT: f32 = 30.0;
+/// Alto máximo de la caja de texto: pasado esto, scrollea en vez de crecer.
+const COMPOSER_TEXT_MAX_HEIGHT: f32 = 150.0;
+/// Banner "Respondiendo a..." arriba del compositor (con su espaciado).
+const REPLY_BANNER_HEIGHT: f32 = 36.0;
+/// Barra `/comando` + descripción arriba del formulario de un slash command.
+const SLASH_HEADER_HEIGHT: f32 = 40.0;
 /// Ancho del avatar (36px) + el espaciado por defecto de egui entre
 /// widgets de un `horizontal` (8px, ver `theme::apply`) + el padding
 /// izquierdo de la fila (16px). Los mensajes agrupados (sin avatar propio)
@@ -146,6 +149,25 @@ fn scoped_id(name: &'static str) -> egui::Id {
     egui::Id::new((name, scope()))
 }
 
+fn type_to_focus_key() -> egui::Id {
+    egui::Id::new("ecord_type_to_focus_allowed")
+}
+
+/// ¿Lo tipeado sin ningún campo enfocado puede ir al compositor / formulario?
+pub fn type_to_focus_allowed(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp(type_to_focus_key())).unwrap_or(false)
+}
+
+fn last_composer_key() -> egui::Id {
+    egui::Id::new("ecord_last_composer")
+}
+
+/// `App::ui` avisa en cada frame si lo tipeado sin ningún campo enfocado puede
+/// ir al compositor (no, si hay un diálogo, ajustes, un visor, etc. encima).
+pub fn set_type_to_focus_allowed(ctx: &egui::Context, allowed: bool) {
+    ctx.data_mut(|d| d.insert_temp(type_to_focus_key(), allowed));
+}
+
 /// Lo que el usuario hizo este frame sobre alguna fila de mensaje (además de
 /// reaccionar, que va aparte por `toggled_reaction`). Cada fila lo va
 /// llenando mientras se dibuja y `show` lo convierte en un [`ChatEvent`].
@@ -157,6 +179,8 @@ struct RowActions {
     create_thread: Option<(String, String, String)>,
     /// Botón de bot apretado.
     component: Option<ComponentClick>,
+    /// Click en la cita de una respuesta: id del mensaje original al que ir.
+    jump_to: Option<String>,
 }
 
 /// Resultado de un frame de `show`: casi siempre `None`, salvo cuando el
@@ -185,6 +209,13 @@ pub enum ChatEvent {
     CreateThread { channel_id: String, message_id: String, name: String },
     /// Se apretó un botón de un bot (`App::press_component`).
     Component(ComponentClick),
+    /// El usuario llegó abajo del todo de una ventana que NO termina en el
+    /// mensaje más nuevo del canal (`has_newer`): hay que pedir la página
+    /// posterior (`App::load_newer_messages`, `?after=<id>`).
+    LoadNewerRequested,
+    /// Click en la cita de una respuesta: ir al mensaje original
+    /// (`App::jump_to_message`).
+    JumpToMessage { message_id: String },
 }
 
 /// Dibuja la lista de mensajes (scrollable) + el input de abajo. Si el
@@ -234,14 +265,39 @@ pub fn show(
     // `false` no se dispara ningún pedido nuevo aunque el usuario llegue
     // arriba del todo. Ver `Friend::has_more` / `Channel::has_more`.
     has_more: bool,
+    // La lista NO llega hasta el mensaje más nuevo del canal (se saltó a un
+    // mensaje con `around`): abajo del todo hay que seguir pidiendo con
+    // `after`. Ver `Friend::has_newer` / `Channel::has_newer`.
+    has_newer: bool,
+    // Hay un pedido de la página posterior (`after`) en curso — spinner
+    // abajo del todo de la lista.
+    loading_newer: bool,
     // Id del mensaje al que hay que volver a anclar el scroll apenas
     // vuelva a aparecer en `messages` (después de que se antepuso una
     // página más vieja) — ver `App::pending_scroll_anchor`. Se consume
     // (se pone en `None`) una sola vez, apenas se aplica.
     scroll_anchor: &mut Option<String>,
+    // Mensaje al que hay que llevar el scroll (centrado) apenas aparezca en
+    // `messages` — ver `App::pending_jump`. También se consume una sola vez.
+    jump_target: &mut Option<String>,
 ) -> ChatEvent {
+    // Alto que se reserva para el compositor: el base + lo que suman la barra
+    // de respuesta, la del slash command y las líneas de más de la caja de
+    // texto (esto último, medido en el frame anterior y siempre acotado: la
+    // caja scrollea pasado `COMPOSER_TEXT_MAX_HEIGHT`). Todo es de alto
+    // conocido, así que no hay forma de que se retroalimente y el compositor
+    // se vaya corriendo solo.
     let reply_banner_extra = if reply_target.is_some() { REPLY_BANNER_HEIGHT } else { 0.0 };
-    let list_height = (ui.available_height() - COMPOSER_HEIGHT - reply_banner_extra).max(80.0);
+    let slash_form_open =
+        crate::ui::slash::load_active(ui.ctx(), scoped_id("ecord_composer_slash_active")).is_some();
+    let slash_extra = if slash_form_open { SLASH_HEADER_HEIGHT } else { 0.0 };
+    let text_extra: f32 = ui
+        .ctx()
+        .memory(|m| m.data.get_temp(scoped_id("ecord_composer_text_extra")))
+        .unwrap_or(0.0_f32)
+        .clamp(0.0, COMPOSER_TEXT_MAX_HEIGHT);
+    let list_height =
+        (ui.available_height() - COMPOSER_HEIGHT - reply_banner_extra - slash_extra - text_extra).max(80.0);
     // Justo el frame en que termina la carga inicial de este canal/DM
     // (`loading`: true -> false, mismo frame en que ya aparecen sus
     // mensajes) el `ScrollArea` de acá abajo todavía no tuvo chance de
@@ -279,6 +335,7 @@ pub fn show(
     let mut nitro_required = false;
     let mut forward_requested = false;
     let mut load_more_requested = false;
+    let mut load_newer_requested = false;
     // Qué mensaje tiene abierto el panel de "más reacciones" (botón "+"
     // de la barra flotante), leído UNA sola vez al principio del frame.
     // El click que lo abre recién queda guardado para el próximo frame
@@ -387,6 +444,7 @@ pub fn show(
                     loading_more_row(ui, palette);
                 } else if has_more
                     && scroll_anchor.is_none()
+                    && jump_target.is_none()
                     && !pointer_held
                     && !load_more_locked(ui.ctx())
                     && ui.is_rect_visible(sentinel_rect)
@@ -540,6 +598,21 @@ pub fn show(
                     // en camino hacia esta fila.
                     lock_load_more_until_settled(ui.ctx());
                 }
+                // Ir a un mensaje puntual (`App::pending_jump`): se centra la
+                // fila en el scroll y se resalta un rato, como el cliente real.
+                if !messages[i].id.is_empty() && jump_target.as_deref() == Some(messages[i].id.as_str()) {
+                    ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
+                    start_jump_highlight(ui.ctx(), &messages[i].id);
+                    *jump_target = None;
+                    lock_load_more_until_settled(ui.ctx());
+                }
+                if let Some(strength) = jump_highlight_strength(ui.ctx(), &messages[i].id) {
+                    ui.painter().rect_filled(
+                        row_rect.expand2(Vec2::new(8.0, 1.0)),
+                        CornerRadius::same(theme::radius_small() + 2),
+                        palette.accent.gamma_multiply(0.22 * strength),
+                    );
+                }
                 // El espacio que va DESPUÉS de esta fila depende de si la
                 // PRÓXIMA fila la va a continuar en la misma racha — no de
                 // si esta fila continuó la racha anterior (`grouped`, que
@@ -555,6 +628,25 @@ pub fn show(
                     .map(|next| next.kind != 18 && messages[i].kind != 18 && next.same_author(&messages[i]))
                     .unwrap_or(false);
                 ui.add_space(if next_is_grouped { GROUPED_SPACING } else { NEW_GROUP_SPACING });
+            }
+            // Ventana que no termina en el último mensaje del canal: abajo
+            // del todo se piden los siguientes (`?after=<id>`).
+            if has_newer && !messages.is_empty() {
+                if loading_newer {
+                    loading_more_row(ui, palette);
+                } else {
+                    let (bottom_rect, _) =
+                        ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+                    let pointer_held = ui.ctx().input(|i| i.pointer.primary_down());
+                    if scroll_anchor.is_none()
+                        && jump_target.is_none()
+                        && !pointer_held
+                        && !load_more_locked(ui.ctx())
+                        && ui.is_rect_visible(bottom_rect)
+                    {
+                        load_newer_requested = true;
+                    }
+                }
             }
             ui.add_space(8.0);
 
@@ -639,12 +731,16 @@ pub fn show(
         ChatEvent::CreateThread { channel_id, message_id, name }
     } else if let Some(click) = actions.component {
         ChatEvent::Component(click)
+    } else if let Some(message_id) = actions.jump_to {
+        ChatEvent::JumpToMessage { message_id }
     } else if forward_requested {
         ChatEvent::ForwardRequested
     } else if nitro_required {
         ChatEvent::NitroRequired
     } else if load_more_requested {
         ChatEvent::LoadMoreRequested
+    } else if load_newer_requested {
+        ChatEvent::LoadNewerRequested
     } else {
         ChatEvent::None
     }
@@ -789,7 +885,13 @@ fn paint_backlight(ui: &egui::Ui, palette: &Palette, rect: egui::Rect) {
         egui::pos2(rect.left() - 8.0, rect.top() - 1.0),
         egui::pos2(rect.right() + 8.0, rect.bottom() + 1.0),
     );
-    ui.painter().rect_filled(highlight_rect, CornerRadius::same(theme::RADIUS_SMALL + 2), palette.surface_hover);
+    // Interfaz nueva: el resalte es una tarjetita más redondeada y suave.
+    let (radius, fill) = if theme::is_modern() {
+        (theme::radius_small() + 6, palette.surface)
+    } else {
+        (theme::radius_small() + 2, palette.surface_hover)
+    };
+    ui.painter().rect_filled(highlight_rect, CornerRadius::same(radius), fill);
 }
 
 fn reaction_panel_memory_id() -> egui::Id {
@@ -835,7 +937,9 @@ fn message_row(
     // el mensaje.
     ui.vertical(|ui| {
     if let Some(replied) = &msg.replied_to {
-        reply_preview_row(ui, palette, replied);
+        if reply_preview_row(ui, palette, replied) {
+            actions.jump_to = Some(replied.message_id.clone());
+        }
     }
     if let Some(line) = &msg.interaction {
         interaction_row(ui, palette, line);
@@ -991,8 +1095,9 @@ fn interaction_row(ui: &mut egui::Ui, palette: &Palette, line: &crate::lib::data
 /// mensaje como respuesta pero no mandó el original embebido (se borró, o
 /// es muy viejo), se avisa en vez de mostrar un autor/preview que no
 /// tenemos (ver `RepliedMessage::deleted`).
-fn reply_preview_row(ui: &mut egui::Ui, palette: &Palette, replied: &RepliedMessage) {
-    ui.horizontal(|ui| {
+/// Devuelve `true` si se clickeó la cita (y se sabe a qué mensaje ir).
+fn reply_preview_row(ui: &mut egui::Ui, palette: &Palette, replied: &RepliedMessage) -> bool {
+    let row = ui.horizontal(|ui| {
         ui.set_min_width(ui.available_width());
         ui.spacing_mut().item_spacing.x = 4.0;
         // Reserva el mismo ancho que el avatar + su padding (`AVATAR_GUTTER`)
@@ -1016,6 +1121,44 @@ fn reply_preview_row(ui: &mut egui::Ui, palette: &Palette, replied: &RepliedMess
             }
         }
     });
+    if replied.deleted || replied.message_id.is_empty() {
+        return false;
+    }
+    ui.interact(row.response.rect, row.response.id.with("reply_jump"), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
+}
+
+fn jump_highlight_memory_id() -> egui::Id {
+    scoped_id("ecord_chat_jump_highlight")
+}
+
+/// Cuánto dura el resaltado del mensaje al que se saltó (segundos).
+const JUMP_HIGHLIGHT_SECS: f64 = 2.5;
+
+/// Marca `message_id` como el recién visitado: se resalta un rato.
+fn start_jump_highlight(ctx: &egui::Context, message_id: &str) {
+    let now = ctx.input(|i| i.time);
+    ctx.memory_mut(|m| m.data.insert_temp(jump_highlight_memory_id(), (message_id.to_string(), now)));
+    ctx.request_repaint();
+}
+
+/// Intensidad (1 → 0) del resaltado de `message_id`, o `None` si no es el
+/// mensaje resaltado o ya se terminó.
+fn jump_highlight_strength(ctx: &egui::Context, message_id: &str) -> Option<f32> {
+    if message_id.is_empty() {
+        return None;
+    }
+    let (id, started) = ctx.memory(|m| m.data.get_temp::<(String, f64)>(jump_highlight_memory_id()))?;
+    if id != message_id {
+        return None;
+    }
+    let elapsed = ctx.input(|i| i.time) - started;
+    if elapsed >= JUMP_HIGHLIGHT_SECS {
+        return None;
+    }
+    ctx.request_repaint();
+    Some((1.0 - elapsed / JUMP_HIGHLIGHT_SECS) as f32)
 }
 
 /// Todo lo que va debajo del encabezado de un mensaje: el texto, los
@@ -1159,7 +1302,7 @@ fn thread_card(ui: &mut egui::Ui, palette: &Palette, card: &ThreadCard, actions:
     let inner = Frame::new()
         .fill(palette.surface)
         .stroke(Stroke::new(1.0, palette.outline))
-        .corner_radius(CornerRadius::same(theme::RADIUS_SMALL))
+        .corner_radius(CornerRadius::same(theme::radius_small()))
         .inner_margin(Margin::symmetric(10, 7))
         .show(ui, |ui| {
             // Un ancho fijo de 380px (+ margen y borde, ~402px) no entra en
@@ -1256,7 +1399,7 @@ fn hover_toolbar(
             Frame::new()
                 .fill(palette.overlay)
                 .stroke(Stroke::new(1.0, palette.outline))
-                .corner_radius(CornerRadius::same(theme::RADIUS))
+                .corner_radius(CornerRadius::same(theme::radius()))
                 .inner_margin(Margin::symmetric(4, 3))
                 .shadow(egui::epaint::Shadow {
                     offset: [0, 4],
@@ -1472,7 +1615,7 @@ fn pill_fill(palette: &Palette, mine: bool, hovered: bool) -> Color32 {
 
 fn paint_pill_background(ui: &egui::Ui, palette: &Palette, rect: egui::Rect, mine: bool, hovered: bool) {
     let fill = pill_fill(palette, mine, hovered);
-    ui.painter().rect_filled(rect, theme::RADIUS_SMALL as f32 + 2.0, fill);
+    ui.painter().rect_filled(rect, theme::radius_small() as f32 + 2.0, fill);
     // Antes solo las reacciones "mías" tenían un borde — el resto se
     // apoyaba solo en el `item_spacing` de `reactions_row` para separarse
     // de sus vecinas, y con emojis angostos (p.ej. las banderitas-letra de
@@ -1482,7 +1625,7 @@ fn paint_pill_background(ui: &egui::Ui, palette: &Palette, rect: egui::Rect, min
     let stroke_color = if mine { palette.accent } else { palette.outline };
     ui.painter().rect_stroke(
         rect,
-        theme::RADIUS_SMALL as f32 + 2.0,
+        theme::radius_small() as f32 + 2.0,
         Stroke::new(1.0, stroke_color),
         egui::StrokeKind::Inside,
     );
@@ -1656,6 +1799,7 @@ fn composer(
     custom_emojis: &[EmojiGroup],
 ) -> bool {
     use crate::ui::compose_menus as menus;
+    use crate::ui::slash as slash_ui;
 
     // Se pone en `true` si se clickeó en el selector un emoji bloqueado (falta
     // Nitro): quien llama (`show`) lo convierte en `ChatEvent::NitroRequired`.
@@ -1671,6 +1815,53 @@ fn composer(
     let picker_open_id = scoped_id("ecord_composer_emoji_open");
     let picker_id = scoped_id("ecord_composer_emoji_picker");
     let mention_menu_id = scoped_id("ecord_composer_mention_menu");
+    let slash_active_id = scoped_id("ecord_composer_slash_active");
+    let slash_menu_id = scoped_id("ecord_composer_slash_menu");
+    let slash_state_id = scoped_id("ecord_composer_slash_state");
+    let text_extra_id = scoped_id("ecord_composer_text_extra");
+
+    // ---- Slash command elegido: su formulario de opciones reemplaza al
+    // compositor hasta que se envía (Enter) o se cancela (Esc).
+    if let Some(mut active) = slash_ui::load_active(&ctx, slash_active_id) {
+        // El formulario reemplaza a la caja de texto: no suma líneas de más.
+        ctx.memory_mut(|m| m.data.insert_temp(text_extra_id, 0.0_f32));
+        match slash_ui::show_command_form(ui, palette, &mut active, slash_active_id) {
+            slash_ui::FormOutcome::None => slash_ui::store_active(&ctx, slash_active_id, Some(active)),
+            slash_ui::FormOutcome::Cancel => {
+                // Esc: se descarta el comando (y lo escrito a su lado).
+                slash_ui::store_active(&ctx, slash_active_id, None);
+                ctx.memory_mut(|m| m.request_focus(text_id));
+            }
+            slash_ui::FormOutcome::ToText => {
+                // Retroceso sobre el comando: pasa de interacción a texto
+                // (`/comando`) y reaparecen las sugerencias. Lo escrito fuera
+                // de los campos desaparece.
+                let text = active.command_text();
+                let len = text.chars().count();
+                *compose_text = text;
+                slash_ui::store_active(&ctx, slash_active_id, None);
+                ctx.memory_mut(|m| m.request_focus(text_id));
+                menus::set_caret(&ctx, text_id, len);
+            }
+            slash_ui::FormOutcome::Submit(options) => {
+                if let Some((_, channel_id, guild_id)) = send_target.clone() {
+                    slash_ui::request_run(
+                        &ctx,
+                        slash_ui::SlashInvocation {
+                            channel_id,
+                            guild_id,
+                            command: active.entry.command.clone(),
+                            path: active.entry.path.clone(),
+                            options,
+                        },
+                    );
+                }
+                slash_ui::store_active(&ctx, slash_active_id, None);
+                ctx.memory_mut(|m| m.request_focus(text_id));
+            }
+        }
+        return nitro_required;
+    }
 
     // Si el selector de emojis estaba abierto, leído UNA sola vez al principio
     // del frame: el click del botón que lo abre/cierra queda guardado para el
@@ -1684,7 +1875,7 @@ fn composer(
             ui.add_space(16.0);
             Frame::new()
                 .fill(palette.surface)
-                .corner_radius(CornerRadius::same(theme::RADIUS))
+                .corner_radius(CornerRadius::same(theme::radius()))
                 .inner_margin(Margin::symmetric(10, 5))
                 .show(ui, |ui| {
                     // `available_width` ya descuenta el margen interno de ambos lados
@@ -1702,6 +1893,48 @@ fn composer(
                     });
                 });
         });
+    }
+
+    // ---- Escribir sin foco: si nada usa el teclado y se tipea (o se pega)
+    // algo, va directo al compositor, sin tener que clickearlo antes. Se pide
+    // el foco ANTES de dibujar el `TextEdit` para que ese mismo frame se lleve
+    // las teclas y no se pierda la primera letra.
+    if send_target.is_some() && !picker_open {
+        let now = ctx.input(|i| i.time);
+        let alive_key = egui::Id::new(("ecord_composer_alive", text_id));
+        ctx.data_mut(|d| d.insert_temp(alive_key, now));
+        let last: Option<egui::Id> = ctx.data(|d| d.get_temp(last_composer_key()));
+        // Con dos compositores a la vez (chat y panel de hilo) manda el último
+        // que tuvo el foco, si todavía se está dibujando.
+        let other_is_last = last.is_some_and(|l| {
+            l != text_id
+                && ctx
+                    .data(|d| d.get_temp::<f64>(egui::Id::new(("ecord_composer_alive", l))))
+                    .is_some_and(|seen| now - seen < 0.5)
+        });
+        if ctx.memory(|m| m.has_focus(text_id)) {
+            ctx.data_mut(|d| d.insert_temp(last_composer_key(), text_id));
+        } else if !other_is_last && ctx.data(|d| d.get_temp(type_to_focus_key())).unwrap_or(false) {
+            // Un campo de texto con el foco (buscador, ajustes...) se queda con
+            // el teclado. Un botón con el foco (tras un click) no lo usa.
+            let busy = ctx
+                .memory(|m| m.focused())
+                .is_some_and(|f| egui::text_edit::TextEditState::load(&ctx, f).is_some());
+            let typed = !busy
+                && ctx.input(|i| {
+                    i.events.iter().any(|e| match e {
+                        // Un espacio suelto no arranca un mensaje (es el atajo
+                        // de pausa de los videos).
+                        egui::Event::Text(t) => !t.is_empty() && !(compose_text.is_empty() && t.trim().is_empty()),
+                        egui::Event::Paste(t) => !t.is_empty(),
+                        _ => false,
+                    })
+                });
+            if typed {
+                ctx.memory_mut(|m| m.request_focus(text_id));
+                ctx.data_mut(|d| d.insert_temp(last_composer_key(), text_id));
+            }
+        }
     }
 
     // ---- Menú de menciones, parte 1: las teclas.
@@ -1748,6 +1981,43 @@ fn composer(
         }
     }
 
+    // ---- Slash commands, parte 1: las teclas. Igual que las del menú de
+    // menciones, se procesan ANTES del `TextEdit` (si no, flechas, Tab y Enter
+    // se las lleva el campo) y con el texto del frame anterior.
+    let slash_catalog = slash_ui::catalog(&ctx);
+    slash_ui::set_wanted(&ctx, send_target.is_some() && slash_ui::browse_query(compose_text).is_some());
+    let mut slash_state = slash_ui::MenuState::load(&ctx, slash_state_id);
+    let mut slash_key_entry: Option<std::sync::Arc<crate::discord::slash::SlashEntry>> = None;
+    if focused_before && send_target.is_some() {
+        if let (Some(query), Some(catalog)) = (slash_ui::browse_query(compose_text), slash_catalog.as_ref()) {
+            slash_state.refresh(catalog, &query);
+            if !slash_state.dismissed && !slash_state.matches.is_empty() {
+                let n = slash_state.matches.len();
+                let mut accept: Option<usize> = None;
+                ctx.input_mut(|i| {
+                    if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                        slash_state.selected = (slash_state.selected + 1) % n;
+                    }
+                    if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                        slash_state.selected = (slash_state.selected + n - 1) % n;
+                    }
+                    if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
+                        || i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                    {
+                        accept = Some(slash_state.selected.min(n - 1));
+                    }
+                    if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+                        slash_state.dismissed = true;
+                    }
+                });
+                slash_key_entry = accept
+                    .and_then(|row| slash_state.matches.get(row))
+                    .and_then(|index| catalog.entries.get(*index))
+                    .cloned();
+            }
+        }
+    }
+
     ui.add_space(6.0);
     // Rect del campo (marco incluido), para anclar los menús flotantes.
     let mut composer_rect = egui::Rect::NOTHING;
@@ -1755,8 +2025,9 @@ fn composer(
         ui.add_space(16.0);
         let framed = Frame::new()
             .fill(palette.surface)
-            .corner_radius(CornerRadius::same(theme::RADIUS + 2))
-            .inner_margin(Margin::symmetric(12, 8))
+            .stroke(Stroke::new(1.0, palette.outline))
+            .corner_radius(CornerRadius::same(theme::radius() + 6))
+            .inner_margin(Margin::symmetric(12, 10))
             .show(ui, |ui| {
                 // `available_width` ya descuenta el margen interno de ambos lados
                 // del Frame: restar 16 deja 16px a la derecha (igual que a la
@@ -1777,19 +2048,52 @@ fn composer(
                     //
                     // El `id` explícito hace falta para poder leer/mover el
                     // cursor (menciones y emojis se insertan donde está).
-                    let response = ui
-                        .add(
-                            egui::TextEdit::multiline(compose_text)
-                                .id(text_id)
-                                .hint_text(placeholder)
-                                .frame(egui::Frame::NONE)
-                                .desired_width(text_width)
-                                .desired_rows(1)
-                                .return_key(Some(egui::KeyboardShortcut::new(
-                                    egui::Modifiers::SHIFT,
-                                    egui::Key::Enter,
-                                ))),
-                        );
+                    // Con mucho texto la caja deja de crecer y pasa a tener su
+                    // propio scroll (el cursor se mantiene a la vista).
+                    // El scroll necesita un alto disponible de verdad (dentro de
+                    // un `horizontal` solo hay una fila y se inflaba hasta su
+                    // alto mínimo), pero SIN reservarlo entero: `scope_builder`
+                    // solo ocupa lo que el contenido usó (`allocate_ui` reservaba
+                    // los 150px aunque la caja estuviera vacía).
+                    let scroll_rect = egui::Rect::from_min_size(
+                        ui.cursor().min,
+                        Vec2::new(text_width, COMPOSER_TEXT_MAX_HEIGHT),
+                    );
+                    let scroll_out = ui
+                        .scope_builder(
+                            egui::UiBuilder::new()
+                                .max_rect(scroll_rect)
+                                .layout(egui::Layout::top_down(egui::Align::Min)),
+                            |ui| {
+                                egui::ScrollArea::vertical()
+                                    .id_salt(text_id.with("scroll"))
+                                    .max_height(COMPOSER_TEXT_MAX_HEIGHT)
+                                    .min_scrolled_height(24.0)
+                                    .auto_shrink([false, true])
+                                    .show(ui, |ui| {
+                                        ui.add(
+                                            egui::TextEdit::multiline(compose_text)
+                                                .id(text_id)
+                                                .hint_text(placeholder)
+                                                .frame(egui::Frame::NONE)
+                                                .desired_width(text_width)
+                                                .desired_rows(1)
+                                                .return_key(Some(egui::KeyboardShortcut::new(
+                                                    egui::Modifiers::SHIFT,
+                                                    egui::Key::Enter,
+                                                ))),
+                                        )
+                                    })
+                            },
+                        )
+                        .inner;
+                    // Cuánto más alto que una fila quedó la caja (para que la
+                    // lista de mensajes ceda ese espacio). Se mide el CONTENIDO (acotado):
+                    // el rect del scroll puede ser más grande que lo que se ve.
+                    let shown_height = scroll_out.content_size.y.min(COMPOSER_TEXT_MAX_HEIGHT);
+                    let text_extra = (shown_height - ui.spacing().interact_size.y).max(0.0);
+                    ctx.memory_mut(|m| m.data.insert_temp(text_extra_id, text_extra));
+                    let response = scroll_out.inner;
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Botón de emojis: abre/cierra el selector (se dibuja
                         // más abajo, anclado a este campo).
@@ -1856,6 +2160,59 @@ fn composer(
             });
         composer_rect = framed.response.rect;
     });
+
+    // ---- Slash commands, parte 2: dibujar el menú y activar el comando
+    // elegido (con el teclado, arriba, o con el mouse, acá).
+    let slash_now = if send_target.is_some() && ctx.memory(|m| m.has_focus(text_id)) {
+        slash_ui::browse_query(compose_text)
+    } else {
+        None
+    };
+    let mut slash_pointer_entry: Option<std::sync::Arc<crate::discord::slash::SlashEntry>> = None;
+    if let Some(query) = slash_now.as_ref() {
+        let anchor = egui::pos2(composer_rect.left(), composer_rect.top() - 6.0);
+        let width = composer_rect.width().clamp(380.0, 640.0);
+        match slash_catalog.as_ref() {
+            Some(catalog) => {
+                slash_state.refresh(catalog, query);
+                if !slash_state.dismissed && !slash_state.matches.is_empty() {
+                    slash_state.selected = slash_state.selected.min(slash_state.matches.len() - 1);
+                    let outcome = slash_ui::show_slash_menu(
+                        &ctx,
+                        palette,
+                        slash_menu_id,
+                        anchor,
+                        width,
+                        catalog,
+                        &slash_state,
+                    );
+                    if let Some(hovered) = outcome.hovered {
+                        if ctx.input(|i| i.pointer.delta() != egui::Vec2::ZERO) {
+                            slash_state.selected = hovered;
+                        }
+                    }
+                    slash_pointer_entry = outcome
+                        .pressed
+                        .and_then(|row| slash_state.matches.get(row))
+                        .and_then(|index| catalog.entries.get(*index))
+                        .cloned();
+                }
+            }
+            // Todavía no llegó el catálogo de este server (se pide en `App::ui`).
+            None => {
+                slash_ui::show_slash_loading(&ctx, palette, slash_menu_id, anchor, width);
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+        }
+    } else {
+        slash_state.dismissed = false;
+    }
+    if let Some(entry) = slash_key_entry.or(slash_pointer_entry) {
+        slash_ui::activate(&ctx, slash_active_id, entry);
+        compose_text.clear();
+        slash_state = slash_ui::MenuState::default();
+    }
+    slash_state.store(&ctx, slash_state_id);
 
     // ---- Menú de menciones, parte 2: dibujarlo y aplicar la elección.
     // Con el texto y el cursor YA actualizados por el `TextEdit` de este frame.

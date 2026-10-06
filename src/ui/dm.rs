@@ -49,7 +49,7 @@ fn profile_panel(app: &mut App, ui: &mut egui::Ui, index: usize) {
     egui::Panel::right("dm_profile")
         .exact_size(340.0)
         .resizable(false)
-        .frame(Frame::new().fill(palette.panel))
+        .frame(theme::card_frame(&palette, Frame::new().fill(palette.panel), 8, 5, 10))
         .show(ui, |ui| {
             if app.dm_profile.is_some() {
                 crate::ui::profile_popup::show_panel(app, ui);
@@ -153,7 +153,13 @@ fn simple_profile(app: &App, ui: &mut egui::Ui, index: usize) {
 fn central_panel(app: &mut App, ui: &mut egui::Ui, index: usize) {
     let palette = app.palette;
     egui::CentralPanel::default()
-        .frame(Frame::new().fill(palette.window).inner_margin(Margin::same(0)))
+        .frame(theme::card_frame(
+            &palette,
+            Frame::new().fill(palette.window).inner_margin(Margin::same(0)),
+            6,
+            5,
+            5,
+        ))
         .show(ui, |ui| {
             let already_connected = app
                 .friends
@@ -202,10 +208,12 @@ fn central_panel(app: &mut App, ui: &mut egui::Ui, index: usize) {
             // `app.friends[index].messages` de acá abajo — son `bool`
             // (Copy), así que no hace falta mantener viva ninguna
             // referencia a `app.friends[index]` mientras dura el `show`.
-            let (loading, loading_more, has_more) = {
+            let (loading, loading_more, has_more, has_newer, loading_newer) = {
                 let friend = &app.friends[index];
-                (friend.loading, friend.loading_more, friend.has_more)
+                (friend.loading, friend.loading_more, friend.has_more, friend.has_newer, friend.loading_newer)
             };
+            // El DM abierto, para saber a qué canal pertenece un salto.
+            let dm_channel_id = app.friends[index].dm_channel_id.clone().unwrap_or_default();
             // En un DM se ofrecen los emojis personalizados de TODOS los
             // servers en los que estás (Discord no restringe esto a
             // servers "mutuos" con el destinatario) — ver `chat::show`.
@@ -232,7 +240,10 @@ fn central_panel(app: &mut App, ui: &mut egui::Ui, index: usize) {
                 loading,
                 loading_more,
                 has_more,
+                has_newer,
+                loading_newer,
                 &mut app.pending_scroll_anchor,
+                &mut app.pending_jump,
             );
             match event {
                 chat::ChatEvent::ForwardRequested => {
@@ -243,6 +254,8 @@ fn central_panel(app: &mut App, ui: &mut egui::Ui, index: usize) {
                     );
                 }
                 chat::ChatEvent::LoadMoreRequested => app.load_more_messages(),
+                chat::ChatEvent::LoadNewerRequested => app.load_newer_messages(),
+                chat::ChatEvent::JumpToMessage { message_id } => app.jump_to_message(&dm_channel_id, &message_id),
                 chat::ChatEvent::NitroRequired => app.open_modal(
                     "Necesitás Discord Nitro",
                     "En mensajes directos, los emojis personalizados requieren Discord Nitro, y tu cuenta no lo tiene. Podés usar los emojis Unicode.",
@@ -273,13 +286,13 @@ fn dm_top_bar(
 ) -> bool {
     let mut call_clicked = false;
     Frame::new()
-        .stroke(egui::Stroke::new(1.0, palette.outline))
+        .stroke(theme::header_stroke(palette))
         .inner_margin(Margin::symmetric(16, 10))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(24.0), egui::Sense::hover());
                 extra::avatar(ui, rect.center(), 12.0, avatar_url, avatar_color, initial, palette);
-                extra::status_dot(ui, rect.center(), 12.0, extra::status_color(status, palette), palette.window);
+                extra::status_dot(ui, rect.center(), 12.0, extra::status_color(status, palette), theme::row_bg(palette));
                 ui.add_space(6.0);
                 theme::text(ui, name, theme::semibold(14.5), palette.text);
                 ui.add_space(6.0);

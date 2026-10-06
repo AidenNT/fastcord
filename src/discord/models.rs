@@ -210,6 +210,11 @@ pub struct Guild {
     pub name: Option<String>,
     #[serde(default)]
     pub icon: Option<String>,
+    /// Hash del banner del server (el que se ve arriba de la lista de
+    /// canales). En el formato nuevo del `READY` puede venir dentro de
+    /// `properties`; ver `banner_url`.
+    #[serde(default)]
+    pub banner: Option<String>,
     #[serde(default)]
     pub unavailable: bool,
     /// En el `READY` de una cuenta de usuario (a diferencia del `READY`
@@ -428,6 +433,26 @@ impl Guild {
         Some(format!(
             "https://cdn.discordapp.com/icons/{}/{}.{}?size=128",
             self.id, hash, ext
+        ))
+    }
+
+    /// URL del banner del server en el CDN (siempre `.png`: para los animados
+    /// es el primer cuadro, que no cuesta memoria), o `None` si no tiene.
+    pub fn banner_url(&self) -> Option<String> {
+        let hash = self
+            .banner
+            .clone()
+            .or_else(|| {
+                self.properties
+                    .as_ref()
+                    .and_then(|p| p.get("banner"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            })
+            .filter(|h| !h.is_empty())?;
+        Some(format!(
+            "https://cdn.discordapp.com/banners/{}/{}.png?size=480",
+            self.id, hash
         ))
     }
 }

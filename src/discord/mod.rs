@@ -11,9 +11,11 @@ pub mod gateway;
 pub mod models;
 pub mod remote_auth;
 pub mod rest;
+pub mod slash;
 pub mod fingerprint;
 pub mod password_auth;
 pub mod captcha;
+pub mod affinities;
 pub mod frecency;
 pub mod user_settings;
 pub mod uwu_rest;
@@ -168,6 +170,14 @@ pub enum AppEvent {
         settings: Box<user_settings::FrecencyUserSettings>,
         partial: bool,
     },
+    /// Afinidades de la cuenta con amigos y servers (`GET
+    /// /users/@me/affinities/{users,guilds}`), ya en porcentaje relativo al más
+    /// alto. Cada mitad llega apenas se pueda traer; `None` = no vino en este
+    /// envío. Ordenan el Inicio de la interfaz nueva. Ver `discord::affinities`.
+    Affinities {
+        users: Option<affinities::AffinityMap>,
+        guilds: Option<affinities::AffinityMap>,
+    },
     /// Mensaje nuevo (server o DM) recibido en vivo.
     MessageCreate(Box<GatewayMessage>),
     /// Mensaje ya existente que cambió (edición, o embeds de un link que
@@ -197,6 +207,29 @@ pub enum AppEvent {
     MoreChannelMessages {
         channel_id: String,
         messages: Vec<GatewayMessage>,
+    },
+    /// Ventana de mensajes alrededor de `target_id`
+    /// (`?limit=30&around=<id>`), pedida por `App::jump_to_message` (ir a un
+    /// mensaje puntual) o por la vista previa de los canales recientes
+    /// (alrededor del último mensaje leído). `jump` indica si hay que dejar
+    /// el scroll parado en `target_id` cuando se abra el chat.
+    AroundChannelMessages {
+        channel_id: String,
+        target_id: String,
+        jump: bool,
+        messages: Vec<GatewayMessage>,
+    },
+    /// Página POSTERIOR al último mensaje cargado (`?after=<id>`), pedida
+    /// por `App::load_newer_messages` cuando la ventana no llega hasta el
+    /// mensaje más nuevo del canal.
+    NewerChannelMessages {
+        channel_id: String,
+        messages: Vec<GatewayMessage>,
+    },
+    /// Falló un pedido `around`/`after`: hay que soltar los "cargando" del
+    /// canal para que se pueda reintentar.
+    MessageWindowFailed {
+        channel_id: String,
     },
     /// Foto de "quién está en qué canal de voz" de un guild. Llega por
     /// `READY_SUPPLEMENTAL` (un `{ id, voice_states }` por guild, justo
@@ -413,6 +446,11 @@ pub enum AppEvent {
     /// Se pudo crear un hilo desde un mensaje (`spawn_create_thread`); el
     /// panel lo abre enseguida.
     ThreadOpened { thread: ThreadChannel },
+    /// Llegó el catálogo de slash commands de `key` (el id del server, o del
+    /// canal en un DM). Ver `spawn_fetch_slash_catalog`.
+    SlashCatalogLoaded { key: String, catalog: std::sync::Arc<slash::SlashCatalog> },
+    /// No se pudo pedir el catálogo de `key`.
+    SlashCatalogFailed { key: String },
 }
 
 /// Arranca todo el flujo en un hilo de SO nuevo con su propio runtime de
@@ -713,6 +751,99 @@ pub fn spawn_fetch_more_channel_messages(
     });
 }
 
+/// Pide la ventana de mensajes alrededor de `around_message_id`
+/// (`?limit=30&around=<id>`). El resultado llega como
+/// `AppEvent::AroundChannelMessages`; si falla, `AppEvent::MessageWindowFailed`
+/// (más un aviso de error).
+pub fn spawn_fetch_messages_around(
+    token: String,
+    channel_id: String,
+    around_message_id: String,
+    jump: bool,
+    tx: std::sync::mpsc::Sender<AppEvent>,
+) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            let _ = tx.send(AppEvent::MessageWindowFailed { channel_id });
+            return;
+        };
+        rt.block_on(async move {
+            let rest = match uwu_rest::UwuRest::for_token(token).await {
+                Ok(rest) => rest,
+                Err(e) => {
+                    let _ = tx.send(AppEvent::MessageWindowFailed { channel_id });
+                    let _ = tx.send(AppEvent::Error(format!(
+                        "No se pudo ir al mensaje: {e}"
+                    )));
+                    return;
+                }
+            };
+            match rest
+                .channel_messages_around(&channel_id, uwu_rest::MESSAGES_WINDOW_SIZE, &around_message_id)
+                .await
+            {
+                Ok(messages) => {
+                    let _ = tx.send(AppEvent::AroundChannelMessages {
+                        channel_id,
+                        target_id: around_message_id,
+                        jump,
+                        messages,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::MessageWindowFailed { channel_id });
+                    let _ = tx.send(AppEvent::Error(format!(
+                        "No se pudo ir al mensaje: {e}"
+                    )));
+                }
+            }
+        });
+    });
+}
+
+/// Pide la página posterior a `after_message_id` (`?limit=30&after=<id>`):
+/// "cargar más hacia abajo" cuando la ventana cargada no es la del final del
+/// canal. El resultado llega como `AppEvent::NewerChannelMessages`.
+pub fn spawn_fetch_newer_channel_messages(
+    token: String,
+    channel_id: String,
+    after_message_id: String,
+    tx: std::sync::mpsc::Sender<AppEvent>,
+) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            let _ = tx.send(AppEvent::MessageWindowFailed { channel_id });
+            return;
+        };
+        rt.block_on(async move {
+            let rest = match uwu_rest::UwuRest::for_token(token).await {
+                Ok(rest) => rest,
+                Err(e) => {
+                    let _ = tx.send(AppEvent::MessageWindowFailed { channel_id });
+                    let _ = tx.send(AppEvent::Error(format!(
+                        "No se pudieron cargar mensajes más nuevos: {e}"
+                    )));
+                    return;
+                }
+            };
+            match rest
+                .channel_messages_after(&channel_id, uwu_rest::MESSAGES_WINDOW_SIZE, &after_message_id)
+                .await
+            {
+                Ok(messages) => {
+                    let _ = tx.send(AppEvent::NewerChannelMessages { channel_id, messages });
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::MessageWindowFailed { channel_id });
+                    let _ = tx.send(AppEvent::Error(format!(
+                        "No se pudieron cargar mensajes más nuevos: {e}"
+                    )));
+                }
+            }
+        });
+    });
+}
+
 /// Datos de un usuario por id, para completar un estado de voz que llegó
 /// sin `member`/`user` (ver `AppEvent::UserFetched`). Si falla, no
 /// molestamos con un toast de error — el peor caso es que esa persona
@@ -772,6 +903,49 @@ pub fn spawn_fetch_frecency_settings(token: String, tx: std::sync::mpsc::Sender<
                 };
                 if let Ok(settings) = rest.get_frecency_settings().await {
                     let _ = tx.send(AppEvent::FrecencySettings(Box::new(settings)));
+                    return;
+                }
+            }
+        });
+    });
+}
+
+/// Trae las afinidades de la cuenta (amigos y servers) y las manda como
+/// `AppEvent::Affinities`. Son solo un orden de cortesía para el Inicio: si
+/// un pedido falla se reintenta unas pocas veces y después se deja el orden
+/// normal. Cada mitad se manda en cuanto llega, sin esperar a la otra.
+pub fn spawn_fetch_affinities(token: String, tx: std::sync::mpsc::Sender<AppEvent>) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            return;
+        };
+        rt.block_on(async move {
+            const DELAYS_SECS: [u64; 4] = [1, 5, 15, 60];
+            let mut users_done = false;
+            let mut guilds_done = false;
+            for delay in DELAYS_SECS {
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                let Ok(rest) = uwu_rest::UwuRest::for_token(token.clone()).await else {
+                    continue;
+                };
+                let mut users = None;
+                let mut guilds = None;
+                if !users_done {
+                    if let Ok(value) = rest.get_user_affinities().await {
+                        users = Some(affinities::parse_users(&value));
+                        users_done = true;
+                    }
+                }
+                if !guilds_done {
+                    if let Ok(value) = rest.get_guild_affinities().await {
+                        guilds = Some(affinities::parse_guilds(&value));
+                        guilds_done = true;
+                    }
+                }
+                if users.is_some() || guilds.is_some() {
+                    let _ = tx.send(AppEvent::Affinities { users, guilds });
+                }
+                if users_done && guilds_done {
                     return;
                 }
             }
@@ -1302,6 +1476,72 @@ pub fn spawn_submit_modal(
                 log::warn!("No se pudo mandar el formulario {modal_custom_id}: {e}");
                 let _ = tx.send(AppEvent::InteractionFailed {
                     message: "No se pudo enviar el formulario.".to_string(),
+                });
+            }
+        });
+    });
+}
+
+/// Pide los slash commands disponibles para esta cuenta en un server (o en un
+/// DM) y avisa con `AppEvent::SlashCatalogLoaded` / `SlashCatalogFailed`. El
+/// aplanado del índice (que puede tener cientos de comandos) se hace acá, en
+/// el hilo de red, no en el de la UI.
+pub fn spawn_fetch_slash_catalog(
+    token: String,
+    key: String,
+    channel_id: String,
+    guild_id: Option<String>,
+    tx: std::sync::mpsc::Sender<AppEvent>,
+) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            let _ = tx.send(AppEvent::SlashCatalogFailed { key });
+            return;
+        };
+        rt.block_on(async move {
+            let result = async {
+                let rest = uwu_rest::UwuRest::for_token(token).await?;
+                rest.application_command_index(&channel_id, guild_id.as_deref()).await
+            }
+            .await;
+            match result {
+                Ok(index) => {
+                    let catalog = std::sync::Arc::new(slash::build_catalog(index));
+                    let _ = tx.send(AppEvent::SlashCatalogLoaded { key, catalog });
+                }
+                Err(e) => {
+                    log::warn!("No se pudieron pedir los slash commands: {e}");
+                    let _ = tx.send(AppEvent::SlashCatalogFailed { key });
+                }
+            }
+        });
+    });
+}
+
+/// Ejecuta un slash command (interacción tipo 2). La respuesta de la app llega
+/// después por el Gateway (un mensaje, una edición o un modal); si el POST
+/// falla se avisa con `AppEvent::InteractionFailed`.
+pub fn spawn_run_slash_command(
+    token: String,
+    ctx: InteractionContext,
+    command: std::sync::Arc<slash::AppCommand>,
+    options: Vec<serde_json::Value>,
+    tx: std::sync::mpsc::Sender<AppEvent>,
+) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            return;
+        };
+        rt.block_on(async move {
+            let result = async {
+                let rest = uwu_rest::UwuRest::for_token(token).await?;
+                rest.run_slash_command(&ctx, &command, options).await
+            }
+            .await;
+            if let Err(e) = result {
+                log::warn!("No se pudo ejecutar /{}: {e}", command.name);
+                let _ = tx.send(AppEvent::InteractionFailed {
+                    message: format!("No se pudo ejecutar /{}.", command.name),
                 });
             }
         });

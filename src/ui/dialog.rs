@@ -54,7 +54,9 @@ use crate::lib::state::App;
 use crate::ui::theme::{self, Icon, Palette};
 
 const CARD_MARGIN: i8 = 24;
-const CARD_RADIUS: u8 = theme::RADIUS + 8;
+fn card_radius() -> u8 {
+    theme::radius() + 8
+}
 const DEFAULT_WIDTH: f32 = 480.0;
 /// Azul de los avisos informativos (la paleta no trae uno).
 const INFO_BLUE: Color32 = Color32::from_rgb(0x5b, 0x9b, 0xf5);
@@ -583,7 +585,7 @@ pub fn render(ctx: &egui::Context, palette: &Palette, d: &mut Dialog) -> Option<
             let card = Frame::new()
                 .fill(palette.overlay)
                 .stroke(Stroke::new(1.0, accent.gamma_multiply(0.55)))
-                .corner_radius(CornerRadius::same(CARD_RADIUS))
+                .corner_radius(CornerRadius::same(card_radius()))
                 .inner_margin(Margin::same(CARD_MARGIN))
                 .shadow(egui::epaint::Shadow {
                     offset: [0, 16],
@@ -641,7 +643,7 @@ pub fn render(ctx: &egui::Context, palette: &Palette, d: &mut Dialog) -> Option<
             let rect = card.response.rect;
             ui.painter().rect_filled(
                 Rect::from_min_size(rect.min, Vec2::new(rect.width(), 4.0)),
-                CornerRadius { nw: CARD_RADIUS, ne: CARD_RADIUS, sw: 0, se: 0 },
+                CornerRadius { nw: card_radius(), ne: card_radius(), sw: 0, se: 0 },
                 accent,
             );
         });
@@ -805,7 +807,7 @@ fn app_banner(
     Frame::new()
         .fill(palette.surface)
         .stroke(Stroke::new(1.0, palette.outline))
-        .corner_radius(CornerRadius::same(theme::RADIUS + 2))
+        .corner_radius(CornerRadius::same(theme::radius() + 2))
         .inner_margin(Margin::same(12))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -845,7 +847,7 @@ fn flag_row(ui: &mut egui::Ui, palette: &Palette, accent: Color32, name: &str, t
     Frame::new()
         .fill(palette.surface)
         .stroke(Stroke::new(1.0, palette.outline))
-        .corner_radius(CornerRadius::same(theme::RADIUS + 2))
+        .corner_radius(CornerRadius::same(theme::radius() + 2))
         .inner_margin(Margin::same(12))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -860,7 +862,7 @@ fn callout(ui: &mut egui::Ui, palette: &Palette, kind: DialogKind, title: &str, 
     Frame::new()
         .fill(color.gamma_multiply(0.10))
         .stroke(Stroke::new(1.0, color.gamma_multiply(0.4)))
-        .corner_radius(CornerRadius::same(theme::RADIUS + 2))
+        .corner_radius(CornerRadius::same(theme::radius() + 2))
         .inner_margin(Margin::same(12))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());

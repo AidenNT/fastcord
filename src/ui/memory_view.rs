@@ -40,7 +40,7 @@ pub fn view(ui: &mut egui::Ui, palette: &Palette, r: &MemoryReport) {
     // --- Cabecera: el número grande ---
     Frame::new()
         .fill(palette.surface)
-        .corner_radius(CornerRadius::same(theme::RADIUS))
+        .corner_radius(CornerRadius::same(theme::radius()))
         .inner_margin(Margin::symmetric(16, 14))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());

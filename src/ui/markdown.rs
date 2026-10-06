@@ -885,7 +885,7 @@ fn spoiler_chip(ui: &mut Ui, palette: &Palette, text: &str, style: InlineStyle, 
 fn code_block(ui: &mut Ui, palette: &Palette, code: &str) {
     Frame::new()
         .fill(palette.surface)
-        .corner_radius(CornerRadius::same(theme::RADIUS_SMALL + 2))
+        .corner_radius(CornerRadius::same(theme::radius_small() + 2))
         .inner_margin(Margin::symmetric(10, 8))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());

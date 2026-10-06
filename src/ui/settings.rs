@@ -51,6 +51,7 @@ enum Action {
     SetImageMode(crate::ui::anim::ImageMode),
     SetNotificationSide(NotificationSide),
     SetNewCallUi(bool),
+    SetUiScale(f32),
     ImportThemes(String),
     OpenNew,
     OpenEdit(String),
@@ -83,6 +84,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let tab = app.settings_tab;
     let notification_side = app.notification_side;
     let new_call_ui = app.new_call_ui;
+    let ui_scale = app.ui_scale;
     let voice_audio = app.voice.audio.clone();
     let voice_audio_sources = app.voice.audio_sources.clone();
     let voice_audio_source_options = app.voice_audio_source_options.clone();
@@ -153,7 +155,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             Frame::new()
                 .fill(palette.overlay)
                 .stroke(Stroke::new(1.0, palette.outline))
-                .corner_radius(CornerRadius::same(theme::RADIUS + 6))
+                .corner_radius(CornerRadius::same(theme::radius() + 6))
                 .inner_margin(Margin::same(22))
                 .shadow(egui::epaint::Shadow {
                     offset: [0, 16],
@@ -224,6 +226,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                                             &custom_themes,
                                             wallpaper_seed,
                                         ) {
+                                            action = Some(taken);
+                                        }
+                                        if let Some(taken) = ui_scale_section(ui, &palette, ui_scale) {
                                             action = Some(taken);
                                         }
                                         if let Some(taken) = notification_side_section(ui, &palette, notification_side) {
@@ -311,6 +316,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             Action::SetImageMode(mode) => app.set_image_mode(mode),
             Action::SetNotificationSide(side) => app.set_notification_side(side),
             Action::SetNewCallUi(enabled) => app.set_new_call_ui(enabled),
+            Action::SetUiScale(scale) => app.set_ui_scale(scale),
             Action::ImportThemes(json) => match app.import_themes(&json) {
                 Ok(n) => {
                     // Vacía el cuadro de pegado y avisa.
@@ -387,21 +393,57 @@ fn notification_side_section(
     action
 }
 
+/// Tamaño de toda la interfaz: botones con porcentajes predefinidos (hacen
+/// zoom sobre todo, texto incluido). También se puede con Ctrl + / Ctrl -.
+fn ui_scale_section(ui: &mut egui::Ui, palette: &Palette, current: f32) -> Option<Action> {
+    const PRESETS: [(f32, &str); 7] = [
+        (0.70, "70%"),
+        (0.80, "80%"),
+        (0.85, "85%"),
+        (0.90, "90%"),
+        (1.00, "100%"),
+        (1.15, "115%"),
+        (1.30, "130%"),
+    ];
+    let mut action = None;
+    ui.add_space(22.0);
+    theme::text(ui, "Tamaño de la interfaz", theme::semibold(14.0), palette.text);
+    ui.add_space(4.0);
+    theme::subtle(
+        ui,
+        palette,
+        "Hace más chica o más grande toda la app (textos, paneles y botones). También podés usar \
+         Ctrl + y Ctrl - desde el teclado. Por defecto es 85%.",
+    );
+    ui.add_space(10.0);
+    ui.horizontal_wrapped(|ui| {
+        for (value, label) in PRESETS {
+            let selected = (current - value).abs() < 0.01;
+            if theme::soft_button(ui, palette, None, label, selected).clicked() {
+                action = Some(Action::SetUiScale(value));
+            }
+        }
+    });
+    action
+}
+
 /// Interruptor de la barra de llamada nueva (a todo el ancho, abajo de la
 /// ventana, como en el cliente oficial). Apagado por default.
 fn new_call_ui_section(ui: &mut egui::Ui, palette: &Palette, enabled: bool) -> Option<Action> {
     let mut action = None;
     ui.add_space(22.0);
-    theme::text(ui, "Barra de llamada", theme::semibold(14.0), palette.text);
+    theme::text(ui, "Interfaz nueva (rediseño completo)", theme::semibold(14.0), palette.text);
     ui.add_space(4.0);
     theme::subtle(
         ui,
         palette,
-        "Muestra los controles de la llamada en una barra a todo el ancho, abajo de la ventana, \
-         en vez de la tarjeta chica del panel izquierdo.",
+        "Rediseño completo: cada zona de la app pasa a ser una tarjeta redondeada que flota sobre \
+         el fondo (servidores, canales, chat y paneles), con filas teñidas con el acento y una \
+         barra de llamada a todo el ancho abajo, y un Inicio en tablero (saludo, amigos y servers \
+         ordenados por afinidad, actividad y canales recientes). Desactívala para volver al diseño anterior.",
     );
     ui.add_space(10.0);
-    if theme::soft_button(ui, palette, None, "Usar nueva interfaz", enabled).clicked() {
+    if theme::soft_button(ui, palette, None, if enabled { "Interfaz nueva: activada" } else { "Usar nueva interfaz" }, enabled).clicked() {
         action = Some(Action::SetNewCallUi(!enabled));
     }
     action
@@ -490,13 +532,24 @@ fn theme_picker_view(
         {
             action = Some(Action::SetMode(ThemeMode::Wallpaper));
         }
+        if theme::soft_button(
+            ui,
+            palette,
+            Some(Icon::Sparkles),
+            "CreArts",
+            *mode == ThemeMode::CreArts,
+        )
+        .clicked()
+        {
+            action = Some(Action::SetMode(ThemeMode::CreArts));
+        }
     });
 
     if *mode == ThemeMode::Wallpaper {
         ui.add_space(10.0);
         Frame::new()
             .fill(palette.surface)
-            .corner_radius(CornerRadius::same(theme::RADIUS))
+            .corner_radius(CornerRadius::same(theme::radius()))
             .inner_margin(Margin::symmetric(12, 10))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -718,7 +771,7 @@ fn backdrop_preview(ui: &mut egui::Ui, editor: &mut crate::theme::ThemeEditor) {
             Vec2::new(side.width() - 16.0, 24.0),
         );
         if k == 0 {
-            painter.rect_filled(row, CornerRadius::same(theme::RADIUS_SMALL), preview.surface_active);
+            painter.rect_filled(row, CornerRadius::same(theme::radius_small()), preview.surface_active);
         }
         painter.text(
             row.left_center() + Vec2::new(8.0, 0.0),
@@ -733,7 +786,7 @@ fn backdrop_preview(ui: &mut egui::Ui, editor: &mut crate::theme::ThemeEditor) {
             egui::pos2(main.left() + 14.0, main.top() + 14.0 + k as f32 * 44.0),
             Vec2::new(main.width() - 28.0, 36.0),
         );
-        painter.rect_filled(bubble, CornerRadius::same(theme::RADIUS_SMALL), preview.surface);
+        painter.rect_filled(bubble, CornerRadius::same(theme::radius_small()), preview.surface);
         painter.text(
             bubble.left_center() + Vec2::new(12.0, 0.0),
             egui::Align2::LEFT_CENTER,

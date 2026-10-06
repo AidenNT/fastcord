@@ -349,7 +349,7 @@ fn file_card(ui: &mut Ui, palette: &Palette, att: &Attachment, icon: Icon) {
     Frame::new()
         .fill(palette.surface)
         .stroke(Stroke::new(1.0, palette.outline))
-        .corner_radius(CornerRadius::same(theme::RADIUS_SMALL))
+        .corner_radius(CornerRadius::same(theme::radius_small()))
         .inner_margin(Margin::symmetric(10, 8))
         .show(ui, |ui| {
             ui.set_width((width - 22.0).max(60.0));
@@ -505,7 +505,7 @@ fn embed_card(ui: &mut Ui, palette: &Palette, e: &Embed) {
     let out = Frame::new()
         .fill(palette.surface)
         .stroke(Stroke::new(1.0, palette.outline))
-        .corner_radius(CornerRadius::same(theme::RADIUS_SMALL))
+        .corner_radius(CornerRadius::same(theme::radius_small()))
         .inner_margin(Margin {
             left: EMBED_PAD_LEFT as i8,
             right: EMBED_PAD_RIGHT as i8,
@@ -585,8 +585,8 @@ fn embed_card(ui: &mut Ui, palette: &Palette, e: &Embed) {
     ui.painter().rect_filled(
         Rect::from_min_size(r.min, Vec2::new(4.0, r.height())),
         CornerRadius {
-            nw: theme::RADIUS_SMALL,
-            sw: theme::RADIUS_SMALL,
+            nw: theme::radius_small(),
+            sw: theme::radius_small(),
             ne: 0,
             se: 0,
         },

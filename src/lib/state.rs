@@ -94,6 +94,11 @@ impl NotificationTarget {
     }
 }
 
+/// Límites y valor por defecto del tamaño de la interfaz (`App::ui_scale`).
+pub const UI_SCALE_MIN: f32 = 0.6;
+pub const UI_SCALE_MAX: f32 = 1.5;
+pub const UI_SCALE_DEFAULT: f32 = 0.85;
+
 /// De qué lado de la ventana se apilan las tarjetas de notificación
 /// (`ui::notifications::show_in_app`). Se elige en Ajustes → Apariencia y se
 /// guarda en `web_local_storage_api` bajo `notification_side`.
@@ -388,6 +393,18 @@ pub struct App {
     /// (parámetro `scroll_anchor`) una sola vez, apenas ese mensaje vuelve
     /// a aparecer en la lista actualizada.
     pub pending_scroll_anchor: Option<String>,
+    /// Id del mensaje al que hay que llevar el scroll del chat apenas
+    /// aparezca en la lista (ir a un mensaje puntual: click en una
+    /// respuesta, abrir un canal reciente en su último leído...). Lo
+    /// consume `ui::chat::show` una sola vez, centrando ese mensaje.
+    pub pending_jump: Option<String>,
+    /// Si el panel de notificaciones de la barra superior está abierto
+    /// (ver `ui::inbox`).
+    pub inbox_open: bool,
+    /// Si falló un pedido `after`, hasta cuándo no se reintenta (la UI lo
+    /// vuelve a pedir en cuanto el final de la lista queda a la vista, y sin
+    /// este freno lo repetiría cada frame).
+    newer_retry_after: Option<Instant>,
     /// Hilo abierto en el panel lateral del server, si hay alguno.
     pub thread_panel: Option<ThreadPanel>,
     /// Último momento (reloj de la UI, segundos) en que se recortó el
@@ -406,6 +423,11 @@ pub struct App {
     /// `session_id` del Gateway (del `READY`): las interacciones con
     /// botones de bots lo piden.
     pub gateway_session_id: String,
+    /// Catálogos de slash commands ya pedidos, por server (o por canal en un
+    /// DM). Ver `ui::slash` y `discord::slash`.
+    pub slash_catalogs: std::collections::HashMap<String, crate::discord::slash::CachedCatalog>,
+    /// Claves de `slash_catalogs` con un pedido en vuelo.
+    pub slash_pending: std::collections::HashSet<String>,
     /// Texto del buscador de la barra superior (`ui::topbar`); decorativo,
     /// no filtra nada todavía.
     pub top_search: String,
@@ -445,6 +467,17 @@ pub struct App {
     custom_statuses: std::collections::HashMap<String, String>,
     /// Actividades de la propia cuenta (`READY.sessions`/`SESSIONS_REPLACE`).
     own_activities: Vec<crate::discord::models::PresenceActivity>,
+    /// Afinidad (%) con cada usuario, de `GET /users/@me/affinities/users`.
+    /// Vacío hasta que llega `AppEvent::Affinities`. Ordena los amigos del
+    /// Inicio de la interfaz nueva.
+    pub affinity_users: crate::discord::affinities::AffinityMap,
+    /// Afinidad (%) con cada server, de `GET /users/@me/affinities/guilds`.
+    /// Ordena "Servidores frecuentes" en el Inicio de la interfaz nueva.
+    pub affinity_guilds: crate::discord::affinities::AffinityMap,
+    /// Pedido de scroll de los carruseles del Inicio nuevo (0 = amigos,
+    /// 1 = servers): offset horizontal al que mover la fila en el próximo
+    /// frame (lo ponen las flechas `‹ ›`).
+    pub home_scroll_req: [Option<f32>; 2],
     /// Tarjetas de notificación dentro de la app, más recientes al final.
     pub in_app_notifications: Vec<InAppNotification>,
     /// Lado de la ventana donde se apilan esas tarjetas y los avisos.
@@ -488,6 +521,13 @@ pub struct App {
     /// de la tarjeta chica del panel izquierdo. Se persiste solo; ver
     /// `set_new_call_ui`.
     pub new_call_ui: bool,
+    /// Tamaño de toda la interfaz (zoom): 1.0 = tamaño original, menos = más
+    /// chica. Se elige en Ajustes → Apariencia (o con Ctrl + / Ctrl -) y se
+    /// persiste; ver `set_ui_scale`.
+    pub ui_scale: f32,
+    /// Último zoom que se le puso a egui (NaN = todavía ninguno). Si el de egui
+    /// difiere, el cambio vino de afuera (atajo de teclado) y se adopta.
+    pub ui_scale_applied: f32,
     /// Editor de temas abierto dentro del panel de ajustes ("Crear
     /// tema"/"Editar tema"), si hay uno.
     pub theme_editor: Option<ThemeEditor>,
@@ -635,6 +675,18 @@ impl Default for App {
             web_local_storage_api::get_item("new_call_ui"),
             Ok(Some(ref raw)) if raw == "1"
         );
+        // Barras flotantes de la interfaz nueva.
+        crate::theme::set_modern(new_call_ui);
+        // Tamaño de la interfaz (zoom). Sin valor guardado arranca más chica
+        // que el 100 %: el rediseño se veía demasiado grande.
+        let ui_scale = match web_local_storage_api::get_item("ui_scale") {
+            Ok(Some(raw)) => raw
+                .trim()
+                .parse::<f32>()
+                .map(|v| v.clamp(UI_SCALE_MIN, UI_SCALE_MAX))
+                .unwrap_or(UI_SCALE_DEFAULT),
+            _ => UI_SCALE_DEFAULT,
+        };
 
         let mut app = Self {
             screen: Screen::Login,
@@ -660,12 +712,17 @@ impl Default for App {
             compose_text: String::new(),
             reply_target: None,
             pending_scroll_anchor: None,
+            pending_jump: None,
+            inbox_open: false,
+            newer_retry_after: None,
             thread_panel: None,
             last_history_trim: 0.0,
             component_modal: None,
             pending_buttons: Vec::new(),
             gateway_disconnected: false,
             gateway_session_id: String::new(),
+            slash_catalogs: std::collections::HashMap::new(),
+            slash_pending: std::collections::HashSet::new(),
             top_search: String::new(),
             toasts: Vec::new(),
             window_focused: true,
@@ -678,6 +735,9 @@ impl Default for App {
             user_activities: std::collections::HashMap::new(),
             custom_statuses: std::collections::HashMap::new(),
             own_activities: Vec::new(),
+            affinity_users: Default::default(),
+            affinity_guilds: Default::default(),
+            home_scroll_req: [None; 2],
             in_app_notifications: Vec::new(),
             notification_side,
             mute_rules: crate::lib::notifications::MuteRules::default(),
@@ -722,6 +782,8 @@ impl Default for App {
             watching_stream: None,
             egui_ctx: None,
             new_call_ui,
+            ui_scale,
+            ui_scale_applied: f32::NAN,
         };
         // Con el modo ya cargado, calculamos la paleta que corresponde
         // (y, si es `Wallpaper`, arrancamos el hilo que lo vigila) antes
@@ -1006,6 +1068,8 @@ impl App {
         self.compose_text.clear();
         self.reply_target = None;
         self.pending_scroll_anchor = None;
+        self.pending_jump = None;
+        self.inbox_open = false;
         self.thread_panel = None;
         self.component_modal = None;
         self.top_search.clear();
@@ -1018,6 +1082,9 @@ impl App {
         self.user_activities.clear();
         self.custom_statuses.clear();
         self.own_activities.clear();
+        self.affinity_users = Default::default();
+        self.affinity_guilds = Default::default();
+        self.home_scroll_req = [None; 2];
         self.in_app_notifications.clear();
         self.mute_rules = crate::lib::notifications::MuteRules::default();
         self.shown_title_count = None;
@@ -1056,6 +1123,8 @@ impl App {
         self.member_subscription = None;
         self.pending_member_subscription = None;
         self.gateway_session_id.clear();
+        self.slash_catalogs.clear();
+        self.slash_pending.clear();
         self.connection_steps.clear();
         self.event_rx = None;
         self.event_tx = None;
@@ -1198,8 +1267,18 @@ impl App {
         self.screen = Screen::Dm(index);
         self.compose_text.clear();
         self.reply_target = None;
+        self.pending_jump = None;
 
         let friend = &mut self.friends[index];
+        // La ventana cargada quedó en el medio del historial (se saltó a un
+        // mensaje con `around`): al abrir el DM a secas se vuelve al final.
+        if friend.has_newer {
+            friend.messages.clear();
+            friend.loaded = false;
+            friend.has_newer = false;
+            friend.loading_newer = false;
+            friend.has_more = true;
+        }
         if friend.loaded || friend.user_id.is_empty() {
             return;
         }
@@ -1544,16 +1623,38 @@ impl App {
     /// no tienen mensajes que pedir (`Channel::from_discord` ya los marca
     /// `loaded` de entrada).
     pub fn open_channel(&mut self, category: usize, channel: usize) {
+        self.open_channel_with(category, channel, true);
+    }
+
+    /// `open_channel`, pero con `fetch_latest = false` no pide ni resetea el
+    /// historial: lo usa `open_channel_at`, que carga la ventana de mensajes
+    /// por su cuenta (`jump_to_message`).
+    fn open_channel_with(&mut self, category: usize, channel: usize, fetch_latest: bool) {
         self.current_channel = (category, channel);
         self.compose_text.clear();
         self.reply_target = None;
         self.thread_panel = None;
+        if fetch_latest {
+            self.pending_jump = None;
+        }
         self.subscribe_member_list();
         self.load_forum_posts_if_needed();
+        if !fetch_latest {
+            return;
+        }
 
         let Screen::Server(server_index) = self.screen else { return };
         let Some(server) = self.servers.get_mut(server_index) else { return };
         let Some(ch) = server.channel_mut(category, channel) else { return };
+        // La ventana cargada quedó en el medio del historial (se saltó a un
+        // mensaje con `around`): al abrir el canal a secas se vuelve al final.
+        if ch.has_newer {
+            ch.messages.clear();
+            ch.loaded = false;
+            ch.has_newer = false;
+            ch.loading_newer = false;
+            ch.has_more = true;
+        }
         if ch.loaded {
             return;
         }
@@ -1698,6 +1799,63 @@ impl App {
         let token = self.discord_token.clone()?;
         let panel = self.thread_panel.as_ref()?;
         Some((token, panel.thread_id.clone(), self.current_guild_id()))
+    }
+
+    /// Publica el catálogo de slash commands del canal abierto para el
+    /// compositor (`ui::slash`) y, si el compositor está escribiendo un `/...`
+    /// y falta (o venció), lo pide a Discord. Mientras llega uno nuevo se sigue
+    /// mostrando el viejo.
+    fn publish_slash_catalog(&mut self, ctx: &egui::Context) {
+        use crate::ui::slash;
+
+        let wanted = slash::take_wanted(ctx);
+        let Some((token, channel_id, guild_id)) = self.current_send_target() else {
+            slash::publish_catalog(ctx, None);
+            return;
+        };
+        // Los comandos son del server (o del DM): el hilo comparte los del padre.
+        let key = guild_id.clone().unwrap_or_else(|| channel_id.clone());
+        let (expired, catalog) = match self.slash_catalogs.get(&key) {
+            Some(cached) => (cached.expired(), Some(cached.catalog.clone())),
+            None => (true, None),
+        };
+        if wanted && expired && !self.slash_pending.contains(&key) {
+            if let Some(tx) = self.event_tx.clone() {
+                self.slash_pending.insert(key.clone());
+                crate::discord::spawn_fetch_slash_catalog(token, key, channel_id, guild_id, tx);
+            }
+        }
+        slash::publish_catalog(ctx, catalog);
+    }
+
+    /// Ejecuta el slash command que el compositor dejó listo
+    /// (`ui::slash::take_invocation`).
+    fn run_slash_invocation(&mut self, invocation: crate::ui::slash::SlashInvocation) {
+        let Some((token, tx)) = self.discord_token.clone().zip(self.event_tx.clone()) else {
+            return;
+        };
+        let application_id = invocation.command.application_id.clone();
+        let Some(ctx) = self.interaction_context(&invocation.channel_id, &application_id, invocation.guild_id.clone())
+        else {
+            self.push_toast(
+                ToastKind::Warning,
+                "No se pudo ejecutar el comando",
+                "Todavía no hay conexión con Discord.",
+            );
+            return;
+        };
+        // Para "usados frecuentemente" del menú de comandos: el id del comando
+        // (con `\0subcomando[:server]` si se usó uno) y la app.
+        let key = match invocation.path.last().filter(|_| invocation.path.len() > 1) {
+            None => invocation.command.id.clone(),
+            Some(leaf) => match invocation.guild_id.as_deref().filter(|g| !g.is_empty()) {
+                Some(guild) => format!("{}\0{leaf}:{guild}", invocation.command.id),
+                None => format!("{}\0{leaf}", invocation.command.id),
+            },
+        };
+        crate::discord::frecency::record_command_use(&key);
+        crate::discord::frecency::record_application_use(&application_id);
+        crate::discord::spawn_run_slash_command(token, ctx, invocation.command, invocation.options, tx);
     }
 
     /// Datos comunes de una interacción con el canal `channel_id` (vacío =
@@ -1952,6 +2110,191 @@ impl App {
         }
     }
 
+    /// Último mensaje que Discord tiene como leído en `channel_id` (el que
+    /// trajo el `READY` o el último ack). Sirve para abrir/previsualizar un
+    /// canal justo donde se había dejado.
+    pub fn last_read_message(&self, channel_id: &str) -> Option<&str> {
+        self.acked_messages
+            .get(channel_id)
+            .map(String::as_str)
+            .filter(|id| !id.is_empty() && *id != "0")
+    }
+
+    /// Va a un mensaje puntual de un canal/DM ya conocido. Si el mensaje ya
+    /// está en la ventana cargada solo se mueve el scroll hasta él; si no,
+    /// se piden los mensajes ALREDEDOR (`?limit=30&around=<id>`) y la lista
+    /// pasa a ser esa ventana (`has_newer` queda en `true`: para ver lo más
+    /// nuevo se sigue bajando con `after`, ver `load_newer_messages`).
+    pub fn jump_to_message(&mut self, channel_id: &str, message_id: &str) {
+        if channel_id.is_empty() || message_id.is_empty() {
+            return;
+        }
+        let Some((token, tx)) = self.discord_token.clone().zip(self.event_tx.clone()) else {
+            return;
+        };
+
+        if let Some(friend) = self
+            .friends
+            .iter_mut()
+            .find(|f| f.dm_channel_id.as_deref() == Some(channel_id))
+        {
+            if friend.messages.iter().any(|m| m.id == message_id) {
+                self.pending_jump = Some(message_id.to_string());
+                return;
+            }
+            // Los mensajes de ahora se quedan hasta que llegue la ventana
+            // nueva (no hay parpadeo); `loading` frena otros pedidos.
+            friend.loaded = true;
+            friend.loading = true;
+            friend.loading_more = false;
+            friend.loading_newer = false;
+            self.pending_jump = None;
+            crate::discord::spawn_fetch_messages_around(
+                token,
+                channel_id.to_string(),
+                message_id.to_string(),
+                true,
+                tx,
+            );
+            return;
+        }
+
+        let Some(channel) = self
+            .servers
+            .iter_mut()
+            .find_map(|s| s.channel_by_id_mut(channel_id))
+        else {
+            return;
+        };
+        if channel.messages.iter().any(|m| m.id == message_id) {
+            self.pending_jump = Some(message_id.to_string());
+            return;
+        }
+        channel.loaded = true;
+        channel.loading = true;
+        channel.loading_more = false;
+        channel.loading_newer = false;
+        self.pending_jump = None;
+        crate::discord::spawn_fetch_messages_around(
+            token,
+            channel_id.to_string(),
+            message_id.to_string(),
+            true,
+            tx,
+        );
+    }
+
+    /// Abre `servers[server].categories[category].channels[channel]` en un
+    /// mensaje puntual (o a secas si `message_id` es `None`). Es lo que usan
+    /// los canales recientes del Inicio para abrir un canal donde se había
+    /// quedado la lectura.
+    pub fn open_channel_at(
+        &mut self,
+        server: usize,
+        category: usize,
+        channel: usize,
+        message_id: Option<String>,
+    ) {
+        self.open_server(server);
+        let Some(message_id) = message_id else {
+            self.open_channel(category, channel);
+            return;
+        };
+        self.open_channel_with(category, channel, false);
+        let channel_id = self
+            .servers
+            .get(server)
+            .and_then(|s| s.channel(category, channel))
+            .and_then(|c| c.channel_id.clone());
+        if let Some(channel_id) = channel_id {
+            self.jump_to_message(&channel_id, &message_id);
+        }
+    }
+
+    /// Vista previa de un canal reciente del Inicio: si todavía no tiene
+    /// mensajes cargados, pide la ventana alrededor del último mensaje leído
+    /// (`around`), así se ve lo que quedó sin leer; sin marca de lectura
+    /// pide lo más nuevo. No mueve el scroll del chat (`jump = false`).
+    pub fn load_recent_preview(&mut self, server: usize, category: usize, channel: usize) {
+        let Some((token, tx)) = self.discord_token.clone().zip(self.event_tx.clone()) else {
+            return;
+        };
+        let Some(channel_id) = self
+            .servers
+            .get(server)
+            .and_then(|s| s.channel(category, channel))
+            .filter(|c| !c.loaded && !c.loading && !c.is_forum)
+            .and_then(|c| c.channel_id.clone())
+        else {
+            return;
+        };
+        let last_read = self.last_read_message(&channel_id).map(str::to_string);
+        if let Some(ch) = self
+            .servers
+            .get_mut(server)
+            .and_then(|s| s.channel_mut(category, channel))
+        {
+            ch.loaded = true;
+            ch.loading = true;
+        }
+        match last_read {
+            Some(id) => crate::discord::spawn_fetch_messages_around(token, channel_id, id, false, tx),
+            None => crate::discord::spawn_fetch_channel_messages(token, channel_id, tx),
+        }
+    }
+
+    /// Pide la página POSTERIOR al último mensaje cargado del canal/DM que
+    /// se está mirando (`?limit=30&after=<id>`). Solo corresponde cuando la
+    /// ventana no llega hasta el final del canal (`has_newer`).
+    pub fn load_newer_messages(&mut self) {
+        let Some(channel_id) = self.viewed_channel_id() else { return };
+        self.load_newer_for_channel(&channel_id);
+    }
+
+    /// Lo mismo que `load_newer_messages` para un canal puntual (la vista
+    /// previa de los canales recientes del Inicio no es el chat abierto).
+    pub fn load_newer_for_channel(&mut self, channel_id: &str) {
+        if self.newer_retry_after.is_some_and(|until| Instant::now() < until) {
+            return;
+        }
+        let Some((token, tx)) = self.discord_token.clone().zip(self.event_tx.clone()) else {
+            return;
+        };
+        let newest = |messages: &[ChatMessage]| {
+            messages
+                .iter()
+                .rev()
+                .find(|m| !m.id.is_empty())
+                .map(|m| m.id.clone())
+        };
+        if let Some(friend) = self
+            .friends
+            .iter_mut()
+            .find(|f| f.dm_channel_id.as_deref() == Some(channel_id))
+        {
+            if !friend.has_newer || friend.loading_newer || friend.loading {
+                return;
+            }
+            let Some(newest_id) = newest(&friend.messages) else { return };
+            friend.loading_newer = true;
+            crate::discord::spawn_fetch_newer_channel_messages(token, channel_id.to_string(), newest_id, tx);
+            return;
+        }
+        let Some(channel) = self
+            .servers
+            .iter_mut()
+            .find_map(|s| s.channel_by_id_mut(channel_id))
+        else {
+            return;
+        };
+        if !channel.has_newer || channel.loading_newer || channel.loading {
+            return;
+        }
+        let Some(newest_id) = newest(&channel.messages) else { return };
+        channel.loading_newer = true;
+        crate::discord::spawn_fetch_newer_channel_messages(token, channel_id.to_string(), newest_id, tx);
+    }
+
     /// Encola una notificación flotante en la esquina de la ventana.
     pub fn push_toast(&mut self, kind: ToastKind, title: impl Into<String>, message: impl Into<String>) {
         self.toasts.push(Toast {
@@ -2136,6 +2479,8 @@ impl App {
                     loading: false,
                     loading_more: false,
                     has_more: true,
+                    has_newer: false,
+                    loading_newer: false,
                     // Solo se abre el DM: no es (ni pasa a ser) un amigo.
                     is_friend: false,
                 });
@@ -2174,6 +2519,7 @@ impl App {
         self.palette = match &mode {
             ThemeMode::Dark => Palette::dark(),
             ThemeMode::Light => Palette::light(),
+            ThemeMode::CreArts => Palette::crearts(),
             ThemeMode::Wallpaper => {
                 self.start_wallpaper_watch();
                 self.wallpaper_seed.map(Palette::from_seed).unwrap_or_else(Palette::dark)
@@ -2199,6 +2545,20 @@ impl App {
     pub fn set_new_call_ui(&mut self, enabled: bool) {
         self.new_call_ui = enabled;
         let _ = web_local_storage_api::set_item("new_call_ui", if enabled { "1" } else { "0" });
+        crate::theme::set_modern(enabled);
+        // Las pestañas del Inicio son distintas en cada interfaz: se vuelve a la
+        // primera para no quedar en un índice que significa otra cosa.
+        self.friends_tab = 0;
+        self.home_scroll_req = [None; 2];
+    }
+
+    /// Cambia el tamaño de toda la interfaz (zoom de egui) y lo persiste. El
+    /// valor se acota a `UI_SCALE_MIN..=UI_SCALE_MAX` y se aplica en el
+    /// próximo frame (ver `App::ui`).
+    pub fn set_ui_scale(&mut self, scale: f32) {
+        let scale = (scale.clamp(UI_SCALE_MIN, UI_SCALE_MAX) * 100.0).round() / 100.0;
+        self.ui_scale = scale;
+        let _ = web_local_storage_api::set_item("ui_scale", &format!("{scale:.2}"));
     }
 
     /// Lleva a la pantalla de la llamada en curso: el canal de voz del server
@@ -2618,6 +2978,14 @@ impl App {
             AppEvent::FrecencyUpdate { settings, partial } => {
                 crate::discord::frecency::ingest_update(*settings, partial);
             }
+            AppEvent::Affinities { users, guilds } => {
+                if let Some(users) = users {
+                    self.affinity_users = users;
+                }
+                if let Some(guilds) = guilds {
+                    self.affinity_guilds = guilds;
+                }
+            }
             AppEvent::UserSettingsUpdate { settings, partial } => {
                 // Un cambio hecho en otro dispositivo (sobre todo el orden y
                 // las carpetas de servers). `guild_folders` se REEMPLAZA
@@ -2653,6 +3021,10 @@ impl App {
                     .map(Friend::from_relationship)
                     .collect();
                 self.servers = ready.guilds.iter().map(Server::from_guild).collect();
+                // Afinidades (amigos y servers) para ordenar el Inicio nuevo.
+                if let Some((token, tx)) = self.discord_token.clone().zip(self.event_tx.clone()) {
+                    crate::discord::spawn_fetch_affinities(token, tx);
+                }
                 self.dms = ready.private_channels.iter().map(PrivateChannel::from_dm).collect();
                 // El `READY` no manda los DMs en orden: se ordenan por el
                 // último mensaje, como el cliente oficial.
@@ -2855,6 +3227,147 @@ impl App {
                 }
                 if let Some((guild_id, user_ids)) = to_request {
                     self.request_members(&guild_id, user_ids);
+                }
+            }
+            AppEvent::AroundChannelMessages { channel_id, target_id, jump, messages } => {
+                use crate::lib::notifications::{dm_sort_key, snowflake};
+                let my_id = self.me.as_ref().map(|m| m.id.clone()).unwrap_or_default();
+                // Chronological (la API los manda del más nuevo al más viejo).
+                let mut sorted: Vec<&crate::discord::models::GatewayMessage> = messages.iter().collect();
+                sorted.sort_by_key(|m| snowflake(&m.id));
+                let target_n = snowflake(&target_id);
+                let older = sorted.iter().filter(|m| snowflake(&m.id) < target_n).count();
+                let newer = sorted.iter().filter(|m| snowflake(&m.id) > target_n).count();
+                let newest_n = sorted.last().map(|m| snowflake(&m.id)).unwrap_or(0);
+                // Si no hay nada más viejo que el mensaje pedido, ya se llegó al
+                // principio del canal.
+                let has_more = older > 0;
+                if jump {
+                    self.pending_jump = Some(target_id.clone());
+                }
+                if let Some(friend) = self
+                    .friends
+                    .iter_mut()
+                    .find(|f| f.dm_channel_id.as_deref() == Some(channel_id.as_str()))
+                {
+                    // En un DM se sabe cuál es el último mensaje: si la ventana
+                    // ya lo incluye, no hay nada más abajo que pedir.
+                    let latest_known = self
+                        .dms
+                        .iter()
+                        .find(|dm| dm.id == channel_id)
+                        .map(dm_sort_key)
+                        .unwrap_or(0);
+                    let at_latest = latest_known != 0 && newest_n >= latest_known;
+                    friend.messages = sorted
+                        .iter()
+                        .map(|m| ChatMessage::from_discord(m, &my_id))
+                        .collect();
+                    friend.loaded = true;
+                    friend.loading = false;
+                    friend.loading_more = false;
+                    friend.loading_newer = false;
+                    friend.has_more = has_more;
+                    friend.has_newer = newer > 0 && !at_latest;
+                    return;
+                }
+                let mut to_request: Option<(String, Vec<String>)> = None;
+                'outer: for server in &mut self.servers {
+                    let names = NameResolver::new(&server.member_info, &server.roles);
+                    for category in &mut server.categories {
+                        for channel in &mut category.channels {
+                            if channel.channel_id.as_deref() == Some(channel_id.as_str()) {
+                                channel.messages = sorted
+                                    .iter()
+                                    .map(|m| ChatMessage::from_discord_in(m, &my_id, Some(names)))
+                                    .collect();
+                                channel.loaded = true;
+                                channel.loading = false;
+                                channel.loading_more = false;
+                                channel.loading_newer = false;
+                                channel.has_more = has_more;
+                                // En un canal de server no sabemos cuál es el último
+                                // mensaje: si hubo algo más nuevo, se sigue con `after`
+                                // (si ya estábamos al final, ese pedido vuelve vacío y
+                                // apaga la bandera).
+                                channel.has_newer = newer > 0;
+                                to_request = Some((server.guild_id.clone(), message_author_ids(&messages)));
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+                if let Some((guild_id, user_ids)) = to_request {
+                    self.request_members(&guild_id, user_ids);
+                }
+            }
+            AppEvent::NewerChannelMessages { channel_id, messages } => {
+                use crate::lib::notifications::snowflake;
+                let my_id = self.me.as_ref().map(|m| m.id.clone()).unwrap_or_default();
+                let mut sorted: Vec<&crate::discord::models::GatewayMessage> = messages.iter().collect();
+                sorted.sort_by_key(|m| snowflake(&m.id));
+                // Una página completa = puede haber más; una corta = ya se llegó
+                // al mensaje más nuevo del canal.
+                let has_newer = messages.len() >= crate::discord::uwu_rest::MESSAGES_WINDOW_SIZE as usize;
+                if let Some(friend) = self
+                    .friends
+                    .iter_mut()
+                    .find(|f| f.dm_channel_id.as_deref() == Some(channel_id.as_str()))
+                {
+                    for m in &sorted {
+                        if friend.messages.iter().any(|x| !x.id.is_empty() && x.id == m.id) {
+                            continue;
+                        }
+                        reconcile_or_push(&mut friend.messages, ChatMessage::from_discord(m, &my_id));
+                    }
+                    friend.loading_newer = false;
+                    friend.has_newer = has_newer;
+                    return;
+                }
+                let mut to_request: Option<(String, Vec<String>)> = None;
+                'outer: for server in &mut self.servers {
+                    let names = NameResolver::new(&server.member_info, &server.roles);
+                    for category in &mut server.categories {
+                        for channel in &mut category.channels {
+                            if channel.channel_id.as_deref() == Some(channel_id.as_str()) {
+                                for m in &sorted {
+                                    if channel.messages.iter().any(|x| !x.id.is_empty() && x.id == m.id) {
+                                        continue;
+                                    }
+                                    reconcile_or_push(
+                                        &mut channel.messages,
+                                        ChatMessage::from_discord_in(m, &my_id, Some(names)),
+                                    );
+                                }
+                                channel.loading_newer = false;
+                                channel.has_newer = has_newer;
+                                to_request = Some((server.guild_id.clone(), message_author_ids(&messages)));
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+                if let Some((guild_id, user_ids)) = to_request {
+                    self.request_members(&guild_id, user_ids);
+                }
+            }
+            AppEvent::MessageWindowFailed { channel_id } => {
+                self.pending_jump = None;
+                self.newer_retry_after = Some(Instant::now() + std::time::Duration::from_secs(5));
+                if let Some(friend) = self
+                    .friends
+                    .iter_mut()
+                    .find(|f| f.dm_channel_id.as_deref() == Some(channel_id.as_str()))
+                {
+                    friend.loading = false;
+                    friend.loading_newer = false;
+                } else if let Some(channel) = self
+                    .servers
+                    .iter_mut()
+                    .find_map(|s| s.channel_by_id_mut(&channel_id))
+                {
+                    channel.loading = false;
+                    channel.loading_newer = false;
                 }
             }
             AppEvent::GuildVoiceStates { guild_id, states } => {
@@ -3158,6 +3671,27 @@ impl App {
                     }
                 }
                 self.open_thread_panel(&thread.id, &title, owner);
+            }
+            AppEvent::SlashCatalogLoaded { key, catalog } => {
+                self.slash_pending.remove(&key);
+                self.slash_catalogs.insert(key, crate::discord::slash::CachedCatalog::new(catalog));
+                // Pocos catálogos en memoria: el de los servers que se dejaron
+                // de visitar se va (se vuelve a pedir si hace falta).
+                while self.slash_catalogs.len() > 12 {
+                    let oldest = self
+                        .slash_catalogs
+                        .iter()
+                        .min_by_key(|(_, cached)| cached.fetched)
+                        .map(|(key, _)| key.clone());
+                    match oldest {
+                        Some(key) => self.slash_catalogs.remove(&key),
+                        None => break,
+                    };
+                }
+            }
+            AppEvent::SlashCatalogFailed { key } => {
+                self.slash_pending.remove(&key);
+                self.slash_catalogs.insert(key, crate::discord::slash::CachedCatalog::failed());
             }
             AppEvent::PresenceUpdate(event) => self.apply_presence_event(&event),
             AppEvent::PresenceSnapshot(events) => {
@@ -3550,15 +4084,17 @@ impl App {
         let (channel_id, messages, loading) = match self.screen {
             Screen::Dm(i) => {
                 let friend = self.friends.get(i)?;
-                (friend.dm_channel_id.clone()?, &friend.messages, friend.loading)
+                (friend.dm_channel_id.clone()?, &friend.messages, friend.loading || friend.has_newer)
             }
             Screen::Server(i) => {
                 let (category, channel) = self.current_channel;
                 let channel = self.servers.get(i)?.channel(category, channel)?;
-                (channel.channel_id.clone()?, &channel.messages, channel.loading)
+                (channel.channel_id.clone()?, &channel.messages, channel.loading || channel.has_newer)
             }
             _ => return None,
         };
+        // Con `has_newer` la lista termina en el medio del historial: no se
+        // marca como leído hasta llegar de verdad al último mensaje.
         if loading {
             return None;
         }
@@ -3634,6 +4170,12 @@ impl App {
 
     /// Tarjetas del panel "Activo ahora": primero lo que hacés vos (si hay),
     /// después los amigos que están jugando o escuchando algo.
+    /// Primera actividad de la propia cuenta (la que muestra la tarjeta de
+    /// "escuchando / jugando" de la interfaz nueva), si hay alguna.
+    pub fn own_activity(&self) -> Option<&crate::discord::models::PresenceActivity> {
+        self.own_activities.first()
+    }
+
     pub fn active_now_cards(&self) -> Vec<crate::lib::data::ActiveNowCard> {
         use crate::lib::data::{ActiveNowCard, Status};
         let mut cards = Vec::new();
@@ -3666,6 +4208,146 @@ impl App {
             });
         }
         cards
+    }
+
+    /// Texto corto de lo que hace `user_id` ahora (juego, canción...), sin el
+    /// estado personalizado. `None` si no está haciendo nada.
+    /// Título ("Jugando X") y detalle de la primera actividad de `user_id`.
+    fn activity_texts_of(&self, user_id: &str) -> (Option<String>, Option<String>) {
+        let Some(a) = self.user_activities.get(user_id).and_then(|v| v.iter().find(|a| a.kind != 4)) else {
+            return (None, None);
+        };
+        let verb = match a.kind {
+            0 => "Jugando",
+            1 => "Transmitiendo",
+            2 => "Escuchando",
+            3 => "Viendo",
+            5 => "Compitiendo en",
+            _ => "",
+        };
+        let title = if verb.is_empty() { a.name.clone() } else { format!("{verb} {}", a.name) };
+        let parts: Vec<&str> = [a.details.as_deref(), a.state.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        (Some(title), (!parts.is_empty()).then(|| parts.join(" · ")))
+    }
+
+    fn short_activity_of(&self, user_id: &str) -> Option<String> {
+        let activity = self.user_activities.get(user_id)?.iter().find(|a| a.kind != 4)?;
+        let pick = |s: &Option<String>| s.clone().filter(|s| !s.trim().is_empty());
+        // Escuchando: la canción; el resto: el nombre del juego/app.
+        let song = if activity.kind == 2 { pick(&activity.details) } else { None };
+        let text = song.unwrap_or_else(|| activity.name.clone());
+        (!text.trim().is_empty()).then_some(text)
+    }
+
+    /// Amigos para el carrusel del Inicio nuevo, en orden de prioridad:
+    /// primero los que están haciendo algo, después los conectados y al final
+    /// los desconectados. Dentro de cada grupo manda la afinidad de Discord
+    /// (mayor % primero); si empatan o no hay dato, por nombre.
+    pub fn home_friends_sorted(&self) -> Vec<crate::lib::data::HomeFriend> {
+        use crate::lib::data::{HomeFriend, Status};
+        let mut out: Vec<HomeFriend> = self
+            .friends
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.is_friend)
+            .map(|(index, f)| HomeFriend {
+                index,
+                name: f.name.clone(),
+                initial: f.initial(),
+                avatar_url: f.avatar_url.clone(),
+                avatar_color: f.avatar_color,
+                status: f.status,
+                activity: if f.status == Status::Offline { None } else { self.short_activity_of(&f.user_id) },
+                affinity: self.affinity_users.pct(&f.user_id),
+                user_id: f.user_id.clone(),
+                handle: {
+                    let h = f.handle.trim_end_matches("#0000").trim_end_matches("#0");
+                    if h.contains('#') { h.to_owned() } else { format!("@{h}") }
+                },
+                activity_title: None,
+                activity_detail: None,
+                ranks: Vec::new(),
+            })
+            .collect();
+        // Detalle de la actividad (solo de quienes están haciendo algo).
+        for f in out.iter_mut().filter(|f| f.activity.is_some()) {
+            let (title, detail) = self.activity_texts_of(&f.user_id);
+            f.activity_title = title;
+            f.activity_detail = detail;
+        }
+        // Puestos de afinidad: global y dentro de cada grupo.
+        let rank_where = |pred: &dyn Fn(&HomeFriend) -> bool| -> std::collections::HashMap<usize, (usize, usize)> {
+            let mut v: Vec<(usize, f32)> = out
+                .iter()
+                .filter(|f| pred(f))
+                .filter_map(|f| f.affinity.map(|p| (f.index, p)))
+                .collect();
+            v.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let total = v.len();
+            v.into_iter().enumerate().map(|(i, (idx, _))| (idx, (i + 1, total))).collect()
+        };
+        let all = rank_where(&|_| true);
+        let doing = rank_where(&|f| f.activity.is_some());
+        let on = rank_where(&|f| f.status != Status::Offline);
+        let off = rank_where(&|f| f.status == Status::Offline);
+        for f in out.iter_mut() {
+            if let Some(&(r, n)) = all.get(&f.index) {
+                f.ranks.push(("Entre todos tus amigos", r, n));
+            }
+            if let Some(&(r, n)) = doing.get(&f.index) {
+                f.ranks.push(("Entre los que hacen algo", r, n));
+            }
+            if let Some(&(r, n)) = on.get(&f.index) {
+                f.ranks.push(("Entre los conectados", r, n));
+            }
+            if let Some(&(r, n)) = off.get(&f.index) {
+                f.ranks.push(("Entre los desconectados", r, n));
+            }
+        }
+        let group = |f: &HomeFriend| -> u8 {
+            if f.activity.is_some() {
+                0
+            } else if f.status != Status::Offline {
+                1
+            } else {
+                2
+            }
+        };
+        out.sort_by(|a, b| {
+            group(a)
+                .cmp(&group(b))
+                .then_with(|| b.affinity.unwrap_or(-1.0).total_cmp(&a.affinity.unwrap_or(-1.0)))
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        out
+    }
+
+    /// Servers para "Servidores frecuentes" del Inicio nuevo: los de mayor
+    /// afinidad primero. Los que Discord no puntuó van al final en el orden
+    /// de siempre (y si todavía no llegaron las afinidades, todos quedan así).
+    pub fn home_servers_sorted(&self) -> Vec<crate::lib::data::HomeServer> {
+        let mut out: Vec<crate::lib::data::HomeServer> = self
+            .servers
+            .iter()
+            .enumerate()
+            .map(|(index, s)| crate::lib::data::HomeServer {
+                index,
+                name: s.name.clone(),
+                initial: s.icon_initial.clone(),
+                icon_url: s.icon_url.clone(),
+                icon_color: s.icon_color,
+                online_count: s.online_count,
+                affinity: self.affinity_guilds.pct(&s.guild_id),
+            })
+            .collect();
+        // `sort_by` es estable: los empatados conservan el orden original.
+        out.sort_by(|a, b| b.affinity.unwrap_or(-1.0).total_cmp(&a.affinity.unwrap_or(-1.0)));
+        out
     }
 
     /// Estado de presencia conocido de `user_id`, para el punto de estado del
@@ -3893,7 +4575,11 @@ impl App {
             .iter_mut()
             .find(|f| f.dm_channel_id.as_deref() == Some(msg.channel_id.as_str()))
         {
-            reconcile_or_push(&mut friend.messages, ChatMessage::from_discord(&msg, &my_id));
+            // Ventana en el medio del historial (`has_newer`): este mensaje
+            // se trae con `after` al bajar; agregarlo ahora dejaría un hueco.
+            if !friend.has_newer {
+                reconcile_or_push(&mut friend.messages, ChatMessage::from_discord(&msg, &my_id));
+            }
             return;
         }
 
@@ -3914,7 +4600,10 @@ impl App {
         let mut in_thread = false;
         if let Some(channel) = server.channel_by_id_mut(&msg.channel_id) {
             in_thread = channel.is_thread;
-            reconcile_or_push(&mut channel.messages, chat_msg);
+            // Ver `Friend::has_newer`: con la ventana en el medio no se agrega.
+            if !channel.has_newer {
+                reconcile_or_push(&mut channel.messages, chat_msg);
+            }
         }
         // Un mensaje dentro de un hilo sube el contador de la tarjeta que
         // está debajo del mensaje original (el mensaje inicial del hilo,
@@ -4089,6 +4778,41 @@ impl App {
         items.extend(roles_out.into_iter().take(menus::MAX_ROLES));
         items.extend(special);
         menus::publish_results(ctx, query, items);
+    }
+
+    /// Arma los canales que coinciden con lo que el formulario de un slash
+    /// command está buscando en una opción de tipo canal (ver `ui::slash`).
+    /// Solo canales visibles del server abierto (sin los hilos de foro).
+    fn publish_channel_results(&mut self, ctx: &egui::Context) {
+        use crate::ui::compose_menus as menus;
+        use crate::ui::slash::{self, ChannelCandidate};
+
+        let Some(query) = slash::take_channel_query(ctx) else { return };
+        let needle = menus::fold(&query);
+        let mut found: Vec<(u8, usize, ChannelCandidate)> = Vec::new();
+        if let Screen::Server(index) = self.screen {
+            if let Some(server) = self.servers.get(index) {
+                let mut order = 0usize;
+                for category in &server.categories {
+                    for channel in &category.channels {
+                        order += 1;
+                        if channel.is_thread || !channel.access.can_view {
+                            continue;
+                        }
+                        let Some(id) = channel.channel_id.clone() else { continue };
+                        let Some(rank) = menus::match_rank(&channel.name, &needle) else { continue };
+                        found.push((
+                            rank,
+                            order,
+                            ChannelCandidate { id, name: channel.name.clone(), category: category.name.clone() },
+                        ));
+                    }
+                }
+            }
+        }
+        found.sort_by_key(|(rank, order, _)| (*rank, *order));
+        let items = found.into_iter().map(|(_, _, cand)| cand).take(25).collect();
+        slash::publish_channel_results(ctx, query, items);
     }
 
     /// Le pide al Gateway los miembros del server abierto cuyo nombre empieza
@@ -4731,6 +5455,28 @@ impl eframe::App for App {
         // Devuelve al sistema la memoria libre del allocator (cada ~20 s).
         crate::support::mem_report::release_free_memory_periodic();
 
+        // Tamaño de la interfaz (zoom). Si egui ya no tiene el zoom que le
+        // pusimos, lo cambió el usuario con Ctrl + / Ctrl - y se adopta; si no,
+        // se le aplica el elegido en Ajustes.
+        {
+            let ctx = ui.ctx().clone();
+            let current = ctx.zoom_factor();
+            if (current - self.ui_scale_applied).abs() > 0.001 {
+                self.set_ui_scale(current);
+                self.ui_scale_applied = self.ui_scale;
+                if (self.ui_scale - current).abs() > 0.001 {
+                    ctx.set_zoom_factor(self.ui_scale);
+                }
+            } else if (self.ui_scale - current).abs() > 0.001 {
+                ctx.set_zoom_factor(self.ui_scale);
+                self.ui_scale_applied = self.ui_scale;
+            }
+            if self.ui_scale_applied.is_nan() {
+                ctx.set_zoom_factor(self.ui_scale);
+                self.ui_scale_applied = self.ui_scale;
+            }
+        }
+
         // Reaplica el estilo cada frame (barato) para poder alternar
         // Palette::dark()/light() en caliente si más adelante agregás un
         // toggle de tema.
@@ -4777,6 +5523,22 @@ impl eframe::App for App {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
         }
         self.poll_wallpaper_updates();
+        // ¿Lo que se tipee sin ningún campo enfocado puede ir al compositor del
+        // chat? No si hay un diálogo, popup, ajustes, visor o video a pantalla
+        // completa encima (ver `ui::chat::set_type_to_focus_allowed`).
+        {
+            let overlay_open = !self.dialogs.is_empty()
+                || self.modal.is_some()
+                || self.component_modal.is_some()
+                || self.profile_popup.is_some()
+                || self.role_popup.is_some()
+                || self.profile_full.is_some()
+                || self.settings_open
+                || self.theme_editor.is_some()
+                || crate::ui::media_viewer::is_open()
+                || crate::ui::video_player::is_fullscreen();
+            crate::ui::chat::set_type_to_focus_allowed(ui.ctx(), !overlay_open);
+        }
         // Recorta las imágenes decodificadas si se pasan de su tope.
         crate::ui::anim::maintain(ui.ctx());
         // Al cambiar de chat, suelta las imágenes decodificadas del anterior.
@@ -4802,6 +5564,14 @@ impl eframe::App for App {
             // Menú de menciones (`@`) del compositor: candidatos para lo que se
             // está tipeando y, si hacen falta más, búsqueda en el Gateway.
             self.publish_mention_results(&ctx);
+            // Opciones de tipo canal de un slash command: canales del server abierto.
+            self.publish_channel_results(&ctx);
+            // Slash commands (`/`): catálogo del canal abierto y, si el
+            // compositor dejó uno listo, ejecutarlo.
+            self.publish_slash_catalog(&ctx);
+            if let Some(invocation) = crate::ui::slash::take_invocation(&ctx) {
+                self.run_slash_invocation(invocation);
+            }
             if let Some(query) = crate::ui::compose_menus::take_member_search(&ctx) {
                 self.search_guild_members(&query);
             }
@@ -4835,6 +5605,16 @@ impl eframe::App for App {
         // centrada de inicio de sesión.
         if !matches!(self.screen, Screen::Login) {
             crate::ui::topbar::show(self, ui);
+            // Interfaz nueva: franja vacía en el borde derecho para que la
+            // última tarjeta no quede pegada a la ventana (GAP/2 de la
+            // tarjeta + esta franja = GAP, igual que a la izquierda).
+            if crate::theme::is_modern() {
+                egui::Panel::right("modern_edge_right")
+                    .exact_size((crate::theme::GAP / 2) as f32)
+                    .resizable(false)
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |_ui| {});
+            }
         }
 
         // Barra de llamada nueva: a todo el ancho, abajo. Va ANTES de las

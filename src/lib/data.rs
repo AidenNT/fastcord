@@ -188,6 +188,10 @@ pub struct RepliedMessage {
     /// `ui::chat::preview_text`). Vacío si el original no tenía texto
     /// (por ejemplo, un mensaje que era solo una imagen o un sticker).
     pub preview: String,
+    /// Id del mensaje citado: sirve para saltar a él con un click en el
+    /// banner (`App::jump_to_message`). Vacío en los ecos locales y cuando
+    /// el original ya no existe.
+    pub message_id: String,
     /// `true` cuando Discord marcó el mensaje como respuesta pero no
     /// mandó el original embebido (se borró, o es muy viejo) — en ese
     /// caso se avisa en vez de mostrar un autor/preview que no tenemos.
@@ -730,6 +734,7 @@ impl ChatMessage {
                 author_base,
                 author_color,
                 preview: reply_preview(original),
+                message_id: original.id.clone(),
                 deleted: false,
             });
         }
@@ -861,6 +866,13 @@ pub struct Friend {
     /// y mientras no se sepa todavía; se actualiza con cada página que
     /// llega según si vino completa o no (ver `MESSAGES_PAGE_SIZE`).
     pub has_more: bool,
+    /// `true` si la ventana de `messages` NO llega hasta el mensaje más
+    /// nuevo del DM (después de saltar a un mensaje con `around`): hay que
+    /// seguir bajando con `after`, y los mensajes en vivo no se agregan
+    /// al final hasta alcanzarlo (si no, quedaría un hueco).
+    pub has_newer: bool,
+    /// Pedido de la página posterior (`after`) en curso.
+    pub loading_newer: bool,
     /// `true` solo para amistades confirmadas (`READY.relationships` con
     /// tipo 1, o los amigos de demo). Un `Friend` con `false` existe solo
     /// para poder abrir el DM con alguien que no es amigo (desde la lista
@@ -905,6 +917,8 @@ impl Friend {
             loading: false,
             loading_more: false,
             has_more: false,
+            has_newer: false,
+            loading_newer: false,
             is_friend: true,
         }
     }
@@ -945,6 +959,8 @@ impl Friend {
             loading: false,
             loading_more: false,
             has_more: true,
+            has_newer: false,
+            loading_newer: false,
             is_friend: true,
         }
     }
@@ -981,6 +997,8 @@ impl Friend {
             loading: false,
             loading_more: false,
             has_more: true,
+            has_newer: false,
+            loading_newer: false,
             is_friend: false,
         })
     }
@@ -1125,6 +1143,46 @@ pub struct ActiveNowCard {
     /// `true` si es la actividad de la propia cuenta.
     pub is_me: bool,
     pub activity: crate::discord::models::PresenceActivity,
+}
+
+/// Un amigo del carrusel del Inicio de la interfaz nueva, ya ordenado por
+/// prioridad (ver `App::home_friends_sorted`).
+pub struct HomeFriend {
+    /// Índice en `App::friends` (para abrir el DM al hacer click).
+    pub index: usize,
+    pub name: String,
+    pub initial: String,
+    pub avatar_url: Option<String>,
+    pub avatar_color: Color32,
+    pub status: Status,
+    /// Lo que está haciendo ahora (juego, canción...), en texto corto.
+    pub activity: Option<String>,
+    /// Afinidad en % (0..=100, relativa al amigo con más afinidad), si Discord
+    /// la informó.
+    pub affinity: Option<f32>,
+    /// Id real de Discord del amigo.
+    pub user_id: String,
+    /// `@usuario` para mostrar en la tarjeta flotante.
+    pub handle: String,
+    /// "Jugando X" / "Escuchando X"..., y su detalle (canción, qué hace...).
+    pub activity_title: Option<String>,
+    pub activity_detail: Option<String>,
+    /// Puestos de afinidad: (etiqueta, puesto, de cuántos). Global, y dentro
+    /// de su grupo (haciendo algo / conectados / desconectados).
+    pub ranks: Vec<(&'static str, usize, usize)>,
+}
+
+/// Un server del carrusel "Servidores frecuentes" del Inicio nuevo.
+pub struct HomeServer {
+    /// Índice en `App::servers` (para abrirlo al hacer click).
+    pub index: usize,
+    pub name: String,
+    pub initial: String,
+    pub icon_url: Option<String>,
+    pub icon_color: Color32,
+    pub online_count: usize,
+    /// Afinidad en % (0..=100, relativa al server con más afinidad).
+    pub affinity: Option<f32>,
 }
 
 pub struct ActivityCard {
@@ -1284,6 +1342,11 @@ pub struct Channel {
     /// Si probablemente queda historial más viejo por cargar — ver
     /// `Friend::has_more`.
     pub has_more: bool,
+    /// Ver `Friend::has_newer`: la ventana cargada no llega al último
+    /// mensaje del canal.
+    pub has_newer: bool,
+    /// Ver `Friend::loading_newer`.
+    pub loading_newer: bool,
     /// `true` para canales de voz/stage (tipo 2/13): no tienen mensajes,
     /// en cambio se les muestra la lista de quién está conectado.
     pub is_voice: bool,
@@ -1448,6 +1511,8 @@ impl Channel {
         self.loading = prev.loading;
         self.loading_more = prev.loading_more;
         self.has_more = prev.has_more;
+        self.has_newer = prev.has_newer;
+        self.loading_newer = prev.loading_newer;
         self.voice_members = prev.voice_members;
         // Las etiquetas son las nuevas; lo demás del foro, lo de antes.
         let tags = std::mem::take(&mut self.forum.tags);
@@ -1464,6 +1529,8 @@ impl Channel {
             loading: false,
             loading_more: false,
             has_more: false,
+            has_newer: false,
+            loading_newer: false,
             is_voice: false,
             voice_members: Vec::new(),
             overwrites: Vec::new(),
@@ -1491,6 +1558,8 @@ impl Channel {
             loading: false,
             loading_more: false,
             has_more: !is_forum,
+            has_newer: false,
+            loading_newer: false,
             is_voice,
             voice_members: Vec::new(),
             overwrites: Vec::new(),
@@ -1538,6 +1607,9 @@ pub struct Server {
     /// URL real del ícono del server (CDN de Discord). `None` en los
     /// servers de demo, o en servers reales sin ícono configurado.
     pub icon_url: Option<String>,
+    /// URL del banner del server (arriba de la lista de canales en la interfaz
+    /// nueva). `None` si no tiene o en los servers de demo.
+    pub banner_url: Option<String>,
     /// Id real de Discord del server. Vacío en los servers de demo.
     pub guild_id: String,
     pub topic: String,
@@ -2252,6 +2324,7 @@ impl Server {
                 .unwrap_or_else(|| "?".to_string()),
             icon_color: color_from_id(&guild.id),
             icon_url: guild.icon_url(),
+            banner_url: guild.banner_url(),
             guild_id: guild.id.clone(),
             topic: String::new(),
             categories: Vec::new(),
@@ -2345,6 +2418,7 @@ pub fn demo_servers() -> Vec<Server> {
             icon_initial: "A".to_string(),
             icon_color: Color32::from_rgb(90, 170, 210),
             icon_url: None,
+            banner_url: None,
             guild_id: String::new(),
             topic: "USE community-support PARA SOPORTE".to_string(),
             categories: vec![
@@ -2493,6 +2567,7 @@ fn demo_small_server(initial: &str, name: &str, color: Color32) -> Server {
         icon_initial: initial.to_string(),
         icon_color: color,
         icon_url: None,
+        banner_url: None,
         guild_id: String::new(),
         topic: "Sin descripción".to_string(),
         categories: vec![ChannelCategory {

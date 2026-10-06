@@ -162,7 +162,7 @@ fn composer(ui: &mut egui::Ui, palette: &Palette, forum: &mut ForumState, event:
     Frame::new()
         .fill(palette.surface)
         .stroke(Stroke::new(1.0, palette.outline))
-        .corner_radius(CornerRadius::same(theme::RADIUS + 2))
+        .corner_radius(CornerRadius::same(theme::radius() + 2))
         .inner_margin(Margin::same(14))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -225,7 +225,7 @@ fn post_card(
     post: &ForumPost,
     now_ms: i64,
 ) -> bool {
-    let radius = CornerRadius::same(theme::RADIUS + 2);
+    let radius = CornerRadius::same(theme::radius() + 2);
     let card = Frame::new()
         .fill(palette.surface)
         .stroke(Stroke::new(1.0, palette.outline))
@@ -308,7 +308,7 @@ fn post_card(
                     ui.add(
                         egui::Image::new(crate::ui::anim::plain(url))
                             .fit_to_exact_size(Vec2::splat(THUMB))
-                            .corner_radius(CornerRadius::same(theme::RADIUS))
+                            .corner_radius(CornerRadius::same(theme::radius()))
                             .show_loading_spinner(false),
                     );
                 }
