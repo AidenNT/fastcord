@@ -6,7 +6,7 @@
 //!   "Est. mes año", descripción (2 líneas) y botón verde
 //!   ("Unirse" te une desde el propio cliente —si Discord pide captcha se
 //!   abre la ventana para resolverlo—; "Ir al servidor" si ya estás, que
-//!   abre el server en el navegador).
+//!   abre el server dentro del propio cliente).
 //! * **No válida / vencida**: "Has enviado una invitación, pero" +
 //!   sobre rojo + "Invitación no válida".
 //! * **Cargando**: el mismo marco con barras grises.
@@ -234,10 +234,8 @@ fn valid_card(ui: &mut Ui, palette: &Palette, info: &InviteInfo) {
     });
     if response.clicked() && !busy {
         if joined {
-            ui.ctx().open_url(egui::OpenUrl::new_tab(format!(
-                "https://discord.com/channels/{}",
-                info.guild_id
-            )));
+            // Abre el server dentro del cliente (ver `App::open_server`).
+            invites::request_goto(ui.ctx(), &info.guild_id);
         } else {
             invites::start_join(ui.ctx(), info);
         }

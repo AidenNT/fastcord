@@ -121,6 +121,15 @@ const ESTIMATED_ROW_HEIGHT_GROUPED: f32 = 20.0;
 /// Igual que el de arriba pero para una fila CON avatar/encabezado
 /// propio (siempre un poco más alta).
 const ESTIMATED_ROW_HEIGHT_HEADER: f32 = 42.0;
+/// Alto del esqueleto de "historial más viejo" que va arriba de la lista,
+/// como múltiplo del alto visible de la lista. Es lo bastante alto como
+/// para que el usuario pueda seguir scrolleando hacia arriba POR ENCIMA del
+/// esqueleto mientras llega la página (en vez de chocar con un tope), y para
+/// que cuando los mensajes lo reemplacen no haya un cambio brusco.
+const SKELETON_HISTORY_VIEWPORTS: f32 = 1.5;
+/// Tope de filas que se dibujan al repetir el esqueleto para llenar alto
+/// (por si el alto pedido fuera absurdo).
+const SKELETON_MAX_ROWS: usize = 64;
 
 thread_local! {
     /// Qué lista de mensajes se está dibujando: 0 = el chat principal, 1 =
@@ -258,7 +267,7 @@ pub fn show(
     // lista vacía. Ver `Friend::loading` / `Channel::loading`.
     loading: bool,
     // Hay un pedido de "cargar más" (página más vieja) en curso — se
-    // muestra un spinner arriba del todo de la lista. Ver
+    // muestra el esqueleto animado arriba del todo de la lista. Ver
     // `Friend::loading_more` / `Channel::loading_more`.
     loading_more: bool,
     // Si probablemente queda historial más viejo por cargar. Con esto en
@@ -269,8 +278,8 @@ pub fn show(
     // mensaje con `around`): abajo del todo hay que seguir pidiendo con
     // `after`. Ver `Friend::has_newer` / `Channel::has_newer`.
     has_newer: bool,
-    // Hay un pedido de la página posterior (`after`) en curso — spinner
-    // abajo del todo de la lista.
+    // Hay un pedido de la página posterior (`after`) en curso — esqueleto
+    // animado abajo del todo de la lista.
     loading_newer: bool,
     // Id del mensaje al que hay que volver a anclar el scroll apenas
     // vuelva a aparecer en `messages` (después de que se antepuso una
@@ -375,11 +384,38 @@ pub fn show(
     // pintar el backlight detrás de sus propias filas.
     let mut row_rects: Vec<(usize, egui::Rect)> = Vec::new();
 
-    ScrollArea::vertical()
+    // Mensaje que quedó arriba del todo de la vista este frame y cuántos
+    // píxeles de él están por encima del borde (para `lib::last_view`).
+    let mut top_visible: Option<(String, f32)> = None;
+    // Este frame se hizo un salto/reanclaje: el scroll todavía no se movió,
+    // así que lo medido no vale para guardar.
+    let mut moved_this_frame = false;
+    // Dónde (en pantalla, relativo al borde de arriba del scroll) estaba cada
+    // mensaje en el frame ANTERIOR, por id. Sirve para que, cuando una página
+    // más vieja reemplaza al esqueleto, el mensaje ancla se quede EXACTAMENTE
+    // donde estaba en pantalla en vez de saltar al borde de arriba: los
+    // mensajes nuevos "rellenan" el lugar del esqueleto sin mover nada.
+    let prev_row_views: Vec<(String, f32)> =
+        ui.ctx().memory(|m| m.data.get_temp(row_views_memory_id()).unwrap_or_default());
+    let mut row_views: Vec<(String, f32)> = Vec::new();
+
+    let scroll_out = ScrollArea::vertical()
         .id_salt("chat_scroll")
         .max_height(list_height)
         .auto_shrink([false, false])
-        .stick_to_bottom(true)
+        // Mientras la ventana cargada NO llega al último mensaje del canal
+        // (`has_newer`, p. ej. tras volver a una posición guardada o saltar
+        // a un mensaje) no se pega al final: si se pegara, cada página de
+        // "más nuevos" que llega haría saltar la vista abajo del todo, el
+        // centinela de abajo seguiría visible y pediría la siguiente página,
+        // en cadena hasta cargar todo el canal.
+        .stick_to_bottom(!has_newer)
+        // Sin animar los reanclajes: al llegar una página de mensajes más
+        // viejos, `scroll_to_rect` animado arrastraba la vista ~2500 px
+        // hacia abajo y, con la rueda girando rápido, el usuario volvía a
+        // chocar con el tope una y otra vez (la "carga infinita").
+        // Instantáneo, la página aparece arriba sin mover lo que se ve.
+        .animated(false)
         .show(ui, |ui| {
             // El estilo global (`theme::apply`) deja `item_spacing.y` en
             // 6px para el resto de la app — acá, dentro de la lista de
@@ -399,14 +435,27 @@ pub fn show(
                 // Todavía no llegó ni la primera página: placeholder tipo
                 // "esqueleto" en vez de la lista vacía, como hace el
                 // cliente real mientras carga un canal/DM.
-                message_skeletons(ui, palette);
+                skeleton_rows(ui, palette, SKELETON_INITIAL);
             } else if messages.is_empty() {
                 ui.horizontal(|ui| {
                     ui.add_space(16.0);
                     theme::text(ui, "Todavía no hay mensajes acá.", theme::regular(12.5), palette.dim);
                 });
             } else {
-                // Centinela de 1px arriba del todo de la lista: si el
+                // Mientras pueda quedar historial más viejo (o se esté
+                // pidiendo), arriba de todo hay un esqueleto ALTO que es parte
+                // del contenido del scroll: se puede seguir subiendo por
+                // encima de los mensajes cargados y mientras tanto se ve el
+                // shimmer. Al llegar la página, los mensajes lo reemplazan
+                // sin mover lo que el usuario tenía en pantalla (ver
+                // `prev_row_views` y el reanclaje más abajo). Como ya está
+                // ahí desde antes del pedido, tampoco empuja la lista de
+                // golpe cuando el pedido arranca.
+                if has_more || loading_more {
+                    skeleton_history(ui, palette, list_height * SKELETON_HISTORY_VIEWPORTS);
+                }
+                // Centinela de 1px justo debajo del esqueleto (arriba del
+                // primer mensaje): si el
                 // `ScrollArea` todavía lo está pintando (`is_rect_visible`,
                 // mismo criterio que ya se usa más abajo para las filas de
                 // mensajes) es que el usuario scrolleó hasta arriba de lo
@@ -445,9 +494,8 @@ pub fn show(
                 // que lo suelte para recién ahí evaluar si corresponde
                 // pedir la página siguiente.
                 let pointer_held = ui.ctx().input(|i| i.pointer.primary_down());
-                if loading_more {
-                    loading_more_row(ui, palette);
-                } else if has_more
+                if !loading_more
+                    && has_more
                     && scroll_anchor.is_none()
                     && jump_target.is_none()
                     && !pointer_held
@@ -579,6 +627,25 @@ pub fn show(
                     ui.add_space(estimated_height);
                     estimated_rect
                 };
+                // Posición en pantalla de esta fila (solo la primera y las que
+                // se ven) para poder reanclar sin saltos cuando llegue una
+                // página más vieja.
+                if !messages[i].id.is_empty()
+                    && (i == 0
+                        || (row_rect.bottom() >= clip_rect.top() - 1.0
+                            && row_rect.top() <= clip_rect.bottom() + 1.0))
+                {
+                    row_views.push((messages[i].id.clone(), row_rect.top() - clip_rect.top()));
+                }
+                // Primer mensaje con algo a la vista: es "donde estás" para
+                // retomar el chat en el mismo lugar al volver a abrirlo.
+                if top_visible.is_none()
+                    && !messages[i].id.is_empty()
+                    && row_rect.bottom() > clip_rect.top() + 1.0
+                    && row_rect.top() < clip_rect.bottom()
+                {
+                    top_visible = Some((messages[i].id.clone(), clip_rect.top() - row_rect.top()));
+                }
                 // Si este es el mensaje que estaba arriba del todo cuando
                 // se pidió "cargar más" (ver `scroll_anchor`), y la página
                 // más vieja ya se antepuso (`!loading_more`: si todavía
@@ -594,7 +661,21 @@ pub fn show(
                     && !messages[i].id.is_empty()
                     && scroll_anchor.as_deref() == Some(messages[i].id.as_str())
                 {
-                    ui.scroll_to_rect(row_rect, Some(egui::Align::TOP));
+                    // El mensaje vuelve al MISMO lugar de la pantalla donde
+                    // estaba justo antes de que llegara la página (no al
+                    // borde de arriba): lo que el usuario veía queda quieto y
+                    // los mensajes nuevos aparecen donde estaba el esqueleto.
+                    // Si no se tiene su posición anterior, cae al borde.
+                    let held_at = prev_row_views
+                        .iter()
+                        .find(|(id, _)| id == &messages[i].id)
+                        .map(|(_, rel)| *rel);
+                    let target = match held_at {
+                        Some(rel) => row_rect.translate(Vec2::new(0.0, -rel)),
+                        None => row_rect,
+                    };
+                    ui.scroll_to_rect(target, Some(egui::Align::TOP));
+                    moved_this_frame = true;
                     *scroll_anchor = None;
                     // Ver `LOAD_MORE_SETTLE`: recién a partir de acá
                     // arranca la ventana en la que no se dispara otro
@@ -606,8 +687,21 @@ pub fn show(
                 // Ir a un mensaje puntual (`App::pending_jump`): se centra la
                 // fila en el scroll y se resalta un rato, como el cliente real.
                 if !messages[i].id.is_empty() && jump_target.as_deref() == Some(messages[i].id.as_str()) {
-                    ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
-                    start_jump_highlight(ui.ctx(), &messages[i].id);
+                    // Retomar donde se había quedado (posición guardada): el
+                    // mensaje vuelve a su lugar exacto, sin centrarlo ni
+                    // resaltarlo. Un salto común (respuesta, canal reciente)
+                    // lo centra y lo resalta.
+                    match crate::lib::last_view::take_restore(&fallback_channel, &messages[i].id) {
+                        Some(offset) => {
+                            let shifted = row_rect.translate(Vec2::new(0.0, offset.max(0.0)));
+                            ui.scroll_to_rect(shifted, Some(egui::Align::TOP));
+                        }
+                        None => {
+                            ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
+                            start_jump_highlight(ui.ctx(), &messages[i].id);
+                        }
+                    }
+                    moved_this_frame = true;
                     *jump_target = None;
                     lock_load_more_until_settled(ui.ctx());
                 }
@@ -636,10 +730,19 @@ pub fn show(
             }
             // Ventana que no termina en el último mensaje del canal: abajo
             // del todo se piden los siguientes (`?after=<id>`).
+            //
+            // Mientras llega la página posterior se muestra el esqueleto
+            // animado. Como el usuario está pegado al final y el esqueleto
+            // se agrega DEBAJO de lo que ve, se scrollea una sola vez hasta
+            // dejarlo a la vista (si no, quedaría fuera de pantalla hasta
+            // que scrollee de nuevo). Cuando llega la página, los mensajes
+            // reemplazan al esqueleto en el mismo lugar, sin saltos.
             if has_newer && !messages.is_empty() {
-                if loading_newer {
-                    loading_more_row(ui, palette);
-                } else {
+                // Sentinel de 1px justo debajo del último mensaje: si se ve, hay que
+                // pedir la página siguiente. Se evalúa ANTES del esqueleto para que el
+                // pedido se dispare apenas se llega al fondo, y así el esqueleto puede
+                // aparecer en el mismo lugar donde estaba el sentinel — sin saltos.
+                if !loading_newer {
                     let (bottom_rect, _) =
                         ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
                     let pointer_held = ui.ctx().input(|i| i.pointer.primary_down());
@@ -651,6 +754,14 @@ pub fn show(
                     {
                         load_newer_requested = true;
                     }
+                }
+                // Esqueleto de "más nuevos" en el mismo lugar del sentinel: aparece
+                // mientras carga y NO empuja lo que ya se ve, porque `stick_to_bottom`
+                // está en `false` (por `has_newer`) y no se fuerza ningún
+                // `scroll_to_rect`. El salto a `Align::BOTTOM` era justamente lo que se
+                // sentía como "tosco / encima del mensaje".
+                if loading_newer {
+                    skeleton_rows(ui, palette, SKELETON_NEWER);
                 }
             }
             ui.add_space(8.0);
@@ -691,6 +802,30 @@ pub fn show(
         });
 
     ui.ctx().memory_mut(|m| m.data.insert_temp(row_rects_memory_id(), row_rects));
+    ui.ctx().memory_mut(|m| m.data.insert_temp(row_views_memory_id(), row_views));
+
+    // Guarda dónde estás (mensaje de arriba + píxeles) para retomar el canal
+    // en el mismo lugar después de cerrar el cliente (`lib::last_view`). Solo
+    // en el chat principal (no en el panel de hilos), cuando el scroll ya se
+    // asentó, y sin guardar nada si estás pegado al último mensaje: en ese
+    // caso el canal vuelve a abrir en lo más nuevo, como siempre.
+    if scope() == 0 && !loading && !messages.is_empty() {
+        if let Some((_, channel_id, _)) = &send_target {
+            let settled = !moved_this_frame
+                && jump_target.is_none()
+                && scroll_anchor.is_none()
+                && !load_more_locked(ui.ctx());
+            if settled {
+                let max_offset = (scroll_out.content_size.y - scroll_out.inner_rect.height()).max(0.0);
+                let at_bottom = !has_newer && scroll_out.state.offset.y >= max_offset - 4.0;
+                if at_bottom {
+                    crate::lib::last_view::record_position(channel_id, None);
+                } else if top_visible.is_some() {
+                    crate::lib::last_view::record_position(channel_id, top_visible.clone());
+                }
+            }
+        }
+    }
 
     if let Some((index, emoji)) = toggled_reaction {
         if let Some(msg) = messages.get_mut(index) {
@@ -751,65 +886,230 @@ pub fn show(
     }
 }
 
-/// Fila angosta con el spinner de "cargando más mensajes", arriba del
-/// todo de la lista mientras `App::load_more_messages` espera la
-/// respuesta de Discord.
-fn loading_more_row(ui: &mut egui::Ui, palette: &Palette) {
-    ui.horizontal(|ui| {
-        ui.add_space(((ui.available_width() - 16.0) / 2.0).max(0.0));
-        theme::spinner(ui, 16.0, palette.dim);
-    });
-    ui.add_space(NEW_GROUP_SPACING);
+/// Una fila del placeholder tipo "esqueleto": avatar + barra de nombre +
+/// líneas de texto (+ opcionalmente un bloque de imagen/adjunto debajo),
+/// igual que el que muestra el cliente real de Discord mientras llegan
+/// los mensajes.
+struct SkeletonRow {
+    /// Ancho de la barra del "nombre", como fracción de `SKELETON_TEXT_WIDTH`.
+    name_w: f32,
+    /// Ancho de cada línea de texto, como fracción de `SKELETON_TEXT_WIDTH`
+    /// (un valor por línea). Escritos a mano para que las filas no se vean
+    /// todas idénticas.
+    lines: &'static [f32],
+    /// Bloque de imagen debajo del texto: (fracción de `SKELETON_MEDIA_WIDTH`, alto en px).
+    media: Option<(f32, f32)>,
 }
 
-/// Placeholder mientras se pide la primera página de mensajes de un
-/// canal/DM (`loading` en `show`), imitando el "esqueleto" gris que
-/// muestra el cliente real de Discord antes de que llegue el historial:
-/// unas filas de rectángulos grises (avatar + una o dos líneas de texto)
-/// con un pulso sutil de opacidad para que no se sienta una pantalla
-/// muerta mientras se espera.
-fn message_skeletons(ui: &mut egui::Ui, palette: &Palette) {
-    // Pulso lento y parejo entre `surface` y `surface_hover` (no el sweep
-    // del `theme::spinner`, que es para un círculo cargando de verdad) —
-    // solo para que las barras no se vean como un dibujo estático.
-    let pulse = (ui.input(|i| i.time) * 1.6).sin() as f32 * 0.5 + 0.5;
-    let bar_color = extra::blend(palette.surface, palette.surface_hover, pulse);
-    ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+/// Ancho máximo (px) sobre el que se reparten las fracciones de texto.
+const SKELETON_TEXT_WIDTH: f32 = 420.0;
+/// Ancho máximo (px) del bloque de imagen del esqueleto.
+const SKELETON_MEDIA_WIDTH: f32 = 460.0;
 
-    // Anchos de línea (como fracción del ancho disponible) escritos a
-    // mano para que las filas no se vean todas idénticas — mismo detalle
-    // que usa el placeholder real de Discord para no sentirse repetido.
-    const ROWS: &[(f32, Option<f32>)] = &[
-        (0.55, Some(0.30)),
-        (0.35, None),
-        (0.62, Some(0.20)),
-        (0.45, Some(0.40)),
-        (0.70, None),
-        (0.30, Some(0.55)),
-        (0.50, None),
-    ];
+/// Carga inicial de un canal/DM (`loading` en `show`): llena la pantalla.
+const SKELETON_INITIAL: &[SkeletonRow] = &[
+    SkeletonRow { name_w: 0.33, lines: &[0.95], media: None },
+    SkeletonRow { name_w: 0.28, lines: &[0.80, 0.55], media: Some((1.0, 220.0)) },
+    SkeletonRow { name_w: 0.36, lines: &[0.55, 0.40, 0.90], media: None },
+    SkeletonRow { name_w: 0.30, lines: &[0.45, 0.85, 0.35, 0.65], media: None },
+    SkeletonRow { name_w: 0.26, lines: &[0.70, 0.45], media: None },
+    SkeletonRow { name_w: 0.34, lines: &[0.60], media: None },
+];
 
-    for &(first_w, second_w) in ROWS {
+/// Historial más viejo (`has_more` / `loading_more`): se muestra arriba de la
+/// lista, encima del mensaje más viejo ya cargado, repetido en ciclo hasta
+/// llenar `SKELETON_HISTORY_VIEWPORTS` alturas de la lista (ver `skeleton_history`).
+const SKELETON_OLDER: &[SkeletonRow] = &[
+    SkeletonRow { name_w: 0.30, lines: &[0.85, 0.50], media: None },
+    SkeletonRow { name_w: 0.26, lines: &[0.60], media: Some((0.80, 160.0)) },
+    SkeletonRow { name_w: 0.34, lines: &[0.45, 0.75, 0.30], media: None },
+    SkeletonRow { name_w: 0.28, lines: &[0.90], media: None },
+];
+
+/// Scroll hacia abajo (`loading_newer`): se muestra abajo de la lista,
+/// debajo del mensaje más nuevo ya cargado.
+const SKELETON_NEWER: &[SkeletonRow] = &[
+    SkeletonRow { name_w: 0.32, lines: &[0.65, 0.35], media: None },
+    SkeletonRow { name_w: 0.27, lines: &[0.90], media: None },
+    SkeletonRow { name_w: 0.35, lines: &[0.50, 0.80, 0.40], media: None },
+    SkeletonRow { name_w: 0.29, lines: &[0.55], media: Some((0.75, 150.0)) },
+];
+
+/// Duración (s) de una pasada completa de la franja de luz del shimmer.
+const SKELETON_SWEEP_SECS: f64 = 1.4;
+/// Ancho (px) de la franja de luz.
+const SKELETON_BAND_WIDTH: f32 = 160.0;
+/// Cuánto se inclina la franja (px de corrimiento horizontal por px hacia
+/// abajo): con eso la luz baja en diagonal por las filas en vez de pegarles
+/// a todas a la vez.
+const SKELETON_BAND_SLANT: f32 = 0.35;
+
+/// Colores y posición de la franja de luz de un frame, compartidos por todas
+/// las formas del esqueleto para que el barrido sea continuo entre ellas.
+struct Shimmer {
+    base: Color32,
+    highlight: Color32,
+    /// X (en pantalla) del centro de la franja a la altura `y == 0`.
+    center_x: f32,
+}
+
+impl Shimmer {
+    /// Intensidad (0..=1) de la franja en `x` para una forma cuyo borde
+    /// superior está en `top`.
+    fn intensity(&self, x: f32, top: f32) -> f32 {
+        let center = self.center_x + top * SKELETON_BAND_SLANT;
+        (1.0 - (x - center).abs() / (SKELETON_BAND_WIDTH * 0.5)).clamp(0.0, 1.0)
+    }
+
+    /// Rectángulo redondeado con la franja de luz pasando por encima.
+    fn rect(&self, painter: &egui::Painter, rect: egui::Rect, radius: f32, fade: f32) {
+        let base = self.base.gamma_multiply(fade);
+        painter.rect_filled(rect, radius, base);
+        // La luz solo se pinta entre las puntas redondeadas (`radius` de cada
+        // lado): ahí el rect es sólido en todo su alto, así que el gradiente
+        // nunca se sale de la forma.
+        let x0 = rect.left() + radius;
+        let x1 = rect.right() - radius;
+        if x1 <= x0 {
+            return;
+        }
+        let center = self.center_x + rect.top() * SKELETON_BAND_SLANT;
+        let half = SKELETON_BAND_WIDTH * 0.5;
+        if center + half < x0 || center - half > x1 {
+            return;
+        }
+        // Cortes del gradiente: bordes recortados + el pico si cae adentro.
+        let mut xs = vec![x0.max(center - half)];
+        if center > x0 && center < x1 {
+            xs.push(center);
+        }
+        xs.push(x1.min(center + half));
+
+        let mut mesh = egui::Mesh::default();
+        for &x in &xs {
+            let color = self.highlight.gamma_multiply(self.intensity(x, rect.top()) * fade);
+            mesh.colored_vertex(egui::pos2(x, rect.top()), color);
+            mesh.colored_vertex(egui::pos2(x, rect.bottom()), color);
+        }
+        for i in 0..(xs.len() as u32 - 1) {
+            let v = i * 2;
+            mesh.add_triangle(v, v + 1, v + 2);
+            mesh.add_triangle(v + 1, v + 3, v + 2);
+        }
+        painter.add(egui::Shape::mesh(mesh));
+    }
+
+    /// Círculo (avatar): demasiado chico para un gradiente, así que se
+    /// mezcla el color con la intensidad de la franja en su centro.
+    fn circle(&self, painter: &egui::Painter, rect: egui::Rect) {
+        let t = self.intensity(rect.center().x, rect.top());
+        painter.circle_filled(rect.center(), rect.width() * 0.5, extra::blend(self.base, self.highlight, t));
+    }
+}
+
+/// Dibuja un conjunto de filas "esqueleto" (ver `SkeletonRow`) con un
+/// shimmer: una franja de luz inclinada que barre las barras de izquierda a
+/// derecha en loop, mientras las formas respiran apenas de brillo. Sirve
+/// tanto para la carga inicial como para las páginas más viejas (arriba) y
+/// más nuevas (abajo) que se piden al scrollear.
+///
+/// Si `min_height` es mayor que 0, las filas se repiten (en ciclo) hasta
+/// llenar al menos ese alto, con UN solo shimmer continuo para todo el
+/// bloque. Con 0 se dibuja cada fila una sola vez.
+///
+/// Devuelve el rect que ocupó todo el esqueleto.
+fn skeleton_fill(ui: &mut egui::Ui, palette: &Palette, rows: &[SkeletonRow], min_height: f32) -> egui::Rect {
+    let time = ui.input(|i| i.time);
+    let top_left = ui.cursor().min;
+    let span = ui.available_width().min(SKELETON_TEXT_WIDTH + 80.0);
+    // La franja arranca fuera por la izquierda y termina fuera por la derecha.
+    let phase = (time / SKELETON_SWEEP_SECS).fract() as f32;
+    let travel = span + SKELETON_BAND_WIDTH * 2.0;
+    let center_at_top = top_left.x - SKELETON_BAND_WIDTH + travel * phase;
+    // Respiración muy sutil del brillo base, para que no quede estático
+    // entre pasada y pasada.
+    let breath = (time * 2.2).sin() as f32 * 0.5 + 0.5;
+    let base = extra::blend(palette.surface, palette.surface_hover, 0.45 + 0.2 * breath);
+    let highlight = extra::blend(palette.surface_active, palette.text, 0.10);
+    let shimmer = Shimmer {
+        base,
+        highlight,
+        // `intensity` suma el corrimiento por altura; se compensa para que
+        // el centro sea `center_at_top` justo en el borde de arriba del esqueleto.
+        center_x: center_at_top - top_left.y * SKELETON_BAND_SLANT,
+    };
+    ui.ctx().request_repaint_after(Duration::from_millis(16));
+
+    let mut drawn = 0usize;
+    for row in rows.iter().cycle() {
+        // Una vuelta completa como mínimo; después se sigue repitiendo solo
+        // hasta alcanzar `min_height`.
+        if drawn >= rows.len()
+            && (ui.cursor().min.y - top_left.y >= min_height || drawn >= SKELETON_MAX_ROWS)
+        {
+            break;
+        }
+        drawn += 1;
         ui.horizontal(|ui| {
             ui.add_space(16.0);
             let (avatar_rect, _) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::hover());
-            ui.painter().circle_filled(avatar_rect.center(), 18.0, bar_color);
+            shimmer.circle(ui.painter(), avatar_rect);
 
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 6.0;
-                let width = ui.available_width().min(420.0);
-                let (first_rect, _) =
-                    ui.allocate_exact_size(Vec2::new(width * first_w, 10.0), Sense::hover());
-                ui.painter().rect_filled(first_rect, 4.0, bar_color);
-                if let Some(second_w) = second_w {
-                    let (second_rect, _) =
-                        ui.allocate_exact_size(Vec2::new(width * second_w, 10.0), Sense::hover());
-                    ui.painter().rect_filled(second_rect, 4.0, bar_color);
+                let text_w = ui.available_width().min(SKELETON_TEXT_WIDTH);
+                // Barra del nombre: un toque más alta que las líneas.
+                let (name_rect, _) =
+                    ui.allocate_exact_size(Vec2::new(text_w * row.name_w, 12.0), Sense::hover());
+                shimmer.rect(ui.painter(), name_rect, 4.0, 1.0);
+                for &line_w in row.lines {
+                    let (line_rect, _) =
+                        ui.allocate_exact_size(Vec2::new(text_w * line_w, 10.0), Sense::hover());
+                    shimmer.rect(ui.painter(), line_rect, 4.0, 1.0);
+                }
+                if let Some((media_w, media_h)) = row.media {
+                    let width = ui.available_width().min(SKELETON_MEDIA_WIDTH) * media_w;
+                    let (media_rect, _) =
+                        ui.allocate_exact_size(Vec2::new(width, media_h), Sense::hover());
+                    // El bloque de imagen va más tenue que las barras.
+                    shimmer.rect(ui.painter(), media_rect, 8.0, 0.6);
                 }
             });
         });
         ui.add_space(NEW_GROUP_SPACING);
     }
+    egui::Rect::from_min_max(top_left, egui::pos2(top_left.x + ui.available_width(), ui.cursor().min.y))
+}
+
+/// Una pasada de filas de esqueleto, sin repetir (ver `skeleton_fill`).
+fn skeleton_rows(ui: &mut egui::Ui, palette: &Palette, rows: &[SkeletonRow]) -> egui::Rect {
+    skeleton_fill(ui, palette, rows, 0.0)
+}
+
+/// Esqueleto alto de "historial más viejo" que va arriba de la lista de
+/// mensajes y es parte del contenido scrolleable. Se virtualiza igual que
+/// las filas de mensajes: si cae bien afuera de lo visible solo se reserva
+/// su alto (medido la última vez que se dibujó) y no se pinta ni se pide
+/// repintado continuo para el shimmer.
+fn skeleton_history(ui: &mut egui::Ui, palette: &Palette, min_height: f32) {
+    let id = scoped_id("ecord_chat_history_skeleton_height");
+    let cached: Option<(f32, f32)> = ui.ctx().memory(|m| m.data.get_temp(id));
+    if let Some((for_min_height, height)) = cached {
+        if (for_min_height - min_height).abs() < 1.0 {
+            let rect = egui::Rect::from_min_size(ui.cursor().min, Vec2::new(ui.available_width().max(1.0), height));
+            let clip = ui.clip_rect();
+            if rect.bottom() < clip.top() - VIRTUALIZE_BUFFER || rect.top() > clip.bottom() + VIRTUALIZE_BUFFER {
+                ui.add_space(height);
+                return;
+            }
+        }
+    }
+    let rect = skeleton_fill(ui, palette, SKELETON_OLDER, min_height);
+    ui.ctx().memory_mut(|m| m.data.insert_temp(id, (min_height, rect.height())));
+}
+
+fn row_views_memory_id() -> egui::Id {
+    scoped_id("ecord_chat_row_views")
 }
 
 fn row_rects_memory_id() -> egui::Id {

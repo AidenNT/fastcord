@@ -76,6 +76,33 @@ static JOINED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 static SESSION_ID: Mutex<Option<String>> = Mutex::new(None);
 static JOINS: OnceLock<Mutex<HashMap<String, JoinState>>> = OnceLock::new();
+static GOTO: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+/// Cuánto se espera a que un server recién unido aparezca en la lista
+/// (llega por el gateway, `GUILD_CREATE`) antes de abandonar el "ir a".
+const GOTO_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Pide abrir el server `guild_id` dentro del cliente ("Ir al servidor" de
+/// la tarjeta). Lo atiende `App` con [`poll_goto`].
+pub fn request_goto(ctx: &egui::Context, guild_id: &str) {
+    *GOTO.lock().unwrap_or_else(|p| p.into_inner()) = Some((guild_id.to_string(), Instant::now()));
+    ctx.request_repaint();
+}
+
+/// Si hay un "ir a" pendiente y `find` ubica ese server (devuelve su
+/// índice), lo consume y devuelve el índice. Si el server todavía no está
+/// (acabás de unirte) queda pendiente hasta `GOTO_TIMEOUT`.
+pub fn poll_goto(find: impl FnOnce(&str) -> Option<usize>) -> Option<usize> {
+    let mut guard = GOTO.lock().unwrap_or_else(|p| p.into_inner());
+    let (guild_id, since) = guard.as_ref().map(|(g, s)| (g.clone(), *s))?;
+    if let Some(index) = find(&guild_id) {
+        *guard = None;
+        return Some(index);
+    }
+    if since.elapsed() >= GOTO_TIMEOUT {
+        *guard = None;
+    }
+    None
+}
 
 /// Estado del botón de la tarjeta.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

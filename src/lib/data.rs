@@ -1736,6 +1736,39 @@ impl Server {
         (0, 0)
     }
 
+    /// Primer canal de TEXTO visible (se saltea voz/stage y foros). Si el
+    /// server no tiene ninguno cae a [`Server::first_channel`].
+    pub fn first_text_channel(&self) -> (usize, usize) {
+        for (cat_idx, category) in self.categories.iter().enumerate() {
+            let found = category
+                .channels
+                .iter()
+                .position(|c| c.access.can_view && !c.is_voice && !c.is_forum && !c.is_thread);
+            if let Some(chan_idx) = found {
+                return (cat_idx, chan_idx);
+            }
+        }
+        self.first_channel()
+    }
+
+    /// Canal con el que se abre el server: el último de texto que se tenía
+    /// abierto (`last_channel_id`, si existe y se puede ver) o, si no, el
+    /// primer canal de texto — nunca uno de voz aunque sea el primero de
+    /// la lista.
+    pub fn initial_channel(&self, last_channel_id: Option<&str>) -> (usize, usize) {
+        if let Some(id) = last_channel_id {
+            if let Some((cat, chan)) = self.channel_position_by_id(id) {
+                let usable = self
+                    .channel(cat, chan)
+                    .is_some_and(|c| c.access.can_view && !c.is_voice && !c.is_forum && !c.is_thread);
+                if usable {
+                    return (cat, chan);
+                }
+            }
+        }
+        self.first_text_channel()
+    }
+
     /// ¿Se muestra este canal? (`false` = la cuenta no lo puede ver con su
     /// rol actual.) Un índice que no existe cuenta como visible.
     pub fn channel_visible(&self, category: usize, channel: usize) -> bool {

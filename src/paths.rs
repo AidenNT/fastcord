@@ -61,6 +61,12 @@ pub fn accounts_file() -> Option<PathBuf> {
     state_dir().map(|dir| dir.join("accounts.json"))
 }
 
+/// Último canal abierto de cada server y posición del scroll de cada canal
+/// (JSON, ver `lib::last_view`).
+pub fn last_view_file() -> Option<PathBuf> {
+    state_dir().map(|dir| dir.join("last_view.json"))
+}
+
 /// Identificadores de sesión del "browser" de Discord (TOML): fingerprint
 /// anónimo e installation id.
 pub fn discord_browser_file() -> Option<PathBuf> {

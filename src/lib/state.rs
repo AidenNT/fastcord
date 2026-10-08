@@ -485,6 +485,11 @@ pub struct App {
     /// respuesta, abrir un canal reciente en su último leído...). Lo
     /// consume `ui::chat::show` una sola vez, centrando ese mensaje.
     pub pending_jump: Option<String>,
+    /// Server recién abierto cuyos canales todavía no habían llegado: cuando
+    /// lleguen (`AppEvent::GuildChannels`) se abre el canal inicial (el
+    /// último de texto que se tenía, o el primero de texto). Ver
+    /// `open_server_with`.
+    pub pending_initial_channel: Option<String>,
     /// Si el panel de notificaciones de la barra superior está abierto
     /// (ver `ui::inbox`).
     pub inbox_open: bool,
@@ -816,6 +821,7 @@ impl Default for App {
             reply_target: None,
             pending_scroll_anchor: None,
             pending_jump: None,
+            pending_initial_channel: None,
             inbox_open: false,
             newer_retry_after: None,
             thread_panel: None,
@@ -1470,8 +1476,25 @@ impl App {
     /// todavía no tiene canales cargados, los pide por REST; llegan como
     /// `AppEvent::GuildChannels`.
     pub fn open_server(&mut self, index: usize) {
+        self.open_server_with(index, true);
+    }
+
+    /// `open_server`; con `restore_last` se abre el último canal de texto
+    /// que se tenía en ese server (guardado en disco, ver `lib::last_view`)
+    /// o, si no hay, el primer canal de TEXTO — nunca uno de voz aunque sea
+    /// el primero de la lista. Con `false` (el que llama va a abrir un canal
+    /// puntual enseguida) se deja el primero, como antes.
+    pub fn open_server_with(&mut self, index: usize, restore_last: bool) {
         let Some(server) = self.servers.get(index) else { return };
-        self.current_channel = server.first_channel();
+        let guild_id = server.guild_id.clone();
+        let awaiting_channels = !guild_id.is_empty() && server.categories.is_empty();
+        self.current_channel = if restore_last {
+            let last = crate::lib::last_view::last_channel(&guild_id);
+            server.initial_channel(last.as_deref())
+        } else {
+            server.first_channel()
+        };
+        self.pending_initial_channel = None;
         self.screen = Screen::Server(index);
         self.compose_text.clear();
         self.reply_target = None;
@@ -1490,6 +1513,31 @@ impl App {
         // Si el canal por defecto es un foro que ya tenía sus canales
         // cargados, hay que pedir sus posts (si no, `open_channel` no corre).
         self.load_forum_posts_if_needed();
+        if restore_last {
+            if awaiting_channels {
+                // Los canales todavía no llegaron: se elige al recibirlos.
+                self.pending_initial_channel = Some(guild_id);
+            } else {
+                // Abre el canal de verdad: pide el historial y, si hay una
+                // posición guardada, vuelve justo ahí.
+                let (category, channel) = self.current_channel;
+                self.open_channel(category, channel);
+            }
+        }
+    }
+
+    /// Anota el canal de texto abierto como "el último" de su server.
+    fn remember_current_channel(&self) {
+        let Screen::Server(index) = self.screen else { return };
+        let Some(server) = self.servers.get(index) else { return };
+        let (category, channel) = self.current_channel;
+        let Some(ch) = server.channel(category, channel) else { return };
+        if server.guild_id.is_empty() || ch.is_voice || ch.is_forum || ch.is_thread {
+            return;
+        }
+        if let Some(channel_id) = &ch.channel_id {
+            crate::lib::last_view::record_channel(&server.guild_id, channel_id);
+        }
     }
 
     /// Si el canal abierto en un server quedó oculto (llegaron los roles y
@@ -1742,6 +1790,8 @@ impl App {
     /// por su cuenta (`jump_to_message`).
     fn open_channel_with(&mut self, category: usize, channel: usize, fetch_latest: bool) {
         self.current_channel = (category, channel);
+        self.pending_initial_channel = None;
+        self.remember_current_channel();
         self.compose_text.clear();
         self.reply_target = None;
         self.thread_panel = None;
@@ -1770,6 +1820,16 @@ impl App {
             return;
         }
         let Some(channel_id) = ch.channel_id.clone() else { return };
+        // Primera vez que se abre este canal en la sesión y quedó una
+        // posición guardada (de antes de cerrar el cliente): en vez de
+        // ir al último mensaje se pide la ventana alrededor del que
+        // estaba arriba y el chat deja el scroll justo donde estaba
+        // (`last_view::take_restore`).
+        if let Some((message_id, offset)) = crate::lib::last_view::position(&channel_id) {
+            crate::lib::last_view::arm_restore(&channel_id, &message_id, offset);
+            self.jump_to_message(&channel_id, &message_id);
+            return;
+        }
         // Se marca `loaded` de una, optimistamente, para no disparar el
         // mismo pedido de nuevo si el usuario cambia de canal y vuelve
         // antes de que responda el REST.
@@ -2170,7 +2230,6 @@ impl App {
     /// una conversación de demo (mensajes sin `id` real de Discord — no
     /// hay `before` válido que mandar).
     pub fn load_more_messages(&mut self) {
-        println!("load_more_messages invoked");
         let Some((token, tx)) = self.discord_token.clone().zip(self.event_tx.clone()) else {
             return;
         };
@@ -2194,13 +2253,9 @@ impl App {
                 crate::discord::spawn_fetch_more_channel_messages(token, channel_id, oldest_id, tx);
             }
             Screen::Server(server_index) => {
-                println!("load_more_messages");
                 let (cat, chan) = self.current_channel;
                 let Some(server) = self.servers.get_mut(server_index) else { return };
                 let Some(channel) = server.channel_mut(cat, chan) else { return };
-                println!("{:?}", channel.loading_more);
-                println!("{:?}", channel.loading);
-                println!("{:?}", channel.has_more);
                 if channel.loading_more || channel.loading || !channel.has_more {
                     return;
                 }
@@ -2306,7 +2361,7 @@ impl App {
         channel: usize,
         message_id: Option<String>,
     ) {
-        self.open_server(server);
+        self.open_server_with(server, false);
         let Some(message_id) = message_id else {
             self.open_channel(category, channel);
             return;
@@ -2687,7 +2742,7 @@ impl App {
                     return;
                 };
                 if !matches!(self.screen, Screen::Server(current) if current == index) {
-                    self.open_server(index);
+                    self.open_server_with(index, false);
                 }
                 self.open_channel_by_id(&channel_id);
             }
@@ -3287,10 +3342,18 @@ impl App {
                     if self.servers.get(index).map(|s| s.guild_id.as_str()) == Some(guild_id.as_str())
                     {
                         let (mut cat, mut chan) = self.current_channel;
-                        // Si el canal por defecto (0, 0) resultó ser uno que
-                        // no se puede ver, se abre el primero que sí.
+                        let pick_initial =
+                            self.pending_initial_channel.as_deref() == Some(guild_id.as_str());
                         if let Some(server) = self.servers.get(index) {
-                            if !server.channel_visible(cat, chan) {
+                            if pick_initial {
+                                // Recién abierto: último canal de texto
+                                // guardado, o el primero de texto.
+                                let last = crate::lib::last_view::last_channel(&guild_id);
+                                (cat, chan) = server.initial_channel(last.as_deref());
+                            } else if !server.channel_visible(cat, chan) {
+                                // Si el canal por defecto (0, 0) resultó ser
+                                // uno que no se puede ver, se abre el primero
+                                // que sí.
                                 (cat, chan) = server.first_channel();
                             }
                         }
@@ -3405,7 +3468,18 @@ impl App {
                 // principio del canal.
                 let has_more = older > 0;
                 if jump {
-                    self.pending_jump = Some(target_id.clone());
+                    // Si el mensaje pedido ya no existe (borrado), se va al
+                    // más cercano en vez de quedar esperándolo para siempre.
+                    let mut jump_id = target_id.clone();
+                    if !sorted.iter().any(|m| m.id == target_id) {
+                        if let Some(nearest) =
+                            sorted.iter().min_by_key(|m| snowflake(&m.id).abs_diff(target_n))
+                        {
+                            jump_id = nearest.id.clone();
+                            crate::lib::last_view::retarget_restore(&channel_id, &jump_id);
+                        }
+                    }
+                    self.pending_jump = Some(jump_id);
                 }
                 if let Some(friend) = self
                     .friends
@@ -4809,7 +4883,7 @@ impl App {
                 else {
                     return;
                 };
-                self.open_server(server_index);
+                self.open_server_with(server_index, false);
                 let position = self.servers[server_index]
                     .categories
                     .iter()
@@ -6186,6 +6260,12 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// eframe llama a esto cada ~30 s y al cerrar: se aprovecha para bajar a
+    /// disco la posición del chat (`lib::last_view`).
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        crate::lib::last_view::flush();
+    }
+
     /// Framebuffer transparente: la ventana se crea con `with_transparent(true)`
     /// (ver `main.rs`) y es `Backdrop::paint` el que decide, cada frame, cuánto
     /// tapa. Con un tema opaco el fondo se pinta al 100 % y no se nota nada.
@@ -6255,6 +6335,12 @@ impl eframe::App for App {
         // nuevo se avisa dentro de la app o en el escritorio.
         self.window_focused = ui.ctx().input(|i| i.viewport().focused.unwrap_or(true));
         self.poll_discord_events(ui.ctx());
+        // "Ir al servidor" de una tarjeta de invitación (`ui::invite_card`).
+        if let Some(index) = crate::discord::invites::poll_goto(|guild_id| {
+            self.servers.iter().position(|s| s.guild_id == guild_id)
+        }) {
+            self.open_server(index);
+        }
         self.tick_pending_buttons(ui.ctx());
         self.pump_stream_frames(ui.ctx());
         self.clear_viewed_mentions();

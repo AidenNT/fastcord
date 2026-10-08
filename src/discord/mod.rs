@@ -744,9 +744,6 @@ pub fn spawn_fetch_more_channel_messages(
     before_message_id: String,
     tx: std::sync::mpsc::Sender<AppEvent>,
 ) {
-    println!("load_more_messages");
-    println!("{:?}", channel_id);
-    println!("{:?}", before_message_id);
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
