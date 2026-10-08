@@ -185,14 +185,18 @@ impl User {
 }
 
 /// `GET /users/@me/relationships` — la lista de amigos. `type == 1` es
-/// amistad confirmada (2 = bloqueado, 3/4 = solicitudes salientes/entrantes);
-/// filtramos por `type == 1` al construir la lista para Home.
+/// amistad confirmada (2 = bloqueado, 3 = solicitud recibida, 4 = solicitud
+/// enviada, 5 = implícita); filtramos por `type == 1` al construir la lista
+/// para Home.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Relationship {
     pub id: String,
     #[serde(rename = "type")]
     pub kind: u8,
     pub user: User,
+    /// Si la persona está ignorada ("Ignorar" del menú de clic derecho).
+    #[serde(default)]
+    pub user_ignored: bool,
 }
 
 /// Un servidor tal como llega en `READY`.

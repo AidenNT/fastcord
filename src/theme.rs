@@ -314,9 +314,18 @@ pub fn install(ctx: &egui::Context) {
     crate::support::http_cache::install(ctx);
 }
 
+/// Paleta activa tal como la dejó el último `apply` (dark si todavía no corrió).
+/// Sirve para los menús contextuales (`ui::audio_menu`), que no reciben la
+/// paleta por parámetro.
+pub fn current(ctx: &egui::Context) -> Palette {
+    ctx.data(|d| d.get_temp::<Palette>(egui::Id::new("ecord_active_palette")))
+        .unwrap_or_else(Palette::dark)
+}
+
 /// Applies the palette to egui's own widgets so dialogs, menus, and text
 /// fields agree with the custom views.
 pub fn apply(ctx: &egui::Context, palette: &Palette) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("ecord_active_palette"), *palette));
     let modern = true;
     let mut style = (*ctx.global_style()).clone();
     let visuals = &mut style.visuals;

@@ -8,6 +8,7 @@
 
 pub mod activity;
 pub mod gateway;
+pub mod invites;
 pub mod models;
 pub mod remote_auth;
 pub mod rest;
@@ -291,6 +292,32 @@ pub enum AppEvent {
         message_id: String,
         user_id: String,
         emoji: Emoji,
+    },
+    /// `RELATIONSHIP_ADD`: cambió una relación (llegó o se envió una
+    /// solicitud de amistad, aceptaron la tuya, bloqueaste a alguien...). Trae
+    /// el tipo nuevo (1 amigo, 2 bloqueado, 3 entrante, 4 saliente) y el usuario.
+    RelationshipAdd(Box<models::Relationship>),
+    /// Terminó el envío de una solicitud de amistad por nombre de usuario
+    /// (`spawn_send_friend_request`); `error == None` es que salió bien.
+    FriendRequestSent { username: String, error: Option<String> },
+    /// `RELATIONSHIP_REMOVE`: se borró la relación con `user_id` (rechazaron o
+    /// cancelaron la solicitud, dejaron de ser amigos, desbloqueo...).
+    RelationshipRemove { user_id: String },
+    /// Terminó una acción del menú de clic derecho sobre una persona (ver
+    /// `spawn_user_action`). `error == None` es que salió bien.
+    UserActionDone {
+        user_id: String,
+        action: UserAction,
+        error: Option<String>,
+        /// Discord contestó 400 con el código `80013`: aceptar la solicitud
+        /// necesita confirmación (popup). Solo es `true` en ese caso.
+        needs_stranger_confirm: bool,
+    },
+    /// La nota privada que tenés de `user_id` (`None` = sin nota), pedida al
+    /// abrir el editor de notas (`spawn_fetch_note`).
+    UserNote {
+        user_id: String,
+        note: Option<String>,
     },
     /// Algo se rompió (login o Gateway); mensaje ya listo para mostrar.
     Error(String),
@@ -883,6 +910,35 @@ pub fn spawn_fetch_user_settings(token: String, tx: std::sync::mpsc::Sender<AppE
     });
 }
 
+/// Manda un `PreloadedUserSettings` parcial a la cuenta
+/// (`PATCH /users/@me/settings-proto/1`), en un hilo aparte y con unos pocos
+/// reintentos. Sirve para lo que se cambia desde este cliente y tiene que
+/// verse en los demás (hoy: el volumen/silencio por persona de las llamadas).
+/// Si todos los intentos fallan solo se deja un aviso en el log: el cambio ya
+/// quedó aplicado en esta sesión.
+pub fn spawn_patch_user_settings(token: String, partial: user_settings::PreloadedUserSettings) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            return;
+        };
+        rt.block_on(async move {
+            const DELAYS_SECS: [u64; 3] = [0, 2, 6];
+            for delay in DELAYS_SECS {
+                if delay > 0 {
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                }
+                let Ok(rest) = uwu_rest::UwuRest::for_token(token.clone()).await else {
+                    continue;
+                };
+                match rest.patch_user_settings(&partial).await {
+                    Ok(()) => return,
+                    Err(e) => log::warn!("No se pudieron guardar los ajustes de la cuenta: {e}"),
+                }
+            }
+        });
+    });
+}
+
 /// Trae los favoritos y la frecency de la cuenta (`settings-proto/2`) y los
 /// manda como `AppEvent::FrecencySettings`. Mientras no llegue, el selector
 /// de emojis/GIFs funciona igual pero no deja marcar favoritos (ver
@@ -1351,6 +1407,143 @@ pub fn spawn_ack_message(token: String, channel_id: String, message_id: String) 
             if let Err(e) = rest.ack_message(&channel_id, &message_id).await {
                 log::warn!("No se pudo marcar el canal {channel_id} como leído: {e}");
             }
+        });
+    });
+}
+
+/// Acción de red que se puede lanzar desde el menú de clic derecho sobre una
+/// persona (`ui::audio_menu`). Ver `spawn_user_action`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UserAction {
+    /// Mandar una solicitud de amistad.
+    AddFriend,
+    /// Aceptar la solicitud que esa persona ya mandó. `confirm` es el valor de
+    /// `confirm_stranger_request`: se intenta con `false` y, si hace falta,
+    /// tras el popup de confirmación, con `true`.
+    AcceptFriend { confirm: bool },
+    /// Quitar al amigo, cancelar la solicitud o rechazarla.
+    RemoveFriend,
+    Block,
+    Unblock,
+    Ignore,
+    Unignore,
+    /// Guardar la nota privada (texto vacío = borrarla).
+    SetNote(String),
+    /// Crear una invitación al server y mandársela por DM.
+    InviteToServer { guild_id: String },
+}
+
+/// Ejecuta una `UserAction` contra Discord sin bloquear el frame y avisa el
+/// resultado con `AppEvent::UserActionDone` (la UI muestra un toast y, si
+/// salió bien, actualiza el estado local).
+pub fn spawn_user_action(
+    token: String,
+    user_id: String,
+    action: UserAction,
+    tx: std::sync::mpsc::Sender<AppEvent>,
+) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            return;
+        };
+        rt.block_on(async move {
+            let result: anyhow::Result<()> = async {
+                let rest = uwu_rest::UwuRest::for_token(token).await?;
+                match &action {
+                    UserAction::AddFriend => rest.add_friend(&user_id, None).await,
+                    UserAction::AcceptFriend { confirm } => {
+                        rest.add_friend(&user_id, Some(*confirm)).await
+                    }
+                    UserAction::RemoveFriend | UserAction::Unblock => {
+                        rest.remove_relationship(&user_id).await
+                    }
+                    UserAction::Block => rest.block_user(&user_id).await,
+                    UserAction::Ignore => rest.ignore_user(&user_id).await,
+                    UserAction::Unignore => rest.unignore_user(&user_id).await,
+                    UserAction::SetNote(note) => rest.set_note(&user_id, note).await,
+                    UserAction::InviteToServer { guild_id } => {
+                        // Un canal de texto del server donde crear la
+                        // invitación: el primero por posición (0 = texto,
+                        // 5 = anuncios).
+                        let mut channels = rest.guild_channels(guild_id).await?;
+                        channels.sort_by_key(|c| c.position.unwrap_or(i64::MAX));
+                        let channel = channels
+                            .iter()
+                            .find(|c| c.kind == 0 || c.kind == 5)
+                            .ok_or_else(|| anyhow::anyhow!("el server no tiene canales de texto"))?;
+                        let code = rest.create_invite(&channel.id).await?;
+                        let dm_channel = rest.open_dm(&user_id).await?;
+                        rest.send_message(
+                            &dm_channel,
+                            None,
+                            &format!("https://discord.gg/{code}"),
+                            None,
+                        )
+                        .await
+                        .map(|_| ())
+                    }
+                }
+            }
+            .await;
+            let needs_stranger_confirm = result.as_ref().err().is_some_and(|e| {
+                e.downcast_ref::<uwu_rest::StrangerConfirmationRequired>().is_some()
+            });
+            let error = result.err().map(|e| e.to_string());
+            if let Some(e) = &error {
+                log::warn!("Falló la acción {action:?} sobre {user_id}: {e}");
+            }
+            let _ = tx.send(AppEvent::UserActionDone {
+                user_id,
+                action,
+                error,
+                needs_stranger_confirm,
+            });
+        });
+    });
+}
+
+/// Manda una solicitud de amistad a `username` (pantalla "Añadir amigo") sin
+/// bloquear el frame; avisa con `AppEvent::FriendRequestSent`.
+pub fn spawn_send_friend_request(token: String, username: String, tx: std::sync::mpsc::Sender<AppEvent>) {
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
+        let Ok(rt) = runtime else {
+            let _ = tx.send(AppEvent::FriendRequestSent {
+                username,
+                error: Some("No se pudo iniciar la conexión.".to_string()),
+            });
+            return;
+        };
+        rt.block_on(async move {
+            let result: anyhow::Result<()> = async {
+                let rest = uwu_rest::UwuRest::for_token(token).await?;
+                rest.send_friend_request(&username).await
+            }
+            .await;
+            let error = result.err().map(|e| e.to_string());
+            if let Some(e) = &error {
+                log::warn!("Falló la solicitud de amistad a {username}: {e}");
+            }
+            let _ = tx.send(AppEvent::FriendRequestSent { username, error });
+        });
+    });
+}
+
+/// Pide la nota privada de `user_id` (para precargarla en el editor de notas).
+pub fn spawn_fetch_note(token: String, user_id: String, tx: std::sync::mpsc::Sender<AppEvent>) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            return;
+        };
+        rt.block_on(async move {
+            let note = match uwu_rest::UwuRest::for_token(token).await {
+                Ok(rest) => rest.get_note(&user_id).await.unwrap_or(None),
+                Err(e) => {
+                    log::warn!("No se pudo loguear el REST para pedir la nota: {e}");
+                    None
+                }
+            };
+            let _ = tx.send(AppEvent::UserNote { user_id, note });
         });
     });
 }

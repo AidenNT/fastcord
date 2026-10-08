@@ -304,7 +304,9 @@ pub fn channel_list_content_ex(
                         for occupant in &channel.voice_members {
                             let speaking =
                                 app.user_voice_speaking_in_guild_str(&guild_id, &occupant.user_id);
-                            voice_member_row(ui, &palette, occupant, speaking);
+                            let local = app.voice_participant_playback(&occupant.user_id);
+                            let is_me = app.me.as_ref().is_some_and(|me| me.id == occupant.user_id);
+                            voice_member_row(ui, &palette, occupant, speaking, local, is_me);
                         }
                     } else if channel_row(ui, &palette, &channel.name, selected, locked) {
                         clicked_channel = Some((cat_idx, chan_idx));
@@ -441,8 +443,10 @@ fn voice_member_row(
     palette: &Palette,
     occupant: &crate::lib::data::VoiceOccupant,
     speaking: bool,
+    local: crate::discord::VoiceParticipantPlaybackSettings,
+    is_me: bool,
 ) {
-    ui.horizontal(|ui| {
+    let row = ui.horizontal(|ui| {
         ui.add_space(34.0);
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(20.0), egui::Sense::hover());
         if speaking {
@@ -474,6 +478,13 @@ fn voice_member_row(
             live_pill(ui, palette);
         }
     });
+    // Clic derecho sobre la fila: volumen de esa persona.
+    let row_resp = ui.interact(
+        row.response.rect,
+        egui::Id::new(("voice_member_row_menu", occupant.user_id.as_str())),
+        egui::Sense::click(),
+    );
+    crate::ui::audio_menu::show(&row_resp, &occupant.name, &occupant.user_id, local, is_me);
     ui.add_space(2.0);
 }
 
@@ -612,6 +623,13 @@ fn member_list_panel(app: &App, ui: &mut egui::Ui, server_index: usize) {
                                 egui::Sense::click(),
                             )
                             .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        crate::ui::audio_menu::show(
+                            &row_response,
+                            &m.name,
+                            &m.user_id,
+                            app.voice_participant_playback(&m.user_id),
+                            app.me.as_ref().is_some_and(|me| me.id == m.user_id),
+                        );
                         if row_response.clicked() {
                             crate::ui::profile_popup::request_open(
                                 ui.ctx(),

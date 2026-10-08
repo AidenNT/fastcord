@@ -102,6 +102,26 @@ impl std::fmt::Display for SearchIndexingError {
 
 impl std::error::Error for SearchIndexingError {}
 
+/// Un 400 de Discord que no pide captcha. El texto del error sigue siendo
+/// "Bad request" (como antes), pero ahora se conservan el `code` y el
+/// `message` del cuerpo (`{"message": "...", "code": 80013}`) para que quien
+/// llama pueda reconocerlos con `downcast_ref::<BadRequestError>()`.
+#[derive(Debug, Clone)]
+pub struct BadRequestError {
+    /// Código de error de Discord (`code` del cuerpo), si vino.
+    pub code: Option<i64>,
+    /// Mensaje de Discord (`message` del cuerpo), si vino.
+    pub message: Option<String>,
+}
+
+impl std::fmt::Display for BadRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Bad request")
+    }
+}
+
+impl std::error::Error for BadRequestError {}
+
 fn should_retry_search_indexing(authentication: Authentication, status: u16, path: &str) -> bool {
     authentication == Authentication::Bot && status == 202 && path.ends_with("/messages/search")
 }
@@ -681,7 +701,10 @@ impl RestClient {
                 }
 
                 error!("Bad request to {}: {}", url, resp_json.to_string());
-                return Err("Bad request".into());
+                return Err(Box::new(BadRequestError {
+                    code: resp_json["code"].as_i64(),
+                    message: resp_json["message"].as_str().map(str::to_owned),
+                }));
             }
             code => {
                 let body = resp.text().await?;

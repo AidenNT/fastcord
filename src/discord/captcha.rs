@@ -484,7 +484,7 @@ fn init_script(sitekey: &str, rqdata: Option<&str>) -> String {
     document.head.appendChild(style);
 
     var msg = document.createElement('p');
-    msg.textContent = 'Resolvé la verificación para seguir iniciando sesión.';
+    msg.textContent = 'Necesitamos verificar que eres un humano.';
     document.body.appendChild(msg);
     var box = document.createElement('div');
     box.id = 'ecord-hcaptcha';

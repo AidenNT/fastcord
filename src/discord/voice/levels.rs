@@ -25,6 +25,10 @@ pub struct MicrophoneBufferMs(u16);
 pub struct VoiceParticipantPlaybackSettings {
     pub volume: VoiceParticipantVolumePercent,
     pub muted: bool,
+    /// "Silenciar panel de sonidos" de esa persona. Se guarda en la cuenta
+    /// (`AudioContextSetting.soundboard_muted`); el runtime de voz todavía no
+    /// separa los sonidos del panel del resto del audio de la persona.
+    pub soundboard_muted: bool,
 }
 
 const MIN_MICROPHONE_SENSITIVITY_DB: i8 = -100;

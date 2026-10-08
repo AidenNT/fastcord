@@ -205,6 +205,52 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
 // pantalla a la izquierda, íconos a la derecha). El buscador de la fila vive
 // dentro de `ui::nav` porque va encima de la tarjeta de mensajes directos.
 
+/// Barra mínima para la pantalla de Login: sin buscador ni estado, solo
+/// arrastre de ventana y los controles minimizar/maximizar/cerrar.
+///
+/// La ventana se crea sin decoraciones nativas (`main.rs`), así que sin esta
+/// barra el login no se podría mover, minimizar ni cerrar (en Linux, sobre
+/// todo en Wayland, tampoco hay ningún atajo que lo suplante).
+pub fn show_login(app: &mut App, ui: &mut egui::Ui) {
+    let palette = app.palette;
+
+    egui::Panel::top("app_topbar")
+        .exact_size(TITLEBAR_HEIGHT)
+        .resizable(false)
+        .frame(Frame::new().fill(palette.window).inner_margin(Margin::symmetric(12, 0)))
+        .show(ui, |ui| {
+            let bar_rect = ui.max_rect();
+
+            let drag = ui.interact(bar_rect, ui.id().with("drag"), Sense::click_and_drag());
+            if drag.drag_started() {
+                ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+            }
+            if drag.double_clicked() {
+                toggle_maximize(ui);
+            }
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if theme::icon_button(ui, Icon::X, 12.0, palette.dim, palette.text, "Cerrar").clicked() {
+                    ui.ctx().send_viewport_cmd(ViewportCommand::Close);
+                }
+
+                let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
+                let (restore_icon, restore_tip) = if maximized {
+                    (Icon::Shrink, "Restaurar")
+                } else {
+                    (Icon::Maximize2, "Maximizar")
+                };
+                if theme::icon_button(ui, restore_icon, 12.0, palette.dim, palette.text, restore_tip).clicked() {
+                    toggle_maximize(ui);
+                }
+
+                if theme::icon_button(ui, Icon::Minus, 12.0, palette.dim, palette.text, "Minimizar").clicked() {
+                    ui.ctx().send_viewport_cmd(ViewportCommand::Minimized(true));
+                }
+            });
+        });
+}
+
 /// Barra de título fina: arrastra la ventana y lleva los controles.
 fn show_titlebar(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;

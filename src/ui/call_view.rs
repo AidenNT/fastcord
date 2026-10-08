@@ -176,10 +176,18 @@ struct CallEvents {
     exit_fullscreen: bool,
     /// (user_id, nombre) de quien se quiere ver.
     watch: Option<(String, String)>,
+    /// Menú de clic derecho del stream: (id de quien transmite, volumen en %).
+    stream_volume: Option<(String, u16)>,
+    stream_muted: Option<(String, bool)>,
+    stream_reset: Option<String>,
 }
 
 /// Datos del stream que se está viendo en este canal (ya clonados).
 struct StageData {
+    /// Id de usuario de quien transmite (clave del volumen del stream).
+    owner_id: String,
+    /// Volumen/silencio local del audio de este stream.
+    playback: crate::discord::VoiceParticipantPlaybackSettings,
     owner_name: String,
     status: StreamWatchStatus,
     message: Option<String>,
@@ -196,6 +204,9 @@ struct TileCtx<'a> {
     clickable: bool,
     /// Hay un tile de stream en la grilla: no repetir "EN VIVO"/"Viendo".
     grid_with_stream: bool,
+    /// Volumen/silencio local de cada integrante (por user_id), para el menú
+    /// de clic derecho.
+    playback: &'a std::collections::HashMap<String, crate::discord::VoiceParticipantPlaybackSettings>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -241,6 +252,11 @@ pub fn show(
         .iter()
         .map(|m| app.user_voice_speaking_in_guild_str(&guild_id, &m.user_id))
         .collect();
+    let playback: std::collections::HashMap<String, crate::discord::VoiceParticipantPlaybackSettings> =
+        members
+            .iter()
+            .map(|m| (m.user_id.clone(), app.voice_participant_playback(&m.user_id)))
+            .collect();
     let (self_mute, self_deaf) = app
         .voice_target
         .as_ref()
@@ -253,6 +269,8 @@ pub fn show(
         .as_ref()
         .filter(|w| Some(&w.channel_id) == channel_id.as_ref());
     let stage: Option<StageData> = watched_here.map(|w| StageData {
+        owner_id: w.stream_key.rsplit(':').next().unwrap_or_default().to_owned(),
+        playback: app.voice_stream_playback(w.stream_key.rsplit(':').next().unwrap_or_default()),
         owner_name: w.owner_name.clone(),
         status: w.status,
         message: w.message.clone(),
@@ -363,6 +381,7 @@ pub fn show(
                     connected_here,
                     clickable: true,
                     grid_with_stream: false,
+                    playback: &playback,
                 };
                 for (i, rect) in strip.iter().enumerate() {
                     draw_tile(ui, palette, *rect, &members[i], speaking[i], &tc, &mut ev);
@@ -379,6 +398,7 @@ pub fn show(
                     connected_here,
                     clickable: false,
                     grid_with_stream: true,
+                    playback: &playback,
                 };
                 for (i, m) in members.iter().enumerate() {
                     if let Some(rect) = rects.get(i + 1) {
@@ -393,6 +413,7 @@ pub fn show(
                 connected_here,
                 clickable: false,
                 grid_with_stream: false,
+                playback: &playback,
             };
             for (i, rect) in grid_layout(content, members.len()).iter().enumerate() {
                 draw_tile(ui, palette, *rect, &members[i], speaking[i], &tc, &mut ev);
@@ -462,6 +483,15 @@ pub fn show(
     if let (Some((owner_id, owner_name)), Some(channel_id)) = (ev.watch.as_ref(), channel_id.as_deref()) {
         app.watch_stream(&guild_id, channel_id, owner_id, owner_name);
     }
+    if let Some((owner_id, percent)) = ev.stream_volume.as_ref() {
+        app.set_voice_stream_volume(owner_id, *percent);
+    }
+    if let Some((owner_id, muted)) = ev.stream_muted.as_ref() {
+        app.set_voice_stream_muted(owner_id, *muted);
+    }
+    if let Some(owner_id) = ev.stream_reset.as_ref() {
+        app.reset_voice_stream_audio(owner_id);
+    }
     if ev.leave {
         app.leave_voice();
     } else if ev.toggle_deafen {
@@ -525,6 +555,9 @@ pub fn show_popup(app: &mut App, ui: &mut egui::Ui) {
         return;
     }
     let stage = StageData {
+        owner_id: watched.stream_key.rsplit(':').next().unwrap_or_default().to_owned(),
+        playback: app
+            .voice_stream_playback(watched.stream_key.rsplit(':').next().unwrap_or_default()),
         owner_name: watched.owner_name.clone(),
         status: watched.status,
         message: watched.message.clone(),
@@ -856,14 +889,17 @@ fn draw_tile(
 
     // El tile entero, debajo de todo lo demás (los botones se registran
     // después y ganan el click).
+    // Un solo widget para el tile: clic izquierdo (cambia la mirada, si es
+    // clickeable) y clic derecho (volumen/silencio de esa persona).
+    let tile_resp = ui.interact(rect, egui::Id::new(("call_tile", &occ.user_id)), Sense::click());
     if tc.clickable {
-        let resp = ui
-            .interact(rect, egui::Id::new(("call_tile", &occ.user_id)), Sense::click())
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
-        if resp.clicked() {
+        if tile_resp.clone().on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
             ev.toggle_layout = true;
         }
     }
+    let is_me_tile = tc.my_id == Some(occ.user_id.as_str());
+    let local = tc.playback.get(&occ.user_id).copied().unwrap_or_default();
+    crate::ui::audio_menu::show(&tile_resp, &occ.name, &occ.user_id, local, is_me_tile);
 
     let fill = extra::blend(palette.surface, occ.avatar_color, 0.22);
     ui.painter().rect_filled(rect, radius, fill);
@@ -958,10 +994,65 @@ fn draw_tile(
         Color32::WHITE,
     );
 
+    // Silenciado (o a 0 %) solo para vos: se nota sin abrir el menú.
+    if !is_me && (local.muted || local.volume.value() == 0) {
+        let badge = Rect::from_center_size(
+            Pos2::new(rect.right() - 22.0, rect.top() + 22.0),
+            Vec2::splat(26.0),
+        );
+        ui.painter().circle_filled(badge.center(), 13.0, Color32::from_black_alpha(170));
+        theme::paint_icon(
+            ui,
+            Icon::VolumeX,
+            Rect::from_center_size(badge.center(), Vec2::splat(14.0)),
+            14.0,
+            palette.danger,
+        );
+    }
+
     if speaking {
         ui.painter()
             .rect_stroke(rect, radius, Stroke::new(3.0, palette.accent), StrokeKind::Inside);
     }
+}
+
+/// Menú de clic derecho sobre el video del stream: volumen del AUDIO DEL STREAM
+/// (0–200 %), silenciarlo y restablecer. Es aparte del volumen de esa persona en
+/// la llamada, igual que en el cliente oficial; se guarda en la cuenta
+/// (`audio_context_settings.stream`).
+fn stream_audio_menu(resp: &egui::Response, stage: &StageData, ev: &mut CallEvents) {
+    if stage.owner_id.is_empty() {
+        return;
+    }
+    resp.clone().context_menu(|ui| {
+        ui.set_min_width(220.0);
+        ui.label(egui::RichText::new(format!("Stream de {}", stage.owner_name)).strong());
+        ui.separator();
+
+        ui.label("Volumen del stream");
+        let mut percent = f32::from(stage.playback.volume.value());
+        let slider = egui::Slider::new(
+            &mut percent,
+            0.0..=f32::from(crate::discord::VoiceParticipantVolumePercent::maximum()),
+        )
+        .integer()
+        .suffix(" %");
+        if ui.add(slider).changed() {
+            ev.stream_volume = Some((stage.owner_id.clone(), percent.round() as u16));
+        }
+
+        let mut muted = stage.playback.muted;
+        if ui.checkbox(&mut muted, "Silenciar stream").changed() {
+            ev.stream_muted = Some((stage.owner_id.clone(), muted));
+        }
+
+        ui.separator();
+        let modified = stage.playback != crate::discord::VoiceParticipantPlaybackSettings::default();
+        if ui.add_enabled(modified, egui::Button::new("Restablecer")).clicked() {
+            ev.stream_reset = Some(stage.owner_id.clone());
+            ui.close();
+        }
+    });
 }
 
 /// Recorta `text` con "…" hasta que entre en `max_w`. Devuelve el texto y su ancho.
@@ -1014,6 +1105,7 @@ fn draw_stream(
 
     // Superficie clickeable debajo de los botones (que se registran después).
     let surface = ui.interact(rect, egui::Id::new(("call_stream_surface", tag)), Sense::click());
+    stream_audio_menu(&surface, stage, ev);
 
     ui.painter()
         .rect_filled(rect, radius, extra::blend(palette.window_solid, Color32::BLACK, 0.6));

@@ -938,7 +938,12 @@ impl Friend {
     /// se actualiza solo cuando entre un evento `PRESENCE_UPDATE` (falta
     /// cablear ese evento en `discord::gateway`, ver el comentario ahí).
     pub fn from_relationship(rel: &crate::discord::models::Relationship) -> Self {
-        let user = &rel.user;
+        Self::from_user(&rel.user)
+    }
+
+    /// Amigo real a partir del objeto de usuario (lo usan `from_relationship`
+    /// y la aceptación de una solicitud pendiente, ver `PendingRequest`).
+    pub fn from_user(user: &crate::discord::models::User) -> Self {
         Self {
             name: user.display_name().to_string(),
             status: Status::Offline,
@@ -1004,10 +1009,58 @@ impl Friend {
     }
 }
 
+/// Solicitud de amistad pendiente: una `Relationship` de tipo 3 (la mandó la
+/// otra persona) o 4 (la mandaste vos). Alimenta la pestaña "Pendiente" del
+/// Inicio (`ui::home`).
+#[derive(Clone)]
+pub struct PendingRequest {
+    /// Objeto de usuario completo; al aceptar sirve para armar el `Friend`.
+    pub user: crate::discord::models::User,
+    pub name: String,
+    /// `@usuario` sin discriminador (el nombre visible puede ser otro).
+    pub username: String,
+    pub avatar_url: Option<String>,
+    pub avatar_color: Color32,
+    /// `true` = te la mandó la otra persona (entrante); `false` = la mandaste
+    /// vos (saliente).
+    pub incoming: bool,
+}
+
+impl PendingRequest {
+    /// `None` si la relación no es una solicitud (tipo distinto de 3 y 4).
+    pub fn from_relationship(rel: &crate::discord::models::Relationship) -> Option<Self> {
+        let incoming = match rel.kind {
+            3 => true,
+            4 => false,
+            _ => return None,
+        };
+        let mut user = rel.user.clone();
+        if user.id.is_empty() {
+            user.id = rel.id.clone();
+        }
+        Some(Self {
+            name: user.display_name().to_string(),
+            username: user.username.clone(),
+            avatar_url: user.avatar_url(),
+            avatar_color: color_from_id(&user.id),
+            incoming,
+            user,
+        })
+    }
+
+    pub fn initial(&self) -> String {
+        self.name
+            .chars()
+            .find(|c| c.is_alphanumeric())
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_else(|| "?".to_string())
+    }
+}
+
 /// Color determinístico a partir de un id de Discord (snowflake), para
 /// usar como fondo del avatar placeholder mientras no hay `avatar_url` o
 /// la imagen todavía no terminó de cargar.
-fn color_from_id(id: &str) -> Color32 {
+pub fn color_from_id(id: &str) -> Color32 {
     let hash: u64 = id.parse().unwrap_or_else(|_| {
         id.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64))
     });

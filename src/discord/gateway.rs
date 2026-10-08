@@ -686,7 +686,7 @@ async fn connect_and_run(
             // sesión guardada.
             10 => {
                 let interval_ms = payload.data()["heartbeat_interval"].as_u64().unwrap_or(41250);
-                let jitter = rand::thread_rng().gen_range(0..=interval_ms);
+                let jitter = rand::thread_rng().gen_range(0..=2000);
                 heartbeat = tokio::time::interval(Duration::from_millis(interval_ms));
                 tokio::time::sleep(Duration::from_millis(jitter)).await;
                 heartbeat.reset();
@@ -1177,6 +1177,20 @@ fn handle_dispatch(
         "SESSIONS_REPLACE" => {
             let activities = crate::discord::models::parse_session_activities(&data);
             let _ = tx.send(AppEvent::OwnActivities(activities));
+        }
+        // Cambió una relación con otra persona: solicitud de amistad nueva
+        // (entrante o saliente), aceptada, bloqueo... Mismo formato que cada
+        // elemento de `READY.relationships`.
+        "RELATIONSHIP_ADD" => {
+            let relationship: crate::discord::models::Relationship = serde_json::from_value(data)?;
+            let _ = tx.send(AppEvent::RelationshipAdd(Box::new(relationship)));
+        }
+        // Se borró la relación (solicitud rechazada/cancelada, amistad
+        // eliminada, desbloqueo): solo trae el id de la persona.
+        "RELATIONSHIP_REMOVE" => {
+            if let Some(user_id) = data.get("id").and_then(Value::as_str) {
+                let _ = tx.send(AppEvent::RelationshipRemove { user_id: user_id.to_owned() });
+            }
         }
         // Un canal se marcó como leído (desde otro dispositivo, o el eco de
         // nuestro propio ack). Trae lo que queda sin leer en `mention_count`.

@@ -281,6 +281,11 @@ pub fn show(
     // `messages` — ver `App::pending_jump`. También se consume una sola vez.
     jump_target: &mut Option<String>,
 ) -> ChatEvent {
+    // El render de mensajes no recibe el estado de la app: se publica el
+    // token para que las tarjetas de invitación puedan consultar la API.
+    if let Some((token, _, _)) = &send_target {
+        crate::discord::invites::set_token(token);
+    }
     // Alto que se reserva para el compositor: el base + lo que suman la barra
     // de respuesta, la del slash command y las líneas de más de la caja de
     // texto (esto último, medido en el frame anterior y siempre acotado: la
@@ -1187,6 +1192,9 @@ fn message_body(
     media::show_attachments(ui, palette, &msg.attachments);
     media::show_stickers(ui, palette, &msg.stickers);
     media::show_embeds(ui, palette, &msg.embeds);
+    // Tarjeta de invitación (`discord.gg/...`): Discord no manda embed para
+    // las invitaciones, la arma el cliente (ver `ui::invite_card`).
+    crate::ui::invite_card::show(ui, palette, &msg.content, msg.is_own);
     // Botones del bot (debajo de los embeds, arriba de las reacciones).
     if let Some(click) = crate::ui::components::show(ui, palette, msg) {
         actions.component = Some(click);

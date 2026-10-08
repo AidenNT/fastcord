@@ -121,3 +121,103 @@ pub fn partial_with_theme(theme: proto::preloaded_user_settings::Theme) -> Prelo
         ..Default::default()
     }
 }
+
+// --- Volumen / silencio por persona (`audio_context_settings`) ----------
+
+/// Volumen y silencio local de cada persona de las llamadas, tal cual los
+/// sincroniza la cuenta (`PreloadedUserSettings.audio_context_settings.user`).
+/// El volumen del proto va en la misma escala que el slider del cliente
+/// oficial: 0..=200 con 100 como valor normal.
+pub fn participant_playback_from_settings(
+    settings: &PreloadedUserSettings,
+) -> Vec<(
+    crate::discord::ids::Id<crate::discord::ids::marker::UserMarker>,
+    crate::discord::VoiceParticipantPlaybackSettings,
+)> {
+    let Some(audio) = settings.audio_context_settings.as_ref() else {
+        return Vec::new();
+    };
+    playback_entries(&audio.user)
+}
+
+/// Lo mismo para el audio de los streams (`audio_context_settings.stream`),
+/// con la clave puesta en quien transmite.
+pub fn stream_playback_from_settings(
+    settings: &PreloadedUserSettings,
+) -> Vec<(
+    crate::discord::ids::Id<crate::discord::ids::marker::UserMarker>,
+    crate::discord::VoiceParticipantPlaybackSettings,
+)> {
+    let Some(audio) = settings.audio_context_settings.as_ref() else {
+        return Vec::new();
+    };
+    playback_entries(&audio.stream)
+}
+
+fn playback_entries(
+    map: &std::collections::HashMap<u64, proto::preloaded_user_settings::AudioContextSetting>,
+) -> Vec<(
+    crate::discord::ids::Id<crate::discord::ids::marker::UserMarker>,
+    crate::discord::VoiceParticipantPlaybackSettings,
+)> {
+    map.iter()
+        .filter_map(|(user_id, entry)| {
+            let id = crate::discord::ids::Id::new_checked(*user_id)?;
+            Some((id, playback_from_entry(entry)))
+        })
+        .collect()
+}
+
+fn playback_from_entry(
+    entry: &proto::preloaded_user_settings::AudioContextSetting,
+) -> crate::discord::VoiceParticipantPlaybackSettings {
+    // Una entrada que nunca se tocó (todo en cero, sin fecha) no es "volumen
+    // 0": es la persona en sus valores normales.
+    if entry.volume == 0.0 && !entry.muted && !entry.soundboard_muted && entry.modified_at == 0 {
+        return crate::discord::VoiceParticipantPlaybackSettings::default();
+    }
+    let percent = entry.volume.round().clamp(0.0, 200.0) as u16;
+    crate::discord::VoiceParticipantPlaybackSettings {
+        volume: crate::discord::VoiceParticipantVolumePercent::new(percent),
+        muted: entry.muted,
+        soundboard_muted: entry.soundboard_muted,
+    }
+}
+
+/// Arma un `PreloadedUserSettings` parcial con SOLO las personas indicadas en
+/// `audio_context_settings.user`, para mandarlo como `PATCH`. Discord mergea
+/// los mapas por clave, así que las demás personas quedan como estaban. Una
+/// persona vuelta a los valores normales se manda igual (100 %, sin silenciar):
+/// un merge no puede borrar una clave, y así los otros clientes también la
+/// restablecen.
+pub fn partial_with_participant_audio(
+    users: &[(u64, crate::discord::VoiceParticipantPlaybackSettings)],
+    streams: &[(u64, crate::discord::VoiceParticipantPlaybackSettings)],
+    modified_at_ms: u64,
+) -> PreloadedUserSettings {
+    use proto::preloaded_user_settings::{AudioContextSetting, AudioSettings};
+
+    let to_map = |entries: &[(u64, crate::discord::VoiceParticipantPlaybackSettings)]| {
+        entries
+            .iter()
+            .map(|(user_id, playback)| {
+                (
+                    *user_id,
+                    AudioContextSetting {
+                        muted: playback.muted,
+                        volume: f32::from(playback.volume.value()),
+                        modified_at: modified_at_ms,
+                        soundboard_muted: playback.soundboard_muted,
+                    },
+                )
+            })
+            .collect()
+    };
+    PreloadedUserSettings {
+        audio_context_settings: Some(AudioSettings {
+            user: to_map(users),
+            stream: to_map(streams),
+        }),
+        ..Default::default()
+    }
+}

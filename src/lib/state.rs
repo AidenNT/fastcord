@@ -11,6 +11,45 @@ use crate::discord::{AppEvent, CurrentVoiceConnectionState, VoiceAudioSettings, 
 use crate::lib::data::{demo_activity, demo_friends, demo_servers, ActivityCard, ChatMessage, Friend, NameResolver, Server};
 use crate::theme::{Backdrop, BackdropRuntime, Palette, ThemeDef, ThemeEditor, ThemeMode};
 use crate::ui::settings::SettingsTab;
+
+/// Cuánto se espera sin cambios en el volumen/silencio de alguien antes de
+/// guardarlo en la cuenta.
+const PARTICIPANT_AUDIO_SYNC_DELAY: std::time::Duration = std::time::Duration::from_millis(700);
+
+/// Mezcla lo que trae la cuenta con el ajuste local de volumen/silencio.
+/// `replace`: `entries` es la lista completa (si no, solo lo que cambió). Lo que
+/// se tocó acá y todavía no se mandó (`dirty`) gana siempre sobre lo que llegue.
+fn merged_playback(
+    current: &std::collections::HashMap<u64, crate::discord::VoiceParticipantPlaybackSettings>,
+    dirty: &std::collections::HashSet<u64>,
+    entries: Vec<(
+        crate::discord::ids::Id<crate::discord::ids::marker::UserMarker>,
+        crate::discord::VoiceParticipantPlaybackSettings,
+    )>,
+    replace: bool,
+) -> std::collections::HashMap<u64, crate::discord::VoiceParticipantPlaybackSettings> {
+    let mut next: std::collections::HashMap<u64, crate::discord::VoiceParticipantPlaybackSettings> =
+        if replace {
+            dirty
+                .iter()
+                .filter_map(|raw| current.get(raw).map(|playback| (*raw, *playback)))
+                .collect()
+        } else {
+            current.clone()
+        };
+    for (id, playback) in entries {
+        let raw = id.get();
+        if dirty.contains(&raw) {
+            continue;
+        }
+        if playback == crate::discord::VoiceParticipantPlaybackSettings::default() {
+            next.remove(&raw);
+        } else {
+            next.insert(raw, playback);
+        }
+    }
+    next
+}
 use web_local_storage_api;
 
 // Informe de memoria (Ajustes → Memoria): hijo de este módulo para poder leer
@@ -342,6 +381,54 @@ pub struct App {
     /// adelante otros campos (status, notificaciones, privacidad...) sin
     /// tener que pedirlo de nuevo.
     pub discord_settings: Option<crate::discord::user_settings::PreloadedUserSettings>,
+    /// Volumen y silencio local de cada persona de las llamadas (clic derecho
+    /// sobre su tile). Es el espejo de `audio_context_settings.user` de la
+    /// cuenta: se llena con lo que trae `AppEvent::UserSettings`/`UserSettingsUpdate`
+    /// y se manda de vuelta con `flush_participant_audio`. Solo guarda a quien
+    /// se apartó de lo normal (100 %, sin silenciar). Clave: id de usuario.
+    participant_playback:
+        std::collections::HashMap<u64, crate::discord::VoiceParticipantPlaybackSettings>,
+    /// Personas cuyo ajuste cambió acá y todavía no se mandó a la cuenta.
+    participant_audio_dirty: std::collections::HashSet<u64>,
+    /// Último cambio pendiente; el `PATCH` sale cuando pasa
+    /// `PARTICIPANT_AUDIO_SYNC_DELAY` sin nuevos cambios (arrastrar el slider
+    /// genera uno por frame).
+    participant_audio_dirty_at: Option<Instant>,
+    /// Lo mismo para el AUDIO DE LOS STREAMS (clic derecho sobre el video):
+    /// volumen y silencio por streamer, espejo de `audio_context_settings.stream`.
+    /// Clave: id de usuario de quien transmite.
+    stream_playback:
+        std::collections::HashMap<u64, crate::discord::VoiceParticipantPlaybackSettings>,
+    /// Streamers cuyo ajuste cambió acá y todavía no se mandó (comparte
+    /// `participant_audio_dirty_at` con las personas).
+    stream_audio_dirty: std::collections::HashSet<u64>,
+    /// Relación con cada persona, por id: 1 amigo, 2 bloqueado, 3 solicitud
+    /// recibida, 4 solicitud enviada. Sin entrada = sin relación. Alimenta el
+    /// menú de clic derecho (`ui::audio_menu`): "Añadir amigo" / "Desbloquear".
+    relationship_kinds: std::collections::HashMap<String, u8>,
+    /// Solicitudes de amistad pendientes (tipos 3 y 4 de `relationship_kinds`,
+    /// con los datos para dibujarlas). Alimenta la pestaña "Pendiente" del
+    /// Inicio; se mantiene al día con `RELATIONSHIP_ADD`/`RELATIONSHIP_REMOVE`.
+    pub pending_requests: Vec<crate::lib::data::PendingRequest>,
+    /// Texto del campo de la pantalla "Añadir amigo".
+    pub add_friend_input: String,
+    /// Hay una solicitud por nombre de usuario en camino.
+    pub add_friend_busy: bool,
+    /// Resultado de la última solicitud por nombre: (salió bien, mensaje).
+    pub add_friend_status: Option<(bool, String)>,
+    /// Personas ignoradas (`Relationship::user_ignored` en `READY`, y las que
+    /// se ignoran desde el menú).
+    ignored_users: std::collections::HashSet<String>,
+    /// Personas con el vídeo deshabilitado desde el menú de clic derecho.
+    video_disabled_users: std::collections::HashSet<String>,
+    /// Llamar a esta persona apenas llegue su canal de DM (`AppEvent::DmOpened`).
+    pending_call_user: Option<String>,
+    /// (id, nombre) de la nota que se está por editar, hasta que llegue su texto.
+    pending_note: Option<(String, String)>,
+    /// Versión de lo que ve el menú de clic derecho; se sube cuando cambia y
+    /// `publish_menu_context` lo vuelve a publicar.
+    menu_ctx_rev: u64,
+    menu_ctx_published: Option<(u64, usize)>,
     /// Ids de las carpetas de servers (`GuildFolder::id`) que están
     /// expandidas en la barra lateral (`ui::rail`). Solo en memoria — no
     /// se persiste entre sesiones a propósito, a diferencia del cliente
@@ -695,6 +782,22 @@ impl Default for App {
             accounts,
             discord_token: None,
             discord_settings: None,
+            participant_playback: std::collections::HashMap::new(),
+            participant_audio_dirty: std::collections::HashSet::new(),
+            participant_audio_dirty_at: None,
+            stream_playback: std::collections::HashMap::new(),
+            stream_audio_dirty: std::collections::HashSet::new(),
+            relationship_kinds: std::collections::HashMap::new(),
+            pending_requests: Vec::new(),
+            add_friend_input: String::new(),
+            add_friend_busy: false,
+            add_friend_status: None,
+            ignored_users: std::collections::HashSet::new(),
+            video_disabled_users: std::collections::HashSet::new(),
+            pending_call_user: None,
+            pending_note: None,
+            menu_ctx_rev: 0,
+            menu_ctx_published: None,
             open_guild_folders: std::collections::HashSet::new(),
             event_rx: None,
             event_tx: None,
@@ -1052,6 +1155,14 @@ impl App {
         if let Some(token) = self.discord_token.as_deref() {
             crate::discord::frecency::tick(token, true);
         }
+        // Idem para el volumen/silencio por persona: sale con el token de ESTA
+        // cuenta antes de olvidarlo todo.
+        self.flush_participant_audio(true);
+        self.participant_playback.clear();
+        self.participant_audio_dirty.clear();
+        self.participant_audio_dirty_at = None;
+        self.stream_playback.clear();
+        self.stream_audio_dirty.clear();
         crate::discord::frecency::reset();
         self.drop_connection();
         self.discord_token = None;
@@ -2879,6 +2990,11 @@ impl App {
         {
             ctx.request_repaint_after(std::time::Duration::from_secs(5));
         }
+        // Volumen/silencio por persona: lo mismo, con un temporizador corto
+        // para que soltar el slider se guarde enseguida.
+        if self.flush_participant_audio(!self.window_focused) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
         let Some(rx) = &self.event_rx else { return };
         let pending: Vec<AppEvent> = rx.try_iter().collect();
         for event in pending {
@@ -2970,7 +3086,15 @@ impl App {
                         self.apply_theme_mode();
                     }
                 }
+                let participant_audio =
+                    crate::discord::user_settings::participant_playback_from_settings(&settings);
+                let stream_audio =
+                    crate::discord::user_settings::stream_playback_from_settings(&settings);
                 self.discord_settings = Some(*settings);
+                self.ingest_stream_audio(stream_audio, true);
+                // Volumen/silencio por persona: la cuenta manda (salvo lo que
+                // se cambió acá y todavía no salió).
+                self.ingest_participant_audio(participant_audio, true);
             }
             AppEvent::FrecencySettings(settings) => {
                 crate::discord::frecency::ingest_initial(*settings);
@@ -2992,6 +3116,15 @@ impl App {
                 // entero, nunca se mergea: es una lista, y mergear
                 // concatenaría y duplicaría los servers en la barra.
                 let settings = *settings;
+                // Volumen/silencio por persona cambiado desde otro dispositivo
+                // (o el eco de nuestro propio guardado). En un update parcial
+                // vienen solo las personas que cambiaron.
+                let participant_audio =
+                    crate::discord::user_settings::participant_playback_from_settings(&settings);
+                self.ingest_participant_audio(participant_audio, !partial);
+                let stream_audio =
+                    crate::discord::user_settings::stream_playback_from_settings(&settings);
+                self.ingest_stream_audio(stream_audio, !partial);
                 let mut merged = false;
                 if partial {
                     if let Some(current) = self.discord_settings.as_mut() {
@@ -3007,6 +3140,7 @@ impl App {
             }
             AppEvent::Ready(ready) => {
                 self.gateway_session_id = ready.session_id.clone();
+                crate::discord::invites::set_session_id(&ready.session_id);
                 let display_name = ready.user.display_name().to_string();
                 // Perfil de la cuenta para el selector (nombre, avatar, id).
                 if let Some(token) = self.discord_token.clone() {
@@ -3020,7 +3154,29 @@ impl App {
                     .filter(|r| r.kind == 1) // 1 = amistad confirmada
                     .map(Friend::from_relationship)
                     .collect();
+                self.relationship_kinds = ready
+                    .relationships
+                    .iter()
+                    .map(|r| (r.id.clone(), r.kind))
+                    .collect();
+                // Solicitudes de amistad entrantes (3) y salientes (4).
+                self.pending_requests = ready
+                    .relationships
+                    .iter()
+                    .filter_map(crate::lib::data::PendingRequest::from_relationship)
+                    .collect();
+                self.ignored_users = ready
+                    .relationships
+                    .iter()
+                    .filter(|r| r.user_ignored)
+                    .map(|r| r.id.clone())
+                    .collect();
+                self.menu_ctx_rev += 1;
                 self.servers = ready.guilds.iter().map(Server::from_guild).collect();
+                // Para la tarjeta de invitación ("Ir al servidor" vs "Unirse").
+                crate::discord::invites::set_joined_guilds(
+                    self.servers.iter().map(|s| s.guild_id.clone()),
+                );
                 // Afinidades (amigos y servers) para ordenar el Inicio nuevo.
                 if let Some((token, tx)) = self.discord_token.clone().zip(self.event_tx.clone()) {
                     crate::discord::spawn_fetch_affinities(token, tx);
@@ -3086,7 +3242,7 @@ impl App {
             } => {
                 let my_id = self.me.as_ref().map(|m| m.id.clone()).unwrap_or_default();
                 if let Some(friend) = self.friends.iter_mut().find(|f| f.user_id == user_id) {
-                    friend.dm_channel_id = Some(channel_id);
+                    friend.dm_channel_id = Some(channel_id.clone());
                     // El endpoint de mensajes los devuelve del más nuevo
                     // al más viejo; los damos vuelta para mostrar el
                     // historial en orden cronológico.
@@ -3098,6 +3254,12 @@ impl App {
                         .collect();
                     friend.loading = false;
                     friend.has_more = has_more;
+                }
+                // "Iniciar una llamada" desde el menú de clic derecho esperaba
+                // este canal.
+                if self.pending_call_user.as_deref() == Some(user_id.as_str()) {
+                    self.pending_call_user = None;
+                    self.start_dm_call(&channel_id);
                 }
             }
             AppEvent::GuildChannels { guild_id, channels } => {
@@ -3462,6 +3624,123 @@ impl App {
                 let is_me = self.me.as_ref().is_some_and(|m| m.id == user_id);
                 if let Some(msg) = self.find_message_mut(&channel_id, &message_id) {
                     apply_remote_reaction(msg, emoji.kind(), is_me, false);
+                }
+            }
+            AppEvent::UserActionDone { user_id, action, error, needs_stranger_confirm } => {
+                use crate::discord::UserAction;
+                match error {
+                    Some(error) => {
+                        // Solo si Discord contestó 400 / código 80013 al aceptar con
+                        // `confirm_stranger_request: false`: se pide confirmación y,
+                        // si la dan, se reintenta con `true`. Cualquier otro error
+                        // sale como toast normal.
+                        if needs_stranger_confirm
+                            && matches!(action, UserAction::AcceptFriend { confirm: false })
+                        {
+                            self.confirm_accept_friend(user_id.clone(), error);
+                        } else {
+                            self.push_toast(
+                                ToastKind::Warning,
+                                "No se pudo completar la acción",
+                                error,
+                            );
+                        }
+                    }
+                    None => {
+                        let (title, text): (&str, String) = match &action {
+                            UserAction::AddFriend | UserAction::AcceptFriend { .. } => {
+                                // Si ella ya había mandado la solicitud, ahora son amigos.
+                                let became_friends =
+                                    self.relationship_kinds.get(&user_id) == Some(&3);
+                                let kind = if became_friends { 1 } else { 4 };
+                                self.relationship_kinds.insert(user_id.clone(), kind);
+                                if became_friends {
+                                    // La solicitud pasa de "Pendiente" a la lista de
+                                    // amigos sin esperar al `RELATIONSHIP_ADD`.
+                                    let accepted = self.take_pending(&user_id);
+                                    if !self.friends.iter().any(|f| f.user_id == user_id) {
+                                        if let Some(request) = accepted {
+                                            self.friends.push(Friend::from_user(&request.user));
+                                        }
+                                    }
+                                    self.set_friend_flag(&user_id, true);
+                                    ("Amigos", "Ahora son amigos.".to_string())
+                                } else {
+                                    ("Amigos", "Solicitud de amistad enviada.".to_string())
+                                }
+                            }
+                            UserAction::RemoveFriend => {
+                                let previous = self.relationship_kinds.remove(&user_id);
+                                self.pending_requests.retain(|p| p.user.id != user_id);
+                                self.set_friend_flag(&user_id, false);
+                                let text = match previous {
+                                    Some(3) => "Solicitud rechazada.",
+                                    Some(4) => "Solicitud cancelada.",
+                                    _ => "Listo.",
+                                };
+                                ("Amigos", text.to_string())
+                            }
+                            UserAction::Block => {
+                                self.relationship_kinds.insert(user_id.clone(), 2);
+                                self.pending_requests.retain(|p| p.user.id != user_id);
+                                self.set_friend_flag(&user_id, false);
+                                ("Bloqueado", "Ya no puede escribirte ni llamarte.".to_string())
+                            }
+                            UserAction::Unblock => {
+                                self.relationship_kinds.remove(&user_id);
+                                ("Desbloqueado", "Listo.".to_string())
+                            }
+                            UserAction::Ignore => {
+                                self.ignored_users.insert(user_id.clone());
+                                ("Ignorado", "Sus mensajes quedan ocultos.".to_string())
+                            }
+                            UserAction::Unignore => {
+                                self.ignored_users.remove(&user_id);
+                                ("Ignorado", "Dejaste de ignorarlo.".to_string())
+                            }
+                            UserAction::SetNote(note) => (
+                                "Nota",
+                                if note.is_empty() {
+                                    "Nota borrada.".to_string()
+                                } else {
+                                    "Nota guardada.".to_string()
+                                },
+                            ),
+                            UserAction::InviteToServer { .. } => {
+                                ("Invitación", "Invitación enviada por mensaje directo.".to_string())
+                            }
+                        };
+                        self.push_toast(ToastKind::Success, title, text);
+                    }
+                }
+                self.menu_ctx_rev += 1;
+            }
+            AppEvent::FriendRequestSent { username, error } => {
+                self.add_friend_busy = false;
+                self.add_friend_status = Some(match error {
+                    None => {
+                        self.add_friend_input.clear();
+                        (true, format!("¡Listo! Tu solicitud de amistad para {username} fue enviada."))
+                    }
+                    Some(error) => (false, error),
+                });
+            }
+            AppEvent::RelationshipAdd(relationship) => {
+                self.apply_relationship_add(*relationship);
+            }
+            AppEvent::RelationshipRemove { user_id } => {
+                self.relationship_kinds.remove(&user_id);
+                self.pending_requests.retain(|p| p.user.id != user_id);
+                self.set_friend_flag(&user_id, false);
+                self.menu_ctx_rev += 1;
+            }
+            AppEvent::UserNote { user_id, note } => {
+                if let Some((id, name)) = self.pending_note.take() {
+                    if id == user_id {
+                        self.show_note_dialog(id, name, note);
+                    } else {
+                        self.pending_note = Some((id, name));
+                    }
                 }
             }
             AppEvent::Error(message) => {
@@ -4861,6 +5140,229 @@ impl App {
 
     // ---- Voz: arranque del runtime y acciones de la UI --------------
 
+    // -----------------------------------------------------------------
+    // Volumen / silencio por persona (clic derecho en la llamada)
+    // -----------------------------------------------------------------
+
+    /// Ajuste local de una persona de las llamadas. Por defecto (nunca se tocó):
+    /// 100 % y sin silenciar. Solo afecta lo que ESTE cliente reproduce de esa
+    /// persona; ella no se entera.
+    pub fn voice_participant_playback(
+        &self,
+        user_id: &str,
+    ) -> crate::discord::VoiceParticipantPlaybackSettings {
+        user_id
+            .parse::<u64>()
+            .ok()
+            .and_then(|id| self.participant_playback.get(&id).copied())
+            .unwrap_or_default()
+    }
+
+    /// Volumen de una persona, en % (0..=200, 100 = normal).
+    pub fn set_voice_participant_volume(&mut self, user_id: &str, percent: u16) {
+        let mut playback = self.voice_participant_playback(user_id);
+        playback.volume = crate::discord::VoiceParticipantVolumePercent::new(percent);
+        self.apply_participant_playback(user_id, playback);
+    }
+
+    /// Silencia (o deja de silenciar) a una persona sin tocar su volumen.
+    pub fn set_voice_participant_muted(&mut self, user_id: &str, muted: bool) {
+        let mut playback = self.voice_participant_playback(user_id);
+        playback.muted = muted;
+        self.apply_participant_playback(user_id, playback);
+    }
+
+    /// Vuelve a una persona a 100 % y sin silenciar.
+    pub fn reset_voice_participant_audio(&mut self, user_id: &str) {
+        self.apply_participant_playback(
+            user_id,
+            crate::discord::VoiceParticipantPlaybackSettings::default(),
+        );
+    }
+
+    /// Aplica el cambio ya (el runtime lo toma en el siguiente bloque de audio)
+    /// y deja marcado que falta guardarlo en la cuenta.
+    fn apply_participant_playback(
+        &mut self,
+        user_id: &str,
+        playback: crate::discord::VoiceParticipantPlaybackSettings,
+    ) {
+        let Some(raw) = user_id.parse::<u64>().ok() else { return };
+        let Some(id) = crate::discord::ids::Id::<crate::discord::ids::marker::UserMarker>::new_checked(raw)
+        else {
+            return;
+        };
+        if self.voice_participant_playback(user_id) == playback {
+            return;
+        }
+        if playback == crate::discord::VoiceParticipantPlaybackSettings::default() {
+            self.participant_playback.remove(&raw);
+        } else {
+            self.participant_playback.insert(raw, playback);
+        }
+        if let Some(tx) = &self.voice_runtime_tx {
+            let _ = tx.send(VoiceRuntimeEvent::UpdateParticipantPlaybackSettings {
+                user_id: id,
+                settings: playback,
+            });
+        }
+        self.participant_audio_dirty.insert(raw);
+        self.participant_audio_dirty_at = Some(Instant::now());
+    }
+
+    // ---- Audio de los streams (volumen / silencio del stream que mirás) ----
+
+    /// Ajuste local del audio del stream de `owner_id` (por defecto: 100 %, sin
+    /// silenciar). Es independiente del volumen de esa persona en la llamada.
+    pub fn voice_stream_playback(
+        &self,
+        owner_id: &str,
+    ) -> crate::discord::VoiceParticipantPlaybackSettings {
+        owner_id
+            .parse::<u64>()
+            .ok()
+            .and_then(|id| self.stream_playback.get(&id).copied())
+            .unwrap_or_default()
+    }
+
+    pub fn set_voice_stream_volume(&mut self, owner_id: &str, percent: u16) {
+        let mut playback = self.voice_stream_playback(owner_id);
+        playback.volume = crate::discord::VoiceParticipantVolumePercent::new(percent);
+        self.apply_stream_playback(owner_id, playback);
+    }
+
+    pub fn set_voice_stream_muted(&mut self, owner_id: &str, muted: bool) {
+        let mut playback = self.voice_stream_playback(owner_id);
+        playback.muted = muted;
+        self.apply_stream_playback(owner_id, playback);
+    }
+
+    pub fn reset_voice_stream_audio(&mut self, owner_id: &str) {
+        self.apply_stream_playback(
+            owner_id,
+            crate::discord::VoiceParticipantPlaybackSettings::default(),
+        );
+    }
+
+    /// Guarda el cambio y deja marcado que falta mandarlo a la cuenta. El audio
+    /// lo toma `pump_stream_frames` en el siguiente frame de UI.
+    fn apply_stream_playback(
+        &mut self,
+        owner_id: &str,
+        playback: crate::discord::VoiceParticipantPlaybackSettings,
+    ) {
+        let Some(raw) = owner_id.parse::<u64>().ok().filter(|id| *id != 0) else { return };
+        if self.voice_stream_playback(owner_id) == playback {
+            return;
+        }
+        if playback == crate::discord::VoiceParticipantPlaybackSettings::default() {
+            self.stream_playback.remove(&raw);
+        } else {
+            self.stream_playback.insert(raw, playback);
+        }
+        self.stream_audio_dirty.insert(raw);
+        self.participant_audio_dirty_at = Some(Instant::now());
+    }
+
+    /// Incorpora lo que dice la cuenta sobre el audio de los streams (mismas
+    /// reglas que `ingest_participant_audio`).
+    fn ingest_stream_audio(
+        &mut self,
+        entries: Vec<(
+            crate::discord::ids::Id<crate::discord::ids::marker::UserMarker>,
+            crate::discord::VoiceParticipantPlaybackSettings,
+        )>,
+        replace: bool,
+    ) {
+        let next =
+            merged_playback(&self.stream_playback, &self.stream_audio_dirty, entries, replace);
+        if next != self.stream_playback {
+            self.stream_playback = next;
+        }
+    }
+
+    /// Le manda al runtime la lista completa (al arrancar, o cuando la cuenta
+    /// trae cambios de otro dispositivo).
+    fn publish_participant_playback(&self) {
+        let Some(tx) = &self.voice_runtime_tx else { return };
+        let list = self
+            .participant_playback
+            .iter()
+            .filter_map(|(raw, playback)| {
+                let id = crate::discord::ids::Id::<crate::discord::ids::marker::UserMarker>::new_checked(*raw)?;
+                Some((id, *playback))
+            })
+            .collect();
+        let _ = tx.send(VoiceRuntimeEvent::ReplaceParticipantPlaybackSettings(list));
+    }
+
+    /// Incorpora lo que dice la cuenta sobre volumen/silencio por persona.
+    /// `replace`: `entries` es la lista completa (carga inicial o update no
+    /// parcial); si no, solo trae a las personas que cambiaron. Lo que se tocó
+    /// acá y todavía no se mandó gana sobre lo que llegue.
+    fn ingest_participant_audio(
+        &mut self,
+        entries: Vec<(
+            crate::discord::ids::Id<crate::discord::ids::marker::UserMarker>,
+            crate::discord::VoiceParticipantPlaybackSettings,
+        )>,
+        replace: bool,
+    ) {
+        let next = merged_playback(
+            &self.participant_playback,
+            &self.participant_audio_dirty,
+            entries,
+            replace,
+        );
+        if next == self.participant_playback {
+            return;
+        }
+        self.participant_playback = next;
+        self.publish_participant_playback();
+    }
+
+    /// Guarda en la cuenta (`audio_context_settings`) lo que cambió, para que
+    /// el cliente oficial y los demás dispositivos lo vean igual. Devuelve
+    /// `true` mientras quede algo esperando el temporizador.
+    fn flush_participant_audio(&mut self, force: bool) -> bool {
+        let Some(at) = self.participant_audio_dirty_at else { return false };
+        if !force && at.elapsed() < PARTICIPANT_AUDIO_SYNC_DELAY {
+            return true;
+        }
+        let Some(token) = self.discord_token.clone() else {
+            // Sin sesión real (pantalla demo) no hay a dónde mandarlo.
+            self.participant_audio_dirty.clear();
+            self.stream_audio_dirty.clear();
+            self.participant_audio_dirty_at = None;
+            return false;
+        };
+        let entries: Vec<(u64, crate::discord::VoiceParticipantPlaybackSettings)> = self
+            .participant_audio_dirty
+            .drain()
+            .map(|raw| (raw, self.participant_playback.get(&raw).copied().unwrap_or_default()))
+            .collect();
+        let stream_entries: Vec<(u64, crate::discord::VoiceParticipantPlaybackSettings)> = self
+            .stream_audio_dirty
+            .drain()
+            .map(|raw| (raw, self.stream_playback.get(&raw).copied().unwrap_or_default()))
+            .collect();
+        self.participant_audio_dirty_at = None;
+        if entries.is_empty() && stream_entries.is_empty() {
+            return false;
+        }
+        let modified_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let partial = crate::discord::user_settings::partial_with_participant_audio(
+            &entries,
+            &stream_entries,
+            modified_at_ms,
+        );
+        crate::discord::spawn_patch_user_settings(token, partial);
+        false
+    }
+
     /// Arranca, si todavía no está arriba, el hilo de SO con su propio
     /// runtime de tokio que corre `voice::run_voice_runtime` — el que abre
     /// de verdad el WebSocket de voz y captura/reproduce audio. Idempotente
@@ -4890,6 +5392,8 @@ impl App {
         });
         let status_publisher = crate::discord::voice::VoiceStatusPublisher::new(event_tx);
         self.voice_runtime_tx = Some(events_tx.clone());
+        // El runtime arranca sabiendo el volumen/silencio de cada persona.
+        self.publish_participant_playback();
         std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
                 return;
@@ -4983,6 +5487,233 @@ impl App {
         let scope = crate::discord::VoiceScope::Guild(guild_id);
         self.voice_target = Some(self.requested_voice_state(scope, channel_id));
         self.sync_voice_target();
+    }
+
+    // -----------------------------------------------------------------
+    // Menú de clic derecho sobre una persona (ver `ui::audio_menu`)
+    // -----------------------------------------------------------------
+
+    /// Marca (o desmarca) como amigo a la entrada de `friends`, si existe, sin
+    /// borrar el DM.
+    fn set_friend_flag(&mut self, user_id: &str, is_friend: bool) {
+        if let Some(friend) = self.friends.iter_mut().find(|f| f.user_id == user_id) {
+            friend.is_friend = is_friend;
+        }
+    }
+
+    /// Cuántas solicitudes de amistad recibidas esperan respuesta (globito rojo
+    /// de la pestaña "Pendiente").
+    pub fn pending_incoming_count(&self) -> usize {
+        self.pending_requests.iter().filter(|p| p.incoming).count()
+    }
+
+    /// "Enviar solicitud de amistad" de la pantalla "Añadir amigo": el resultado
+    /// llega como `AppEvent::FriendRequestSent` y se muestra bajo el campo.
+    pub fn send_friend_request(&mut self, username: String) {
+        let Some((token, tx)) = self.discord_token.clone().zip(self.event_tx.clone()) else {
+            self.add_friend_status =
+                Some((false, "Necesitas iniciar sesión en Discord para añadir amigos.".to_string()));
+            return;
+        };
+        self.add_friend_busy = true;
+        self.add_friend_status = None;
+        crate::discord::spawn_send_friend_request(token, username, tx);
+    }
+
+    /// Saca de `pending_requests` la solicitud de `user_id`, si está.
+    fn take_pending(&mut self, user_id: &str) -> Option<crate::lib::data::PendingRequest> {
+        let index = self.pending_requests.iter().position(|p| p.user.id == user_id)?;
+        Some(self.pending_requests.remove(index))
+    }
+
+    /// `RELATIONSHIP_ADD`: deja `relationship_kinds`, la lista de amigos y las
+    /// solicitudes pendientes de acuerdo con la relación nueva.
+    fn apply_relationship_add(&mut self, relationship: crate::discord::models::Relationship) {
+        let user_id = relationship.id.clone();
+        self.relationship_kinds.insert(user_id.clone(), relationship.kind);
+        self.pending_requests.retain(|p| p.user.id != user_id);
+        if relationship.user_ignored {
+            self.ignored_users.insert(user_id.clone());
+        }
+        match relationship.kind {
+            // Amistad confirmada (aceptaron la nuestra, o aceptamos desde otro
+            // dispositivo).
+            1 => {
+                if let Some(friend) = self.friends.iter_mut().find(|f| f.user_id == user_id) {
+                    friend.is_friend = true;
+                } else {
+                    self.friends.push(Friend::from_relationship(&relationship));
+                }
+            }
+            3 | 4 => {
+                if let Some(request) = crate::lib::data::PendingRequest::from_relationship(&relationship) {
+                    if request.incoming {
+                        self.push_toast(
+                            ToastKind::Info,
+                            "Solicitud de amistad",
+                            format!("{} quiere ser tu amigo.", request.name),
+                        );
+                    }
+                    self.pending_requests.push(request);
+                }
+            }
+            // Bloqueado: deja de ser amigo.
+            _ => self.set_friend_flag(&user_id, false),
+        }
+        self.menu_ctx_rev += 1;
+    }
+
+    /// Lanza una acción de red sobre una persona (amistad, ignorar, bloquear,
+    /// nota, invitación). El resultado llega como `AppEvent::UserActionDone`.
+    pub fn run_user_action(&mut self, user_id: String, action: crate::discord::UserAction) {
+        let Some((token, tx)) = self.discord_token.clone().zip(self.event_tx.clone()) else {
+            self.push_toast(
+                ToastKind::Warning,
+                "Sin sesión",
+                "Necesitás iniciar sesión en Discord para hacer esto.",
+            );
+            return;
+        };
+        crate::discord::spawn_user_action(token, user_id, action, tx);
+    }
+
+    /// Pide la nota actual y, cuando llega (`AppEvent::UserNote`), abre el
+    /// editor con el texto precargado.
+    fn open_note_editor(&mut self, user_id: String, name: String) {
+        let Some((token, tx)) = self.discord_token.clone().zip(self.event_tx.clone()) else {
+            self.push_toast(
+                ToastKind::Warning,
+                "Sin sesión",
+                "Necesitás iniciar sesión en Discord para guardar notas.",
+            );
+            return;
+        };
+        self.pending_note = Some((user_id.clone(), name));
+        crate::discord::spawn_fetch_note(token, user_id, tx);
+    }
+
+    fn show_note_dialog(&mut self, user_id: String, name: String, note: Option<String>) {
+        use crate::ui::dialog::{ButtonStyle, Dialog, DialogKind, FormField};
+        self.open_dialog(
+            Dialog::new("user_note", DialogKind::Question, format!("Nota sobre {name}"))
+                .subtitle("Solo visible para ti")
+                .field(
+                    FormField::new("note", "Nota")
+                        .placeholder("Haz clic para añadir una nota")
+                        .value(note.unwrap_or_default())
+                        .multiline(true)
+                        .rows(4)
+                        .max_len(256),
+                )
+                .button("cancel", "Cancelar", ButtonStyle::Secondary)
+                .button("save", "Guardar", ButtonStyle::Primary)
+                .dismissable()
+                .on_result(move |app, _ctx, result| {
+                    if result.is("save") {
+                        let note = result.value("note").unwrap_or_default().trim().to_string();
+                        app.run_user_action(user_id, crate::discord::UserAction::SetNote(note));
+                    }
+                }),
+        );
+    }
+
+    /// Popup para aceptar una solicitud que Discord no dejó aceptar sin
+    /// confirmación (`confirm_stranger_request`). Al confirmar se reenvía con
+    /// `true`.
+    fn confirm_accept_friend(&mut self, user_id: String, reason: String) {
+        use crate::ui::dialog::{Dialog, DialogKind};
+        let name = self
+            .friends
+            .iter()
+            .find(|f| f.user_id == user_id)
+            .map(|f| f.name.clone())
+            .or_else(|| {
+                self.dms
+                    .iter()
+                    .flat_map(|d| d.recipients.iter())
+                    .find(|r| r.id == user_id)
+                    .map(|r| r.display_name().to_string())
+            })
+            .unwrap_or_else(|| "esta persona".to_string());
+        self.open_dialog(
+            Dialog::confirm(
+                format!("accept_friend_{user_id}"),
+                DialogKind::Warning,
+                "¿Aceptar solicitud de amistad?",
+                format!(
+                    "Discord pidió confirmación para aceptar la solicitud de {name}. \
+                     Puede ser alguien con quien no tienes amigos ni servidores en común."
+                ),
+                "Aceptar",
+            )
+            .note(format!("Respuesta de Discord: {reason}"))
+            .on_result(move |app, _ctx, result| {
+                if result.is("confirm") {
+                    app.run_user_action(
+                        user_id,
+                        crate::discord::UserAction::AcceptFriend { confirm: true },
+                    );
+                }
+            }),
+        );
+    }
+
+    /// "Iniciar una llamada": abre el DM y llama. Si todavía no se conoce el
+    /// canal, la llamada sale cuando llega (`AppEvent::DmOpened`).
+    fn call_user(&mut self, user_id: &str, name: &str) {
+        let known = self
+            .friends
+            .iter()
+            .find(|f| f.user_id == user_id)
+            .and_then(|f| f.dm_channel_id.clone())
+            .or_else(|| {
+                self.dms
+                    .iter()
+                    .find(|d| d.recipients.len() == 1 && d.recipients[0].id == user_id)
+                    .map(|d| d.id.clone())
+            });
+        self.message_user_from_profile(
+            user_id,
+            name,
+            None,
+            crate::lib::data::color_from_id(user_id),
+            None,
+        );
+        match known {
+            Some(channel_id) => self.start_dm_call(&channel_id),
+            None => self.pending_call_user = Some(user_id.to_string()),
+        }
+    }
+
+    /// Publica lo que el menú de clic derecho necesita ver de `App` (relaciones,
+    /// ignorados, servers) cuando cambió.
+    fn publish_menu_context(&mut self, ctx: &egui::Context) {
+        let fingerprint = (self.menu_ctx_rev, self.servers.len());
+        if self.menu_ctx_published == Some(fingerprint) {
+            return;
+        }
+        self.menu_ctx_published = Some(fingerprint);
+        crate::ui::audio_menu::publish_context(
+            ctx,
+            crate::ui::audio_menu::MenuContext {
+                relationships: self.relationship_kinds.clone(),
+                ignored: self.ignored_users.clone(),
+                video_disabled: self.video_disabled_users.clone(),
+                guilds: self
+                    .servers
+                    .iter()
+                    .filter(|s| !s.guild_id.is_empty())
+                    .map(|s| (s.guild_id.clone(), s.name.clone()))
+                    .collect(),
+            },
+        );
+    }
+
+    /// "Silenciar panel de sonidos" de una persona (se guarda en la cuenta).
+    pub fn set_voice_participant_soundboard_muted(&mut self, user_id: &str, muted: bool) {
+        let mut playback = self.voice_participant_playback(user_id);
+        playback.soundboard_muted = muted;
+        self.apply_participant_playback(user_id, playback);
     }
 
     /// Arranca (o se une a) una llamada de voz de un DM/grupo. A diferencia
@@ -5405,6 +6136,7 @@ impl App {
             user_id,
             session_id: self.gateway_session_id.clone(),
             owner_user_id,
+            output_source: self.voice.audio_sources.output.clone(),
         };
         watched.handle = Some(spawn_stream_watch(params, event_tx, repaint));
     }
@@ -5412,11 +6144,24 @@ impl App {
     /// Pasa el último frame decodificado (si llegó uno) a la textura del
     /// visor. Se llama una vez por frame de UI.
     fn pump_stream_frames(&mut self, ctx: &egui::Context) {
+        // Ensordecerte también calla el audio del stream.
+        let deaf = self.voice_target.as_ref().map(|t| t.self_deaf).unwrap_or(self.self_deaf);
         let Some(watched) = self.watching_stream.as_mut() else { return };
         // Respaldo: aunque el hilo de video no logre despertar la UI, mientras
         // se mira un stream se repinta unas 10 veces por segundo.
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
         let Some(handle) = watched.handle.as_ref() else { return };
+        // Volumen/silencio del audio de ESTE stream (clave: quien transmite).
+        let playback = watched
+            .stream_key
+            .rsplit(':')
+            .next()
+            .and_then(|id| id.parse::<u64>().ok())
+            .and_then(|id| self.stream_playback.get(&id).copied())
+            .unwrap_or_default();
+        handle
+            .audio
+            .set(playback.volume.value().min(200) as u8, playback.muted || deaf);
         let Some(frame) = handle.frames.take_new() else { return };
         let size = [frame.width as usize, frame.height as usize];
         if size[0] == 0 || size[1] == 0 || frame.rgba.len() != size[0] * size[1] * 4 {
@@ -5591,6 +6336,53 @@ impl eframe::App for App {
         }
         // Alguien clickeó un avatar/nombre en algún lado (chat, DM, panel
         // de amigos) — ver `ui::profile_popup::request_open`.
+        // Menú de clic derecho de volumen por persona (ver `ui::audio_menu`).
+        self.publish_menu_context(ui.ctx());
+        for change in crate::ui::audio_menu::take_changes(ui.ctx()) {
+            match change {
+                crate::ui::audio_menu::AudioChange::Volume(id, percent) => {
+                    self.set_voice_participant_volume(&id, percent)
+                }
+                crate::ui::audio_menu::AudioChange::Muted(id, muted) => {
+                    self.set_voice_participant_muted(&id, muted)
+                }
+                crate::ui::audio_menu::AudioChange::Reset(id) => {
+                    self.reset_voice_participant_audio(&id)
+                }
+                crate::ui::audio_menu::AudioChange::SoundboardMuted(id, muted) => {
+                    self.set_voice_participant_soundboard_muted(&id, muted)
+                }
+                crate::ui::audio_menu::AudioChange::VideoDisabled(id, disabled) => {
+                    if disabled {
+                        self.video_disabled_users.insert(id);
+                    } else {
+                        self.video_disabled_users.remove(&id);
+                    }
+                    self.menu_ctx_rev += 1;
+                }
+                crate::ui::audio_menu::AudioChange::Profile(id, name) => {
+                    let color = crate::lib::data::color_from_id(&id);
+                    self.open_user_profile(id, name, None, color);
+                }
+                crate::ui::audio_menu::AudioChange::Mention(id) => {
+                    self.compose_text.push_str(&format!("<@{id}> "));
+                }
+                crate::ui::audio_menu::AudioChange::Message(id, name) => {
+                    let color = crate::lib::data::color_from_id(&id);
+                    self.message_user_from_profile(&id, &name, None, color, None);
+                }
+                crate::ui::audio_menu::AudioChange::Call(id, name) => self.call_user(&id, &name),
+                crate::ui::audio_menu::AudioChange::Note(id, name) => self.open_note_editor(id, name),
+                crate::ui::audio_menu::AudioChange::VerificationCode(_) => {
+                    self.open_dialog(crate::ui::dialog::Dialog::info(
+                        "verification_code",
+                        "Código de verificación",
+                        "Esta función todavía no está disponible en ecord.",
+                    ));
+                }
+                crate::ui::audio_menu::AudioChange::Api(id, action) => self.run_user_action(id, action),
+            }
+        }
         if let Some(request) = crate::ui::profile_popup::take_requested(ui.ctx()) {
             let anchor = request.anchor;
             self.open_user_profile(request.user_id, request.name, request.avatar_url, request.avatar_color);
@@ -5601,8 +6393,12 @@ impl eframe::App for App {
 
         // Barra superior propia (arrastre + buscador + estado + controles
         // de ventana): ocupa todo el ancho, por encima de rail/paneles/
-        // central. No aplica en Login, que tiene su propia pantalla
-        // centrada de inicio de sesión.
+        // central. En Login (que tiene su propia pantalla centrada) se
+        // muestra una versión mínima: solo arrastre y controles de ventana,
+        // porque la ventana no tiene decoraciones nativas.
+        if matches!(self.screen, Screen::Login) {
+            crate::ui::topbar::show_login(self, ui);
+        }
         if !matches!(self.screen, Screen::Login) {
             crate::ui::topbar::show(self, ui);
             // Interfaz nueva: franja vacía en el borde derecho para que la

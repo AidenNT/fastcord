@@ -29,7 +29,7 @@ use std::future::Future;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use discord_client_rest::captcha::{CaptchaRequiredError, SolvedCaptcha};
-use discord_client_rest::rest::{RequestProperties, RequestPropertiesBuilder, RestClient as UwuInner};
+use discord_client_rest::rest::{BadRequestError, RequestProperties, RequestPropertiesBuilder, RestClient as UwuInner};
 use discord_client_rest::structs::referer::{DmChannelReferer, GuildChannelReferer, Referer};
 use discord_client_structs::structs::client::BuildNumbers;
 use discord_client_structs::structs::message::{Message, MessageBuilder, MessageReferenceBuilder};
@@ -170,6 +170,50 @@ fn dump_json_if_requested(tag: &str, id: &str, value: &Value) {
 
 fn err(e: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!("{e}")
+}
+
+/// Código de error de Discord (HTTP 400) al aceptar una solicitud de amistad
+/// de alguien sin amigos ni servers en común: hace falta confirmarla con
+/// `confirm_stranger_request: true`.
+pub const STRANGER_CONFIRM_CODE: i64 = 80013;
+
+/// Error propio de `UwuRest::add_friend`: Discord contestó 400 con el código
+/// `80013`. Es lo único que abre el popup de "¿Aceptar solicitud de
+/// amistad?"; cualquier otro error se muestra como siempre.
+#[derive(Debug)]
+pub struct StrangerConfirmationRequired;
+
+impl std::fmt::Display for StrangerConfirmationRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Debes confirmar la solicitud de amistad para añadir a este usuario.")
+    }
+}
+
+impl std::error::Error for StrangerConfirmationRequired {}
+
+/// ¿Es este error el 400 / `80013` de Discord? Primero por el `code` que
+/// guarda `BadRequestError`; si el error es de otro tipo, se mira el texto
+/// (el número, el JSON `{"code": 80013, ...}` o el mensaje).
+fn is_stranger_confirmation(error: &BoxError) -> bool {
+    // El cliente vendorizado conserva el cuerpo de los 400 (`BadRequestError`):
+    // se mira el `code` directamente.
+    if let Some(bad_request) = error.downcast_ref::<BadRequestError>() {
+        return bad_request.code == Some(STRANGER_CONFIRM_CODE);
+    }
+    let text = error.to_string();
+    if text.contains(&STRANGER_CONFIRM_CODE.to_string()) {
+        return true;
+    }
+    if let Some(start) = text.find('{') {
+        if let Ok(value) = serde_json::from_str::<Value>(&text[start..]) {
+            if value.get("code").and_then(Value::as_i64) == Some(STRANGER_CONFIRM_CODE) {
+                return true;
+            }
+        }
+    }
+    let lower = text.to_lowercase();
+    lower.contains("confirmar la solicitud de amistad")
+        || lower.contains("confirm the friend request")
 }
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -635,6 +679,212 @@ impl UwuRest {
             .and_then(Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| anyhow::anyhow!("Discord no devolvió el id del canal de DM"))
+    }
+
+    // --- Acciones del menú de clic derecho sobre una persona ---------------
+
+    /// `GET /users/@me/notes/{id}`: la nota privada que tenés de esa persona.
+    /// Discord contesta 404 cuando nunca escribiste una: eso es "sin nota", no
+    /// un error.
+    pub async fn get_note(&self, user_id: &str) -> anyhow::Result<Option<String>> {
+        let path = format!("users/@me/notes/{user_id}");
+        let value: Result<Value, _> = self.client.get(&path, None, Some(Self::home())).await;
+        Ok(value
+            .ok()
+            .and_then(|v| v.get("note").and_then(Value::as_str).map(str::to_string))
+            .filter(|note| !note.is_empty()))
+    }
+
+    /// `PUT /users/@me/notes/{id}`: guarda (o borra, con texto vacío) la nota.
+    pub async fn set_note(&self, user_id: &str, note: &str) -> anyhow::Result<()> {
+        let path = format!("users/@me/notes/{user_id}");
+        let _: Value = self
+            .client
+            .put(&path, Some(json!({ "note": note })), Some(Self::home()))
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// `PUT /users/@me/relationships/{id}` (sin `type`): crea una solicitud de
+    /// amistad o acepta la que esa persona ya mandó.
+    ///
+    /// - `confirm_stranger == None`: cuerpo `{}` (enviar una solicitud nueva).
+    /// - `Some(valor)`: aceptar; manda `confirm_stranger_request: valor`. Primero
+    ///   con `false` y, si Discord no la acepta y la persona lo confirma, con
+    ///   `true` (solicitudes de alguien sin amigos ni servers en común).
+    pub async fn add_friend(
+        &self,
+        user_id: &str,
+        confirm_stranger: Option<bool>,
+    ) -> anyhow::Result<()> {
+        let path = format!("users/@me/relationships/{user_id}");
+        let body = match confirm_stranger {
+            Some(confirm) => json!({ "confirm_stranger_request": confirm }),
+            None => json!({}),
+        };
+        let _: Value = self
+            .client
+            .put(&path, Some(body), Some(Self::home()))
+            .await
+            .map_err(|e| {
+                // Solo al aceptar sin confirmar (`false`): el 80013 se
+                // convierte en un error tipado para abrir el popup.
+                if confirm_stranger == Some(false) && is_stranger_confirmation(&e) {
+                    anyhow::Error::new(StrangerConfirmationRequired)
+                } else {
+                    err(e)
+                }
+            })?;
+        Ok(())
+    }
+
+    /// `POST /users/@me/relationships`: manda una solicitud de amistad por
+    /// nombre de usuario (pantalla "Añadir amigo"). Acepta `usuario`,
+    /// `@usuario` y el formato viejo `usuario#1234`.
+    pub async fn send_friend_request(&self, username: &str) -> anyhow::Result<()> {
+        let raw = username.trim().trim_start_matches('@');
+        let (name, discriminator) = match raw.rsplit_once('#') {
+            Some((name, tag)) if !tag.is_empty() && tag.chars().all(|c| c.is_ascii_digit()) => {
+                (name, tag.parse::<u32>().ok().filter(|d| *d != 0))
+            }
+            _ => (raw, None),
+        };
+        let body = json!({ "username": name, "discriminator": discriminator });
+        let _: Value = self
+            .client
+            .post("users/@me/relationships", Some(body), Some(Self::home()))
+            .await
+            .map_err(|e| {
+                if let Some(bad_request) = e.downcast_ref::<BadRequestError>() {
+                    // 80004: no existe nadie con ese nombre.
+                    if bad_request.code == Some(80004) {
+                        return anyhow::anyhow!(
+                            "No se encontró a nadie con ese nombre de usuario. Revisa mayúsculas, ortografía, espacios y números."
+                        );
+                    }
+                    if let Some(message) = &bad_request.message {
+                        return anyhow::anyhow!("{message}");
+                    }
+                }
+                err(e)
+            })?;
+        Ok(())
+    }
+
+    /// `PUT /users/@me/relationships/{id}` con `type: 2` (bloqueado).
+    pub async fn block_user(&self, user_id: &str) -> anyhow::Result<()> {
+        let path = format!("users/@me/relationships/{user_id}");
+        let _: Value = self
+            .client
+            .put(&path, Some(json!({ "type": 2 })), Some(Self::home()))
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// `DELETE /users/@me/relationships/{id}`: desbloquea, quita al amigo o
+    /// cancela la solicitud, según qué relación haya.
+    pub async fn remove_relationship(&self, user_id: &str) -> anyhow::Result<()> {
+        let path = format!("users/@me/relationships/{user_id}");
+        let _: Value = self
+            .client
+            .delete(&path, None::<()>, Some(Self::home()))
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// `PUT /users/@me/relationships/{id}/ignore`: oculta sus mensajes sin
+    /// bloquearla.
+    pub async fn ignore_user(&self, user_id: &str) -> anyhow::Result<()> {
+        let path = format!("users/@me/relationships/{user_id}/ignore");
+        let _: Value = self
+            .client
+            .put(&path, None::<()>, Some(Self::home()))
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// `DELETE /users/@me/relationships/{id}/ignore`.
+    pub async fn unignore_user(&self, user_id: &str) -> anyhow::Result<()> {
+        let path = format!("users/@me/relationships/{user_id}/ignore");
+        let _: Value = self
+            .client
+            .delete(&path, None::<()>, Some(Self::home()))
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// `GET /invites/{code}?with_counts=true`: datos públicos de una
+    /// invitación (server, miembros, en línea). Si venció o no existe,
+    /// Discord contesta 404 / código 10006 y esto devuelve `Err` (ver
+    /// `discord::invites`, que lo traduce a la tarjeta "Invitación no válida").
+    pub async fn get_invite(&self, code: &str) -> anyhow::Result<Value> {
+        let mut query = HashMap::new();
+        query.insert("with_counts".to_string(), "true".to_string());
+        query.insert("with_expiration".to_string(), "true".to_string());
+        let path = format!("invites/{code}");
+        let value: Value = self
+            .client
+            .get(&path, Some(query), Some(Self::home()))
+            .await
+            .map_err(err)?;
+        Ok(value)
+    }
+
+    /// `POST /invites/{code}`: te une al server de la invitación. Si Discord
+    /// pide captcha, `CaptchaClient` abre la ventana de hCaptcha y repite la
+    /// request con la solución (si se cierra, falla con `CaptchaCancelled`).
+    /// `session_id` es el de la sesión del gateway; el header de contexto
+    /// ("Join Guild" + server y canal de la invitación) lo manda el cliente
+    /// oficial y Discord lo usa para validar el pedido.
+    pub async fn join_invite(
+        &self,
+        code: &str,
+        session_id: &str,
+        guild_id: u64,
+        channel_id: u64,
+        channel_type: u8,
+    ) -> anyhow::Result<Value> {
+        use discord_client_rest::structs::context::{Context, InviteContext};
+        let path = format!("invites/{code}");
+        let props = Self::home().with_context(Context::InviteContext(InviteContext {
+            location_guild_id: guild_id,
+            location_channel_id: channel_id,
+            location_channel_type: channel_type,
+        }));
+        let body = json!({ "session_id": session_id });
+        let value: Value = self
+            .client
+            .post(&path, Some(body), Some(props))
+            .await
+            .map_err(err)?;
+        Ok(value)
+    }
+
+    /// `POST /channels/{id}/invites`: crea una invitación (7 días, usos
+    /// ilimitados) y devuelve su código.
+    pub async fn create_invite(&self, channel_id: &str) -> anyhow::Result<String> {
+        let path = format!("channels/{channel_id}/invites");
+        let body = json!({
+            "max_age": 604800,
+            "max_uses": 0,
+            "temporary": false,
+            "flags": 0,
+        });
+        let value: Value = self
+            .client
+            .post(&path, Some(body), Some(Self::home()))
+            .await
+            .map_err(err)?;
+        value
+            .get("code")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("Discord no devolvió el código de la invitación"))
     }
 
     /// `POST /channels/{id}/messages` armando el cuerpo con `MessageBuilder`

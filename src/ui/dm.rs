@@ -8,20 +8,14 @@ use crate::ui::theme::{self, Icon, Palette};
 use crate::ui::chat;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
-    println!("show dm");
     let Screen::Dm(index) = app.screen else {
-        // imprimir en consola el índice del amigo
-        println!("return warn");
         return;
     };
     if index >= app.friends.len() {
         // imprimir en consola el índice del amigo
-        println!("return {:?}", index);
         app.go_home();
         return;
     }
-
-    println!("show dm with index: {}", index);
 
     // Rail de servidores + panel de amigos/DMs + barra de usuario
     // combinada; ver `ui::nav`.

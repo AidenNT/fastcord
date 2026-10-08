@@ -240,7 +240,7 @@ impl VoiceDecodedAudioOutput {
             .map(|sink| (sink.samples_tx.clone(), Arc::clone(&sink.stats)))
     }
 
-    fn try_send(&self, samples: Vec<f32>) {
+    pub(super) fn try_send(&self, samples: Vec<f32>) {
         let Some((samples_tx, stats)) = self.snapshot() else {
             return;
         };

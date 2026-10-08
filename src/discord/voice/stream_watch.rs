@@ -11,10 +11,11 @@
 //! su propio runtime de tokio y reutiliza solo las piezas de bajo nivel
 //! (`VoiceDaveState`, `VoiceRtpDecryptor`, descubrimiento UDP, heartbeat).
 //!
-//! Alcance actual: solo VIDEO. El audio del stream (mismo servidor, SSRC de
-//! audio) todavía no se reproduce.
+//! Video H.264 y audio Opus llegan por el mismo UDP. El audio se descifra
+//! (transporte + DAVE), se decodifica y suena por su propia salida, con
+//! volumen y silencio propios (`StreamAudioControl`).
 
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering as AtomicOrdering};
 
 use super::dave::handles_gateway_json_op;
 use super::gateway::{
@@ -26,6 +27,10 @@ use super::gateway::{
 use super::h264::{H264Depacketizer, RtpReorderBuffer, RtpVideoPacket};
 use super::video_decode::H264Decoder;
 use super::*;
+#[cfg(feature = "voice-playback")]
+use super::opus::VoiceDecodedAudioOutput;
+#[cfg(feature = "voice-playback")]
+use super::playback::VoiceAudioOutput;
 
 /// Payload types que se anuncian en `SELECT_PROTOCOL`. Coinciden con los que
 /// anuncian los clientes oficiales para Opus (120) y H.264 (101, RTX 102).
@@ -99,6 +104,9 @@ pub(crate) struct StreamWatchParams {
     pub(crate) session_id: String,
     /// Quién transmite: es de quien hay que descifrar el video con DAVE.
     pub(crate) owner_user_id: Id<UserMarker>,
+    /// Dispositivo de salida elegido en Ajustes (`None` = el predeterminado)
+    /// por donde suena el audio del stream.
+    pub(crate) output_source: Option<String>,
 }
 
 impl fmt::Debug for StreamWatchParams {
@@ -115,12 +123,47 @@ impl fmt::Debug for StreamWatchParams {
     }
 }
 
+/// Extremo por el que la tarea de recepción le pasa PCM a la salida de audio
+/// del stream (`()` si el cliente se compiló sin reproducción de audio).
+#[cfg(feature = "voice-playback")]
+type StreamAudioSink = VoiceDecodedAudioOutput;
+#[cfg(not(feature = "voice-playback"))]
+type StreamAudioSink = ();
+
 /// Mango de una sesión de visualización en curso. Al soltarlo (`Drop`) o al
 /// llamar a `stop`, la conexión se cierra.
 pub(crate) struct StreamWatchHandle {
     pub(crate) stream_key: String,
     pub(crate) frames: StreamFrameSlot,
+    /// Volumen y silencio del audio del stream (se puede cambiar en vivo).
+    pub(crate) audio: StreamAudioControl,
     stop_tx: watch::Sender<bool>,
+}
+
+/// Volumen y silencio del audio de un stream, compartidos con el callback de
+/// salida: cambiarlos tiene efecto en el siguiente bloque de audio, sin
+/// reconectar nada.
+#[derive(Clone)]
+#[cfg_attr(not(feature = "voice-playback"), allow(dead_code))]
+pub(crate) struct StreamAudioControl {
+    volume: Arc<AtomicU8>,
+    enabled: Arc<AtomicBool>,
+}
+
+impl StreamAudioControl {
+    fn new() -> Self {
+        Self {
+            volume: Arc::new(AtomicU8::new(100)),
+            enabled: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// `percent`: 0..=200 (100 = normal). `muted` corta el audio sin perder el
+    /// volumen elegido.
+    pub(crate) fn set(&self, percent: u8, muted: bool) {
+        self.volume.store(percent.min(200), AtomicOrdering::Relaxed);
+        self.enabled.store(!muted, AtomicOrdering::Relaxed);
+    }
 }
 
 impl StreamWatchHandle {
@@ -145,10 +188,12 @@ pub(crate) fn spawn_stream_watch(
     repaint: Arc<dyn Fn() + Send + Sync>,
 ) -> StreamWatchHandle {
     let frames = StreamFrameSlot::default();
+    let audio = StreamAudioControl::new();
     let (stop_tx, stop_rx) = watch::channel(false);
     let stream_key = params.stream_key.clone();
 
     let thread_frames = frames.clone();
+    let thread_audio = audio.clone();
     let thread_events = events.clone();
     let spawned = std::thread::Builder::new()
         .name("stream-watch".to_owned())
@@ -172,6 +217,7 @@ pub(crate) fn spawn_stream_watch(
                 params,
                 thread_events,
                 thread_frames,
+                thread_audio,
                 repaint,
                 stop_rx,
             ));
@@ -188,6 +234,7 @@ pub(crate) fn spawn_stream_watch(
     StreamWatchHandle {
         stream_key,
         frames,
+        audio,
         stop_tx,
     }
 }
@@ -209,6 +256,7 @@ async fn run_stream_watch(
     params: StreamWatchParams,
     events: std::sync::mpsc::Sender<AppEvent>,
     frames: StreamFrameSlot,
+    audio: StreamAudioControl,
     repaint: Arc<dyn Fn() + Send + Sync>,
     stop_rx: watch::Receiver<bool>,
 ) {
@@ -219,7 +267,7 @@ async fn run_stream_watch(
         StreamWatchStatus::Connecting,
         None,
     );
-    match watch_stream_session(&params, &events, &frames, &repaint, stop_rx).await {
+    match watch_stream_session(&params, &events, &frames, &audio, &repaint, stop_rx).await {
         Ok(()) => {
             logging::debug("stream", "stream watch ended");
             publish_status(&events, &params.stream_key, StreamWatchStatus::Ended, None);
@@ -260,6 +308,7 @@ async fn watch_stream_session(
     params: &StreamWatchParams,
     events: &std::sync::mpsc::Sender<AppEvent>,
     frames: &StreamFrameSlot,
+    audio: &StreamAudioControl,
     repaint: &Arc<dyn Fn() + Send + Sync>,
     mut stop_rx: watch::Receiver<bool>,
 ) -> Result<(), String> {
@@ -303,6 +352,15 @@ async fn watch_stream_session(
             .name("stream-decode".to_owned())
             .spawn(move || run_decode_thread(decode_rx, frames, repaint, events, stream_key));
     }
+
+    // Salida de audio del stream. `_stream_audio_output` tiene que seguir vivo
+    // mientras dure la sesión (si se suelta, se corta el sonido), y vive acá
+    // —no en la tarea de recepción— porque el stream de cpal no es `Send`.
+    #[cfg(feature = "voice-playback")]
+    let (_stream_audio_output, stream_audio_sink) =
+        open_stream_audio(audio, params.output_source.as_deref());
+    #[cfg(not(feature = "voice-playback"))]
+    let (stream_audio_sink, _) = ((), audio);
 
     let mut tasks = StreamTasks::default();
     let mut udp_socket: Option<Arc<UdpSocket>> = None;
@@ -406,6 +464,7 @@ async fn watch_stream_session(
                                 params.owner_user_id,
                                 our_ssrc,
                                 decode_tx.clone(),
+                                stream_audio_sink.clone(),
                             )));
                             // "Quiero cualquier stream, calidad máxima."
                             send_voice_text(&writer, stream_sink_wants_payload()).await?;
@@ -534,6 +593,7 @@ async fn run_stream_video_receive(
     owner_user_id: Id<UserMarker>,
     sender_ssrc: u32,
     decode_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    audio_sink: StreamAudioSink,
 ) {
     let decryptor = match VoiceRtpDecryptor::new(&description.mode, &description.secret_key) {
         Ok(decryptor) => decryptor,
@@ -558,6 +618,11 @@ async fn run_stream_video_receive(
         "stream",
         format!("stream UDP receive active: mode={}", description.mode),
     );
+
+    #[cfg(feature = "voice-playback")]
+    let mut audio_player = StreamAudioPlayer::new(audio_sink);
+    #[cfg(not(feature = "voice-playback"))]
+    let () = audio_sink;
 
     let mut packet = vec![0u8; 2048];
     let mut reorder = RtpReorderBuffer::default();
@@ -584,8 +649,19 @@ async fn run_stream_video_receive(
         let Ok(header) = parse_rtp_header(datagram) else {
             continue;
         };
-        // Solo el video H.264: el audio del stream y las retransmisiones (RTX)
-        // se ignoran por ahora.
+        // Audio del stream (Opus): se descifra, se decodifica y suena por la
+        // salida del stream, con su propio volumen.
+        #[cfg(feature = "voice-playback")]
+        {
+            if header.payload_type == STREAM_OPUS_PAYLOAD_TYPE {
+                audio_player
+                    .push_packet(&decryptor, datagram, &header, &dave_state, owner_user_id)
+                    .await;
+                continue;
+            }
+        }
+        // Del resto solo interesa el video H.264: las retransmisiones (RTX) se
+        // ignoran por ahora.
         if header.payload_type != STREAM_H264_PAYLOAD_TYPE {
             continue;
         }
@@ -713,6 +789,153 @@ async fn run_stream_video_receive(
     }
 }
 
+/// Abre la salida de audio del stream y devuelve, junto a ella, el extremo con
+/// el que la tarea de recepción le manda PCM. Sin dispositivo de salida el
+/// stream se ve igual, solo que sin sonido.
+#[cfg(feature = "voice-playback")]
+fn open_stream_audio(
+    control: &StreamAudioControl,
+    output_source: Option<&str>,
+) -> (Option<VoiceAudioOutput>, VoiceDecodedAudioOutput) {
+    let sink = VoiceDecodedAudioOutput::default();
+    let output = match VoiceAudioOutput::start(
+        Arc::clone(&control.enabled),
+        Arc::clone(&control.volume),
+        output_source,
+    ) {
+        Ok(output) => Some(output),
+        Err(error) => {
+            logging::error("stream", format!("stream audio output unavailable: {error}"));
+            None
+        }
+    };
+    sink.replace(output.as_ref());
+    (output, sink)
+}
+
+/// Audio del stream: descifra (transporte + DAVE), decodifica Opus y se lo pasa
+/// a la salida. Es un solo emisor (quien transmite), así que no hace falta
+/// mezclar ni jitter buffer propio: la salida ya tiene su colchón.
+#[cfg(feature = "voice-playback")]
+struct StreamAudioPlayer {
+    sink: VoiceDecodedAudioOutput,
+    decoder: Option<::opus::Decoder>,
+    /// SSRC de audio ya asociado a quien transmite en el estado DAVE.
+    recorded_ssrc: Option<u32>,
+    packets: u64,
+    pending: u64,
+    failures: u64,
+}
+
+#[cfg(feature = "voice-playback")]
+impl StreamAudioPlayer {
+    fn new(sink: VoiceDecodedAudioOutput) -> Self {
+        Self {
+            sink,
+            decoder: None,
+            recorded_ssrc: None,
+            packets: 0,
+            pending: 0,
+            failures: 0,
+        }
+    }
+
+    async fn push_packet(
+        &mut self,
+        decryptor: &VoiceRtpDecryptor,
+        datagram: &[u8],
+        header: &RtpHeader,
+        dave_state: &Arc<Mutex<VoiceDaveState>>,
+        owner_user_id: Id<UserMarker>,
+    ) {
+        self.packets = self.packets.saturating_add(1);
+        if self.packets == 1 {
+            logging::debug(
+                "stream",
+                format!("first stream audio packet: ssrc={} seq={}", header.ssrc, header.sequence),
+            );
+        }
+        let payload = match decryptor.decrypt_packet_any(datagram, header) {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.failures = self.failures.saturating_add(1);
+                if self.failures == 1 || self.failures.is_multiple_of(200) {
+                    logging::debug(
+                        "stream",
+                        format!("stream audio RTP decrypt failed: count={} error={error}", self.failures),
+                    );
+                }
+                return;
+            }
+        };
+        let media = {
+            let mut dave = dave_state.lock().await;
+            // El único que transmite audio en este stream es su dueño: se
+            // asocia su SSRC para que DAVE sepa con qué clave descifrar.
+            if self.recorded_ssrc != Some(header.ssrc) {
+                dave.record_ssrc_user(header.ssrc, owner_user_id);
+                self.recorded_ssrc = Some(header.ssrc);
+            }
+            dave.unwrap_media_payload_for_ssrc(header.ssrc, &payload.media_payload)
+        };
+        let opus = match media {
+            VoiceMediaPayload::Plain(opus) | VoiceMediaPayload::DaveDecrypted { opus, .. } => opus,
+            VoiceMediaPayload::DaveDecryptFailed { message, .. } => {
+                self.failures = self.failures.saturating_add(1);
+                if self.failures == 1 || self.failures.is_multiple_of(200) {
+                    logging::debug(
+                        "stream",
+                        format!("stream audio DAVE decrypt failed: count={} error={message}", self.failures),
+                    );
+                }
+                return;
+            }
+            pending => {
+                self.pending = self.pending.saturating_add(1);
+                if self.pending == 1 || self.pending.is_multiple_of(200) {
+                    logging::debug(
+                        "stream",
+                        format!(
+                            "stream audio waiting for DAVE: count={} reason={}",
+                            self.pending,
+                            pending.pending_reason()
+                        ),
+                    );
+                }
+                return;
+            }
+        };
+        self.decode(&opus);
+    }
+
+    fn decode(&mut self, opus: &[u8]) {
+        if self.decoder.is_none() {
+            match ::opus::Decoder::new(::opus::Channels::Stereo, ::opus::SampleRate::Hz48000) {
+                Ok(decoder) => self.decoder = Some(decoder),
+                Err(error) => {
+                    logging::error(
+                        "stream",
+                        format!("stream Opus decoder init failed: {}", error.message()),
+                    );
+                    return;
+                }
+            }
+        }
+        let Some(decoder) = self.decoder.as_mut() else { return };
+        let channels = usize::from(DISCORD_VOICE_CHANNELS);
+        let mut decoded = vec![0.0f32; OPUS_MAX_FRAME_SAMPLES_PER_CHANNEL * channels];
+        match decoder.decode_float_to_slice(opus, &mut decoded, false) {
+            Ok(samples_per_channel) => {
+                decoded.truncate(samples_per_channel * channels);
+                self.sink.try_send(decoded);
+            }
+            Err(error) => {
+                logging::debug("stream", format!("stream Opus decode failed: {}", error.message()));
+            }
+        }
+    }
+}
+
 /// PLI (Picture Loss Indication, RFC 4585): "perdí el video, mandame una
 /// keyframe". 12 bytes: cabecera RTCP, SSRC propio y SSRC del video.
 fn build_pli_packet(sender_ssrc: u32, media_ssrc: u32) -> [u8; 12] {
@@ -831,6 +1054,7 @@ mod tests {
             user_id: Id::new(10),
             session_id: "session".to_owned(),
             owner_user_id: Id::new(3),
+            output_source: None,
         }
     }
 

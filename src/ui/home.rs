@@ -293,9 +293,26 @@ fn central_panel(app: &mut App, ui: &mut egui::Ui) {
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(16.0);
-                    theme::pill_button(ui, &palette, "Añadir amigo", true);
+                    if theme::pill_button(ui, &palette, "Añadir amigo", true).clicked() {
+                        app.friends_tab = ADD_FRIEND_TAB;
+                    }
                 });
             });
+
+            // "Añadir amigo" (clásica): reemplaza buscador y lista.
+            if app.friends_tab == ADD_FRIEND_TAB {
+                ui.add_space(20.0);
+                let area = ui.available_rect_before_wrap().shrink2(Vec2::new(16.0, 0.0));
+                let send = in_rect(ui, area, |ui| {
+                    theme::text(ui, "Añadir amigo", theme::bold(20.0), palette.text);
+                    ui.add_space(8.0);
+                    add_friend_form(ui, &palette, app)
+                });
+                if let Some(username) = send {
+                    app.send_friend_request(username);
+                }
+                return;
+            }
 
             ui.add_space(14.0);
             ui.horizontal(|ui| {
@@ -327,6 +344,16 @@ fn central_panel(app: &mut App, ui: &mut egui::Ui) {
                 })
                 .collect();
 
+            // "Pendiente" (clásica): solicitudes entrantes y salientes.
+            if app.friends_tab == 2 {
+                let area = ui.available_rect_before_wrap().shrink2(Vec2::new(16.0, 0.0));
+                let click = in_rect(ui, area, |ui| pending_list(ui, &palette, &*app, &app.friends_search));
+                if let Some(click) = click {
+                    apply_pending_click(app, click);
+                }
+                return;
+            }
+
             ui.horizontal(|ui| {
                 ui.add_space(16.0);
                 theme::text(
@@ -338,7 +365,7 @@ fn central_panel(app: &mut App, ui: &mut egui::Ui) {
             });
             ui.add_space(6.0);
 
-            if app.friends_tab >= 2 {
+            if app.friends_tab >= 3 {
                 ui.add_space(40.0);
                 ui.vertical_centered(|ui| {
                     theme::text(ui, "No hay elementos en esta vista (demo)", theme::regular(13.0), palette.dim);
@@ -418,6 +445,10 @@ const ROW_RADIUS: u8 = 16;
 const MODERN_TABS: [&str; 6] = ["Inicio", "En línea", "Todos", "Pendiente", "Bloqueados", "Canales"];
 const HOME_TAB: usize = 0;
 const ONLINE_TAB: usize = 1;
+const PENDING_TAB: usize = 3;
+/// "Añadir amigo": no es una pestaña de la fila; se abre con el botón verde
+/// (interfaz nueva) o el botón "Añadir amigo" (clásica).
+const ADD_FRIEND_TAB: usize = 6;
 const ALL_TAB: usize = 2;
 const RECENT_TAB: usize = 5;
 
@@ -442,7 +473,10 @@ pub(crate) fn row_tabs(app: &mut App, ui: &mut egui::Ui) {
         let galley = ui
             .painter()
             .layout_no_wrap(tab.to_string(), theme::medium(14.0), palette.text);
-        let size = Vec2::new(galley.size().x + 22.0, 30.0);
+        // "Pendiente" lleva un globito rojo con las solicitudes recibidas.
+        let badge = if i == PENDING_TAB { app.pending_incoming_count() } else { 0 };
+        let badge_w = if badge > 0 { 24.0 } else { 0.0 };
+        let size = Vec2::new(galley.size().x + 22.0 + badge_w, 30.0);
         let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
         let bg = if selected {
             palette.surface_active
@@ -452,13 +486,36 @@ pub(crate) fn row_tabs(app: &mut App, ui: &mut egui::Ui) {
             Color32::TRANSPARENT
         };
         ui.painter().rect_filled(rect, CornerRadius::same(8), bg);
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            *tab,
-            theme::medium(14.0),
-            if selected { palette.text } else { palette.secondary },
-        );
+        let label_color = if selected { palette.text } else { palette.secondary };
+        if badge > 0 {
+            ui.painter().text(
+                egui::pos2(rect.left() + 11.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                *tab,
+                theme::medium(14.0),
+                label_color,
+            );
+            let pill = Rect::from_center_size(
+                egui::pos2(rect.right() - 11.0 - 9.0, rect.center().y),
+                Vec2::new(18.0, 16.0),
+            );
+            ui.painter().rect_filled(pill, CornerRadius::same(8), palette.danger);
+            ui.painter().text(
+                pill.center(),
+                egui::Align2::CENTER_CENTER,
+                if badge > 9 { "9+".to_string() } else { badge.to_string() },
+                theme::bold(10.5),
+                Color32::WHITE,
+            );
+        } else {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                *tab,
+                theme::medium(14.0),
+                label_color,
+            );
+        }
         if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
             app.friends_tab = i;
         }
@@ -474,20 +531,24 @@ pub(crate) fn row_tabs(app: &mut App, ui: &mut egui::Ui) {
         let (rect, resp) =
             ui.allocate_exact_size(Vec2::new(galley.size().x + 26.0, 30.0), Sense::click());
         let green = extra::status_color(Status::Online, &palette);
-        let fill = if resp.hovered() { extra::blend(green, Color32::WHITE, 0.12) } else { green };
+        let selected = app.friends_tab == ADD_FRIEND_TAB;
+        let fill = if selected {
+            extra::blend(palette.panel, green, 0.18)
+        } else if resp.hovered() {
+            extra::blend(green, Color32::WHITE, 0.12)
+        } else {
+            green
+        };
         ui.painter().rect_filled(rect, CornerRadius::same(8), fill);
         ui.painter().text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
             label,
             theme::semibold(13.0),
-            Color32::WHITE,
+            if selected { green } else { Color32::WHITE },
         );
         if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-            app.open_modal(
-                "Añadir amigo",
-                "Añadir amigos todavía no está disponible en esta demo.",
-            );
+            app.friends_tab = ADD_FRIEND_TAB;
         }
     });
 }
@@ -503,6 +564,8 @@ fn card_bg(ui: &egui::Ui, palette: &Palette, rect: Rect) {
 fn modern_central(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
     let mut action: Option<HomeAction> = None;
+    let mut pending_click: Option<PendingClick> = None;
+    let mut send_request: Option<String> = None;
     let gap = theme::GAP as f32;
 
     egui::CentralPanel::default()
@@ -537,6 +600,8 @@ fn modern_central(app: &mut App, ui: &mut egui::Ui) {
                 // Los canales recientes dibujan su propio título y tarjeta.
                 let app_ref: &App = app;
                 channels_section(app_ref, ui, center, &mut action);
+            } else if app.friends_tab == ADD_FRIEND_TAB {
+                send_request = add_friend_card(app, ui, center, &palette);
             } else {
                 card_bg(ui, &palette, center);
                 let inner = center.shrink(20.0);
@@ -580,11 +645,12 @@ fn modern_central(app: &mut App, ui: &mut egui::Ui) {
                     .layout_no_wrap(title.to_string(), theme::bold(22.0), palette.text);
                 let title_w = title_galley.size().x;
                 ui.painter().galley(inner.min, title_galley, palette.text);
-                if tab == ONLINE_TAB || tab == ALL_TAB {
+                if tab == ONLINE_TAB || tab == ALL_TAB || tab == PENDING_TAB {
+                    let count = if tab == PENDING_TAB { app.pending_requests.len() } else { order.len() };
                     ui.painter().text(
                         inner.min + Vec2::new(title_w + 10.0, 3.0),
                         egui::Align2::LEFT_TOP,
-                        format!("– {}", order.len()),
+                        format!("– {count}"),
                         theme::regular(20.0),
                         palette.dim,
                     );
@@ -620,7 +686,9 @@ fn modern_central(app: &mut App, ui: &mut egui::Ui) {
                     inner.max,
                 );
                 let app_ref: &App = app;
-                if tab >= 3 {
+                if tab == PENDING_TAB {
+                    pending_click = in_rect(ui, body, |ui| pending_list(ui, &palette, app_ref, &needle));
+                } else if tab >= 3 {
                     in_rect(ui, body, |ui| {
                         ui.add_space(30.0);
                         ui.vertical_centered(|ui| {
@@ -719,6 +787,318 @@ fn modern_central(app: &mut App, ui: &mut egui::Ui) {
         Some(HomeAction::OpenServer(i)) => app.open_server(i),
         None => {}
     }
+    if let Some(click) = pending_click {
+        apply_pending_click(app, click);
+    }
+    if let Some(username) = send_request {
+        app.send_friend_request(username);
+    }
+}
+
+// ---------------------------------------------------------------------
+// "Añadir amigo": mandar una solicitud por nombre de usuario
+// ---------------------------------------------------------------------
+
+/// Tarjeta "Añadir amigo" de la interfaz nueva. Devuelve el nombre a enviar
+/// cuando se toca el botón (o Enter en el campo).
+fn add_friend_card(app: &mut App, ui: &mut egui::Ui, center: Rect, palette: &Palette) -> Option<String> {
+    card_bg(ui, palette, center);
+    in_rect(ui, center.shrink(20.0), |ui| {
+        theme::text(ui, "Añadir amigo", theme::bold(22.0), palette.text);
+        ui.add_space(8.0);
+        add_friend_form(ui, palette, app)
+    })
+}
+
+/// Texto de ayuda, campo con el botón "Enviar solicitud de amistad" a la
+/// derecha y, debajo, el resultado del último envío (verde si salió bien,
+/// rojo si falló). Devuelve el nombre a enviar si se confirmó.
+fn add_friend_form(ui: &mut egui::Ui, palette: &Palette, app: &mut App) -> Option<String> {
+    ui.add(
+        egui::Label::new(
+            RichText::new("Puedes añadir amigos con su nombre de usuario de Discord.")
+                .font(theme::regular(13.5))
+                .color(palette.secondary),
+        )
+        .wrap(),
+    );
+    ui.add_space(14.0);
+
+    let (bar, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 56.0), Sense::hover());
+    let label = "Enviar solicitud de amistad";
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), theme::semibold(13.0), Color32::WHITE);
+    let btn_w = galley.size().x + 28.0;
+    let btn = Rect::from_center_size(
+        egui::pos2(bar.right() - 10.0 - btn_w / 2.0, bar.center().y),
+        Vec2::new(btn_w, 36.0),
+    );
+    let text_rect = Rect::from_min_max(
+        bar.min + Vec2::new(16.0, 0.0),
+        egui::pos2((btn.left() - 12.0).max(bar.min.x + 40.0), bar.max.y),
+    );
+
+    ui.painter()
+        .rect_filled(bar, CornerRadius::same(10), theme::inset(palette));
+    let edit = ui
+        .scope_builder(
+            UiBuilder::new()
+                .max_rect(text_rect)
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.add_friend_input)
+                        .hint_text("Escribe un nombre de usuario")
+                        .frame(egui::Frame::NONE)
+                        .desired_width(text_rect.width()),
+                )
+            },
+        )
+        .inner;
+    if edit.has_focus() {
+        ui.painter().rect_stroke(
+            bar,
+            CornerRadius::same(10),
+            Stroke::new(1.0, palette.accent),
+            StrokeKind::Inside,
+        );
+    }
+
+    let trimmed = app.add_friend_input.trim().to_string();
+    let enabled = !trimmed.is_empty() && !app.add_friend_busy;
+    let resp = ui.interact(
+        btn,
+        ui.id().with("add_friend_send"),
+        if enabled { Sense::click() } else { Sense::hover() },
+    );
+    let fill = if !enabled {
+        extra::blend(palette.accent, palette.panel, 0.55)
+    } else if resp.hovered() {
+        palette.accent_hover
+    } else {
+        palette.accent
+    };
+    ui.painter().rect_filled(btn, CornerRadius::same(8), fill);
+    ui.painter().text(
+        btn.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        theme::semibold(13.0),
+        palette.on_accent,
+    );
+    let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    let mut send = None;
+    if enabled && (resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() || enter) {
+        send = Some(trimmed);
+    }
+
+    ui.add_space(14.0);
+    if app.add_friend_busy {
+        theme::text(ui, "Enviando solicitud…", theme::regular(13.0), palette.dim);
+    } else if let Some((ok, message)) = &app.add_friend_status {
+        let color = if *ok { extra::status_color(Status::Online, palette) } else { palette.danger };
+        ui.add(
+            egui::Label::new(RichText::new(message.as_str()).font(theme::regular(13.0)).color(color)).wrap(),
+        );
+    }
+    send
+}
+
+// ---------------------------------------------------------------------
+// Pestaña "Pendiente": solicitudes de amistad entrantes y salientes
+// ---------------------------------------------------------------------
+
+/// Alto de cada fila de solicitud.
+const PENDING_ROW_H: f32 = 64.0;
+
+/// Qué se tocó en la lista de solicitudes (se aplica al final del frame, así
+/// la lista solo lee `&App`).
+#[derive(Clone)]
+enum PendingClick {
+    /// Aceptar la solicitud entrante de esta persona (id).
+    Accept(String),
+    /// Rechazar la entrante o cancelar la saliente (id).
+    Remove(String),
+    /// Abrir el perfil de la persona (id).
+    Profile(String),
+}
+
+fn apply_pending_click(app: &mut App, click: PendingClick) {
+    use crate::discord::UserAction;
+    match click {
+        // Primero sin `confirm_stranger_request`; si Discord contesta 80013 sale
+        // el popup de confirmación (ver `App::confirm_accept_friend`).
+        PendingClick::Accept(id) => app.run_user_action(id, UserAction::AcceptFriend { confirm: false }),
+        PendingClick::Remove(id) => app.run_user_action(id, UserAction::RemoveFriend),
+        PendingClick::Profile(id) => {
+            let found = app
+                .pending_requests
+                .iter()
+                .find(|p| p.user.id == id)
+                .map(|p| (p.name.clone(), p.avatar_url.clone(), p.avatar_color));
+            if let Some((name, avatar_url, color)) = found {
+                app.open_user_profile(id, name, avatar_url, color);
+            }
+        }
+    }
+}
+
+/// Lista de solicitudes pendientes en dos secciones (entrantes primero, después
+/// las enviadas), filtrada por `needle` (minúsculas) sobre nombre y usuario.
+fn pending_list(ui: &mut egui::Ui, palette: &Palette, app: &App, needle: &str) -> Option<PendingClick> {
+    let needle = needle.trim().to_lowercase();
+    let matches = |p: &crate::lib::data::PendingRequest| {
+        needle.is_empty()
+            || p.name.to_lowercase().contains(&needle)
+            || p.username.to_lowercase().contains(&needle)
+    };
+    let incoming: Vec<&crate::lib::data::PendingRequest> =
+        app.pending_requests.iter().filter(|p| p.incoming && matches(p)).collect();
+    let outgoing: Vec<&crate::lib::data::PendingRequest> =
+        app.pending_requests.iter().filter(|p| !p.incoming && matches(p)).collect();
+
+    if incoming.is_empty() && outgoing.is_empty() {
+        if app.pending_requests.is_empty() {
+            empty_card(
+                ui,
+                palette,
+                "No hay solicitudes pendientes",
+                "Cuando alguien te mande una solicitud de amistad, o mandes una tú, aparece aquí.",
+            );
+        } else {
+            empty_card(ui, palette, "Sin resultados", "Ninguna solicitud coincide con la búsqueda.");
+        }
+        return None;
+    }
+
+    let mut click = None;
+    ScrollArea::vertical()
+        .id_salt("home_pending_list")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for (title, list) in [("Solicitudes entrantes", &incoming), ("Solicitudes enviadas", &outgoing)] {
+                if list.is_empty() {
+                    continue;
+                }
+                theme::text(ui, format!("{title} — {}", list.len()), theme::semibold(12.5), palette.dim);
+                ui.add_space(6.0);
+                for request in list.iter() {
+                    if let Some(c) = pending_row(ui, palette, request) {
+                        click = Some(c);
+                    }
+                    ui.add_space(2.0);
+                }
+                ui.add_space(14.0);
+            }
+        });
+    click
+}
+
+/// Una solicitud: avatar, nombre, "Solicitud de amistad entrante/enviada" y a
+/// la derecha los botones redondos (✓ aceptar solo en las entrantes, ✕ rechazar
+/// o cancelar). Click en el resto de la fila: abre el perfil.
+fn pending_row(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    request: &crate::lib::data::PendingRequest,
+) -> Option<PendingClick> {
+    let mut click = None;
+    let (rect, row) = ui.allocate_exact_size(Vec2::new(ui.available_width(), PENDING_ROW_H), Sense::click());
+    let hovered = ui.rect_contains_pointer(rect);
+    if hovered {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(theme::radius() + 2), palette.surface);
+    }
+
+    let avatar_center = rect.left_center() + Vec2::new(28.0, 0.0);
+    extra::avatar(
+        ui,
+        avatar_center,
+        20.0,
+        request.avatar_url.as_deref(),
+        request.avatar_color,
+        &request.initial(),
+        palette,
+    );
+
+    // Botones, de derecha a izquierda.
+    let btn = 36.0;
+    let mut right = rect.right() - 12.0;
+    let remove_rect = Rect::from_center_size(egui::pos2(right - btn / 2.0, rect.center().y), Vec2::splat(btn));
+    right -= btn + 8.0;
+    let accept_rect = request
+        .incoming
+        .then(|| Rect::from_center_size(egui::pos2(right - btn / 2.0, rect.center().y), Vec2::splat(btn)));
+    let buttons_w = if request.incoming { 2.0 * btn + 8.0 + 12.0 } else { btn + 12.0 };
+
+    // Texto.
+    let text_x = 64.0;
+    let max_w = (rect.width() - text_x - buttons_w - 12.0).max(40.0);
+    crate::ui::emoji::paint_line_top(
+        ui,
+        rect.left_top() + Vec2::new(text_x, 13.0),
+        &request.name,
+        theme::medium(14.5),
+        palette.text,
+        max_w,
+    );
+    let label = if request.incoming {
+        "Solicitud de amistad entrante"
+    } else {
+        "Solicitud de amistad enviada"
+    };
+    let sub = if request.username.is_empty() || request.username == request.name {
+        label.to_string()
+    } else {
+        format!("{} · {label}", request.username)
+    };
+    let sub = clip_line(&sub, ((max_w / 6.0).max(8.0)) as usize);
+    ui.painter().text(
+        rect.left_top() + Vec2::new(text_x, 35.0),
+        egui::Align2::LEFT_TOP,
+        sub,
+        theme::regular(12.0),
+        palette.dim,
+    );
+
+    let base = if hovered { palette.surface_hover } else { palette.surface };
+    let id = ui.id().with(("pending_row", &request.user.id));
+    if let Some(accept_rect) = accept_rect {
+        let green = extra::status_color(Status::Online, palette);
+        if round_icon_button(ui, palette, base, accept_rect, id.with("accept"), Icon::Check, green, "Aceptar") {
+            click = Some(PendingClick::Accept(request.user.id.clone()));
+        }
+    }
+    let tip = if request.incoming { "Rechazar" } else { "Cancelar solicitud" };
+    if round_icon_button(ui, palette, base, remove_rect, id.with("remove"), Icon::X, palette.danger, tip) {
+        click = Some(PendingClick::Remove(request.user.id.clone()));
+    }
+
+    if click.is_none() && row.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+        click = Some(PendingClick::Profile(request.user.id.clone()));
+    }
+    click
+}
+
+/// Botón circular con un ícono; el ícono toma `hover_color` al pasar el mouse.
+#[allow(clippy::too_many_arguments)]
+fn round_icon_button(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    base: Color32,
+    rect: Rect,
+    id: egui::Id,
+    icon: Icon,
+    hover_color: Color32,
+    tip: &str,
+) -> bool {
+    let resp = ui.interact(rect, id, Sense::click());
+    let hovered = resp.hovered();
+    let bg = if hovered { palette.surface_active } else { base };
+    ui.painter().circle_filled(rect.center(), rect.width() / 2.0, bg);
+    theme::paint_icon(ui, icon, rect, 18.0, if hovered { hover_color } else { palette.secondary });
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip).clicked()
 }
 
 /// Tarjeta de amigo: banner de color arriba, avatar grande que lo pisa con su
