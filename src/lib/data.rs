@@ -685,6 +685,22 @@ impl ChatMessage {
             }
     }
 
+    /// Momento en que se mandó el mensaje (ms desde epoch), sacado de su id.
+    /// `None` en mensajes de demo o ecos locales, que todavía no tienen id real.
+    pub fn timestamp_ms(&self) -> Option<i64> {
+        snowflake_ms(&self.id)
+    }
+
+    /// ¿Este mensaje y `other` están lo bastante cerca en el tiempo (hasta
+    /// [`GROUP_MAX_GAP_MS`], 7 minutos) como para ir bajo un mismo encabezado?
+    /// Si alguno no tiene id real no se puede medir y no se corta la racha.
+    pub fn within_group_gap(&self, other: &Self) -> bool {
+        match (self.timestamp_ms(), other.timestamp_ms()) {
+            (Some(a), Some(b)) => (b - a).abs() <= GROUP_MAX_GAP_MS,
+            _ => true,
+        }
+    }
+
     /// Vuelve a calcular nombre y color del autor (y del autor citado, si
     /// es una respuesta) con lo que `names` sabe ahora. Se usa cuando llega
     /// el apodo/rol de alguien después de que su mensaje ya se dibujó.
@@ -1113,6 +1129,18 @@ fn reply_preview(original: &crate::discord::models::GatewayMessage) -> String {
 }
 
 fn format_timestamp(ts: &str) -> String {
+    // Discord manda la hora en UTC: se muestra en la hora local de la PC.
+    // Si el mensaje es de hoy sale solo la hora ("14:05"); si es de otro día
+    // sale con la fecha ("08/10/2026 14:05").
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) {
+        let local = parsed.with_timezone(&chrono::Local);
+        let format = if local.date_naive() == chrono::Local::now().date_naive() {
+            "%H:%M"
+        } else {
+            "%d/%m/%Y %H:%M"
+        };
+        return local.format(format).to_string();
+    }
     ts.split('T')
         .nth(1)
         .and_then(|time_part| time_part.get(0..5))
@@ -1410,6 +1438,9 @@ pub struct Channel {
     /// Overwrites de permisos del canal, tal como llegaron de Discord (ver
     /// `lib::permissions`). Vacío en canales demo.
     pub overwrites: Vec<crate::discord::models::PermissionOverwrite>,
+    /// Modo lento del canal en segundos (0 = apagado), tal como lo manda
+    /// Discord. Ver `ChannelAccess::bypass_slowmode` para quién está exento.
+    pub slowmode_secs: u32,
     /// Qué tan accesible es para esta cuenta: si se ve, si va con candado.
     /// Lo recalcula `Server::recompute_access` cada vez que llega algo que
     /// lo cambia (canales, roles, roles propios).
@@ -1473,6 +1504,10 @@ pub struct ForumPost {
 }
 
 /// Milisegundos desde epoch, ahora.
+/// Máxima separación (7 minutos) entre dos mensajes del mismo autor para que
+/// el segundo se dibuje sin encabezado, agrupado bajo el primero.
+pub const GROUP_MAX_GAP_MS: i64 = 7 * 60 * 1000;
+
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1587,6 +1622,7 @@ impl Channel {
             is_voice: false,
             voice_members: Vec::new(),
             overwrites: Vec::new(),
+            slowmode_secs: 0,
             access: Default::default(),
             is_forum: false,
             is_thread: false,
@@ -1616,6 +1652,7 @@ impl Channel {
             is_voice,
             voice_members: Vec::new(),
             overwrites: Vec::new(),
+            slowmode_secs: 0,
             access: Default::default(),
             is_forum,
             is_thread: false,
@@ -1899,6 +1936,7 @@ impl Server {
         fn build(c: crate::discord::models::Channel) -> Channel {
             let mut ch = Channel::from_discord(c.id.clone(), c.name.as_deref().unwrap_or("canal"), c.kind);
             ch.overwrites = c.permission_overwrites;
+            ch.slowmode_secs = c.rate_limit_per_user;
             ch.parent_id = c.parent_id;
             ch.forum.tags = c.available_tags;
             ch
@@ -3338,7 +3376,12 @@ mod chat_names_tests {
         assert_eq!(forward.snapshots.len(), 1);
         let snapshot = &forward.snapshots[0];
         assert_eq!(snapshot.content, "texto original");
-        assert_eq!(snapshot.time, "23:59");
+        let expected = chrono::DateTime::parse_from_rfc3339("2025-12-31T23:59:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%d/%m/%Y %H:%M")
+            .to_string();
+        assert_eq!(snapshot.time, expected);
         assert!(!snapshot.edited);
         assert_eq!(snapshot.attachments.len(), 1);
         assert_eq!(snapshot.mentions, vec![("20".to_string(), "Bob".to_string())]);
@@ -3822,5 +3865,34 @@ mod channel_events_tests {
         server.remove_role("r1");
         assert!(!server.roles.iter().any(|r| r.id == "r1"));
         assert_eq!(server.access_ctx.my_roles, Some(Vec::new()));
+    }
+}
+
+/// "N mensajes nuevos desde las ..." del chat abierto. Se arma al entrar a un
+/// canal/DM con el último mensaje leído de ANTES de entrar (el ack se manda
+/// enseguida y borraría esa referencia) y vive mientras el chat siga abierto.
+#[derive(Clone, Debug)]
+pub struct UnreadMarker {
+    /// Último mensaje que Discord tenía como leído al entrar.
+    pub last_read: String,
+    /// La barra de arriba ya no se muestra (la cerró o ya vio lo nuevo).
+    pub dismissed: bool,
+    /// Ya se miró la primera lista cargada para decidir si había algo nuevo.
+    pub evaluated: bool,
+    /// Había mensajes nuevos al entrar: se dibuja la línea "NUEVO".
+    pub had_unread: bool,
+    /// Cuándo se creó (la barra espera un momento antes de aparecer).
+    pub created: std::time::Instant,
+}
+
+impl UnreadMarker {
+    pub fn new(last_read: String) -> Self {
+        Self {
+            last_read,
+            dismissed: false,
+            evaluated: false,
+            had_unread: false,
+            created: std::time::Instant::now(),
+        }
     }
 }

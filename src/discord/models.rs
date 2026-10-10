@@ -479,6 +479,10 @@ pub struct Channel {
     /// categoría si está sincronizado: Discord manda los efectivos).
     #[serde(default)]
     pub permission_overwrites: Vec<PermissionOverwrite>,
+    /// Modo lento del canal: segundos que hay que esperar entre un mensaje y
+    /// otro (`rate_limit_per_user`; 0 = apagado).
+    #[serde(default)]
+    pub rate_limit_per_user: u32,
     /// Solo foros (tipo 15/16): las etiquetas que se le pueden poner a un
     /// post (`available_tags`).
     #[serde(default)]

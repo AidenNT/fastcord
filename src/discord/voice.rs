@@ -18,6 +18,8 @@ mod levels;
 #[cfg(feature = "voice-playback")]
 mod microphone;
 #[cfg(feature = "voice-playback")]
+mod echo_reference;
+#[cfg(feature = "voice-playback")]
 mod noise;
 mod opus;
 mod outbound;
@@ -30,6 +32,14 @@ mod state;
 mod h264;
 mod stream_watch;
 mod video_decode;
+// Transmitir la propia pantalla (Go Live): captura + H.264 con ffmpeg-the-third y la
+// sesión de media que lo manda. Ver `stream_publish.rs`.
+mod screen_capture;
+mod stream_publish;
+mod window_list;
+mod source_thumbs;
+#[cfg(windows)]
+mod window_capture;
 
 pub(crate) use devices::{VoiceAudioSourceOptions, VoiceAudioSources, list_voice_audio_sources};
 #[cfg(all(feature = "voice-playback", not(test)))]
@@ -39,7 +49,8 @@ use gateway::*;
 #[cfg(not(test))]
 use gateway::{run_voice_gateway_session, send_voice_binary, send_voice_text};
 pub use info::{
-    MemberInfo, VoiceConnectionStatus, VoiceScope, VoiceServerInfo, VoiceSoundKind, VoiceStateInfo,
+    MemberInfo, VoiceConnectPhase, VoiceConnectionStatus, VoiceScope, VoiceServerInfo, VoiceSoundKind,
+    VoiceStateInfo,
 };
 #[cfg(all(feature = "voice-playback", target_os = "linux", not(test)))]
 use microphone::log_captured_alsa_errors;
@@ -53,6 +64,13 @@ pub(crate) use runtime::{forward_app_event, run_voice_runtime};
 pub use state::{CurrentVoiceConnectionState, VoiceAudioSettings, VoiceCache, VoiceParticipantState};
 pub use stream_watch::{StreamFrame, StreamFrameSlot, StreamWatchStatus};
 pub(crate) use stream_watch::{StreamWatchHandle, StreamWatchParams, spawn_stream_watch};
+pub use stream_publish::StreamPublishStatus;
+pub(crate) use stream_publish::{StreamPublishHandle, StreamPublishParams, spawn_stream_publish};
+pub(crate) use screen_capture::{CaptureTarget, ScreenCaptureConfig, StreamQuality};
+pub(crate) use source_thumbs::{ThumbKey, Thumbnail, spawn_source_thumbnails};
+pub(crate) use window_list::{
+    CaptureMonitor, CaptureWindow, WINDOW_CAPTURE_SUPPORTED, list_capture_monitors, list_capture_windows,
+};
 // `parse_*_id` son `pub(in crate::discord)` en `state.rs` (privado hacia
 // afuera del subsistema de voz); acá se re-exportan como `pub(crate)` para
 // que `lib::state` (las acciones join_voice/leave_voice/etc.) puedan armar
@@ -112,7 +130,7 @@ use tokio::{
     task::JoinHandle,
     time::{sleep, timeout},
 };
-use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Message as WsMessage};
+use crate::discord::websocket::{self, Message as WsMessage};
 
 use crate::discord::ids::{
     Id,
@@ -128,21 +146,6 @@ use super::{gateway::GatewayCommand, AppEvent};
 
 const VOICE_GATEWAY_VERSION: u8 = 9;
 const VOICE_WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-#[cfg(not(feature = "stream-broadcast"))]
-const STREAM_BROADCAST_FEATURE_DISABLED: &str =
-    "stream broadcasting requires the stream-broadcast feature";
-
-pub(crate) fn ensure_stream_broadcast_available() -> Result<(), String> {
-    #[cfg(feature = "stream-broadcast")]
-    {
-        Ok(())
-    }
-    #[cfg(not(feature = "stream-broadcast"))]
-    {
-        Err(STREAM_BROADCAST_FEATURE_DISABLED.to_owned())
-    }
-}
-
 const VOICE_RESUME_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const VOICE_CONNECTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const VOICE_CONNECTION_STABLE_INTERVAL: Duration = Duration::from_secs(10);
@@ -315,8 +318,7 @@ const VOICE_OP_DAVE_MLS_ANNOUNCE_COMMIT_TRANSITION: u8 = 29;
 const VOICE_OP_DAVE_MLS_WELCOME: u8 = 30;
 const VOICE_OP_DAVE_MLS_INVALID_COMMIT_WELCOME: u8 = 31;
 
-type VoiceGatewayStream =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type VoiceGatewayStream = websocket::WebSocket;
 type VoiceWriter = Arc<Mutex<futures_util::stream::SplitSink<VoiceGatewayStream, WsMessage>>>;
 type VoiceReader = futures_util::stream::SplitStream<VoiceGatewayStream>;
 
@@ -408,6 +410,14 @@ impl VoiceStatusPublisher {
             channel_id: Some(session.channel_id.to_string()),
             status,
             message: Some(message.into()),
+        });
+    }
+
+    /// Fase del arranque de la conexión (ver `VoiceConnectPhase`).
+    async fn publish_phase(&self, session: &VoiceGatewaySession, phase: VoiceConnectPhase) {
+        let _ = self.events.send(AppEvent::VoiceConnectPhaseChanged {
+            channel_id: Some(session.channel_id.to_string()),
+            phase,
         });
     }
 

@@ -137,6 +137,39 @@ pub enum VoiceConnectionStatus {
     Failed,
 }
 
+/// Fase en la que va el arranque de la conexión de voz (para mostrarla en la
+/// barra de llamada). Se publica desde el hilo de voz con
+/// `VoiceStatusPublisher::publish_phase`; mientras no llega ninguna, la
+/// llamada pedida está en `WaitingVoiceServer`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VoiceConnectPhase {
+    /// Pedimos entrar y esperamos el `VOICE_SERVER_UPDATE` del Gateway.
+    WaitingVoiceServer,
+    /// Abriendo el websocket contra el servidor RTC.
+    ConnectingRtc,
+    /// Identify enviado; esperando que el servidor RTC nos acepte.
+    Authenticating,
+    /// Servidor RTC listo: descubriendo IP/puerto y abriendo el UDP.
+    Transport,
+    /// Negociando claves y cifrado (modo de transporte + DAVE).
+    Encrypting,
+    /// Todo listo: audio andando.
+    Ready,
+}
+
+impl VoiceConnectPhase {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::WaitingVoiceServer => "Esperando al servidor de voz",
+            Self::ConnectingRtc => "Esperando servidor RTC",
+            Self::Authenticating => "Autenticando",
+            Self::Transport => "Estableciendo transporte",
+            Self::Encrypting => "Encriptando",
+            Self::Ready => "Conectado",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VoiceSoundKind {
     Join,

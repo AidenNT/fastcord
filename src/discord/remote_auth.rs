@@ -36,8 +36,9 @@
 //!
 //! Lo que se agregó sobre la primera versión de este archivo (mirando
 //! cómo lo resuelve Concord, `discord/qr_auth.rs` ahí): mandar los
-//! headers/fingerprint reales en la conexión y en el canje del ticket (en
-//! vez de un `reqwest::Client` nuevo y sin headers), verificar el
+//! headers/fingerprint reales en el canje del ticket (en vez de un
+//! `reqwest::Client` nuevo y sin headers; el handshake del WebSocket imita
+//! al de un navegador, ver `discord::websocket`), verificar el
 //! fingerprint del server antes de confiar en él, y un puñado de
 //! reintentos si la conexión se corta antes de terminar — a diferencia
 //! del Gateway principal esto es un flujo corto (dura lo que tarda
@@ -52,11 +53,10 @@ use rsa::pkcs8::EncodePublicKey;
 use rsa::{Oaep, RsaPrivateKey, RsaPublicKey};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::Message;
 
 use crate::discord::auth_http::{discord_login_headers, DiscordAuthSession};
-use crate::discord::fingerprint::{self, ClientFingerprint};
+use crate::discord::fingerprint::ClientFingerprint;
+use crate::discord::websocket::{self, Message};
 use crate::discord::AppEvent;
 
 const REMOTE_AUTH_URL: &str = "wss://remote-auth-gateway.discord.gg/?v=2";
@@ -106,9 +106,7 @@ async fn run_once(auth_session: &DiscordAuthSession, tx: &std::sync::mpsc::Sende
     // `init` — ver el comentario de más arriba.
     let expected_fingerprint = URL_SAFE_NO_PAD.encode(Sha256::digest(pub_key_der.as_bytes()));
 
-    let mut request = REMOTE_AUTH_URL.into_client_request()?;
-    request.headers_mut().extend(fingerprint::discord_gateway_headers(auth_session.fingerprint()));
-    let (ws_stream, _) = tokio_tungstenite::connect_async(request).await?;
+    let ws_stream = websocket::connect(REMOTE_AUTH_URL).await?;
     let (mut write, mut read) = ws_stream.split();
 
     // El QR tarda un rato en escanearse, así que hay que mandar heartbeats

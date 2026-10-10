@@ -7,6 +7,7 @@
 //! (`App::poll_discord_events`, en `lib/state.rs`) y actualiza su estado.
 
 pub mod activity;
+pub mod clean_mic;
 pub mod gateway;
 pub mod invites;
 pub mod models;
@@ -19,9 +20,11 @@ pub mod captcha;
 pub mod affinities;
 pub mod frecency;
 pub mod user_settings;
+pub mod uploads;
 pub mod uwu_rest;
 pub mod voice;
 mod auth_http;
+mod websocket;
 
 /// Texto con el que Discord (vía el cliente REST vendorizado) rechaza un
 /// token: lo devuelve tal cual ante un 401 que no es de MFA.
@@ -68,7 +71,7 @@ pub(crate) mod ids;
 
 pub use voice::{
     CurrentVoiceConnectionState, MemberInfo, MicrophoneBufferMs, MicrophoneSensitivityDb,
-    StreamWatchStatus, VoiceAudioSettings, VoiceCache, VoiceConnectionStatus,
+    StreamPublishStatus, StreamWatchStatus, VoiceAudioSettings, VoiceCache, VoiceConnectPhase, VoiceConnectionStatus,
     VoiceParticipantState, VoiceScope, VoiceServerInfo, VoiceSoundKind, VoiceStateInfo,
     VoiceParticipantPlaybackSettings, VoiceParticipantVolumePercent, VoiceVolumePercent,
 };
@@ -262,6 +265,18 @@ pub enum AppEvent {
         status: StreamWatchStatus,
         message: Option<String>,
     },
+    /// Miniatura de un stream ajeno (`spawn_fetch_stream_preview`).
+    StreamPreview {
+        stream_key: String,
+        url: Option<String>,
+    },
+    /// Progreso de NUESTRA transmisión (`voice::spawn_stream_publish`):
+    /// conectando, en vivo, falló...
+    StreamPublishStatus {
+        stream_key: String,
+        status: StreamPublishStatus,
+        message: Option<String>,
+    },
     /// Datos de un usuario pedidos por REST como respaldo, cuando un
     /// estado de voz llegó sin `member`/`user` embebido (ver
     /// `spawn_fetch_user`).
@@ -411,6 +426,14 @@ pub enum AppEvent {
         channel_id: Option<String>,
         status: voice::VoiceConnectionStatus,
         message: Option<String>,
+    },
+    /// Fase del arranque de la conexión de voz propia (esperando servidor
+    /// RTC, autenticando, encriptando…). Solo informativa: la barra de
+    /// llamada la muestra mientras `VoiceConnectionStatusChanged` no diga
+    /// que todo está listo.
+    VoiceConnectPhaseChanged {
+        channel_id: Option<String>,
+        phase: voice::VoiceConnectPhase,
     },
     /// Alguien empezó/dejó de hablar en el canal de voz que tenemos
     /// abierto (detectado del propio audio RTP entrante, no un evento de
@@ -1006,6 +1029,25 @@ pub fn spawn_fetch_affinities(token: String, tx: std::sync::mpsc::Sender<AppEven
     });
 }
 
+/// Pide la miniatura de un stream (`GET /streams/{key}/preview`) en un hilo
+/// aparte. Solo avisa si Discord contestó bien; con un error (por ejemplo, no
+/// hay miniatura todavía) no manda nada y el tile sigue sin imagen.
+pub fn spawn_fetch_stream_preview(token: String, stream_key: String, tx: std::sync::mpsc::Sender<AppEvent>) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            return;
+        };
+        rt.block_on(async move {
+            let Ok(rest) = uwu_rest::UwuRest::for_token(token).await else {
+                return;
+            };
+            if let Ok(url) = rest.stream_preview(&stream_key).await {
+                let _ = tx.send(AppEvent::StreamPreview { stream_key, url });
+            }
+        });
+    });
+}
+
 pub fn spawn_fetch_user(token: String, user_id: String, tx: std::sync::mpsc::Sender<AppEvent>) {
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
@@ -1403,6 +1445,74 @@ pub fn spawn_ack_message(token: String, channel_id: String, message_id: String) 
             };
             if let Err(e) = rest.ack_message(&channel_id, &message_id).await {
                 log::warn!("No se pudo marcar el canal {channel_id} como leído: {e}");
+            }
+        });
+    });
+}
+
+/// Borra un mensaje (`ui::chat`, menú del mensaje). El mensaje ya se sacó de
+/// la lista local; si falla (falta de permisos, por ejemplo) solo se registra.
+pub fn spawn_delete_message(token: String, channel_id: String, message_id: String) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            return;
+        };
+        rt.block_on(async move {
+            let rest = match uwu_rest::UwuRest::for_token(token).await {
+                Ok(rest) => rest,
+                Err(e) => {
+                    log::warn!("No se pudo loguear el REST para borrar el mensaje: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = rest.delete_message(&channel_id, &message_id).await {
+                log::warn!("No se pudo borrar el mensaje {message_id}: {e}");
+            }
+        });
+    });
+}
+
+/// Saca todas las reacciones de un mensaje, o solo las de `emoji`.
+pub fn spawn_clear_reactions(token: String, channel_id: String, message_id: String, emoji: Option<String>) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            return;
+        };
+        rt.block_on(async move {
+            let rest = match uwu_rest::UwuRest::for_token(token).await {
+                Ok(rest) => rest,
+                Err(e) => {
+                    log::warn!("No se pudo loguear el REST para sacar reacciones: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = rest
+                .clear_reactions(&channel_id, &message_id, emoji.as_deref())
+                .await
+            {
+                log::warn!("No se pudieron sacar las reacciones de {message_id}: {e}");
+            }
+        });
+    });
+}
+
+/// "Marcar no leído" desde el menú de un mensaje: manda un ack hacia atrás
+/// (ver `UwuRest::ack_message_manual`).
+pub fn spawn_ack_message_manual(token: String, channel_id: String, message_id: String) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            return;
+        };
+        rt.block_on(async move {
+            let rest = match uwu_rest::UwuRest::for_token(token).await {
+                Ok(rest) => rest,
+                Err(e) => {
+                    log::warn!("No se pudo loguear el REST para marcar como no leído: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = rest.ack_message_manual(&channel_id, &message_id).await {
+                log::warn!("No se pudo marcar como no leído el canal {channel_id}: {e}");
             }
         });
     });

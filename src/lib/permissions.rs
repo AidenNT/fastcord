@@ -20,7 +20,16 @@ use crate::discord::models::{PermissionOverwrite, Role};
 pub const ADMINISTRATOR: u64 = 1 << 3;
 pub const VIEW_CHANNEL: u64 = 1 << 10;
 pub const MENTION_EVERYONE: u64 = 1 << 17;
+pub const MANAGE_MESSAGES: u64 = 1 << 13;
 pub const CONNECT: u64 = 1 << 20;
+pub const ADD_REACTIONS: u64 = 1 << 6;
+pub const EMBED_LINKS: u64 = 1 << 14;
+pub const ATTACH_FILES: u64 = 1 << 15;
+pub const SEND_MESSAGES: u64 = 1 << 11;
+pub const READ_MESSAGE_HISTORY: u64 = 1 << 16;
+/// Desde el 23/02/2026 es el ÚNICO permiso que exime del modo lento (antes
+/// también lo hacían Administrar mensajes / canales / hilos).
+pub const BYPASS_SLOWMODE: u64 = 1 << 52;
 
 /// Qué tan accesible es un canal para la cuenta. El `Default` es "visible,
 /// sin candado" (el caso fail-open).
@@ -34,6 +43,22 @@ pub struct ChannelAccess {
     /// Solo canales de voz: la cuenta puede verlo pero no conectarse.
     /// Se marca con candado.
     pub cannot_connect: bool,
+    /// Permiso "Enviar mensajes". Sin él el compositor se bloquea.
+    pub can_send: bool,
+    /// Permiso "Adjuntar archivos".
+    pub can_attach: bool,
+    /// Permiso "Insertar enlaces" (sin él los links y GIFs no se expanden).
+    pub can_embed: bool,
+    /// Permiso "Ver el historial de mensajes": sin él no hay historial, solo
+    /// se ven los mensajes que llegan mientras se está mirando el canal.
+    pub can_read_history: bool,
+    /// Permiso "Añadir reacciones" (reacciones NUEVAS: sumarse a una que ya
+    /// existe sí se puede).
+    pub can_react: bool,
+    /// Exento del modo lento del canal (permiso "Saltarse el modo lento",
+    /// Administrador o dueño). Fail-open: si no se sabe, se asume exento para
+    /// no bloquear el envío por error.
+    pub bypass_slowmode: bool,
 }
 
 impl Default for ChannelAccess {
@@ -42,6 +67,12 @@ impl Default for ChannelAccess {
             can_view: true,
             private: false,
             cannot_connect: false,
+            can_send: true,
+            can_attach: true,
+            can_embed: true,
+            can_read_history: true,
+            can_react: true,
+            bypass_slowmode: true,
         }
     }
 }
@@ -148,6 +179,7 @@ pub fn channel_access(
             can_view: false,
             private: false,
             cannot_connect: false,
+            ..ChannelAccess::default()
         };
     }
 
@@ -167,6 +199,12 @@ pub fn channel_access(
         can_view: true,
         private,
         cannot_connect,
+        can_send: mine & SEND_MESSAGES != 0,
+        can_attach: mine & ATTACH_FILES != 0,
+        can_embed: mine & EMBED_LINKS != 0,
+        can_read_history: mine & READ_MESSAGE_HISTORY != 0,
+        can_react: mine & ADD_REACTIONS != 0,
+        bypass_slowmode: mine & BYPASS_SLOWMODE != 0,
     }
 }
 
@@ -188,12 +226,44 @@ pub fn can_mention_everyone(guild_id: &str, ctx: &AccessContext, roles: &[Role])
     base & (ADMINISTRATOR | MENTION_EVERYONE) != 0
 }
 
+/// ¿La cuenta puede borrar mensajes ajenos y sacar reacciones de otros en un
+/// canal (permiso "Administrar mensajes")? A diferencia del resto del módulo
+/// es fail-closed: si no se sabe, se asume que NO (mejor no ofrecer borrar
+/// que ofrecerlo y que falle).
+pub fn can_manage_messages(
+    guild_id: &str,
+    ctx: &AccessContext,
+    roles: &[Role],
+    overwrites: &[PermissionOverwrite],
+) -> bool {
+    if ctx.my_id.is_empty() {
+        return false;
+    }
+    if ctx.owner_id.as_deref() == Some(ctx.my_id.as_str()) {
+        return true;
+    }
+    let Some(my_roles) = ctx.my_roles.as_deref() else {
+        return false;
+    };
+    let Some(base) = base_permissions(guild_id, roles, my_roles) else {
+        return false;
+    };
+    if base & ADMINISTRATOR != 0 {
+        return true;
+    }
+    apply_overwrites(base, guild_id, overwrites, my_roles, Some(ctx.my_id.as_str())) & MANAGE_MESSAGES != 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const GUILD: &str = "1";
     const ME: &str = "42";
+    /// Lo que un @everyone normal puede hacer en el chat (sin saltarse el
+    /// modo lento).
+    const CHAT_PERMS: u64 =
+        SEND_MESSAGES | ATTACH_FILES | EMBED_LINKS | READ_MESSAGE_HISTORY | ADD_REACTIONS;
 
     fn role(id: &str, perms: u64) -> Role {
         Role {
@@ -222,7 +292,7 @@ mod tests {
 
     fn roles() -> Vec<Role> {
         vec![
-            role(GUILD, VIEW_CHANNEL | CONNECT),
+            role(GUILD, VIEW_CHANNEL | CONNECT | CHAT_PERMS),
             role("mod", 0),
             role("admin", ADMINISTRATOR),
         ]
@@ -231,7 +301,14 @@ mod tests {
     #[test]
     fn public_channel_is_open() {
         let a = channel_access(GUILD, &ctx(Some(vec![])), &roles(), &[], false);
-        assert_eq!(a, ChannelAccess::default());
+        // Abierto del todo, salvo que un @everyone común no se salta el modo lento.
+        assert_eq!(
+            a,
+            ChannelAccess {
+                bypass_slowmode: false,
+                ..ChannelAccess::default()
+            }
+        );
     }
 
     #[test]
@@ -303,6 +380,45 @@ mod tests {
         assert!(can_mention_everyone(GUILD, &ctx(Some(vec!["admin"])), &roles));
         // Datos que faltan: fail-open.
         assert!(can_mention_everyone(GUILD, &ctx(None), &roles));
+    }
+
+    #[test]
+    fn chat_permissions_follow_overwrites() {
+        // @everyone: sin enviar, sin adjuntar, sin historial ni reacciones.
+        let overwrites = [ow(
+            GUILD,
+            0,
+            0,
+            SEND_MESSAGES | ATTACH_FILES | READ_MESSAGE_HISTORY | ADD_REACTIONS,
+        )];
+        let a = channel_access(GUILD, &ctx(Some(vec![])), &roles(), &overwrites, false);
+        assert!(a.can_view && !a.can_send && !a.can_attach && !a.can_read_history && !a.can_react);
+        assert!(a.can_embed);
+        // Un rol que lo vuelve a permitir.
+        let overwrites = [
+            ow(GUILD, 0, 0, SEND_MESSAGES),
+            ow("mod", 0, SEND_MESSAGES, 0),
+        ];
+        let a = channel_access(GUILD, &ctx(Some(vec!["mod"])), &roles(), &overwrites, false);
+        assert!(a.can_send);
+    }
+
+    #[test]
+    fn slowmode_is_only_bypassed_with_the_permission() {
+        let plain = channel_access(GUILD, &ctx(Some(vec![])), &roles(), &[], false);
+        assert!(!plain.bypass_slowmode);
+        let all_roles = [
+            role(GUILD, VIEW_CHANNEL | CHAT_PERMS),
+            role("free", BYPASS_SLOWMODE),
+            role("admin", ADMINISTRATOR),
+        ];
+        let free = channel_access(GUILD, &ctx(Some(vec!["free"])), &all_roles, &[], false);
+        assert!(free.bypass_slowmode);
+        let admin = channel_access(GUILD, &ctx(Some(vec!["admin"])), &all_roles, &[], false);
+        assert!(admin.bypass_slowmode && admin.can_send);
+        // Sin datos: fail-open (exento).
+        let unknown = channel_access(GUILD, &ctx(None), &all_roles, &[], false);
+        assert!(unknown.bypass_slowmode && unknown.can_send);
     }
 
     #[test]

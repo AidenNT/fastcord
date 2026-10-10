@@ -1,4 +1,9 @@
-//! Depaquetizador H.264 sobre RTP (RFC 6184) para el visor de streams (Go Live).
+//! H.264 sobre RTP (RFC 6184) para Go Live: depaquetizador del visor y, al final
+//! del archivo, el lado emisor (divisor de access units, paquetizador FU-A y
+//! armado del paquete RTP de video).
+//!
+//! Parte receptora:
+//!
 //!
 //! Recibe los payloads RTP ya descifrados (capa de transporte) y devuelve
 //! *access units* completos en formato Annex B (cada NAL precedida por
@@ -412,5 +417,363 @@ mod tests {
             delivered += buffer.push(packet(sequence, 1, false, &[0])).len();
         }
         assert!(delivered > 0, "debería haber saltado el hueco");
+    }
+}
+
+
+// ===========================================================================
+// Lado emisor: transmitir nuestra pantalla (Go Live propio)
+// ===========================================================================
+//
+// El orden en el emisor es el inverso del receptor:
+//
+// 1. el codificador entrega un access unit completo en Annex B,
+// 2. se cifra con DAVE (`VoiceDaveState::prepare_outbound_h264`) ANTES de
+//    paquetizar,
+// 3. se paquetiza en RTP (este módulo: NAL sueltas o FU-A),
+// 4. se cifra cada paquete con el AEAD del transporte y se manda por UDP.
+
+/// Tamaño máximo del payload H.264 de un paquete RTP. Con la cabecera RTP, la
+/// extensión, el tag AEAD y el sufijo del nonce queda por debajo de los ~1280
+/// bytes que se pueden mandar por UDP sin fragmentar.
+pub(super) const RTP_VIDEO_MAX_PAYLOAD: usize = 1200;
+
+/// Reloj RTP del video: 90 kHz (RFC 6184 §8.2.1).
+pub(super) const RTP_VIDEO_CLOCK_HZ: u64 = 90_000;
+
+const NAL_SLICE: u8 = 1;
+const NAL_SEI: u8 = 6;
+const NAL_PPS: u8 = 8;
+const NAL_AUD: u8 = 9;
+
+/// Un frame ya codificado (un access unit en Annex B).
+#[derive(Clone, Debug)]
+pub(crate) struct EncodedFrame {
+    pub(crate) data: Vec<u8>,
+    /// Contiene una IDR: un espectador nuevo puede empezar a decodificar acá.
+    pub(crate) keyframe: bool,
+}
+
+/// Posiciones `(inicio_del_start_code, inicio_de_la_NAL)` de cada start code
+/// (`00 00 01` o `00 00 00 01`) de un buffer Annex B.
+fn find_start_codes(data: &[u8]) -> Vec<(usize, usize)> {
+    let mut found = Vec::new();
+    let mut index = 0;
+    while index + 3 <= data.len() {
+        if data[index] == 0 && data[index + 1] == 0 && data[index + 2] == 1 {
+            let code_start = if index > 0 && data[index - 1] == 0 {
+                index - 1
+            } else {
+                index
+            };
+            found.push((code_start, index + 3));
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    found
+}
+
+/// Parte un buffer Annex B en NALs, sin los start codes. Una NAL nunca termina
+/// en `0x00` (el RBSP siempre cierra con un bit en 1), así que los ceros del
+/// final pertenecen al start code siguiente o son relleno y se descartan.
+pub(super) fn split_annexb_nals(data: &[u8]) -> Vec<&[u8]> {
+    let codes = find_start_codes(data);
+    let mut nals = Vec::with_capacity(codes.len());
+    for (position, &(_, nal_start)) in codes.iter().enumerate() {
+        let mut end = codes
+            .get(position + 1)
+            .map(|&(next_code_start, _)| next_code_start)
+            .unwrap_or(data.len());
+        while end > nal_start && data[end - 1] == 0 {
+            end -= 1;
+        }
+        if end > nal_start {
+            nals.push(&data[nal_start..end]);
+        }
+    }
+    nals
+}
+
+/// Convierte un access unit Annex B en la lista de payloads RTP (RFC 6184):
+/// las NAL que entran van como "single NAL unit packet"; las más grandes, como
+/// fragmentos FU-A. El llamador pone el bit de marcador en el último payload.
+pub(super) fn packetize_h264_access_unit(access_unit: &[u8], max_payload: usize) -> Vec<Vec<u8>> {
+    let max_payload = max_payload.max(3);
+    let mut payloads = Vec::new();
+    for nal in split_annexb_nals(access_unit) {
+        if nal.len() <= max_payload {
+            payloads.push(nal.to_vec());
+            continue;
+        }
+        let indicator = (nal[0] & 0xE0) | NAL_FU_A;
+        let nal_type = nal[0] & 0x1F;
+        let body = &nal[1..];
+        let chunk = max_payload - 2;
+        let count = body.len().div_ceil(chunk);
+        for (index, part) in body.chunks(chunk).enumerate() {
+            let mut fu_header = nal_type;
+            if index == 0 {
+                fu_header |= 0x80; // S: primer fragmento
+            }
+            if index + 1 == count {
+                fu_header |= 0x40; // E: último fragmento
+            }
+            let mut payload = Vec::with_capacity(2 + part.len());
+            payload.push(indicator);
+            payload.push(fu_header);
+            payload.extend_from_slice(part);
+            payloads.push(payload);
+        }
+    }
+    payloads
+}
+
+/// Arma un paquete RTP de video con la extensión de "playout delay" que
+/// llevan los paquetes del cliente oficial (one-byte header, id 5, valor 0).
+///
+/// Con los modos `*_rtpsize` la cabecera fija y la cabecera de la extensión
+/// quedan como AAD y el cuerpo de la extensión se cifra junto con el payload;
+/// `parse_rtp_header` + `VoiceRtpEncryptor::encrypt_media_packet` ya lo hacen
+/// así para los paquetes que se reciben.
+pub(super) fn build_video_rtp_packet(
+    sequence: u16,
+    timestamp: u32,
+    ssrc: u32,
+    payload_type: u8,
+    marker: bool,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(12 + 8 + payload.len());
+    packet.push(0x90); // V=2, P=0, X=1, CC=0
+    packet.push((u8::from(marker) << 7) | (payload_type & 0x7F));
+    packet.extend_from_slice(&sequence.to_be_bytes());
+    packet.extend_from_slice(&timestamp.to_be_bytes());
+    packet.extend_from_slice(&ssrc.to_be_bytes());
+    packet.extend_from_slice(&[0xBE, 0xDE, 0x00, 0x01]);
+    packet.extend_from_slice(&[0x51, 0x00, 0x00, 0x00]);
+    packet.extend_from_slice(payload);
+    packet
+}
+
+/// ¿La NAL es el primer slice de una imagen nueva? `first_mb_in_slice` es un
+/// Exp-Golomb: vale 0 cuando el primer bit tras el header de la NAL es 1.
+fn starts_new_picture(nal: &[u8]) -> bool {
+    nal.get(1).is_some_and(|byte| byte & 0x80 != 0)
+}
+
+/// Corta el stream Annex B que escribe el codificador en access units. No
+/// depende de que el codificador emita delimitadores (AUD): una NAL abre un
+/// access unit nuevo si llega después de un slice y es un AUD/SEI/SPS/PPS o el
+/// primer slice de otra imagen. Los frames con varios slices (x264 con
+/// `zerolatency` los usa) quedan juntos.
+///
+/// Un access unit se entrega recién cuando llega el principio del siguiente, así
+/// que suma como mucho un frame de latencia.
+#[derive(Default)]
+pub(crate) struct AccessUnitSplitter {
+    /// Bytes que todavía no forman una NAL completa (falta el start code siguiente).
+    tail: Vec<u8>,
+    pending: Vec<u8>,
+    pending_has_slice: bool,
+    pending_keyframe: bool,
+}
+
+impl AccessUnitSplitter {
+    pub(crate) fn push(&mut self, bytes: &[u8]) -> Vec<EncodedFrame> {
+        self.tail.extend_from_slice(bytes);
+        let codes = find_start_codes(&self.tail);
+        // La última NAL puede estar a medias: solo valen las que tienen un
+        // start code después.
+        let Some(&(last_code_start, _)) = codes.last() else {
+            // Sin ningún start code todavía: se descarta basura vieja para que
+            // no crezca sin límite.
+            if self.tail.len() > MAX_FRAME_BYTES {
+                self.tail.clear();
+            }
+            return Vec::new();
+        };
+        let complete = self.tail[..last_code_start].to_vec();
+        self.tail.drain(..last_code_start);
+
+        let mut frames = Vec::new();
+        for nal in split_annexb_nals(&complete) {
+            let nal_type = nal[0] & 0x1F;
+            let is_slice = matches!(nal_type, NAL_SLICE | NAL_IDR);
+            let opens_new_unit = self.pending_has_slice
+                && match nal_type {
+                    NAL_AUD | NAL_SEI | NAL_SPS | NAL_PPS => true,
+                    NAL_SLICE | NAL_IDR => starts_new_picture(nal),
+                    _ => false,
+                };
+            if opens_new_unit {
+                frames.push(EncodedFrame {
+                    data: std::mem::take(&mut self.pending),
+                    keyframe: self.pending_keyframe,
+                });
+                self.pending_has_slice = false;
+                self.pending_keyframe = false;
+            }
+            self.pending.extend_from_slice(&START_CODE);
+            self.pending.extend_from_slice(nal);
+            if is_slice {
+                self.pending_has_slice = true;
+            }
+            if nal_type == NAL_IDR {
+                self.pending_keyframe = true;
+            }
+        }
+        frames
+    }
+}
+
+/// Arma un frame a partir de un access unit que ya llega entero (un paquete de
+/// `avcodec_receive_packet`). A diferencia de `AccessUnitSplitter`, no espera
+/// a ver el principio del siguiente: no suma latencia. Normaliza los start
+/// codes a 4 bytes y marca `keyframe` si trae una IDR. Devuelve `None` si no
+/// hay ningún slice (paquete vacío o solo cabeceras).
+pub(crate) fn encoded_frame_from_access_unit(data: &[u8]) -> Option<EncodedFrame> {
+    let mut out = Vec::with_capacity(data.len() + 8);
+    let mut has_slice = false;
+    let mut keyframe = false;
+    for nal in split_annexb_nals(data) {
+        let nal_type = nal[0] & 0x1F;
+        match nal_type {
+            NAL_SLICE => has_slice = true,
+            NAL_IDR => {
+                has_slice = true;
+                keyframe = true;
+            }
+            _ => {}
+        }
+        out.extend_from_slice(&START_CODE);
+        out.extend_from_slice(nal);
+    }
+    has_slice.then_some(EncodedFrame {
+        data: out,
+        keyframe,
+    })
+}
+
+#[cfg(test)]
+mod sender_tests {
+    use super::*;
+
+    fn annexb(nals: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for nal in nals {
+            out.extend_from_slice(&START_CODE);
+            out.extend_from_slice(nal);
+        }
+        out
+    }
+
+    #[test]
+    fn splits_three_and_four_byte_start_codes() {
+        let data = [0, 0, 1, 0x67, 1, 2, 0, 0, 0, 1, 0x68, 3, 0, 0, 1, 0x65, 4];
+        let nals = split_annexb_nals(&data);
+        assert_eq!(nals, vec![&[0x67, 1, 2][..], &[0x68, 3][..], &[0x65, 4][..]]);
+    }
+
+    #[test]
+    fn whole_access_unit_is_normalized_and_flags_idr() {
+        // AUD + SPS + PPS + IDR con start codes mezclados de 3 y 4 bytes.
+        let data = [
+            0, 0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x67, 1, 0, 0, 0, 1, 0x68, 2, 0, 0, 1, 0x65, 0x88, 9,
+        ];
+        let frame = encoded_frame_from_access_unit(&data).expect("tiene slice");
+        assert!(frame.keyframe);
+        assert_eq!(
+            frame.data,
+            annexb(&[&[0x09, 0xF0], &[0x67, 1], &[0x68, 2], &[0x65, 0x88, 9]])
+        );
+        // Un P-frame no es keyframe; sin slices no hay frame.
+        let p = encoded_frame_from_access_unit(&[0, 0, 0, 1, 0x41, 0x9A, 1]).unwrap();
+        assert!(!p.keyframe);
+        assert!(encoded_frame_from_access_unit(&[0, 0, 0, 1, 0x67, 1]).is_none());
+        assert!(encoded_frame_from_access_unit(&[]).is_none());
+    }
+
+    #[test]
+    fn small_nals_are_sent_as_single_packets() {
+        let au = annexb(&[&[0x67, 1, 2, 3], &[0x68, 4]]);
+        let payloads = packetize_h264_access_unit(&au, 100);
+        assert_eq!(payloads, vec![vec![0x67, 1, 2, 3], vec![0x68, 4]]);
+    }
+
+    #[test]
+    fn big_nals_round_trip_through_fu_a() {
+        let mut nal = vec![0x65];
+        nal.extend((0..5000u32).map(|n| (n % 251) as u8 + 1));
+        let au = annexb(&[&nal]);
+        let payloads = packetize_h264_access_unit(&au, 1200);
+        assert!(payloads.len() > 1);
+        assert!(payloads.iter().all(|payload| payload.len() <= 1200));
+        assert_eq!(payloads[0][0], (0x65 & 0xE0) | NAL_FU_A);
+        assert_eq!(payloads[0][1], 0x80 | 5);
+        assert_eq!(payloads.last().unwrap()[1], 0x40 | 5);
+
+        // El depaquetizador del visor tiene que rearmar lo mismo.
+        let mut depacketizer = H264Depacketizer::default();
+        let mut rebuilt = None;
+        let last = payloads.len() - 1;
+        for (index, payload) in payloads.into_iter().enumerate() {
+            rebuilt = depacketizer.push(&RtpVideoPacket {
+                sequence: index as u16,
+                timestamp: 1000,
+                marker: index == last,
+                payload,
+            });
+        }
+        assert_eq!(rebuilt.expect("access unit"), au);
+    }
+
+    #[test]
+    fn splitter_groups_slices_and_marks_keyframes() {
+        let sps = [0x67, 0x42, 0x00, 0x1f];
+        let pps = [0x68, 0xce, 0x38];
+        let idr_a = [0x65, 0x88, 1, 2]; // first_mb = 0
+        let idr_b = [0x65, 0x10, 3, 4]; // otro slice de la misma imagen
+        let p_frame = [0x41, 0x9a, 5, 6];
+        // El último AUD solo sirve de centinela: una NAL se procesa cuando llega
+        // el start code que la sigue, así que la final queda esperando.
+        let stream = annexb(&[
+            &[0x09, 0x10],
+            &sps,
+            &pps,
+            &idr_a,
+            &idr_b,
+            &[0x09, 0x30],
+            &p_frame,
+            &[0x09, 0x30],
+            &[0x09, 0x10],
+        ]);
+
+        let mut splitter = AccessUnitSplitter::default();
+        let mut frames = Vec::new();
+        // En trozos de 5 bytes, para ejercitar los cortes en medio de una NAL.
+        for chunk in stream.chunks(5) {
+            frames.extend(splitter.push(chunk));
+        }
+        assert_eq!(frames.len(), 2);
+        assert!(frames[0].keyframe);
+        assert!(!frames[1].keyframe);
+        assert_eq!(
+            frames[0].data,
+            annexb(&[&[0x09, 0x10], &sps, &pps, &idr_a, &idr_b])
+        );
+        assert_eq!(frames[1].data, annexb(&[&[0x09, 0x30], &p_frame]));
+    }
+
+    #[test]
+    fn video_rtp_packet_parses_with_its_extension() {
+        let packet = build_video_rtp_packet(7, 9000, 0x01020304, 101, true, &[1, 2, 3]);
+        let header = crate::discord::voice::rtp::parse_rtp_header(&packet).unwrap();
+        assert_eq!(header.payload_type, 101);
+        assert!(header.marker);
+        assert_eq!(header.authenticated_header_len, 16);
+        assert_eq!(header.encrypted_extension_body_len, 4);
+        assert_eq!(&packet[header.payload_offset..], &[1, 2, 3]);
     }
 }

@@ -5,9 +5,12 @@ use egui::Color32;
 use crate::discord::models::{PrivateChannel, User, UserProfileResponse};
 use crate::discord::voice::VoiceRuntimeEvent;
 use crate::discord::voice::{StreamWatchHandle, StreamWatchParams, spawn_stream_watch};
-use crate::discord::StreamWatchStatus;
+use crate::discord::voice::{CaptureMonitor, CaptureTarget, CaptureWindow, ScreenCaptureConfig, StreamPublishHandle, StreamPublishParams, StreamQuality, list_capture_monitors, list_capture_windows, spawn_stream_publish};
+use crate::discord::{StreamPublishStatus, StreamWatchStatus};
 use crate::discord::voice::{VoiceAudioSourceOptions, VoiceAudioSources, list_voice_audio_sources};
-use crate::discord::{AppEvent, CurrentVoiceConnectionState, VoiceAudioSettings, VoiceCache, VoiceConnectionStatus};
+use crate::discord::{
+    AppEvent, CurrentVoiceConnectionState, VoiceAudioSettings, VoiceCache, VoiceConnectPhase, VoiceConnectionStatus,
+};
 use crate::lib::data::{demo_activity, demo_friends, demo_servers, ActivityCard, ChatMessage, Friend, NameResolver, Server};
 use crate::theme::{Backdrop, BackdropRuntime, Palette, ThemeDef, ThemeEditor, ThemeMode};
 use crate::ui::settings::SettingsTab;
@@ -326,6 +329,32 @@ pub struct FullProfile {
     pub tab: usize,
 }
 
+/// Nuestra propia transmisión (Go Live), a lo sumo una. Ver
+/// `App::start_broadcast`.
+pub struct BroadcastStream {
+    /// `guild:<guild>:<canal>:<yo>` o `call:<canal>:<yo>`.
+    pub stream_key: String,
+    /// Canal de voz desde el que se transmite.
+    pub channel_id: String,
+    pub status: StreamPublishStatus,
+    /// Detalle del error cuando `status == Failed`.
+    pub message: Option<String>,
+    /// Qué se transmite (toda la pantalla o una ventana). Se elige en
+    /// `ui::share_picker`; se usa recién cuando llegan los datos de media
+    /// (`try_start_stream_publish`), por eso se guarda acá.
+    capture_target: CaptureTarget,
+    /// Conexión de media + captura. `None` hasta que llegan `rtc_server_id`,
+    /// endpoint y token; al soltarlo se corta la transmisión.
+    handle: Option<StreamPublishHandle>,
+    /// Vista previa de lo que se está transmitiendo: el hilo de captura deja
+    /// ahí un frame chico a pocos fps (`pump_stream_frames` lo sube a
+    /// `preview_texture`). Se pausa solo con la ventana en segundo plano.
+    pub preview: crate::discord::voice::StreamFrameSlot,
+    pub preview_texture: Option<egui::TextureHandle>,
+    /// Tamaño en píxeles de `preview_texture`, para respetar la proporción.
+    pub preview_size: [usize; 2],
+}
+
 /// Lo que ya se sabe de un stream (Go Live) que pedimos ver. `STREAM_CREATE`
 /// y `STREAM_SERVER_UPDATE` llegan por separado y pueden invertirse, así que
 /// se van juntando acá hasta tener los tres datos (`try_start_stream_watch`).
@@ -357,6 +386,15 @@ pub struct WatchedStream {
     /// Cuántos frames se subieron a la textura (contador de diagnóstico que
     /// muestra el visor).
     pub frames_shown: u64,
+    /// El video está pausado porque la ventana está en segundo plano
+    /// (`App::update_video_pause`): la UI muestra un aviso en vez del video.
+    pub paused: bool,
+}
+
+/// Miniatura de un stream ajeno y cuándo se pidió (`App::stream_preview_url`).
+struct StreamPreviewEntry {
+    url: Option<String>,
+    requested_at: Instant,
 }
 
 pub struct App {
@@ -542,6 +580,14 @@ pub struct App {
     /// Cuándo se mandó el último ack por canal, para no pegarle a la API en
     /// cada mensaje cuando el chat abierto recibe muchos seguidos.
     ack_sent_at: std::collections::HashMap<String, Instant>,
+    /// "N mensajes nuevos desde ..." del chat abierto (canal → marca). Ver
+    /// `track_unread_marker`.
+    pub unread_markers: std::collections::HashMap<String, crate::lib::data::UnreadMarker>,
+    /// Canal al que corresponde la marca de arriba (para detectar el cambio).
+    unread_tracked_channel: Option<String>,
+    /// Canal donde se usó "Marcar no leído": mientras se siga mirando no se
+    /// vuelve a marcar como leído solo (`ack_viewed_channel`).
+    unread_hold: Option<String>,
     /// Menciones sin leer que trajo el `READY` y todavía no se pudieron
     /// asignar a un canal conocido (los canales de un server recién se
     /// cargan al abrirlo). Se reintenta al llegar `GuildChannels`.
@@ -608,6 +654,18 @@ pub struct App {
     pub custom_themes: Vec<ThemeDef>,
     /// Si el panel de ajustes (`ui::settings`) está abierto.
     pub settings_open: bool,
+    /// Si el popup de micrófono y Clean Mic (`ui::clean_mic_popup`) está abierto.
+    pub clean_mic_open: bool,
+    /// Si el selector de "Compartir pantalla" (`ui::share_picker`) está abierto.
+    pub(crate) share_picker_open: bool,
+    /// Ventanas que ofrece el selector; se vuelve a leer al abrirlo y con el
+    /// botón de actualizar (`refresh_share_windows`).
+    pub(crate) share_picker_windows: Vec<CaptureWindow>,
+    /// Pantallas que ofrece la pestaña "Pantalla completa" del selector.
+    pub(crate) share_picker_monitors: Vec<CaptureMonitor>,
+    /// Resolución y fps que eligió la persona en el engranaje de "Calidad"
+    /// del selector; se aplican al arrancar la transmisión.
+    pub(crate) share_quality: StreamQuality,
     /// "Usar nueva interfaz" (Ajustes → Apariencia): la barra de llamada va a
     /// todo el ancho abajo de la ventana (`ui::call_bar::show_bottom`) en vez
     /// de la tarjeta chica del panel izquierdo. Se persiste solo; ver
@@ -702,6 +760,9 @@ pub struct App {
     /// llamada: "Conectando...", "Voz conectada", un error, etc.
     pub voice_connection_status: Option<VoiceConnectionStatus>,
     pub voice_connection_message: Option<String>,
+    /// Fase del arranque de la conexión de voz (`AppEvent::VoiceConnectPhaseChanged`);
+    /// `None` = todavía no llegó ninguna (se está esperando al servidor de voz).
+    pub voice_connect_phase: Option<VoiceConnectPhase>,
     /// Preferencia de mute/deafen del propio usuario, independiente de
     /// estar en una llamada o no — igual que en el cliente real, los
     /// botones de mic/audífonos de la barra de usuario (`ui::friends_panel
@@ -717,6 +778,15 @@ pub struct App {
     stream_sessions: std::collections::HashMap<String, PendingStreamSession>,
     /// Stream que se está viendo (`watch_stream`), si hay uno.
     pub watching_stream: Option<WatchedStream>,
+    /// Nuestra propia transmisión (`start_broadcast`), si hay una.
+    pub broadcasting_stream: Option<BroadcastStream>,
+    /// Miniaturas de los streams de otras personas, por `stream_key`.
+    stream_previews: std::collections::HashMap<String, StreamPreviewEntry>,
+    /// Desde cuándo la ventana está sin foco o minimizada (`None` = al frente).
+    window_inactive_since: Option<Instant>,
+    /// La ventana lleva un rato en segundo plano: se deja de procesar el video
+    /// de los streams (el que se ve y la vista previa del propio).
+    pub video_paused: bool,
     /// Contexto de egui, guardado para que el hilo de video pueda pedir un
     /// repintado cada vez que hay un frame nuevo (los eventos de Discord se
     /// procesan sin acceso al contexto).
@@ -758,6 +828,8 @@ impl Default for App {
             Ok(Some(json)) => serde_json::from_str::<VoiceAudioSettings>(&json).unwrap_or_default(),
             _ => VoiceAudioSettings::default(),
         };
+        // Parámetros de la cadena de Clean Mic (ver `discord::clean_mic`).
+        crate::discord::clean_mic::load_from_storage();
         let voice_audio_sources = match web_local_storage_api::get_item("voice_audio_sources") {
             Ok(Some(json)) => serde_json::from_str::<VoiceAudioSources>(&json).unwrap_or_default(),
             _ => VoiceAudioSources::default(),
@@ -839,6 +911,9 @@ impl Default for App {
             guild_mentions: std::collections::HashMap::new(),
             acked_messages: std::collections::HashMap::new(),
             ack_sent_at: std::collections::HashMap::new(),
+            unread_markers: std::collections::HashMap::new(),
+            unread_tracked_channel: None,
+            unread_hold: None,
             pending_mentions: std::collections::HashMap::new(),
             presences: std::collections::HashMap::new(),
             user_activities: std::collections::HashMap::new(),
@@ -861,6 +936,11 @@ impl Default for App {
             theme_mode: theme_mode.clone(),
             custom_themes,
             settings_open: false,
+            clean_mic_open: false,
+            share_picker_open: false,
+            share_picker_windows: Vec::new(),
+            share_picker_monitors: Vec::new(),
+            share_quality: StreamQuality::default(),
             theme_editor: None,
             backdrop: Backdrop::default(),
             backdrop_rt: BackdropRuntime::default(),
@@ -885,10 +965,15 @@ impl Default for App {
             voice_target: None,
             voice_connection_status: None,
             voice_connection_message: None,
+            voice_connect_phase: None,
             self_mute: false,
             self_deaf: false,
             stream_sessions: std::collections::HashMap::new(),
             watching_stream: None,
+            broadcasting_stream: None,
+            stream_previews: std::collections::HashMap::new(),
+            window_inactive_since: None,
+            video_paused: false,
             egui_ctx: None,
             new_call_ui,
             ui_scale,
@@ -1194,6 +1279,9 @@ impl App {
         self.guild_mentions.clear();
         self.acked_messages.clear();
         self.ack_sent_at.clear();
+        self.unread_markers.clear();
+        self.unread_tracked_channel = None;
+        self.unread_hold = None;
         self.pending_mentions.clear();
         self.presences.clear();
         self.user_activities.clear();
@@ -1211,6 +1299,8 @@ impl App {
         self.dm_profile = None;
         self.profile_full = None;
         self.watching_stream = None;
+        self.broadcasting_stream = None;
+        self.share_picker_open = false;
         self.stream_sessions.clear();
         self.voice_target = None;
         // El estado de voz es de la cuenta, pero el audio elegido es una
@@ -1231,6 +1321,7 @@ impl App {
         self.voice_runtime_tx = None;
         self.voice_connection_status = None;
         self.voice_connection_message = None;
+        self.voice_connect_phase = None;
         // Si el Gateway sigue vivo (p. ej. un 401 de REST con el socket
         // todavía abierto) hay que pedirle que cierre, si no seguiría
         // conectado en segundo plano sin nadie escuchándolo.
@@ -1820,6 +1911,14 @@ impl App {
             return;
         }
         let Some(channel_id) = ch.channel_id.clone() else { return };
+        // Sin "Ver el historial de mensajes" Discord devuelve la lista vacía:
+        // no se pide nada y el chat avisa (solo se ven los mensajes nuevos).
+        if !ch.access.can_read_history {
+            ch.loaded = true;
+            ch.loading = false;
+            ch.has_more = false;
+            return;
+        }
         // Primera vez que se abre este canal en la sesión y quedó una
         // posición guardada (de antes de cerrar el cliente): en vez de
         // ir al último mensaje se pide la ventana alrededor del que
@@ -2286,6 +2385,148 @@ impl App {
             .filter(|id| !id.is_empty() && *id != "0")
     }
 
+    /// Mensajes cargados del canal/DM que se está mirando.
+    fn viewed_messages(&self) -> Option<&[ChatMessage]> {
+        match self.screen {
+            Screen::Dm(i) => Some(self.friends.get(i)?.messages.as_slice()),
+            Screen::Server(i) => {
+                let (category, channel) = self.current_channel;
+                Some(self.servers.get(i)?.channel(category, channel)?.messages.as_slice())
+            }
+            _ => None,
+        }
+    }
+
+    /// Al entrar a un canal/DM guarda el último mensaje leído de ANTES de
+    /// entrar (`unread_markers`): sirve para la barra "N mensajes nuevos
+    /// desde las ..." y la línea "NUEVO". Va antes de `ack_viewed_channel`,
+    /// que pisa esa referencia. Al salir del canal la marca se descarta.
+    fn track_unread_marker(&mut self) {
+        let current = self.viewed_channel_id();
+        if current == self.unread_tracked_channel {
+            return;
+        }
+        self.unread_hold = None;
+        if let Some(prev) = self.unread_tracked_channel.take() {
+            self.unread_markers.remove(&prev);
+        }
+        if let Some(channel_id) = current.clone() {
+            if let Some(last_read) = self.last_read_message(&channel_id).map(str::to_string) {
+                self.unread_markers
+                    .insert(channel_id, crate::lib::data::UnreadMarker::new(last_read));
+            }
+        }
+        self.unread_tracked_channel = current;
+    }
+
+    /// Click en "N mensajes nuevos desde...": va al primer mensaje que no se
+    /// vio. Si no está en la ventana cargada, pide los mensajes alrededor del
+    /// último leído (los nuevos quedan justo debajo).
+    pub fn jump_to_first_unread(&mut self) {
+        use crate::lib::notifications::snowflake;
+        let Some(channel_id) = self.viewed_channel_id() else { return };
+        let Some(last_read) = self.unread_markers.get(&channel_id).map(|m| m.last_read.clone()) else {
+            return;
+        };
+        let last_n = snowflake(&last_read);
+        let first = self.viewed_messages().and_then(|msgs| {
+            msgs.iter()
+                .find(|m| !m.is_own && !m.id.is_empty() && snowflake(&m.id) > last_n)
+                .map(|m| m.id.clone())
+        });
+        match first {
+            Some(id) => self.jump_to_message(&channel_id, &id),
+            None => self.jump_to_message(&channel_id, &last_read),
+        }
+    }
+
+    /// "Marcar no leídos" (menú de un mensaje): el canal queda sin leer desde
+    /// ese mensaje (ack hacia atrás, como el cliente oficial) y se muestra la
+    /// barra "N mensajes nuevos desde..." con la línea NUEVO. No se vuelve a
+    /// marcar como leído solo hasta salir del canal o apretar "Marcar como leído".
+    pub fn mark_message_unread(&mut self, message_id: &str) {
+        use crate::lib::notifications::snowflake;
+        let Some(channel_id) = self.viewed_channel_id() else { return };
+        let n = snowflake(message_id);
+        if n == 0 {
+            return;
+        }
+        let before = (n - 1).to_string();
+        self.acked_messages.insert(channel_id.clone(), before.clone());
+        self.ack_sent_at.insert(channel_id.clone(), Instant::now());
+        self.unread_hold = Some(channel_id.clone());
+        self.unread_markers
+            .insert(channel_id.clone(), crate::lib::data::UnreadMarker::new(before.clone()));
+        if let Some(token) = self.discord_token.clone() {
+            crate::discord::spawn_ack_message_manual(token, channel_id, before);
+        }
+    }
+
+    /// "Marcar como leído": oculta la barra y, si la ventana quedó en el
+    /// medio del historial, vuelve a lo más nuevo (que es lo que se marca).
+    pub fn mark_viewed_read(&mut self) {
+        self.unread_hold = None;
+        if let Some(channel_id) = self.viewed_channel_id() {
+            if let Some(marker) = self.unread_markers.get_mut(&channel_id) {
+                marker.dismissed = true;
+            }
+        }
+        self.jump_to_present();
+    }
+
+    /// "Ir al actual": si la ventana cargada no llega al último mensaje
+    /// (`has_newer`) la descarta y pide lo más nuevo; si ya llega, no hace
+    /// nada acá (el chat solo baja el scroll).
+    pub fn jump_to_present(&mut self) {
+        let Some((token, tx)) = self.discord_token.clone().zip(self.event_tx.clone()) else {
+            return;
+        };
+        match self.screen {
+            Screen::Dm(i) => {
+                let Some(friend) = self.friends.get_mut(i) else { return };
+                if !friend.has_newer {
+                    return;
+                }
+                let Some(channel_id) = friend.dm_channel_id.clone() else { return };
+                friend.messages.clear();
+                friend.has_newer = false;
+                friend.has_more = true;
+                friend.loaded = true;
+                friend.loading = true;
+                friend.loading_more = false;
+                friend.loading_newer = false;
+                self.pending_jump = None;
+                self.pending_scroll_anchor = None;
+                crate::discord::spawn_fetch_channel_messages(token, channel_id, tx);
+            }
+            Screen::Server(i) => {
+                let (category, channel) = self.current_channel;
+                let Some(ch) = self
+                    .servers
+                    .get_mut(i)
+                    .and_then(|s| s.channel_mut(category, channel))
+                else {
+                    return;
+                };
+                if !ch.has_newer {
+                    return;
+                }
+                let Some(channel_id) = ch.channel_id.clone() else { return };
+                ch.messages.clear();
+                ch.has_newer = false;
+                ch.has_more = true;
+                ch.loaded = true;
+                ch.loading = true;
+                ch.loading_more = false;
+                ch.loading_newer = false;
+                self.pending_jump = None;
+                self.pending_scroll_anchor = None;
+                crate::discord::spawn_fetch_channel_messages(token, channel_id, tx);
+            }
+            _ => {}
+        }
+    }
+
     /// Va a un mensaje puntual de un canal/DM ya conocido. Si el mensaje ya
     /// está en la ventana cargada solo se mueve el scroll hasta él; si no,
     /// se piden los mensajes ALREDEDOR (`?limit=30&around=<id>`) y la lista
@@ -2475,6 +2716,12 @@ impl App {
     /// sesión o Discord no lo informó (ver `User::has_nitro`).
     pub fn has_nitro(&self) -> Option<bool> {
         self.me.as_ref().and_then(|u| u.has_nitro())
+    }
+
+    /// Tamaño máximo por archivo que se le ofrece subir a la cuenta (ver
+    /// `discord::uploads::max_upload_bytes`).
+    pub fn upload_limit_bytes(&self, in_guild: bool) -> u64 {
+        crate::discord::uploads::max_upload_bytes(self.me.as_ref().and_then(|u| u.premium_type), in_guild)
     }
 
     /// Abre un popup modal centrado. Reemplaza cualquier modal ya abierto.
@@ -4155,6 +4402,19 @@ impl App {
                     self.stream_sessions.entry(key.clone()).or_default().rtc_server_id =
                         create.rtc_server_id.clone();
                     self.try_start_stream_watch(&key);
+                } else if self.broadcasting_stream.as_ref().is_some_and(|b| b.stream_key == key) {
+                    self.stream_sessions.entry(key.clone()).or_default().rtc_server_id =
+                        create.rtc_server_id.clone();
+                    // Un stream propio nace pausado: hay que reanudarlo.
+                    if create.paused
+                        && let Some(commands) = self.gateway_commands.clone()
+                    {
+                        let _ = commands.send(crate::discord::gateway::GatewayCommand::StreamSetPaused {
+                            stream_key: key.clone(),
+                            paused: false,
+                        });
+                    }
+                    self.try_start_stream_publish(&key);
                 }
             }
             AppEvent::StreamServerUpdate(update) => {
@@ -4164,11 +4424,30 @@ impl App {
                     pending.endpoint = update.endpoint.clone();
                     pending.token = update.token.clone();
                     self.try_start_stream_watch(&key);
+                } else if self.broadcasting_stream.as_ref().is_some_and(|b| b.stream_key == key) {
+                    let pending = self.stream_sessions.entry(key.clone()).or_default();
+                    pending.endpoint = update.endpoint.clone();
+                    pending.token = update.token.clone();
+                    self.try_start_stream_publish(&key);
                 }
             }
             AppEvent::StreamUpdate(_) => {}
             AppEvent::StreamDelete(delete) => {
                 self.stream_sessions.remove(&delete.stream_key);
+                if self
+                    .broadcasting_stream
+                    .as_ref()
+                    .is_some_and(|b| b.stream_key == delete.stream_key)
+                {
+                    // Discord cortó nuestro stream (o ya lo cortamos nosotros):
+                    // se suelta la captura sin volver a avisarle al Gateway.
+                    self.broadcasting_stream = None;
+                    self.push_toast(
+                        ToastKind::Info,
+                        "Transmisión terminada",
+                        "Dejaste de compartir tu pantalla".to_string(),
+                    );
+                }
                 if self.watching_stream.as_ref().is_some_and(|w| w.stream_key == delete.stream_key) {
                     let name = self
                         .watching_stream
@@ -4184,6 +4463,31 @@ impl App {
                         format!("{name} dejó de transmitir"),
                     );
                 }
+            }
+            AppEvent::StreamPublishStatus { stream_key, status, message } => {
+                let mut failed = false;
+                if let Some(broadcast) = self.broadcasting_stream.as_mut()
+                    && broadcast.stream_key == stream_key
+                {
+                    broadcast.status = status;
+                    broadcast.message = message.clone();
+                    failed = status == StreamPublishStatus::Failed;
+                }
+                if failed {
+                    // La conexión ya murió: se corta también el stream en Discord.
+                    self.stop_broadcast();
+                    self.push_toast(
+                        ToastKind::Warning,
+                        "No se pudo transmitir",
+                        message.unwrap_or_else(|| "Error de conexión".to_string()),
+                    );
+                }
+            }
+            AppEvent::StreamPreview { stream_key, url } => {
+                self.stream_previews.insert(
+                    stream_key,
+                    StreamPreviewEntry { url, requested_at: Instant::now() },
+                );
             }
             AppEvent::StreamWatchStatus { stream_key, status, message } => {
                 if let Some(watched) = self.watching_stream.as_mut()
@@ -4210,6 +4514,8 @@ impl App {
                 // vez de quedarse mostrando una llamada que ya no existe.
                 if matches!(status, VoiceConnectionStatus::Disconnected | VoiceConnectionStatus::Failed) {
                     self.voice_target = None;
+                    self.voice_connect_phase = None;
+                    self.stop_broadcast();
                 }
                 if status == VoiceConnectionStatus::Failed
                     && let Some(message) = &message
@@ -4218,6 +4524,13 @@ impl App {
                 }
                 self.voice_connection_status = Some(status);
                 self.voice_connection_message = message;
+            }
+            AppEvent::VoiceConnectPhaseChanged { phase, .. } => {
+                // Un evento rezagado de una llamada que ya cortamos no debe
+                // reaparecer en la barra.
+                if self.voice_target.is_some() {
+                    self.voice_connect_phase = Some(phase);
+                }
             }
             // Ya actualizado en `apply_voice_wire_event` arriba del
             // `match` (afecta a `self.voice.states`, no a nada más de
@@ -4473,6 +4786,9 @@ impl App {
         }
         let Some(token) = self.discord_token.clone() else { return };
         let Some((channel_id, latest)) = self.viewed_latest_message() else { return };
+        if self.unread_hold.as_deref() == Some(channel_id.as_str()) {
+            return;
+        }
         let latest_n = snowflake(&latest);
         if latest_n == 0 {
             return;
@@ -5559,7 +5875,8 @@ impl App {
             return;
         };
         let scope = crate::discord::VoiceScope::Guild(guild_id);
-        self.voice_target = Some(self.requested_voice_state(scope, channel_id));
+        let target = self.requested_voice_state(scope, channel_id);
+        self.set_voice_target(target);
         self.sync_voice_target();
     }
 
@@ -5796,20 +6113,49 @@ impl App {
     pub fn start_dm_call(&mut self, channel_id: &str) {
         let Some(id) = crate::discord::voice::parse_channel_id(channel_id) else { return };
         let scope = crate::discord::VoiceScope::Private(id);
-        self.voice_target = Some(self.requested_voice_state(scope, id));
+        let target = self.requested_voice_state(scope, id);
+        self.set_voice_target(target);
         self.sync_voice_target();
     }
 
     /// Corta la conexión de voz actual, si hay una (canal de server o
     /// llamada de DM). Botón de colgar de la barra de llamada.
     pub fn leave_voice(&mut self) {
-        // Un stream se ve estando en el canal: al salir se corta también.
+        // Un stream se ve (o se transmite) estando en el canal: al salir se corta también.
+        self.stop_broadcast();
         self.stop_watching_stream();
         if self.voice_target.is_none() {
             return;
         }
         self.voice_target = None;
+        self.voice_connection_status = None;
+        self.voice_connection_message = None;
+        self.voice_connect_phase = None;
         self.sync_voice_target();
+    }
+
+    /// Fija la llamada pedida. Si es otro canal (o no había llamada), el
+    /// progreso de conexión de la anterior se descarta para que la barra
+    /// arranque de cero en "Esperando al servidor de voz".
+    fn set_voice_target(&mut self, target: CurrentVoiceConnectionState) {
+        let changed = self
+            .voice_target
+            .as_ref()
+            .is_none_or(|current| current.scope != target.scope || current.channel_id != target.channel_id);
+        if changed {
+            self.voice_connection_status = None;
+            self.voice_connection_message = None;
+            self.voice_connect_phase = None;
+        }
+        self.voice_target = Some(target);
+    }
+
+    /// `true` con la conexión de voz completamente lista (websocket abierto y
+    /// el cifrado negociado). `Connected` solo significa que el websocket
+    /// abrió, así que además hay que haber llegado a la última fase.
+    pub fn voice_fully_connected(&self) -> bool {
+        self.voice_connection_status == Some(VoiceConnectionStatus::Connected)
+            && matches!(self.voice_connect_phase, None | Some(VoiceConnectPhase::Ready))
     }
 
     /// Prende/apaga el propio micrófono. Silenciarse no toca `self_deaf`;
@@ -6119,6 +6465,138 @@ fn apply_remote_reaction(msg: &mut ChatMessage, emoji: crate::lib::data::Reactio
     }
 }
 
+// ---- Go Live: transmitir la propia pantalla ----
+impl App {
+    /// ¿Hay una transmisión propia en curso (o arrancando)?
+    pub fn is_broadcasting(&self) -> bool {
+        self.broadcasting_stream.is_some()
+    }
+
+    /// Botón "Compartir pantalla" de la barra de llamada: con una transmisión
+    /// en curso la corta; si no, abre el selector para elegir qué transmitir
+    /// (el selector llama a `start_broadcast` con lo elegido).
+    pub fn toggle_broadcast(&mut self) {
+        if self.is_broadcasting() {
+            self.stop_broadcast();
+        } else {
+            self.open_share_picker();
+        }
+    }
+
+    /// Abre el selector de "Compartir pantalla" con la lista de ventanas al día.
+    pub fn open_share_picker(&mut self) {
+        self.refresh_share_windows();
+        self.share_picker_open = true;
+    }
+
+    /// Vuelve a leer las ventanas abiertas (botón de actualizar del selector).
+    pub fn refresh_share_windows(&mut self) {
+        self.share_picker_windows = list_capture_windows();
+        self.share_picker_monitors = list_capture_monitors();
+    }
+
+    /// Empieza a transmitir `target` (toda la pantalla o una ventana) al canal
+    /// de voz actual (opcode 18). Discord responde con `STREAM_CREATE` +
+    /// `STREAM_SERVER_UPDATE` y recién ahí (`try_start_stream_publish`) se abre
+    /// la conexión de media y arranca la captura.
+    pub(crate) fn start_broadcast(&mut self, target: CaptureTarget) {
+        self.share_picker_open = false;
+        if self.broadcasting_stream.is_some() {
+            return;
+        }
+        let Some(voice) = self.voice_target.as_ref() else {
+            self.push_toast(
+                ToastKind::Info,
+                "Compartir pantalla",
+                "Entrá a un canal de voz o a una llamada para transmitir".to_string(),
+            );
+            return;
+        };
+        if !self.voice_fully_connected() {
+            self.push_toast(
+                ToastKind::Info,
+                "Compartir pantalla",
+                "Esperá a que termine de conectarse la llamada".to_string(),
+            );
+            return;
+        }
+        let guild_id = voice.scope.guild_id().map(|id| id.to_string());
+        let channel_id = voice.channel_id.to_string();
+        let Some(me_id) = self.me.as_ref().map(|me| me.id.clone()) else { return };
+        let Some(commands) = self.gateway_commands.clone() else {
+            self.push_toast(ToastKind::Warning, "Sin conexión", "Todavía no hay conexión con Discord".to_string());
+            return;
+        };
+        let stream_key = match &guild_id {
+            Some(guild_id) => format!("guild:{guild_id}:{channel_id}:{me_id}"),
+            None => format!("call:{channel_id}:{me_id}"),
+        };
+        self.stream_sessions.remove(&stream_key);
+        self.broadcasting_stream = Some(BroadcastStream {
+            stream_key,
+            channel_id: channel_id.clone(),
+            status: StreamPublishStatus::Connecting,
+            message: None,
+            capture_target: target,
+            handle: None,
+            preview: crate::discord::voice::StreamFrameSlot::default(),
+            preview_texture: None,
+            preview_size: [0, 0],
+        });
+        let _ = commands.send(crate::discord::gateway::GatewayCommand::StreamCreate {
+            guild_id,
+            channel_id,
+        });
+    }
+
+    /// Deja de transmitir: le avisa al Gateway (opcode 19) y corta la conexión
+    /// y la captura.
+    pub fn stop_broadcast(&mut self) {
+        let Some(broadcast) = self.broadcasting_stream.take() else { return };
+        self.stream_sessions.remove(&broadcast.stream_key);
+        if let Some(commands) = self.gateway_commands.clone() {
+            let _ = commands.send(crate::discord::gateway::GatewayCommand::StreamDelete {
+                stream_key: broadcast.stream_key.clone(),
+            });
+        }
+        // `broadcast` se suelta acá: `StreamPublishHandle::drop` corta todo.
+    }
+
+    /// Si ya se juntaron `rtc_server_id`, endpoint y token de nuestro stream,
+    /// abre la conexión de media y arranca la captura.
+    fn try_start_stream_publish(&mut self, stream_key: &str) {
+        let Some(pending) = self.stream_sessions.get(stream_key) else { return };
+        let (Some(rtc_server_id), Some(endpoint), Some(token)) =
+            (pending.rtc_server_id.clone(), pending.endpoint.clone(), pending.token.clone())
+        else {
+            return;
+        };
+        let Some(user_id) = self.me.as_ref().and_then(|me| crate::discord::voice::parse_user_id(&me.id)) else {
+            return;
+        };
+        let Some(event_tx) = self.event_tx.clone() else { return };
+        if self.gateway_session_id.is_empty() {
+            return;
+        }
+        let session_id = self.gateway_session_id.clone();
+        let Some(broadcast) = self.broadcasting_stream.as_mut() else { return };
+        if broadcast.stream_key != stream_key || broadcast.handle.is_some() {
+            return;
+        }
+        let params = StreamPublishParams {
+            stream_key: stream_key.to_string(),
+            rtc_server_id,
+            endpoint,
+            token,
+            user_id,
+            session_id,
+            capture: ScreenCaptureConfig::new(broadcast.capture_target.clone(), self.share_quality),
+            preview: broadcast.preview.clone(),
+        };
+        broadcast.handle = Some(spawn_stream_publish(params, event_tx));
+    }
+}
+
 // ---- Go Live: ver el stream de otra persona ----
 impl App {
     /// Pide ver el stream de `owner_user_id` en el canal de voz `channel_id`
@@ -6150,6 +6628,7 @@ impl App {
             texture: None,
             frame_size: [0, 0],
             frames_shown: 0,
+            paused: false,
         });
         let _ = commands.send(crate::discord::gateway::GatewayCommand::StreamWatch { stream_key });
     }
@@ -6215,16 +6694,99 @@ impl App {
         watched.handle = Some(spawn_stream_watch(params, event_tx, repaint));
     }
 
+    /// `true` si la ventana lleva un rato (`BACKGROUND_PAUSE_DELAY`) sin foco o
+    /// minimizada. El margen evita pausar y reanudar el video por un clic
+    /// suelto en otra ventana.
+    fn update_video_pause(&mut self, ctx: &egui::Context) -> bool {
+        const BACKGROUND_PAUSE_DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
+        let (focused, minimized) = ctx.input(|i| {
+            let viewport = i.viewport();
+            (viewport.focused.unwrap_or(true), viewport.minimized.unwrap_or(false))
+        });
+        if focused && !minimized {
+            self.window_inactive_since = None;
+            self.video_paused = false;
+        } else {
+            let since = *self.window_inactive_since.get_or_insert_with(Instant::now);
+            let elapsed = since.elapsed();
+            if elapsed >= BACKGROUND_PAUSE_DELAY {
+                self.video_paused = true;
+            } else {
+                ctx.request_repaint_after(BACKGROUND_PAUSE_DELAY - elapsed + std::time::Duration::from_millis(20));
+            }
+        }
+        self.video_paused
+    }
+
+    /// Sube a la GPU el último frame de la vista previa de NUESTRA transmisión
+    /// (el tile propio de la llamada). Pausada, no hace nada.
+    fn pump_broadcast_preview(&mut self, ctx: &egui::Context, paused: bool) {
+        let Some(broadcast) = self.broadcasting_stream.as_mut() else { return };
+        broadcast.preview.set_paused(paused);
+        if paused {
+            broadcast.preview.discard();
+            return;
+        }
+        // El hilo de captura no despierta la UI: mientras se transmite y la
+        // ventana está al frente se repinta unas 8 veces por segundo.
+        ctx.request_repaint_after(std::time::Duration::from_millis(125));
+        let Some(frame) = broadcast.preview.take_new() else { return };
+        let size = [frame.width as usize, frame.height as usize];
+        if size[0] == 0 || size[1] == 0 || frame.rgba.len() != size[0] * size[1] * 4 {
+            return;
+        }
+        let image = egui::ColorImage::from_rgba_unmultiplied(size, &frame.rgba);
+        match broadcast.preview_texture.as_mut() {
+            Some(texture) => texture.set(image, egui::TextureOptions::LINEAR),
+            None => {
+                broadcast.preview_texture =
+                    Some(ctx.load_texture("broadcast_preview", image, egui::TextureOptions::LINEAR));
+            }
+        }
+        broadcast.preview_size = size;
+    }
+
+    /// URL de la miniatura del stream `stream_key` (de otra persona), si ya se
+    /// sabe. La primera vez (y cada minuto) la pide a Discord en segundo plano.
+    pub fn stream_preview_url(&mut self, stream_key: &str) -> Option<String> {
+        const TTL: std::time::Duration = std::time::Duration::from_secs(60);
+        let stale = self
+            .stream_previews
+            .get(stream_key)
+            .is_none_or(|entry| entry.requested_at.elapsed() >= TTL);
+        if stale {
+            if self.stream_previews.len() >= 64 {
+                self.stream_previews.clear();
+            }
+            let previous = self.stream_previews.get(stream_key).and_then(|entry| entry.url.clone());
+            self.stream_previews.insert(
+                stream_key.to_string(),
+                StreamPreviewEntry { url: previous, requested_at: Instant::now() },
+            );
+            if let (Some(token), Some(tx)) = (&self.discord_token, &self.event_tx) {
+                crate::discord::spawn_fetch_stream_preview(token.clone(), stream_key.to_string(), tx.clone());
+            }
+        }
+        self.stream_previews.get(stream_key).and_then(|entry| entry.url.clone())
+    }
+
     /// Pasa el último frame decodificado (si llegó uno) a la textura del
     /// visor. Se llama una vez por frame de UI.
     fn pump_stream_frames(&mut self, ctx: &egui::Context) {
+        // Con la ventana en segundo plano no se procesa video: ni el del stream
+        // que se mira ni la vista previa del que se transmite.
+        let paused = self.update_video_pause(ctx);
+        self.pump_broadcast_preview(ctx, paused);
         // Ensordecerte también calla el audio del stream.
         let deaf = self.voice_target.as_ref().map(|t| t.self_deaf).unwrap_or(self.self_deaf);
         let Some(watched) = self.watching_stream.as_mut() else { return };
+        watched.paused = paused;
         // Respaldo: aunque el hilo de video no logre despertar la UI, mientras
-        // se mira un stream se repinta unas 10 veces por segundo.
-        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        // se mira un stream se repinta unas 10 veces por segundo (una por
+        // segundo si el video está pausado).
+        ctx.request_repaint_after(std::time::Duration::from_millis(if paused { 1000 } else { 100 }));
         let Some(handle) = watched.handle.as_ref() else { return };
+        handle.frames.set_paused(paused);
         // Volumen/silencio del audio de ESTE stream (clave: quien transmite).
         let playback = watched
             .stream_key
@@ -6236,6 +6798,11 @@ impl App {
         handle
             .audio
             .set(playback.volume.value().min(200) as u8, playback.muted || deaf);
+        if paused {
+            // El audio sigue; del video solo se tira lo que haya quedado.
+            handle.frames.discard();
+            return;
+        }
         let Some(frame) = handle.frames.take_new() else { return };
         let size = [frame.width as usize, frame.height as usize];
         if size[0] == 0 || size[1] == 0 || frame.rgba.len() != size[0] * size[1] * 4 {
@@ -6344,6 +6911,7 @@ impl eframe::App for App {
         self.tick_pending_buttons(ui.ctx());
         self.pump_stream_frames(ui.ctx());
         self.clear_viewed_mentions();
+        self.track_unread_marker();
         self.ack_viewed_channel();
         self.sync_window_title(ui.ctx());
         // El hilo de Discord no despierta la UI al llegar un evento, y sin
@@ -6525,6 +7093,8 @@ impl eframe::App for App {
         crate::ui::role_popup::show(self, ui);
         crate::ui::profile_popup::show_full(self, ui);
         crate::ui::settings::show(self, ui);
+        crate::ui::clean_mic_popup::show(self, ui);
+        crate::ui::share_picker::show(self, ui);
         // Cola de diálogos (aviso de seguridad, novedades, confirmaciones...):
         // va al final para quedar por encima de todo, incluida la pantalla de
         // login (donde se escribe el token).

@@ -37,6 +37,8 @@ pub enum SettingsTab {
     Account,
     /// Contador de memoria (RAM, GPU y caché en disco), ver `ui::memory_view`.
     Memory,
+    /// Calculadora de permisos de Discord, ver `ui::permissions_calc`.
+    Permissions,
 }
 
 /// Todo lo que puede pasar en un frame del panel: un solo clic a la vez,
@@ -66,6 +68,8 @@ enum Action {
     SetMicrophoneSensitivity(i8),
     SetMicrophoneVolume(u8),
     SetOutputVolume(u8),
+    /// Abrir el popup de micrófono y Clean Mic.
+    OpenCleanMic,
     /// Cambiar de cuenta, agregar otra o cerrar sesión (Ajustes → Cuenta).
     Account(crate::ui::accounts::AccountAction),
 }
@@ -205,6 +209,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                             {
                                 action = Some(Action::SetTab(SettingsTab::Memory));
                             }
+                            if theme::soft_button(ui, &palette, None, "Permisos", tab == SettingsTab::Permissions)
+                                .clicked()
+                            {
+                                action = Some(Action::SetTab(SettingsTab::Permissions));
+                            }
                         });
                         ui.add_space(14.0);
                     }
@@ -296,6 +305,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                                             crate::ui::memory_view::view(ui, &palette, report);
                                         }
                                     }
+                                    SettingsTab::Permissions => {
+                                        crate::ui::permissions_calc::view(ui, &palette);
+                                    }
                                 }
                             }
                         });
@@ -352,6 +364,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             Action::SetMicrophoneSensitivity(db) => app.set_voice_microphone_sensitivity(db),
             Action::SetMicrophoneVolume(percent) => app.set_voice_microphone_volume(percent),
             Action::SetOutputVolume(percent) => app.set_voice_output_volume(percent),
+            Action::OpenCleanMic => {
+                app.refresh_voice_audio_sources();
+                app.clean_mic_open = true;
+            }
             Action::Account(account_action) => {
                 use crate::ui::accounts::AccountAction;
                 match account_action {
@@ -1078,6 +1094,11 @@ fn voice_settings_view(
         theme::regular(11.5),
         palette.dim,
     );
+    ui.add_space(12.0);
+
+    if theme::soft_button(ui, palette, None, "Configurar micrófono y Clean Mic…", false).clicked() {
+        action = Some(Action::OpenCleanMic);
+    }
     ui.add_space(12.0);
 
     ui.add_enabled_ui(audio.allow_microphone_transmit, |ui| {

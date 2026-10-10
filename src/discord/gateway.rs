@@ -21,6 +21,9 @@
 //!   rápido y no repite todo el historial de servers/amigos de arriba.
 //! - Reconexión con backoff exponencial + jitter en vez de cortar toda la
 //!   sesión (lo que hacía antes esta función) ante cualquier corte.
+//! - El WebSocket se abre con `wreq` (emulación de Chrome, la misma del
+//!   REST de `uwu_rest`; ver `discord::websocket`): así el handshake
+//!   TLS/HTTP1 del Gateway tiene la misma huella que el resto del tráfico.
 //! - Un `IDENTIFY` con las propiedades reales del fingerprint
 //!   (`discord::fingerprint`, ya lo usa `rest.rs` para las llamadas REST)
 //!   en vez de un `"eCord"/"linux"` inventado.
@@ -41,8 +44,6 @@ use rand::Rng;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::Message;
 use url::Url;
 
 
@@ -53,6 +54,7 @@ use crate::discord::models::{
     MemberListMember, MemberListUpdate, MessageUpdate, PresenceEvent, ReactionEvent,
     ReadyPayload, VoiceState,
 };
+use crate::discord::websocket::{self, Message};
 use crate::discord::AppEvent;
 
 const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json&compress=zlib-stream";
@@ -224,6 +226,11 @@ pub enum GatewayCommand {
     StreamDelete { stream_key: String },
     /// Opcode 22 (`STREAM_SET_PAUSED`): pausar/reanudar el stream.
     StreamSetPaused { stream_key: String, paused: bool },
+    /// Opcode 18 (`STREAM_CREATE`): empezar a transmitir (Go Live) desde el
+    /// canal de voz donde estamos. `guild_id` es `None` en una llamada de DM.
+    /// Discord responde con `STREAM_CREATE` + `STREAM_SERVER_UPDATE` de
+    /// nuestro propio stream (`guild:<guild>:<canal>:<yo>` o `call:<canal>:<yo>`).
+    StreamCreate { guild_id: Option<String>, channel_id: String },
 }
 
 /// La suscripción a la lista de miembros vigente. Se guarda para volver a
@@ -299,6 +306,30 @@ fn update_voice_state_payload(
 /// Opcode 20: pedir ver un stream (Go Live).
 fn stream_watch_payload(stream_key: &str) -> String {
     serde_json::json!({ "op": 20, "d": { "stream_key": stream_key } }).to_string()
+}
+
+/// Opcode 18: crear un stream propio (empezar a transmitir).
+fn stream_create_payload(guild_id: Option<&str>, channel_id: &str) -> String {
+    match guild_id {
+        Some(guild_id) => serde_json::json!({
+            "op": 18,
+            "d": {
+                "type": "guild",
+                "guild_id": guild_id,
+                "channel_id": channel_id,
+                "preferred_region": null,
+            },
+        }),
+        None => serde_json::json!({
+            "op": 18,
+            "d": {
+                "type": "call",
+                "channel_id": channel_id,
+                "preferred_region": null,
+            },
+        }),
+    }
+    .to_string()
 }
 
 /// Opcode 19: dejar de ver / terminar un stream.
@@ -557,9 +588,7 @@ async fn connect_and_run(
     }
 
     crate::discord::step(tx, "Conectando con el gateway…");
-    let mut request = url.into_client_request()?;
-    request.headers_mut().extend(fingerprint::discord_gateway_headers(fingerprint));
-    let (ws_stream, _) = tokio_tungstenite::connect_async(request).await?;
+    let ws_stream = websocket::connect(&url).await?;
     let (mut write, mut read) = ws_stream.split();
     let mut zlib = GatewayZlibDecoder::default();
 
@@ -650,6 +679,10 @@ async fn connect_and_run(
                     GatewayCommand::Shutdown => return Ok(Outcome::Stop),
                     GatewayCommand::StreamSetPaused { stream_key, paused } => {
                         let payload = stream_set_paused_payload(&stream_key, paused);
+                        write.send(Message::Text(payload.into())).await?;
+                    }
+                    GatewayCommand::StreamCreate { guild_id, channel_id } => {
+                        let payload = stream_create_payload(guild_id.as_deref(), &channel_id);
                         write.send(Message::Text(payload.into())).await?;
                     }
                 }

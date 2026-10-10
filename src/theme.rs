@@ -651,6 +651,14 @@ pub enum Icon {
     ZoomOut,
     Download,
     Forward,
+    // Menú de mensajes (`ui::chat::message_menu`).
+    Reply,
+    SmilePlus,
+    LayoutGrid,
+    Link,
+    Flag,
+    Hash,
+    SmileMinus,
 }
 
 const ICONS: &[(Icon, &str, &[u8])] = icons! {
@@ -753,6 +761,13 @@ const ICONS: &[(Icon, &str, &[u8])] = icons! {
     ZoomOut => "zoom-out",
     Download => "download",
     Forward => "forward",
+    Reply => "reply",
+    SmilePlus => "smile-plus",
+    LayoutGrid => "layout-grid",
+    Link => "link",
+    Flag => "flag",
+    Hash => "hash",
+    SmileMinus => "smile-minus",
 };
 
 impl Icon {
@@ -772,7 +787,14 @@ impl Icon {
 
 fn register_icons(ctx: &egui::Context) {
     for (_, uri, bytes) in ICONS {
-        ctx.include_bytes(*uri, *bytes);
+        // Los íconos se pintan multiplicando su color por el del tema, así
+        // que tienen que ser blancos: si un SVG viene en negro o con
+        // `currentColor` (que se dibuja negro) saldría negro siempre.
+        let mut svg = String::from_utf8_lossy(bytes).into_owned();
+        for black in ["\"currentColor\"", "\"black\"", "\"#000\"", "\"#000000\""] {
+            svg = svg.replace(black, "\"#ffffff\"");
+        }
+        ctx.include_bytes(*uri, svg.into_bytes());
     }
 }
 

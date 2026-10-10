@@ -15,8 +15,7 @@ use reqwest::{
     Url,
     cookie::CookieStore,
     header::{
-        ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE, CACHE_CONTROL, HeaderMap, HeaderValue, ORIGIN,
-        PRAGMA, REFERER, USER_AGENT,
+        ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE, HeaderMap, HeaderValue, REFERER, USER_AGENT,
     },
 };
 use reqwest_cookie_store::{
@@ -611,23 +610,6 @@ fn insert_chrome_client_hints(headers: &mut HeaderMap, os: &str) {
             _ => "\"Linux\"",
         }),
     );
-}
-
-pub(super) fn discord_gateway_headers(fingerprint: &ClientFingerprint) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        USER_AGENT,
-        HeaderValue::from_str(&fingerprint.user_agent).expect("web user agent is valid"),
-    );
-    headers.insert(
-        ACCEPT_LANGUAGE,
-        HeaderValue::from_str(&accept_language(&fingerprint.system_locale))
-            .expect("system locale is a valid header value"),
-    );
-    headers.insert(ORIGIN, HeaderValue::from_static(DISCORD_ORIGIN));
-    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-    headers.insert(PRAGMA, HeaderValue::from_static("no-cache"));
-    headers
 }
 
 fn build_super_properties(fingerprint: &ClientFingerprint) -> String {

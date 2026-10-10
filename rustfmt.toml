@@ -1,0 +1,3 @@
+edition = "2024"
+# El código ya usa líneas largas (414 de >110 cols); 100 reformatearía miles.
+max_width = 120

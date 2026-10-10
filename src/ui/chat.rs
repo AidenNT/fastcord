@@ -7,7 +7,7 @@ use egui::{Area, Color32, CornerRadius, Frame, Margin, Order, ScrollArea, Sense,
 
 use crate::lib::data::{
     ChatMessage, ComponentClick, EmojiGroup, Forward, ReactionKind, RepliedMessage, ReplyTarget,
-    ThreadCard,
+    ThreadCard, UnreadMarker,
 };
 use crate::ui::emoji as twemoji;
 use crate::ui::extra;
@@ -16,6 +16,209 @@ use crate::ui::markdown::MentionCtx;
 use crate::ui::theme::{self, Icon, Palette};
 
 const COMPOSER_HEIGHT: f32 = 64.0;
+
+/// Alto de cada línea de aviso sobre la caja de texto (modo lento, permisos
+/// que faltan…).
+const NOTICE_H: f32 = 20.0;
+
+/// Lo que el canal le permite hacer a la cuenta en el chat: sale de los
+/// permisos (`lib::permissions::ChannelAccess`) y del modo lento. El
+/// `Default` es "sin límites" (DMs, hilos y cualquier dato que falte).
+///
+/// Lo arma quien llama a `show` y se lo deja con `set_next_limits` justo antes
+/// (en la memoria temporal de egui): así `show` no cambia de firma para los
+/// demás chats. `show` lo consume y lo deja a mano para las funciones de
+/// adentro (compositor, reacciones).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChatLimits {
+    pub can_send: bool,
+    pub can_attach: bool,
+    pub can_embed: bool,
+    pub can_read_history: bool,
+    pub can_react: bool,
+    /// Segundos de modo lento que le tocan a ESTA cuenta (0 = sin modo lento
+    /// o exenta).
+    pub slowmode_secs: u32,
+    /// Tamaño máximo por archivo adjunto (ver `discord::uploads::max_upload_bytes`).
+    pub max_upload_bytes: u64,
+}
+
+impl Default for ChatLimits {
+    fn default() -> Self {
+        Self {
+            can_send: true,
+            can_attach: true,
+            can_embed: true,
+            can_read_history: true,
+            can_react: true,
+            slowmode_secs: 0,
+            max_upload_bytes: crate::discord::uploads::max_upload_bytes(None, true),
+        }
+    }
+}
+
+impl ChatLimits {
+    pub fn from_channel(channel: &crate::lib::data::Channel) -> Self {
+        let access = channel.access;
+        Self {
+            can_send: access.can_send,
+            can_attach: access.can_attach,
+            can_embed: access.can_embed,
+            can_read_history: access.can_read_history,
+            can_react: access.can_react,
+            slowmode_secs: if access.bypass_slowmode { 0 } else { channel.slowmode_secs },
+            // Lo ajusta quien llama (`ui::server`) según el Nitro de la cuenta.
+            max_upload_bytes: Self::default().max_upload_bytes,
+        }
+    }
+}
+
+fn next_limits_id() -> egui::Id {
+    egui::Id::new("ecord_chat_limits_next")
+}
+
+fn current_limits_id() -> egui::Id {
+    egui::Id::new("ecord_chat_limits_current")
+}
+
+/// Deja los límites para el próximo `show` (se consumen ahí).
+pub fn set_next_limits(ctx: &egui::Context, limits: ChatLimits) {
+    ctx.data_mut(|d| d.insert_temp(next_limits_id(), limits));
+}
+
+fn current_limits(ctx: &egui::Context) -> ChatLimits {
+    ctx.data(|d| d.get_temp::<ChatLimits>(current_limits_id())).unwrap_or_default()
+}
+
+/// Aviso rojo pasajero sobre el compositor ("no tienes permiso para…").
+fn set_notice(ctx: &egui::Context, text: &str) {
+    let now = ctx.input(|i| i.time);
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("ecord_chat_notice"), (text.to_owned(), now)));
+    ctx.request_repaint_after(std::time::Duration::from_millis(4100));
+}
+
+fn active_notice(ctx: &egui::Context) -> Option<String> {
+    let (text, at) = ctx.data(|d| d.get_temp::<(String, f64)>(egui::Id::new("ecord_chat_notice")))?;
+    let now = ctx.input(|i| i.time);
+    (now - at < 4.0).then_some(text)
+}
+
+fn slowmode_id(channel_id: &str) -> egui::Id {
+    egui::Id::new(("ecord_slowmode_until", channel_id.to_owned()))
+}
+
+/// Segundos que faltan para poder mandar otro mensaje en el canal.
+fn slowmode_wait(ctx: &egui::Context, channel_id: &str) -> f64 {
+    let until = ctx.data(|d| d.get_temp::<f64>(slowmode_id(channel_id))).unwrap_or(0.0);
+    (until - ctx.input(|i| i.time)).max(0.0)
+}
+
+/// Arranca la cuenta regresiva del modo lento (se llama al enviar).
+fn start_slowmode(ctx: &egui::Context, channel_id: &str, secs: u32) {
+    let until = ctx.input(|i| i.time) + f64::from(secs);
+    ctx.data_mut(|d| d.insert_temp(slowmode_id(channel_id), until));
+    ctx.request_repaint();
+}
+
+fn format_secs(secs: u32) -> String {
+    if secs >= 3600 && secs % 3600 == 0 {
+        format!("{} h", secs / 3600)
+    } else if secs >= 60 && secs % 60 == 0 {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{secs} s")
+    }
+}
+
+/// Líneas de aviso que van sobre la caja de texto, en orden. Las usan `show`
+/// (para reservar el alto) y `composer` (para dibujarlas), así que tienen que
+/// salir iguales en los dos.
+fn composer_notices(
+    ctx: &egui::Context,
+    palette: &Palette,
+    limits: ChatLimits,
+    channel_id: &str,
+) -> Vec<(String, Color32)> {
+    let mut out = Vec::new();
+    if let Some(text) = active_notice(ctx) {
+        out.push((text, palette.danger));
+    }
+    if let Some(text) = crate::ui::attachments::status_line(ctx, scoped_id("ecord_composer_jobs")) {
+        out.push((text, palette.dim));
+    }
+    if limits.slowmode_secs > 0 {
+        let wait = slowmode_wait(ctx, channel_id);
+        if wait > 0.0 {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            out.push((
+                format!("Modo lento: podrás enviar otro mensaje en {} s.", wait.ceil() as u32),
+                palette.warning,
+            ));
+        } else {
+            out.push((
+                format!("Modo lento activado: {} entre mensajes.", format_secs(limits.slowmode_secs)),
+                palette.dim,
+            ));
+        }
+    }
+    let mut missing = Vec::new();
+    if !limits.can_attach {
+        missing.push("adjuntar archivos");
+    }
+    if !limits.can_embed {
+        missing.push("insertar enlaces");
+    }
+    if !missing.is_empty() {
+        out.push((
+            format!("No tienes permiso para {} en este canal.", missing.join(" ni ")),
+            palette.dim,
+        ));
+    }
+    out
+}
+
+/// Barra que reemplaza a la caja de texto cuando no se puede escribir.
+fn restriction_bar(ui: &mut egui::Ui, palette: &Palette, text: &str, tone: Color32) {
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.add_space(16.0);
+        Frame::new()
+            .fill(palette.surface)
+            .stroke(Stroke::new(1.0, palette.outline))
+            .corner_radius(CornerRadius::same(theme::radius() + 6))
+            .inner_margin(Margin::symmetric(14, 12))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width() - 16.0);
+                ui.horizontal(|ui| {
+                    theme::icon(ui, Icon::Lock, 16.0, palette.dim);
+                    theme::text(ui, text, theme::regular(13.0), tone);
+                });
+            });
+    });
+}
+
+/// Aviso arriba de la lista cuando no hay permiso para ver el historial.
+fn history_notice(ui: &mut egui::Ui, palette: &Palette) {
+    ui.horizontal(|ui| {
+        ui.add_space(16.0);
+        Frame::new()
+            .fill(palette.surface)
+            .corner_radius(CornerRadius::same(theme::radius()))
+            .inner_margin(Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    theme::icon(ui, Icon::Lock, 14.0, palette.warning);
+                    theme::text(
+                        ui,
+                        "No tienes permiso para ver el historial de este canal: solo verás los mensajes nuevos.",
+                        theme::regular(12.5),
+                        palette.secondary,
+                    );
+                });
+            });
+    });
+    ui.add_space(8.0);
+}
 /// Alto máximo de la caja de texto: pasado esto, scrollea en vez de crecer.
 const COMPOSER_TEXT_MAX_HEIGHT: f32 = 150.0;
 /// Banner "Respondiendo a..." arriba del compositor (con su espaciado).
@@ -61,8 +264,11 @@ fn quick_reactions() -> Vec<String> {
 /// tolerancia para elegir la fila más cercana (ver `hovered_index` en
 /// `show`), nunca hace que dos filas cuenten como hovereadas a la vez.
 const HOVER_ZONE_MARGIN: f32 = 18.0;
-const TOOLBAR_BUTTON: f32 = 26.0;
-const TOOLBAR_WIDTH: f32 = 148.0;
+const TOOLBAR_BUTTON: f32 = 28.0;
+/// 3 reacciones + separador + 4 botones (ver `hover_toolbar`).
+const TOOLBAR_WIDTH: f32 = 236.0;
+/// Ancho del menú de un mensaje (`message_menu`).
+const MENU_WIDTH: f32 = 290.0;
 /// Ancho de la tarjeta "Hilo de respuestas" que va debajo de un mensaje.
 const THREAD_CARD_WIDTH: f32 = 380.0;
 /// Margen derecho de los mensajes (igual al izquierdo): sin él, en un panel
@@ -158,6 +364,20 @@ fn scoped_id(name: &'static str) -> egui::Id {
     egui::Id::new((name, scope()))
 }
 
+/// ¿Este compositor es el que recibe lo que llega "a la ventana" (archivos
+/// soltados, imagen pegada)? Con dos a la vez (chat y panel de hilo) manda el
+/// último que tuvo el foco, si todavía se está dibujando.
+fn is_input_target(ctx: &egui::Context, text_id: egui::Id) -> bool {
+    let now = ctx.input(|i| i.time);
+    let last: Option<egui::Id> = ctx.data(|d| d.get_temp(last_composer_key()));
+    !last.is_some_and(|l| {
+        l != text_id
+            && ctx
+                .data(|d| d.get_temp::<f64>(egui::Id::new(("ecord_composer_alive", l))))
+                .is_some_and(|seen| now - seen < 0.5)
+    })
+}
+
 fn type_to_focus_key() -> egui::Id {
     egui::Id::new("ecord_type_to_focus_allowed")
 }
@@ -225,6 +445,19 @@ pub enum ChatEvent {
     /// Click en la cita de una respuesta: ir al mensaje original
     /// (`App::jump_to_message`).
     JumpToMessage { message_id: String },
+    /// Click en "N mensajes nuevos desde...": ir al primer mensaje sin ver
+    /// (`App::jump_to_first_unread`).
+    JumpToFirstUnread,
+    /// Click en "Marcar como leído" (`App::mark_viewed_read`).
+    MarkAsRead,
+    /// Click en "Ir al actual" de "Estás viendo mensajes antiguos"
+    /// (`App::jump_to_present`).
+    JumpToPresent,
+    /// "Marcar no leídos" desde el menú de un mensaje (`App::mark_message_unread`).
+    MarkUnread { message_id: String },
+    /// Opción del menú que todavía no existe en este cliente: se avisa con un
+    /// toast con este nombre.
+    Unavailable(&'static str),
 }
 
 /// Dibuja la lista de mensajes (scrollable) + el input de abajo. Si el
@@ -289,7 +522,20 @@ pub fn show(
     // Mensaje al que hay que llevar el scroll (centrado) apenas aparezca en
     // `messages` — ver `App::pending_jump`. También se consume una sola vez.
     jump_target: &mut Option<String>,
+    // Marca de "mensajes nuevos" del chat abierto (`App::unread_markers`).
+    // `None` en el panel de hilos.
+    unread: Option<&mut UnreadMarker>,
+    // La cuenta puede borrar mensajes ajenos y sacar reacciones de otros
+    // (permiso "Administrar mensajes"; `false` en DMs y en hilos).
+    can_manage_messages: bool,
 ) -> ChatEvent {
+    // Límites del canal (permisos y modo lento) que dejó quien llamó; se
+    // publican también para las funciones de adentro (compositor, reacciones).
+    let limits = ui
+        .ctx()
+        .data_mut(|d| d.remove_temp::<ChatLimits>(next_limits_id()))
+        .unwrap_or_default();
+    ui.ctx().data_mut(|d| d.insert_temp(current_limits_id(), limits));
     // El render de mensajes no recibe el estado de la app: se publica el
     // token para que las tarjetas de invitación puedan consultar la API.
     if let Some((token, _, _)) = &send_target {
@@ -310,8 +556,20 @@ pub fn show(
         .memory(|m| m.data.get_temp(scoped_id("ecord_composer_text_extra")))
         .unwrap_or(0.0_f32)
         .clamp(0.0, COMPOSER_TEXT_MAX_HEIGHT);
-    let list_height =
-        (ui.available_height() - COMPOSER_HEIGHT - reply_banner_extra - slash_extra - text_extra).max(80.0);
+    // Líneas de aviso (modo lento, permisos) que se dibujan sobre la caja.
+    let notice_extra = if limits.can_send {
+        let channel_key = send_target.as_ref().map(|(_, c, _)| c.as_str()).unwrap_or("");
+        composer_notices(ui.ctx(), palette, limits, channel_key).len() as f32 * NOTICE_H
+    } else {
+        0.0
+    };
+    let list_height = (ui.available_height()
+        - COMPOSER_HEIGHT
+        - reply_banner_extra
+        - slash_extra
+        - text_extra
+        - notice_extra)
+        .max(80.0);
     // Justo el frame en que termina la carga inicial de este canal/DM
     // (`loading`: true -> false, mismo frame en que ya aparecen sus
     // mensajes) el `ScrollArea` de acá abajo todavía no tuvo chance de
@@ -348,6 +606,10 @@ pub fn show(
     let fallback_channel = send_target.as_ref().map(|(_, id, _)| id.clone()).unwrap_or_default();
     let mut nitro_required = false;
     let mut forward_requested = false;
+    // Acción pedida desde el menú de un mensaje (`message_menu`).
+    let mut menu_event: Option<ChatEvent> = None;
+    let mut message_op: Option<MessageOp> = None;
+    let menu_guild: Option<String> = send_target.as_ref().and_then(|(_, _, g)| g.clone());
     let mut load_more_requested = false;
     let mut load_newer_requested = false;
     // Qué mensaje tiene abierto el panel de "más reacciones" (botón "+"
@@ -358,6 +620,8 @@ pub fn show(
     // click de apertura se contaría como "click afuera" del panel
     // (`Response::clicked_elsewhere`) y lo cerraría al toque.
     let open_panel_index = open_reaction_panel_index(ui.ctx());
+    // Igual que el panel de reacciones: se lee una sola vez por frame.
+    let open_menu = open_message_menu(ui.ctx());
 
     // Posición del mouse UNA sola vez al principio del frame — se usa dos
     // veces más abajo (para el backlight y para elegir a qué mensaje le
@@ -399,6 +663,45 @@ pub fn show(
         ui.ctx().memory(|m| m.data.get_temp(row_views_memory_id()).unwrap_or_default());
     let mut row_views: Vec<(String, f32)> = Vec::new();
 
+    // ---- Mensajes sin leer ("N mensajes nuevos desde...") y "Ir al actual" ----
+    let mut unread = unread;
+    let mut unread_view: Option<UnreadView> = None;
+    let mut unread_first_visible = false;
+    let mut unread_live = false;
+    if scope() == 0 && !loading && !messages.is_empty() {
+        if let Some(marker) = unread.as_deref_mut() {
+            let view = compute_unread_view(messages.as_slice(), &marker.last_read, has_more);
+            if !marker.evaluated {
+                marker.evaluated = true;
+                // Entró sin nada nuevo: nunca se muestra la barra en este chat.
+                if view.is_none() && !has_newer {
+                    marker.dismissed = true;
+                }
+            }
+            if view.is_some() && !marker.dismissed {
+                marker.had_unread = true;
+            }
+            unread_live = marker.had_unread;
+            unread_view = view;
+        }
+    }
+    // La línea "NUEVO" solo se dibuja si se conoce el punto exacto (la
+    // ventana cargada incluye el último mensaje leído).
+    let divider_index: Option<usize> = if unread_live {
+        unread_view.as_ref().filter(|v| v.exact).map(|v| v.first_index)
+    } else {
+        None
+    };
+    // "Ir al actual" / "Marcar como leído" con la ventana en el medio: bajar
+    // el scroll apenas llegue la lista nueva.
+    let now = ui.ctx().input(|i| i.time);
+    let want_bottom = ui
+        .ctx()
+        .memory(|m| m.data.get_temp::<f64>(scroll_bottom_id()))
+        .is_some_and(|t| now - t < 15.0);
+    let bottom_ready = want_bottom && !loading && !has_newer && !messages.is_empty() && jump_target.is_none();
+    let mut did_scroll_bottom = false;
+
     let scroll_out = ScrollArea::vertical()
         .id_salt("chat_scroll")
         .max_height(list_height)
@@ -431,6 +734,9 @@ pub fn show(
             // ÚNICA fuente de separación vertical entre mensajes.
             ui.spacing_mut().item_spacing.y = 0.0;
             ui.add_space(8.0);
+            if !limits.can_read_history {
+                history_notice(ui, palette);
+            }
             if loading && messages.is_empty() {
                 // Todavía no llegó ni la primera página: placeholder tipo
                 // "esqueleto" en vez de la lista vacía, como hace el
@@ -522,12 +828,22 @@ pub fn show(
                     && messages[i - 1].kind != 18
                     && messages[i].kind != 18
                     && messages[i - 1].same_author(&messages[i])
+                    // Pasados 7 minutos entre un mensaje y el siguiente del
+                    // mismo autor, el segundo vuelve a llevar encabezado.
+                    && messages[i - 1].within_group_gap(&messages[i])
                     // Una respuesta siempre arranca un bloque nuevo, con
                     // avatar/header propios arriba del banner citado — no
                     // tendría sentido agruparla bajo el mensaje anterior
                     // y que el banner "Respondiendo a..." quede sin
                     // ningún encabezado propio, como en el cliente real.
-                    && messages[i].replied_to.is_none();
+                    && messages[i].replied_to.is_none()
+                    // La línea "NUEVO" corta la racha: el primer mensaje
+                    // nuevo arranca con su propio header.
+                    && divider_index != Some(i);
+
+                if divider_index == Some(i) {
+                    unread_divider(ui, palette);
+                }
 
                 // VIRTUALIZACIÓN: armar cada fila entera (parsear el
                 // markdown, pedir el avatar, las reacciones...) cuesta lo
@@ -637,6 +953,14 @@ pub fn show(
                 {
                     row_views.push((messages[i].id.clone(), row_rect.top() - clip_rect.top()));
                 }
+                // ¿Ya se ve el primer mensaje nuevo? (oculta la barra de arriba)
+                if unread_live
+                    && unread_view.as_ref().is_some_and(|v| v.first_index == i)
+                    && row_rect.top() >= clip_rect.top() - 4.0
+                    && row_rect.top() < clip_rect.bottom() - 24.0
+                {
+                    unread_first_visible = true;
+                }
                 // Primer mensaje con algo a la vista: es "donde estás" para
                 // retomar el chat en el mismo lugar al volver a abrirlo.
                 if top_visible.is_none()
@@ -724,7 +1048,13 @@ pub fn show(
                 // de qué separación necesita respecto al de ABAJO.
                 let next_is_grouped = messages
                     .get(i + 1)
-                    .map(|next| next.kind != 18 && messages[i].kind != 18 && next.same_author(&messages[i]))
+                    .map(|next| {
+                        next.kind != 18
+                            && messages[i].kind != 18
+                            && next.same_author(&messages[i])
+                            && messages[i].within_group_gap(next)
+                            && divider_index != Some(i + 1)
+                    })
                     .unwrap_or(false);
                 ui.add_space(if next_is_grouped { GROUPED_SPACING } else { NEW_GROUP_SPACING });
             }
@@ -765,6 +1095,10 @@ pub fn show(
                 }
             }
             ui.add_space(8.0);
+            if bottom_ready {
+                ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+                did_scroll_bottom = true;
+            }
 
             // Un solo mensaje puede estar "hovereado" a la vez. Antes esto
             // se decidía fila por fila mientras se dibujaban (cada una
@@ -778,10 +1112,22 @@ pub fn show(
             // `hovered_row_index`) — un solo ganador.
             let hovered_index = hovered_row_index(pointer_pos, &row_rects);
 
+            // Click derecho sobre un mensaje: abre su menú en el cursor.
+            if ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary)) {
+                if let Some(p) = pointer_pos {
+                    let on_list = ui.ctx().layer_id_at(p) == Some(ui.layer_id());
+                    if let (true, Some((idx, _))) = (on_list, row_rects.iter().find(|(_, r)| r.contains(p))) {
+                        set_open_reaction_panel(ui.ctx(), None);
+                        set_open_message_menu(ui.ctx(), Some(MsgMenu { index: *idx, pos: p, toggle: None }));
+                    }
+                }
+            }
+
             for (index, rect) in &row_rects {
                 let is_hovered = hovered_index == Some(*index);
                 let panel_open_here = open_panel_index == Some(*index);
-                if is_hovered || panel_open_here {
+                let menu_open_here = open_menu.as_ref().is_some_and(|m| m.index == *index);
+                if (is_hovered && open_menu.is_none()) || panel_open_here || menu_open_here {
                     hover_toolbar(
                         ui,
                         palette,
@@ -795,6 +1141,25 @@ pub fn show(
                         can_create_thread,
                     );
                 }
+                if let Some(menu) = open_menu.as_ref().filter(|m| m.index == *index) {
+                    message_menu(
+                        ui,
+                        palette,
+                        &messages[*index],
+                        menu,
+                        &mut actions,
+                        can_create_thread,
+                        MenuOutputs {
+                            toggled_reaction: &mut toggled_reaction,
+                            reply_target: &mut *reply_target,
+                            forward_requested: &mut forward_requested,
+                            event: &mut menu_event,
+                            guild_id: menu_guild.as_deref(),
+                            op: &mut message_op,
+                            can_manage: can_manage_messages,
+                        },
+                    );
+                }
                 if panel_open_here {
                     reaction_panel(ui, palette, *index, *rect, &mut toggled_reaction, &mut nitro_required, custom_emojis);
                 }
@@ -803,6 +1168,63 @@ pub fn show(
 
     ui.ctx().memory_mut(|m| m.data.insert_temp(row_rects_memory_id(), row_rects));
     ui.ctx().memory_mut(|m| m.data.insert_temp(row_views_memory_id(), row_views));
+    if did_scroll_bottom {
+        ui.ctx().memory_mut(|m| m.data.remove::<f64>(scroll_bottom_id()));
+    }
+
+    // Barras flotantes: "N mensajes nuevos desde..." (arriba) y "Estás
+    // viendo mensajes antiguos" (abajo). Solo en el chat principal.
+    let mut overlay_event: Option<ChatEvent> = menu_event;
+    if scope() == 0 {
+        let inner = scroll_out.inner_rect;
+        let settled = !moved_this_frame
+            && jump_target.is_none()
+            && scroll_anchor.is_none()
+            && !load_more_locked(ui.ctx());
+        let mut banner_text: Option<String> = None;
+        if let (Some(marker), Some(view)) = (unread.as_deref_mut(), unread_view.as_ref()) {
+            if marker.had_unread && !marker.dismissed {
+                if marker.created.elapsed() < UNREAD_ARM {
+                    ui.ctx().request_repaint_after(UNREAD_ARM);
+                } else if settled && unread_first_visible {
+                    marker.dismissed = true;
+                } else {
+                    banner_text = Some(unread_banner_text(view));
+                }
+            }
+        }
+        let banner_t = ui
+            .ctx()
+            .animate_bool_with_time(scoped_id("ecord_unread_banner_anim"), banner_text.is_some(), 0.15);
+        if let (Some(text), true) = (banner_text.as_deref(), banner_t > 0.01) {
+            match draw_unread_banner(ui, palette, inner, text, banner_t) {
+                BannerClick::Jump => overlay_event = Some(ChatEvent::JumpToFirstUnread),
+                BannerClick::MarkRead => {
+                    if let Some(marker) = unread.as_deref_mut() {
+                        marker.dismissed = true;
+                    }
+                    if has_newer {
+                        request_scroll_to_bottom(ui.ctx());
+                    }
+                    overlay_event = Some(ChatEvent::MarkAsRead);
+                }
+                BannerClick::None => {}
+            }
+        }
+
+        let max_offset = (scroll_out.content_size.y - inner.height()).max(0.0);
+        let dist_from_bottom = max_offset - scroll_out.state.offset.y;
+        let show_old = !loading
+            && !messages.is_empty()
+            && (has_newer || dist_from_bottom > inner.height() * OLD_VIEW_VIEWPORTS);
+        let old_t = ui
+            .ctx()
+            .animate_bool_with_time(scoped_id("ecord_old_bar_anim"), show_old, 0.15);
+        if old_t > 0.01 && draw_old_messages_bar(ui, palette, inner, old_t) {
+            request_scroll_to_bottom(ui.ctx());
+            overlay_event = Some(ChatEvent::JumpToPresent);
+        }
+    }
 
     // Guarda dónde estás (mensaje de arriba + píxeles) para retomar el canal
     // en el mismo lugar después de cerrar el cliente (`lib::last_view`). Solo
@@ -827,6 +1249,71 @@ pub fn show(
         }
     }
 
+    // Confirmación de "Eliminar mensaje" (shift + click la salta).
+    if let Some(confirm) = open_delete_confirm(ui.ctx()) {
+        match messages.iter().find(|m| m.id == confirm.message_id) {
+            None => set_delete_confirm(ui.ctx(), None),
+            Some(msg) => match delete_confirm_dialog(ui, palette, msg) {
+                Some(true) => {
+                    message_op = Some(MessageOp::Delete { message_id: confirm.message_id.clone() });
+                    set_delete_confirm(ui.ctx(), None);
+                }
+                Some(false) => set_delete_confirm(ui.ctx(), None),
+                None => {}
+            },
+        }
+    }
+
+    // Borrar mensaje / sacar reacciones: se aplica en la lista local al
+    // toque y se le avisa a Discord (si falla, solo queda en el log).
+    if let Some(op) = message_op {
+        let message_id = match &op {
+            MessageOp::Delete { message_id }
+            | MessageOp::ClearAll { message_id }
+            | MessageOp::ClearEmoji { message_id, .. } => message_id.clone(),
+        };
+        if let Some(pos) = messages.iter().position(|m| m.id == message_id) {
+            let channel_id = if messages[pos].channel_id.is_empty() {
+                send_target.as_ref().map(|(_, c, _)| c.clone()).unwrap_or_default()
+            } else {
+                messages[pos].channel_id.clone()
+            };
+            let token = send_target.as_ref().map(|(t, _, _)| t.clone());
+            match op {
+                MessageOp::Delete { .. } => {
+                    messages.remove(pos);
+                    if let Some(token) = token.filter(|_| !channel_id.is_empty()) {
+                        crate::discord::spawn_delete_message(token, channel_id, message_id);
+                    }
+                }
+                MessageOp::ClearAll { .. } => {
+                    messages[pos].reactions.clear();
+                    if let Some(token) = token.filter(|_| !channel_id.is_empty()) {
+                        crate::discord::spawn_clear_reactions(token, channel_id, message_id, None);
+                    }
+                }
+                MessageOp::ClearEmoji { emoji, .. } => {
+                    messages[pos].reactions.retain(|r| r.emoji != emoji);
+                    if let Some(token) = token.filter(|_| !channel_id.is_empty()) {
+                        crate::discord::spawn_clear_reactions(token, channel_id, message_id, Some(emoji.api_format()));
+                    }
+                }
+            }
+        }
+    }
+
+    // Sin "Añadir reacciones" no se puede poner una reacción NUEVA (sumarse a
+    // una que ya existe sí).
+    let toggled_reaction = toggled_reaction.filter(|(index, emoji)| {
+        let is_new = messages
+            .get(*index)
+            .is_some_and(|m| !m.reactions.iter().any(|r| r.emoji == *emoji));
+        let blocked = !limits.can_react && is_new;
+        if blocked {
+            set_notice(ui.ctx(), "No tienes permiso para añadir reacciones nuevas en este canal.");
+        }
+        !blocked
+    });
     if let Some((index, emoji)) = toggled_reaction {
         if let Some(msg) = messages.get_mut(index) {
             let adding = msg.toggle_reaction(&emoji);
@@ -864,7 +1351,9 @@ pub fn show(
         custom_emojis,
     );
 
-    if let Some((id, name, owner_id)) = actions.open_thread {
+    if let Some(event) = overlay_event {
+        event
+    } else if let Some((id, name, owner_id)) = actions.open_thread {
         ChatEvent::OpenThread { id, name, owner_id }
     } else if let Some((channel_id, message_id, name)) = actions.create_thread {
         let channel_id = if channel_id.is_empty() { fallback_channel } else { channel_id };
@@ -884,6 +1373,254 @@ pub fn show(
     } else {
         ChatEvent::None
     }
+}
+
+/// Cuánto espera la barra "N mensajes nuevos" antes de aparecer (si lo nuevo
+/// ya se ve en pantalla, nunca llega a mostrarse).
+const UNREAD_ARM: Duration = Duration::from_millis(500);
+/// A cuántas alturas de lista del final aparece "Estás viendo mensajes antiguos".
+const OLD_VIEW_VIEWPORTS: f32 = 1.5;
+
+/// Mensajes sin leer del chat abierto, respecto de `UnreadMarker::last_read`.
+struct UnreadView {
+    /// Índice (en `messages`) del primer mensaje nuevo.
+    first_index: usize,
+    /// Cuántos mensajes nuevos (de otros) hay cargados.
+    count: usize,
+    /// `false` si la ventana cargada empieza después del último leído: hay
+    /// más nuevos de los que se ven ("65+") y el punto exacto no se conoce.
+    exact: bool,
+    /// Id del mensaje cuya hora se muestra en "desde ...": el primer mensaje
+    /// nuevo si se conoce, si no el último leído.
+    since_id: String,
+}
+
+fn compute_unread_view(messages: &[ChatMessage], last_read: &str, has_more: bool) -> Option<UnreadView> {
+    use crate::lib::notifications::snowflake;
+    let last = snowflake(last_read);
+    if last == 0 {
+        return None;
+    }
+    let is_new = |m: &ChatMessage| !m.is_own && !m.id.is_empty() && snowflake(&m.id) > last;
+    let first_index = messages.iter().position(|m| is_new(m))?;
+    let count = messages.iter().filter(|m| is_new(*m)).count();
+    let covers = messages.iter().any(|m| !m.id.is_empty() && snowflake(&m.id) <= last);
+    let exact = covers || !has_more;
+    let since_id = if exact { messages[first_index].id.clone() } else { last_read.to_string() };
+    Some(UnreadView { first_index, count, exact, since_id })
+}
+
+/// Hora/día de un mensaje a partir de su id, en hora local: "las 0:29" (hoy),
+/// "ayer a las 0:29" o "el 7 de octubre" (más viejo).
+fn since_label(message_id: &str) -> String {
+    use chrono::Datelike;
+    let id: u64 = message_id.parse().unwrap_or(0);
+    if id == 0 {
+        return String::new();
+    }
+    let ms = (id >> 22) as i64 + 1_420_070_400_000;
+    let Some(utc) = chrono::DateTime::from_timestamp_millis(ms) else { return String::new() };
+    let local = utc.with_timezone(&chrono::Local);
+    let today = chrono::Local::now().date_naive();
+    let days_ago = (today - local.date_naive()).num_days();
+    let time = local.format("%-H:%M");
+    match days_ago {
+        i64::MIN..=0 => format!("las {time}"),
+        1 => format!("ayer a las {time}"),
+        _ => {
+            const MONTHS: [&str; 12] = [
+                "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto",
+                "septiembre", "octubre", "noviembre", "diciembre",
+            ];
+            let month = MONTHS[local.month0() as usize];
+            if local.year() == today.year() {
+                format!("el {} de {month}", local.day())
+            } else {
+                format!("el {} de {month} de {}", local.day(), local.year())
+            }
+        }
+    }
+}
+
+fn unread_banner_text(view: &UnreadView) -> String {
+    let plus = if view.exact { "" } else { "+" };
+    let noun = if view.count == 1 && view.exact { "mensaje nuevo" } else { "mensajes nuevos" };
+    let since = since_label(&view.since_id);
+    if since.is_empty() {
+        format!("{}{plus} {noun}", view.count)
+    } else {
+        format!("{}{plus} {noun} desde {since}", view.count)
+    }
+}
+
+fn scroll_bottom_id() -> egui::Id {
+    scoped_id("ecord_scroll_to_bottom")
+}
+
+/// Pide bajar el scroll hasta el último mensaje apenas la lista esté lista.
+fn request_scroll_to_bottom(ctx: &egui::Context) {
+    let now = ctx.input(|i| i.time);
+    ctx.memory_mut(|m| m.data.insert_temp(scroll_bottom_id(), now));
+}
+
+/// Línea roja con la etiqueta "NUEVO" justo arriba del primer mensaje nuevo.
+fn unread_divider(ui: &mut egui::Ui, palette: &Palette) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let color = palette.danger;
+    let luma = 0.299 * color.r() as f32 + 0.587 * color.g() as f32 + 0.114 * color.b() as f32;
+    let label_color = if luma > 150.0 { Color32::from_rgb(0x1a, 0x1a, 0x1a) } else { Color32::WHITE };
+    let painter = ui.painter();
+    let label_w = painter
+        .layout_no_wrap("NUEVO".to_string(), theme::bold(10.0), label_color)
+        .size()
+        .x;
+    let y = rect.center().y;
+    painter.hline(
+        (rect.left() + 16.0)..=(rect.right() - 16.0),
+        y,
+        Stroke::new(1.0, color),
+    );
+    let pill = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - 16.0 - (label_w + 12.0) / 2.0, y),
+        Vec2::new(label_w + 12.0, 15.0),
+    );
+    painter.rect_filled(pill, CornerRadius::same(8), color);
+    painter.text(pill.center(), egui::Align2::CENTER_CENTER, "NUEVO", theme::bold(10.0), label_color);
+}
+
+enum BannerClick {
+    None,
+    Jump,
+    MarkRead,
+}
+
+/// Barra de arriba: "65 mensajes nuevos desde las 0:29" + "Marcar como leído".
+/// Click en la barra = ir al primer mensaje nuevo.
+fn draw_unread_banner(ui: &mut egui::Ui, palette: &Palette, inner: egui::Rect, text: &str, alpha: f32) -> BannerClick {
+    let size = Vec2::new((inner.width() - 24.0).max(120.0), 32.0);
+    let pos = egui::pos2(inner.left() + 8.0, inner.top() + 6.0);
+    let mut click = BannerClick::None;
+    Area::new(scoped_id("ecord_unread_banner"))
+        .order(Order::Foreground)
+        .fixed_pos(pos)
+        .show(ui.ctx(), |ui| {
+            let (rect, bar) = ui.allocate_exact_size(size, Sense::click());
+            let bar = bar.on_hover_cursor(egui::CursorIcon::PointingHand);
+            let fg = palette.on_accent.gamma_multiply(alpha);
+            let font = theme::semibold(12.5);
+            let show_label = rect.width() >= 430.0;
+            let label = "Marcar como leído";
+            let icon_size = 15.0;
+            let label_w = if show_label {
+                ui.painter().layout_no_wrap(label.to_string(), font.clone(), fg).size().x
+            } else {
+                0.0
+            };
+            let btn_w = 8.0 + if show_label { label_w + 6.0 } else { 0.0 } + icon_size + 8.0;
+            let btn_rect = egui::Rect::from_min_max(
+                egui::pos2(rect.right() - 6.0 - btn_w, rect.top() + 4.0),
+                egui::pos2(rect.right() - 6.0, rect.bottom() - 4.0),
+            );
+            let btn = ui
+                .interact(btn_rect, scoped_id("ecord_unread_mark_read"), Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+            let painter = ui.painter();
+            painter.rect_filled(rect, CornerRadius::same(8), palette.accent.gamma_multiply(alpha));
+            painter.text(
+                egui::pos2(rect.left() + 12.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                text,
+                font.clone(),
+                fg,
+            );
+            if btn.hovered() {
+                painter.rect_filled(btn_rect, CornerRadius::same(6), fg.gamma_multiply(0.18));
+            }
+            if show_label {
+                painter.text(
+                    egui::pos2(btn_rect.left() + 8.0, btn_rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    font,
+                    fg,
+                );
+            }
+            let icon_rect = egui::Rect::from_center_size(
+                egui::pos2(btn_rect.right() - 8.0 - icon_size / 2.0, btn_rect.center().y),
+                Vec2::splat(icon_size),
+            );
+            theme::paint_icon(ui, Icon::CircleCheck, icon_rect, icon_size, fg);
+
+            if btn.clicked() {
+                click = BannerClick::MarkRead;
+            } else if bar.clicked() {
+                click = BannerClick::Jump;
+            }
+        });
+    click
+}
+
+/// Píldora de abajo: "Estás viendo mensajes antiguos  [Ir al actual]".
+/// Devuelve `true` si se apretó el botón.
+fn draw_old_messages_bar(ui: &mut egui::Ui, palette: &Palette, inner: egui::Rect, alpha: f32) -> bool {
+    let text = "Estás viendo mensajes antiguos";
+    let label = "Ir al actual";
+    let font = theme::semibold(12.5);
+    let (text_w, label_w) = {
+        let painter = ui.painter();
+        (
+            painter.layout_no_wrap(text.to_string(), font.clone(), palette.text).size().x,
+            painter.layout_no_wrap(label.to_string(), font.clone(), palette.on_accent).size().x,
+        )
+    };
+    let btn_size = Vec2::new(label_w + 22.0, 26.0);
+    let size = Vec2::new(16.0 + text_w + 14.0 + btn_size.x + 5.0, 36.0);
+    let x = (inner.center().x - size.x / 2.0).max(inner.left() + 4.0);
+    let pos = egui::pos2(x, inner.bottom() - size.y - 10.0);
+    let mut clicked = false;
+    Area::new(scoped_id("ecord_old_messages_bar"))
+        .order(Order::Foreground)
+        .fixed_pos(pos)
+        .show(ui.ctx(), |ui| {
+            let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+            let btn_rect = egui::Rect::from_min_size(
+                egui::pos2(rect.right() - 5.0 - btn_size.x, rect.center().y - btn_size.y / 2.0),
+                btn_size,
+            );
+            let btn = ui
+                .interact(btn_rect, scoped_id("ecord_old_messages_go"), Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            let painter = ui.painter();
+            painter.rect_filled(rect, CornerRadius::same(18), palette.overlay.gamma_multiply(alpha));
+            painter.rect_stroke(
+                rect,
+                CornerRadius::same(18),
+                Stroke::new(1.0, palette.outline.gamma_multiply(alpha)),
+                egui::StrokeKind::Inside,
+            );
+            painter.text(
+                egui::pos2(rect.left() + 16.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                text,
+                font.clone(),
+                palette.text.gamma_multiply(alpha),
+            );
+            let fill = if btn.hovered() { palette.accent_hover } else { palette.accent };
+            painter.rect_filled(btn_rect, CornerRadius::same(13), fill.gamma_multiply(alpha));
+            painter.text(
+                btn_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                label,
+                font,
+                palette.on_accent.gamma_multiply(alpha),
+            );
+            clicked = btn.clicked();
+        });
+    clicked
 }
 
 /// Una fila del placeholder tipo "esqueleto": avatar + barra de nombre +
@@ -1240,7 +1977,7 @@ fn message_row(
     // backlight cubren el bloque entero (banner + mensaje) — igual que en
     // el cliente real, donde pasar el mouse por la cita también resalta
     // el mensaje.
-    ui.vertical(|ui| {
+    let row = ui.vertical(|ui| {
     if let Some(replied) = &msg.replied_to {
         if reply_preview_row(ui, palette, replied) {
             actions.jump_to = Some(replied.message_id.clone());
@@ -1319,9 +2056,22 @@ fn message_row(
                 });
             }
         })
-    })
-    .response
-    .rect
+    });
+    let rect = row.response.rect;
+    // Mensaje agrupado (sin encabezado): al pasar el mouse sale su hora en el
+    // margen izquierdo, como en Discord. Solo la hora, aunque `msg.time`
+    // lleve fecha. Se pinta directo, sin ocupar lugar, así la fila no salta.
+    if grouped && ui.rect_contains_pointer(rect) {
+        let short_time = msg.time.rsplit(' ').next().unwrap_or(&msg.time);
+        ui.painter().text(
+            egui::pos2(rect.left() + AVATAR_GUTTER / 2.0 + 2.0, rect.top() + 3.0),
+            egui::Align2::CENTER_TOP,
+            short_time,
+            theme::regular(10.5),
+            palette.dim,
+        );
+    }
+    rect
 }
 
 /// Insignia "APP" que Discord pone junto al nombre de un bot (con un tilde
@@ -1675,16 +2425,61 @@ fn thread_created_row(ui: &mut egui::Ui, palette: &Palette, msg: &ChatMessage, a
     .rect
 }
 
-/// Barra flotante que aparece al pasar el mouse por un mensaje, con las
-/// acciones rápidas: responder, reenviar, agregar la reacción rápida de
-/// turno, y abrir el panel de más reacciones. Reemplaza al botón de "+"
-/// que antes se mostraba siempre debajo de cada mensaje.
-///
-/// Nota sobre los íconos: el set de Lucide que trae este proyecto
-/// (`assets/icons/`) no incluye ninguno de "responder" (flecha curva) ni
-/// "reenviar" (flecha compartir) — se usan `ArrowLeft`/`ArrowRight` como
-/// reemplazo, mismo criterio que ya usa `composer` con `Sparkles` para el
-/// ícono de emoji que tampoco está en el set.
+/// Menú abierto de un mensaje (botón "..." de la barra flotante o click
+/// derecho). Vive en la memoria de egui, como el panel de reacciones.
+#[derive(Clone)]
+struct MsgMenu {
+    index: usize,
+    /// Esquina superior izquierda del menú (egui lo corre si no entra).
+    pos: egui::Pos2,
+    /// Botón "..." que lo abrió (apretarlo de nuevo lo cierra).
+    toggle: Option<egui::Rect>,
+}
+
+fn message_menu_id() -> egui::Id {
+    scoped_id("ecord_message_menu")
+}
+
+fn open_message_menu(ctx: &egui::Context) -> Option<MsgMenu> {
+    ctx.memory(|m| m.data.get_temp(message_menu_id()))
+}
+
+fn set_open_message_menu(ctx: &egui::Context, menu: Option<MsgMenu>) {
+    ctx.memory_mut(|m| match menu {
+        Some(menu) => {
+            m.data.insert_temp(message_menu_id(), menu);
+        }
+        None => {
+            m.data.remove::<MsgMenu>(message_menu_id());
+        }
+    });
+    ctx.request_repaint();
+}
+
+/// Botón cuadrado con un emoji (reacciones rápidas de la barra flotante).
+fn quick_emoji_button(ui: &mut egui::Ui, palette: &Palette, emoji: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(TOOLBAR_BUTTON), Sense::click());
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(6), palette.surface_hover);
+    }
+    let icon_rect = egui::Rect::from_center_size(rect.center(), Vec2::splat(18.0));
+    if twemoji::paint(ui, icon_rect, emoji) == twemoji::State::Failed {
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            emoji,
+            theme::regular(16.0),
+            palette.text,
+        );
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Barra flotante que aparece al pasar el mouse por un mensaje: tres
+/// reacciones rápidas (las que más usa la cuenta), separador, agregar
+/// reacción, responder, reenviar y "..." (menú del mensaje, ver
+/// `message_menu`).
 #[allow(clippy::too_many_arguments)]
 fn hover_toolbar(
     ui: &mut egui::Ui,
@@ -1695,8 +2490,8 @@ fn hover_toolbar(
     toggled_reaction: &mut Option<(usize, ReactionKind)>,
     reply_target: &mut Option<ReplyTarget>,
     forward_requested: &mut bool,
-    actions: &mut RowActions,
-    can_create_thread: bool,
+    _actions: &mut RowActions,
+    _can_create_thread: bool,
 ) {
     let pos = egui::pos2(row_rect.right() - TOOLBAR_WIDTH - 12.0, row_rect.top() - TOOLBAR_BUTTON / 2.0);
 
@@ -1719,7 +2514,29 @@ fn hover_toolbar(
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
 
-                        if theme::icon_button(ui, Icon::ArrowLeft, 14.0, palette.dim, palette.text, "Responder").clicked() {
+                        for emoji in quick_reactions().into_iter().take(3) {
+                            if quick_emoji_button(ui, palette, &emoji).clicked() {
+                                if let Some(key) = crate::discord::frecency::emoji_key_for_unicode(&emoji) {
+                                    crate::discord::frecency::record_reaction_use(&key);
+                                }
+                                *toggled_reaction = Some((index, ReactionKind::Unicode(emoji)));
+                            }
+                        }
+
+                        // Separador vertical.
+                        let (sep, _) = ui.allocate_exact_size(Vec2::new(9.0, TOOLBAR_BUTTON), Sense::hover());
+                        ui.painter().vline(
+                            sep.center().x,
+                            (sep.top() + 5.0)..=(sep.bottom() - 5.0),
+                            Stroke::new(1.0, palette.outline),
+                        );
+
+                        if theme::icon_button(ui, Icon::Smile, 16.0, palette.dim, palette.text, "Añadir reacción").clicked() {
+                            set_open_message_menu(ui.ctx(), None);
+                            set_open_reaction_panel(ui.ctx(), Some(index));
+                        }
+
+                        if theme::icon_button(ui, Icon::Reply, 16.0, palette.dim, palette.text, "Responder").clicked() {
                             *reply_target = Some(ReplyTarget {
                                 message_id: msg.id.clone(),
                                 author: msg.author.clone(),
@@ -1727,52 +2544,499 @@ fn hover_toolbar(
                             });
                         }
 
-                        // Reenviar: no hay picker de canal/DM destino
-                        // todavía en este cliente, así que esto no manda
-                        // nada por su cuenta — solo le avisa a quien
-                        // llamó a `show` (ver `ChatEvent`), que es quien
-                        // sabe mostrar un toast.
-                        if theme::icon_button(ui, Icon::ArrowRight, 14.0, palette.dim, palette.text, "Reenviar").clicked() {
+                        // Reenviar: todavía no hay selector de canal/DM
+                        // destino; solo le avisa a quien llamó a `show`
+                        // (ver `ChatEvent`), que muestra un toast.
+                        if theme::icon_button(ui, Icon::Forward, 16.0, palette.dim, palette.text, "Reenviar").clicked() {
                             *forward_requested = true;
                         }
 
-                        // Hilo: abre el que ya tiene el mensaje o, si no
-                        // tiene y se puede, crea uno (con el principio del
-                        // mensaje de nombre, como el cliente real).
-                        let has_thread = msg.thread.is_some();
-                        if !msg.id.is_empty() && (has_thread || (can_create_thread && msg.kind == 0)) {
-                            let tooltip = if has_thread { "Abrir hilo" } else { "Crear hilo" };
-                            if theme::icon_button(ui, Icon::ListPlus, 14.0, palette.dim, palette.text, tooltip).clicked() {
-                                if let Some(card) = msg.thread.as_ref() {
-                                    actions.open_thread =
-                                        Some((card.id.clone(), card.name.clone(), card.owner_id.clone()));
-                                } else {
-                                    let name: String = msg.content.chars().take(100).collect();
-                                    let name = if name.trim().is_empty() { "Nuevo hilo".to_string() } else { name };
-                                    actions.create_thread = Some((msg.channel_id.clone(), msg.id.clone(), name));
-                                }
+                        let more = theme::icon_button(ui, Icon::Ellipsis, 16.0, palette.dim, palette.text, "Más");
+                        if more.clicked() {
+                            let ctx = ui.ctx().clone();
+                            if open_message_menu(&ctx).is_some_and(|m| m.index == index) {
+                                set_open_message_menu(&ctx, None);
+                            } else {
+                                set_open_reaction_panel(&ctx, None);
+                                set_open_message_menu(
+                                    &ctx,
+                                    Some(MsgMenu {
+                                        index,
+                                        pos: egui::pos2(more.rect.right() - MENU_WIDTH, more.rect.bottom() + 6.0),
+                                        toggle: Some(more.rect),
+                                    }),
+                                );
                             }
-                        }
-
-                        if theme::icon_button(ui, Icon::Sparkles, 14.0, palette.dim, palette.text, "Reacción rápida").clicked() {
-                            let quick = quick_reactions();
-                            if let Some(next_emoji) = quick.iter().find(|e| {
-                                let candidate = ReactionKind::Unicode((*e).clone());
-                                !msg.reactions.iter().any(|r| r.emoji == candidate)
-                            }) {
-                                if let Some(key) = crate::discord::frecency::emoji_key_for_unicode(next_emoji) {
-                                    crate::discord::frecency::record_reaction_use(&key);
-                                }
-                                *toggled_reaction = Some((index, ReactionKind::Unicode(next_emoji.clone())));
-                            }
-                        }
-
-                        if theme::icon_button(ui, Icon::CirclePlus, 14.0, palette.dim, palette.text, "Más reacciones").clicked() {
-                            set_open_reaction_panel(ui.ctx(), Some(index));
                         }
                     });
                 });
         });
+}
+
+/// Fila del menú: ícono + texto (+ flecha si abre un submenú).
+fn menu_item(ui: &mut egui::Ui, palette: &Palette, icon: Icon, label: &str, arrow: bool, danger: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::click());
+    let color = if danger { palette.danger } else { palette.text };
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(6), palette.surface_hover);
+    }
+    let cy = rect.center().y;
+    theme::paint_icon(
+        ui,
+        icon,
+        egui::Rect::from_center_size(egui::pos2(rect.left() + 22.0, cy), Vec2::splat(18.0)),
+        18.0,
+        if danger { color } else { palette.secondary },
+    );
+    ui.painter().text(
+        egui::pos2(rect.left() + 44.0, cy),
+        egui::Align2::LEFT_CENTER,
+        label,
+        theme::regular(14.0),
+        color,
+    );
+    if arrow {
+        theme::paint_icon(
+            ui,
+            Icon::ChevronRight,
+            egui::Rect::from_center_size(egui::pos2(rect.right() - 16.0, cy), Vec2::splat(16.0)),
+            16.0,
+            palette.dim,
+        );
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn menu_separator(ui: &mut egui::Ui, palette: &Palette) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 9.0), Sense::hover());
+    ui.painter().hline(
+        (rect.left() + 4.0)..=(rect.right() - 4.0),
+        rect.center().y,
+        Stroke::new(1.0, palette.outline),
+    );
+}
+
+/// Lo que el menú de un mensaje puede pedirle a `show`.
+struct MenuOutputs<'a> {
+    toggled_reaction: &'a mut Option<(usize, ReactionKind)>,
+    reply_target: &'a mut Option<ReplyTarget>,
+    forward_requested: &'a mut bool,
+    event: &'a mut Option<ChatEvent>,
+    /// Server del chat (`None` en un DM), para armar el enlace del mensaje.
+    guild_id: Option<&'a str>,
+    /// Borrar el mensaje / sacar reacciones (se aplica en `show`).
+    op: &'a mut Option<MessageOp>,
+    /// La cuenta puede administrar mensajes en este canal.
+    can_manage: bool,
+}
+
+/// Cambio pedido desde el menú de un mensaje.
+enum MessageOp {
+    Delete { message_id: String },
+    ClearAll { message_id: String },
+    ClearEmoji { message_id: String, emoji: ReactionKind },
+}
+
+/// Mensaje que espera confirmación para borrarse (memoria de egui).
+#[derive(Clone)]
+struct DeleteConfirm {
+    message_id: String,
+}
+
+fn delete_confirm_id() -> egui::Id {
+    scoped_id("ecord_delete_confirm_state")
+}
+
+fn open_delete_confirm(ctx: &egui::Context) -> Option<DeleteConfirm> {
+    ctx.memory(|m| m.data.get_temp(delete_confirm_id()))
+}
+
+fn set_delete_confirm(ctx: &egui::Context, confirm: Option<DeleteConfirm>) {
+    ctx.memory_mut(|m| match confirm {
+        Some(confirm) => {
+            m.data.insert_temp(delete_confirm_id(), confirm);
+        }
+        None => {
+            m.data.remove::<DeleteConfirm>(delete_confirm_id());
+        }
+    });
+    ctx.request_repaint();
+}
+
+/// Cartel "Eliminar mensaje": `Some(true)` = confirmar, `Some(false)` =
+/// cancelar (botón o Esc), `None` = sigue abierto.
+fn delete_confirm_dialog(ui: &mut egui::Ui, palette: &Palette, msg: &ChatMessage) -> Option<bool> {
+    let mut result = None;
+    let center = ui.clip_rect().center();
+    Area::new(scoped_id("ecord_delete_confirm_area"))
+        .order(Order::Foreground)
+        .pivot(egui::Align2::CENTER_CENTER)
+        .fixed_pos(center)
+        .show(ui.ctx(), |ui| {
+            Frame::new()
+                .fill(palette.overlay)
+                .stroke(Stroke::new(1.0, palette.outline))
+                .corner_radius(CornerRadius::same(12))
+                .inner_margin(Margin::same(18))
+                .shadow(egui::epaint::Shadow {
+                    offset: [0, 8],
+                    blur: 24,
+                    spread: 0,
+                    color: palette.shadow,
+                })
+                .show(ui, |ui| {
+                    ui.set_width(360.0);
+                    theme::text(ui, "Eliminar mensaje", theme::bold(17.0), palette.text);
+                    ui.add_space(4.0);
+                    theme::text(ui, "¿Seguro que quieres eliminar este mensaje?", theme::regular(13.5), palette.secondary);
+                    ui.add_space(10.0);
+                    Frame::new()
+                        .fill(palette.surface)
+                        .stroke(Stroke::new(1.0, palette.outline))
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(Margin::same(10))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            theme::text(ui, &msg.author, theme::semibold(13.5), palette.text);
+                            let preview = if msg.content.trim().is_empty() {
+                                "(sin texto)".to_string()
+                            } else {
+                                preview_text(&msg.content)
+                            };
+                            theme::text(ui, &preview, theme::regular(13.0), palette.dim);
+                        });
+                    ui.add_space(14.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let danger = palette.danger;
+                        let luma = 0.299 * danger.r() as f32 + 0.587 * danger.g() as f32 + 0.114 * danger.b() as f32;
+                        let on_danger = if luma > 150.0 { Color32::from_rgb(0x1a, 0x1a, 0x1a) } else { Color32::WHITE };
+
+                        let (rect, response) = ui.allocate_exact_size(Vec2::new(96.0, 34.0), Sense::click());
+                        let fill = if response.hovered() { danger.gamma_multiply(0.85) } else { danger };
+                        ui.painter().rect_filled(rect, CornerRadius::same(8), fill);
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "Eliminar",
+                            theme::semibold(13.5),
+                            on_danger,
+                        );
+                        if response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            result = Some(true);
+                        }
+
+                        let (rect, response) = ui.allocate_exact_size(Vec2::new(90.0, 34.0), Sense::click());
+                        if response.hovered() {
+                            ui.painter()
+                                .rect_filled(rect, CornerRadius::same(8), palette.surface_hover);
+                        }
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "Cancelar",
+                            theme::semibold(13.5),
+                            palette.text,
+                        );
+                        if response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            result = Some(false);
+                        }
+                    });
+                });
+        });
+    if result.is_none() && ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
+        result = Some(false);
+    }
+    result
+}
+
+/// Menú de un mensaje (botón "..." o click derecho). Las opciones que
+/// todavía no existen en este cliente (marcar mensaje, recordatorio,
+/// aplicaciones, leer, ver reacciones y denunciar) avisan con un toast.
+fn message_menu(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    msg: &ChatMessage,
+    menu: &MsgMenu,
+    actions: &mut RowActions,
+    can_create_thread: bool,
+    out: MenuOutputs<'_>,
+) {
+    let MenuOutputs { toggled_reaction, reply_target, forward_requested, event, guild_id, op, can_manage } = out;
+    // Lo de reacciones solo aparece si el mensaje tiene alguna.
+    let has_reactions = !msg.reactions.is_empty() && !msg.id.is_empty();
+    // Submenú "Eliminar reacciones": fila que lo abre (se arma abajo).
+    let mut reactions_rect: Option<egui::Rect> = None;
+    let ctx = ui.ctx().clone();
+    let index = menu.index;
+    let mut close = false;
+
+    let shown = Area::new(scoped_id("ecord_message_menu_area"))
+        .order(Order::Foreground)
+        .fixed_pos(menu.pos)
+        .show(&ctx, |ui| {
+            Frame::new()
+                .fill(palette.overlay)
+                .stroke(Stroke::new(1.0, palette.outline))
+                .corner_radius(CornerRadius::same(10))
+                .inner_margin(Margin::same(6))
+                .shadow(egui::epaint::Shadow {
+                    offset: [0, 6],
+                    blur: 18,
+                    spread: 0,
+                    color: palette.shadow,
+                })
+                .show(ui, |ui| {
+                    ui.set_width(MENU_WIDTH);
+                    ui.spacing_mut().item_spacing = Vec2::new(0.0, 0.0);
+
+                    // Reacciones rápidas.
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(6.0, 0.0);
+                        let tile_w = (MENU_WIDTH - 3.0 * 6.0) / 4.0;
+                        for emoji in quick_reactions().into_iter().take(4) {
+                            let (rect, response) = ui.allocate_exact_size(Vec2::new(tile_w, 40.0), Sense::click());
+                            let fill = if response.hovered() { palette.surface_active } else { palette.surface_hover };
+                            ui.painter().rect_filled(rect, CornerRadius::same(8), fill);
+                            let icon_rect = egui::Rect::from_center_size(rect.center(), Vec2::splat(22.0));
+                            if twemoji::paint(ui, icon_rect, &emoji) == twemoji::State::Failed {
+                                ui.painter().text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    &emoji,
+                                    theme::regular(18.0),
+                                    palette.text,
+                                );
+                            }
+                            if response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                if let Some(key) = crate::discord::frecency::emoji_key_for_unicode(&emoji) {
+                                    crate::discord::frecency::record_reaction_use(&key);
+                                }
+                                *toggled_reaction = Some((index, ReactionKind::Unicode(emoji)));
+                                close = true;
+                            }
+                        }
+                    });
+                    ui.add_space(4.0);
+
+                    let item = |ui: &mut egui::Ui, icon: Icon, label: &str, arrow: bool, danger: bool| -> bool {
+                        menu_item(ui, palette, icon, label, arrow, danger).clicked()
+                    };
+
+                    if item(ui, Icon::SmilePlus, "Añadir reacción", true, false) {
+                        set_open_reaction_panel(&ctx, Some(index));
+                        close = true;
+                    }
+                    if has_reactions && item(ui, Icon::Smile, "Ver reacciones", false, false) {
+                        *event = Some(ChatEvent::Unavailable("Ver reacciones"));
+                        close = true;
+                    }
+                    menu_separator(ui, palette);
+                    if item(ui, Icon::Reply, "Responder", false, false) {
+                        *reply_target = Some(ReplyTarget {
+                            message_id: msg.id.clone(),
+                            author: msg.author.clone(),
+                            preview: preview_text(&msg.content),
+                        });
+                        close = true;
+                    }
+                    if item(ui, Icon::Forward, "Reenviar", false, false) {
+                        *forward_requested = true;
+                        close = true;
+                    }
+
+                    // Hilo: abre el que ya tiene el mensaje o, si se puede,
+                    // crea uno (con el principio del mensaje de nombre).
+                    let has_thread = msg.thread.is_some();
+                    if !msg.id.is_empty() && (has_thread || (can_create_thread && msg.kind == 0)) {
+                        let label = if has_thread { "Abrir hilo" } else { "Crear hilo" };
+                        if item(ui, Icon::ListPlus, label, false, false) {
+                            if let Some(card) = msg.thread.as_ref() {
+                                actions.open_thread =
+                                    Some((card.id.clone(), card.name.clone(), card.owner_id.clone()));
+                            } else {
+                                let name: String = msg.content.chars().take(100).collect();
+                                let name = if name.trim().is_empty() { "Nuevo hilo".to_string() } else { name };
+                                actions.create_thread = Some((msg.channel_id.clone(), msg.id.clone(), name));
+                            }
+                            close = true;
+                        }
+                    }
+
+                    menu_separator(ui, palette);
+                    if item(ui, Icon::Copy, "Copiar texto", false, false) {
+                        ctx.copy_text(msg.content.clone());
+                        close = true;
+                    }
+                    if item(ui, Icon::Bookmark, "Marcar mensaje", false, false) {
+                        *event = Some(ChatEvent::Unavailable("Marcar mensaje"));
+                        close = true;
+                    }
+                    if item(ui, Icon::Clock, "Crear recordatorio", true, false) {
+                        *event = Some(ChatEvent::Unavailable("Crear recordatorio"));
+                        close = true;
+                    }
+                    if item(ui, Icon::LayoutGrid, "Aplicaciones", true, false) {
+                        *event = Some(ChatEvent::Unavailable("Aplicaciones"));
+                        close = true;
+                    }
+                    if item(ui, Icon::MessageCircle, "Marcar no leídos", false, false) && !msg.id.is_empty() {
+                        *event = Some(ChatEvent::MarkUnread { message_id: msg.id.clone() });
+                        close = true;
+                    }
+                    if item(ui, Icon::Link, "Copiar enlace del mensaje", false, false) {
+                        ctx.copy_text(format!(
+                            "https://discord.com/channels/{}/{}/{}",
+                            guild_id.unwrap_or("@me"),
+                            msg.channel_id,
+                            msg.id
+                        ));
+                        close = true;
+                    }
+                    if item(ui, Icon::Volume2, "Leer mensaje", false, false) {
+                        *event = Some(ChatEvent::Unavailable("Leer mensaje"));
+                        close = true;
+                    }
+                    let can_clear = has_reactions && can_manage;
+                    let can_delete = !msg.id.is_empty() && (msg.is_own || can_manage);
+                    let can_report = !msg.is_own && !msg.id.is_empty();
+                    if can_clear || can_delete || can_report {
+                        menu_separator(ui, palette);
+                    }
+                    if can_clear {
+                        let row = menu_item(ui, palette, Icon::Smile, "Eliminar reacciones", true, true);
+                        reactions_rect = Some(row.rect);
+                        if item(ui, Icon::SmileMinus, "Eliminar todas las reacciones", false, true) {
+                            *op = Some(MessageOp::ClearAll { message_id: msg.id.clone() });
+                            close = true;
+                        }
+                    }
+                    if can_delete && item(ui, Icon::Trash, "Eliminar mensaje", false, true) {
+                        if ui.input(|i| i.modifiers.shift) {
+                            *op = Some(MessageOp::Delete { message_id: msg.id.clone() });
+                        } else {
+                            set_delete_confirm(&ctx, Some(DeleteConfirm { message_id: msg.id.clone() }));
+                        }
+                        close = true;
+                    }
+                    if can_report && item(ui, Icon::Flag, "Denunciar mensaje", false, true) {
+                        *event = Some(ChatEvent::Unavailable("Denunciar mensaje"));
+                        close = true;
+                    }
+                    menu_separator(ui, palette);
+                    if item(ui, Icon::Hash, "Copiar ID del mensaje", false, false) {
+                        ctx.copy_text(msg.id.clone());
+                        close = true;
+                    }
+                });
+        });
+
+    // Se cierra con Esc o con un click afuera (el botón "..." que lo abrió
+    // se encarga solo de alternarlo).
+    let menu_rect = shown.response.rect;
+
+    // Submenú "Eliminar reacciones": una fila por emoji. Se abre con el mouse
+    // sobre la fila y sigue abierto mientras el mouse esté en él.
+    let sub_id = scoped_id("ecord_message_submenu");
+    let hover = ctx.input(|i| i.pointer.hover_pos());
+    let prev_sub: Option<egui::Rect> = ctx.memory(|m| m.data.get_temp(sub_id));
+    let mut sub_rect: Option<egui::Rect> = None;
+    if let Some(item_rect) = reactions_rect {
+        let over_item = hover.is_some_and(|p| item_rect.contains(p));
+        let over_sub = prev_sub.zip(hover).is_some_and(|(r, p)| r.expand(8.0).contains(p));
+        if over_item || over_sub {
+            let sub = Area::new(scoped_id("ecord_message_submenu_area"))
+                .order(Order::Foreground)
+                .fixed_pos(egui::pos2(menu_rect.right() + 4.0, item_rect.top() - 6.0))
+                .show(&ctx, |ui| {
+                    Frame::new()
+                        .fill(palette.overlay)
+                        .stroke(Stroke::new(1.0, palette.outline))
+                        .corner_radius(CornerRadius::same(10))
+                        .inner_margin(Margin::same(6))
+                        .shadow(egui::epaint::Shadow {
+                            offset: [0, 6],
+                            blur: 18,
+                            spread: 0,
+                            color: palette.shadow,
+                        })
+                        .show(ui, |ui| {
+                            ui.set_width(200.0);
+                            ui.spacing_mut().item_spacing = Vec2::ZERO;
+                            for reaction in &msg.reactions {
+                                let (rect, response) =
+                                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::click());
+                                if response.hovered() {
+                                    ui.painter()
+                                        .rect_filled(rect, CornerRadius::same(6), palette.surface_hover);
+                                }
+                                let icon_rect = egui::Rect::from_center_size(
+                                    egui::pos2(rect.left() + 20.0, rect.center().y),
+                                    Vec2::splat(18.0),
+                                );
+                                match &reaction.emoji {
+                                    ReactionKind::Unicode(e) => {
+                                        if twemoji::paint(ui, icon_rect, e) == twemoji::State::Failed {
+                                            ui.painter().text(
+                                                icon_rect.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                e,
+                                                theme::regular(15.0),
+                                                palette.text,
+                                            );
+                                        }
+                                    }
+                                    ReactionKind::Custom { name, .. } => {
+                                        ui.painter().text(
+                                            egui::pos2(rect.left() + 12.0, rect.center().y),
+                                            egui::Align2::LEFT_CENTER,
+                                            format!(":{name}:"),
+                                            theme::regular(13.0),
+                                            palette.text,
+                                        );
+                                    }
+                                }
+                                ui.painter().text(
+                                    egui::pos2(rect.right() - 12.0, rect.center().y),
+                                    egui::Align2::RIGHT_CENTER,
+                                    reaction.count.to_string(),
+                                    theme::regular(13.0),
+                                    palette.dim,
+                                );
+                                if response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                    *op = Some(MessageOp::ClearEmoji {
+                                        message_id: msg.id.clone(),
+                                        emoji: reaction.emoji.clone(),
+                                    });
+                                    close = true;
+                                }
+                            }
+                        });
+                });
+            sub_rect = Some(sub.response.rect);
+        }
+    }
+    ctx.memory_mut(|m| match sub_rect {
+        Some(r) => {
+            m.data.insert_temp(sub_id, r);
+        }
+        None => {
+            m.data.remove::<egui::Rect>(sub_id);
+        }
+    });
+
+    let toggle = menu.toggle;
+    let outside_press = ctx.input(|i| {
+        i.pointer.any_pressed()
+            && i.pointer.interact_pos().is_some_and(|p| {
+                !menu_rect.contains(p)
+                    && !toggle.is_some_and(|t| t.contains(p))
+                    && !sub_rect.is_some_and(|r| r.contains(p))
+            })
+    });
+    if close || outside_press || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        set_open_message_menu(&ctx, None);
+    }
 }
 
 /// Recorta el contenido de un mensaje para mostrarlo como vista previa en
@@ -2128,6 +3392,27 @@ fn composer(
     let slash_state_id = scoped_id("ecord_composer_slash_state");
     let text_extra_id = scoped_id("ecord_composer_text_extra");
 
+    // Permisos y modo lento del canal (ver `ChatLimits`).
+    let limits = current_limits(&ctx);
+    let channel_key: String = send_target.as_ref().map(|(_, c, _)| c.clone()).unwrap_or_default();
+
+    // Sin "Enviar mensajes" no hay caja de texto: una barra lo explica.
+    if !limits.can_send {
+        ctx.memory_mut(|m| m.data.insert_temp(text_extra_id, 0.0_f32));
+        match active_notice(&ctx) {
+            Some(text) => restriction_bar(ui, palette, &text, palette.danger),
+            None => restriction_bar(
+                ui,
+                palette,
+                "No tienes permiso para enviar mensajes en este canal.",
+                palette.dim,
+            ),
+        }
+        return nitro_required;
+    }
+    // Modo lento: mientras corre la cuenta regresiva no se puede mandar nada.
+    let slow_blocked = limits.slowmode_secs > 0 && slowmode_wait(&ctx, &channel_key) > 0.0;
+
     // ---- Slash command elegido: su formulario de opciones reemplaza al
     // compositor hasta que se envía (Enter) o se cancela (Esc).
     if let Some(mut active) = slash_ui::load_active(&ctx, slash_active_id) {
@@ -2169,6 +3454,64 @@ fn composer(
             }
         }
         return nitro_required;
+    }
+
+    // ---- Adjuntos: archivos pendientes de este canal, subidas en curso y lo
+    // que llega del selector, de arrastrar y soltar o del portapapeles.
+    use crate::ui::attachments as files_ui;
+    let files_id = scoped_id("ecord_composer_files").with(&channel_key);
+    let jobs_id = scoped_id("ecord_composer_jobs");
+    let file_picker_id = scoped_id("ecord_composer_filepicker");
+    let mut pending = files_ui::load(&ctx, files_id);
+    for msg in files_ui::poll_jobs(&ctx, jobs_id) {
+        set_notice(&ctx, &msg);
+    }
+    if send_target.is_some() {
+        let mut incoming = files_ui::take_picked(&ctx, file_picker_id);
+        let mut rejected_for_permission = false;
+        if is_input_target(&ctx, text_id) {
+            if files_ui::hovering_files(&ctx) {
+                files_ui::drop_overlay(&ctx, palette, limits.can_attach);
+            }
+            let dropped = files_ui::dropped_paths(&ctx);
+            if !dropped.is_empty() {
+                if limits.can_attach {
+                    incoming.extend(dropped);
+                } else {
+                    rejected_for_permission = true;
+                }
+            }
+            // Ctrl+V con una imagen en el portapapeles (y sin texto): captura
+            // de pantalla, "copiar imagen" desde el navegador...
+            let paste_image_wanted = ctx.memory(|m| m.has_focus(text_id))
+                && ctx.input(|i| {
+                    i.modifiers.command
+                        && i.key_pressed(egui::Key::V)
+                        && !i.events.iter().any(|e| matches!(e, egui::Event::Paste(t) if !t.is_empty()))
+                });
+            if paste_image_wanted {
+                if !limits.can_attach {
+                    // Sin texto que pegar y sin permiso: se avisa solo si de
+                    // verdad había una imagen (si no, es un Ctrl+V vacío).
+                    if arboard::Clipboard::new().is_ok_and(|mut c| c.get_image().is_ok()) {
+                        rejected_for_permission = true;
+                    }
+                } else {
+                    match files_ui::paste_image(&mut pending, limits.max_upload_bytes) {
+                        Ok(_) => {}
+                        Err(msg) => set_notice(&ctx, &msg),
+                    }
+                }
+            }
+        }
+        if rejected_for_permission {
+            set_notice(&ctx, "No tienes permiso para adjuntar archivos en este canal.");
+        }
+        if !incoming.is_empty() {
+            for problem in files_ui::add_paths(&mut pending, incoming, limits.max_upload_bytes) {
+                set_notice(&ctx, &problem);
+            }
+        }
     }
 
     // Si el selector de emojis estaba abierto, leído UNA sola vez al principio
@@ -2329,6 +3672,16 @@ fn composer(
     ui.add_space(6.0);
     // Rect del campo (marco incluido), para anclar los menús flotantes.
     let mut composer_rect = egui::Rect::NOTHING;
+    for (text, color) in composer_notices(&ctx, palette, limits, &channel_key) {
+        ui.horizontal(|ui| {
+            ui.set_min_height(NOTICE_H);
+            ui.add_space(22.0);
+            theme::text(ui, text, theme::medium(11.5), color);
+        });
+    }
+    // Archivos pendientes de enviar (su alto se suma al que se le reserva al
+    // compositor, ver `text_extra` más abajo).
+    let chips_h = files_ui::show_chips(ui, palette, &mut pending);
     ui.horizontal(|ui| {
         ui.add_space(16.0);
         let framed = Frame::new()
@@ -2342,7 +3695,19 @@ fn composer(
                 // izquierda); con 32 quedaban 32px y el campo se veía corrido.
                 ui.set_width(ui.available_width() - 16.0);
                 ui.horizontal(|ui| {
-                    theme::icon(ui, Icon::CirclePlus, 16.0, palette.dim);
+                    let plus_tone = if limits.can_attach { palette.dim } else { palette.danger };
+                    let plus_tip = if limits.can_attach {
+                        "Adjuntar archivos"
+                    } else {
+                        "No tienes permiso para adjuntar archivos en este canal."
+                    };
+                    if theme::icon_button(ui, Icon::CirclePlus, 16.0, plus_tone, palette.text, plus_tip).clicked() {
+                        if limits.can_attach {
+                            files_ui::open_picker(&ctx, file_picker_id);
+                        } else {
+                            set_notice(&ctx, "No tienes permiso para adjuntar archivos en este canal.");
+                        }
+                    }
 
                     let text_width = ui.available_width() - 44.0;
                     // `return_key`: Enter sin Shift no inserta un salto de
@@ -2400,7 +3765,7 @@ fn composer(
                     // el rect del scroll puede ser más grande que lo que se ve.
                     let shown_height = scroll_out.content_size.y.min(COMPOSER_TEXT_MAX_HEIGHT);
                     let text_extra = (shown_height - ui.spacing().interact_size.y).max(0.0);
-                    ctx.memory_mut(|m| m.data.insert_temp(text_extra_id, text_extra));
+                    ctx.memory_mut(|m| m.data.insert_temp(text_extra_id, text_extra + chips_h));
                     let response = scroll_out.inner;
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Botón de emojis: abre/cierra el selector (se dibuja
@@ -2422,10 +3787,45 @@ fn composer(
                     // estaba abierto, ya se llevó ese Enter más arriba.)
                     let enter_pressed = response.has_focus()
                         && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-                    if enter_pressed && !compose_text.trim().is_empty() {
+                    let has_files = !pending.files.is_empty();
+                    if enter_pressed && (!compose_text.trim().is_empty() || has_files) && !slow_blocked {
                         // `:nombre:` -> `<:nombre:id>` para los emojis personalizados.
                         let picked = menus::take_customs(&ctx, customs_id);
                         let content = menus::expand_shortcodes(compose_text.trim(), &picked, custom_emojis);
+                        if has_files {
+                            // Mensaje con archivos: sin eco local (el mensaje
+                            // real llega por el Gateway cuando termina la subida).
+                            if !limits.can_attach {
+                                set_notice(&ctx, "No tienes permiso para adjuntar archivos en este canal.");
+                            } else if let Some(big) =
+                                pending.files.iter().find(|f| f.size > limits.max_upload_bytes)
+                            {
+                                set_notice(&ctx, &format!("«{}» supera el tamaño máximo permitido.", big.filename));
+                            } else if let Some((token, channel_id, guild_id)) = send_target.clone() {
+                                let reply_to = reply_target
+                                    .take()
+                                    .map(|r| r.message_id)
+                                    .filter(|id| !id.is_empty());
+                                let job = crate::discord::uploads::UploadJob::new(pending.files.len());
+                                files_ui::push_job(&ctx, jobs_id, job.clone());
+                                crate::discord::uploads::spawn_send_with_files(
+                                    ctx.clone(),
+                                    token,
+                                    channel_id,
+                                    guild_id,
+                                    content,
+                                    reply_to,
+                                    files_ui::to_upload_files(&pending),
+                                    job,
+                                );
+                                pending.files.clear();
+                                compose_text.clear();
+                                if limits.slowmode_secs > 0 {
+                                    start_slowmode(&ctx, &channel_key, limits.slowmode_secs);
+                                }
+                            }
+                            response.request_focus();
+                        } else {
                         let mut echo = ChatMessage::own(own_author, "ahora", &content, own_color);
                         // Para que el eco local muestre `@Nombre` y no `<@id>`.
                         echo.mentions = menus::take_remembered(&ctx, mentions_id, &content);
@@ -2457,17 +3857,22 @@ fn composer(
                             crate::discord::spawn_send_message(token, channel_id, guild_id, content, reply_to);
                         }
                         compose_text.clear();
+                        if limits.slowmode_secs > 0 {
+                            start_slowmode(&ctx, &channel_key, limits.slowmode_secs);
+                        }
                         // `multiline` no suelta el foco solo, pero tampoco
                         // lo retiene mágicamente frame a frame después de
                         // vaciar el texto por fuera del widget — lo
                         // reafirmamos para que se pueda seguir tipeando
                         // sin tener que volver a clickear la barra.
                         response.request_focus();
+                        }
                     }
                 });
             });
         composer_rect = framed.response.rect;
     });
+    files_ui::store(&ctx, files_id, pending);
 
     // ---- Slash commands, parte 2: dibujar el menú y activar el comando
     // elegido (con el teclado, arriba, o con el mouse, acá).
@@ -2644,6 +4049,10 @@ fn composer(
                 nitro_required = true;
                 close(&ctx);
             }
+            menus::PickerResult::Sticker(_) if slow_blocked => {
+                set_notice(&ctx, "Modo lento: espera a que termine la cuenta para enviar el sticker.");
+                close(&ctx);
+            }
             menus::PickerResult::Sticker(sticker) => {
                 // Un sticker se manda solo, sin texto. Si había una respuesta
                 // en curso, el sticker la contesta.
@@ -2653,7 +4062,18 @@ fn composer(
                         .map(|r| r.message_id)
                         .filter(|id| !id.is_empty());
                     crate::discord::spawn_send_sticker(token, channel_id, guild_id, sticker.id.clone(), reply_to);
+                    if limits.slowmode_secs > 0 {
+                        start_slowmode(&ctx, &channel_key, limits.slowmode_secs);
+                    }
                 }
+                close(&ctx);
+            }
+            menus::PickerResult::Gif(_) if !limits.can_embed => {
+                set_notice(&ctx, "No tienes permiso para insertar enlaces: no se puede enviar el GIF.");
+                close(&ctx);
+            }
+            menus::PickerResult::Gif(_) if slow_blocked => {
+                set_notice(&ctx, "Modo lento: espera a que termine la cuenta para enviar el GIF.");
                 close(&ctx);
             }
             menus::PickerResult::Gif(url) => {
@@ -2675,6 +4095,9 @@ fn composer(
                     .filter(|id| !id.is_empty());
                 if let Some((token, channel_id, guild_id)) = send_target.clone() {
                     crate::discord::spawn_send_message(token, channel_id, guild_id, url, reply_to);
+                }
+                if limits.slowmode_secs > 0 {
+                    start_slowmode(&ctx, &channel_key, limits.slowmode_secs);
                 }
                 close(&ctx);
             }

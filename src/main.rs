@@ -34,7 +34,6 @@ fn main() -> eframe::Result<()> {
     if single_instance::acquire() == single_instance::Role::Secondary {
         return Ok(());
     }
-    println!("Hello, world!");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])

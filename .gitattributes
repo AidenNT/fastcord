@@ -1,0 +1,6 @@
+# Saltos de línea consistentes: LF en todo el repo, CRLF solo en PowerShell.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.png binary
+*.jpg binary
+*.ico binary

@@ -4,7 +4,10 @@
 //!
 //! * **Sin integrantes**: degradado con el color de acento del tema, nombre
 //!   del canal, "No hay nadie en el chat de voz" y "Unirse a canal de voz".
-//! * **Con integrantes, sin stream**: grilla de tiles.
+//! * **Con integrantes, sin stream**: grilla de tiles. Cada transmisión es
+//!   un tile aparte, como si fuera otra persona, pegado al de quien transmite:
+//!   con la miniatura de fondo y un botón "Ver transmisión" en el centro; el
+//!   propio muestra lo que estás transmitiendo.
 //! * **Con integrantes, viendo un stream**: dos miradas que se alternan
 //!   con un click (sobre el stream o sobre los integrantes):
 //!     - *Escenario* (por defecto): el stream grande y los integrantes en una
@@ -17,7 +20,11 @@
 //!   flotante que se mueve arrastrándola y se redimensiona desde las esquinas
 //!   (`show_popup`).
 //!
-//! Los controles (barra de mic/ensordecer/colgar y los botones sobre el
+//! Con la ventana en segundo plano el video no se procesa (`App::video_paused`)
+//! y el tile muestra "Para ahorrar recursos este video se pausó".
+//!
+//! Los controles (barra de mic/ensordecer/cámara/transmitir/chat/ajustes/colgar,
+//! que reemplaza a la barra inferior de `ui::call_bar` mientras estás acá, y los botones sobre el
 //! stream) se desvanecen tras `IDLE_SECS` sin mover el mouse ni tocar teclas.
 //!
 //! Los clics se juntan en `CallEvents` y se aplican al final del frame, con
@@ -31,7 +38,7 @@ use egui::{
     Vec2,
 };
 
-use crate::discord::StreamWatchStatus;
+use crate::discord::{StreamPublishStatus, StreamWatchStatus};
 use crate::lib::data::VoiceOccupant;
 use crate::lib::state::{App, Screen};
 use crate::ui::emoji as twemoji;
@@ -57,7 +64,9 @@ const BAR_PAD: f32 = 8.0;
 const BAR_GAP: f32 = 8.0;
 const W_ROUND: f32 = 48.0;
 const W_LEAVE: f32 = 64.0;
-const BAR_W: f32 = W_ROUND * 2.0 + W_LEAVE + BAR_GAP * 2.0 + BAR_PAD * 2.0;
+/// Mic, ensordecer, cámara, transmitir, chat de voz y ajustes + desconectar.
+const BAR_ROUND_BTNS: f32 = 6.0;
+const BAR_W: f32 = W_ROUND * BAR_ROUND_BTNS + W_LEAVE + BAR_GAP * BAR_ROUND_BTNS + BAR_PAD * 2.0;
 
 // ---------------------------------------------------------------------
 // Estado de la vista
@@ -168,6 +177,11 @@ struct CallEvents {
     leave: bool,
     toggle_mute: bool,
     toggle_deafen: bool,
+    /// Transmitir pantalla / cortar la transmisión.
+    toggle_share: bool,
+    /// Mostrar / ocultar el panel del chat de voz.
+    toggle_chat: bool,
+    open_settings: bool,
     close_stream: bool,
     /// Alterna entre escenario y grilla.
     toggle_layout: bool,
@@ -193,20 +207,86 @@ struct StageData {
     message: Option<String>,
     frame_size: [usize; 2],
     texture: Option<egui::TextureHandle>,
+    /// Ventana en segundo plano: el video está pausado.
+    paused: bool,
+}
+
+/// Lo que se ve en el tile de NUESTRA transmisión (vista previa local).
+struct OwnStream {
+    status: StreamPublishStatus,
+    texture: Option<egui::TextureHandle>,
+    size: [usize; 2],
 }
 
 /// Contexto común a todos los tiles de integrantes.
 struct TileCtx<'a> {
     my_id: Option<&'a str>,
-    watching_user: Option<&'a str>,
-    connected_here: bool,
     /// Los tiles son clickeables (en la tira: pasan a la grilla).
     clickable: bool,
-    /// Hay un tile de stream en la grilla: no repetir "EN VIVO"/"Viendo".
-    grid_with_stream: bool,
     /// Volumen/silencio local de cada integrante (por user_id), para el menú
     /// de clic derecho.
     playback: &'a std::collections::HashMap<String, crate::discord::VoiceParticipantPlaybackSettings>,
+}
+
+/// Qué va en cada casillero de la grilla / la tira.
+#[derive(Clone, Copy)]
+enum Item {
+    /// Tile de una persona (índice en `members`).
+    Member(usize),
+    /// Tile de la transmisión de esa persona (miniatura + "Ver transmisión",
+    /// o la vista previa propia).
+    Stream(usize),
+    /// La transmisión que se está viendo, como un tile más (mirada de grilla).
+    Watched,
+}
+
+/// Todo lo que hace falta para dibujar los casilleros.
+struct Scene<'a> {
+    members: &'a [VoiceOccupant],
+    speaking: &'a [bool],
+    stage: Option<&'a StageData>,
+    own: Option<&'a OwnStream>,
+    /// Miniatura (URL) de la transmisión de cada persona, por user_id.
+    previews: &'a std::collections::HashMap<String, Option<String>>,
+    connected_here: bool,
+    /// Ventana en segundo plano: no se procesa video.
+    video_paused: bool,
+    tc: &'a TileCtx<'a>,
+}
+
+/// Arma los casilleros: cada integrante y, pegada a él, su transmisión como
+/// otro tile. `hide_watched` saca la que se está viendo (en el escenario ya
+/// ocupa el lugar grande).
+fn build_items(
+    members: &[VoiceOccupant],
+    my_id: Option<&str>,
+    watching_user: Option<&str>,
+    own_stream: bool,
+    has_stage: bool,
+    hide_watched: bool,
+) -> Vec<Item> {
+    let mut items = Vec::with_capacity(members.len() * 2);
+    let mut watched_placed = false;
+    for (i, m) in members.iter().enumerate() {
+        items.push(Item::Member(i));
+        let is_me = my_id == Some(m.user_id.as_str());
+        if !(m.streaming || (is_me && own_stream)) {
+            continue;
+        }
+        if !is_me && watching_user == Some(m.user_id.as_str()) {
+            watched_placed = true;
+            if !hide_watched {
+                items.push(Item::Watched);
+            }
+        } else {
+            items.push(Item::Stream(i));
+        }
+    }
+    // Se mira un stream cuyo dueño ya no figura entre los integrantes.
+    if has_stage && !watched_placed && !hide_watched {
+        items.insert(0, Item::Watched);
+    }
+    items
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -263,6 +343,39 @@ pub fn show(
         .map(|t| (t.self_mute, t.self_deaf))
         .unwrap_or((app.self_mute, app.self_deaf));
 
+    // Mi transmisión, si sale de ESTE canal: el tile propio muestra la vista
+    // previa local.
+    let own_stream: Option<OwnStream> = app
+        .broadcasting_stream
+        .as_ref()
+        .filter(|b| Some(&b.channel_id) == channel_id.as_ref())
+        .map(|b| OwnStream {
+            status: b.status,
+            texture: b.preview_texture.clone(),
+            size: b.preview_size,
+        });
+    let video_paused = app.video_paused;
+    // Transmitir solo tiene sentido con la llamada ya conectada; si ya hay una
+    // transmisión en curso el botón sirve para cortarla en cualquier estado.
+    let broadcasting = app.is_broadcasting();
+    let share_enabled = broadcasting || app.voice_fully_connected();
+    // Mientras no hay nadie en pantalla se muestra en qué fase va la conexión.
+    let connect_label =
+        crate::ui::call_bar::connection_label(app.voice_connection_status, app.voice_connect_phase);
+    // Miniaturas de las transmisiones de los demás (se piden a Discord en
+    // segundo plano y se refrescan cada tanto).
+    let previews: std::collections::HashMap<String, Option<String>> = match channel_id.as_deref() {
+        Some(cid) => members
+            .iter()
+            .filter(|m| m.streaming && my_id.as_deref() != Some(m.user_id.as_str()))
+            .map(|m| {
+                let key = format!("guild:{guild_id}:{cid}:{}", m.user_id);
+                (m.user_id.clone(), app.stream_preview_url(&key))
+            })
+            .collect(),
+        None => std::collections::HashMap::new(),
+    };
+
     // Stream que se está viendo, solo si es de ESTE canal.
     let watched_here = app
         .watching_stream
@@ -276,6 +389,7 @@ pub fn show(
         message: w.message.clone(),
         frame_size: w.frame_size,
         texture: w.texture.clone(),
+        paused: w.paused,
     });
     let watching_user: Option<String> =
         watched_here.and_then(|w| w.stream_key.rsplit(':').next().map(str::to_owned));
@@ -355,75 +469,71 @@ pub fn show(
             ui.painter().text(
                 content.center(),
                 Align2::CENTER_CENTER,
-                "Conectando…",
+                connect_label,
                 theme::medium(14.0),
                 palette.dim,
             );
-        } else if let Some(stage) = stage.as_ref() {
-            if vs.focus {
-                // Escenario + tira (ocultable).
-                let strip = if vs.strip_hidden || members.is_empty() {
-                    Vec::new()
-                } else {
-                    strip_layout(content, members.len())
-                };
-                let stage_bottom = strip
-                    .first()
-                    .map(|r| r.top() - TILE_GAP)
-                    .unwrap_or(content.bottom())
-                    .max(content.top() + 80.0);
-                let stage_rect =
-                    Rect::from_min_max(content.min, Pos2::new(content.max.x, stage_bottom));
-                draw_stream(ui, palette, stage_rect, stage, StreamMode::Stage, vs.strip_hidden, alpha, &mut ev);
-                let tc = TileCtx {
-                    my_id: my_id.as_deref(),
-                    watching_user: watching_user.as_deref(),
-                    connected_here,
-                    clickable: true,
-                    grid_with_stream: false,
-                    playback: &playback,
-                };
-                for (i, rect) in strip.iter().enumerate() {
-                    draw_tile(ui, palette, *rect, &members[i], speaking[i], &tc, &mut ev);
-                }
-            } else {
-                // Grilla: el stream es el primer tile.
-                let rects = grid_layout(content, members.len() + 1);
-                if let Some(rect) = rects.first() {
-                    draw_stream(ui, palette, *rect, stage, StreamMode::GridTile, false, alpha, &mut ev);
-                }
-                let tc = TileCtx {
-                    my_id: my_id.as_deref(),
-                    watching_user: watching_user.as_deref(),
-                    connected_here,
-                    clickable: false,
-                    grid_with_stream: true,
-                    playback: &playback,
-                };
-                for (i, m) in members.iter().enumerate() {
-                    if let Some(rect) = rects.get(i + 1) {
-                        draw_tile(ui, palette, *rect, m, speaking[i], &tc, &mut ev);
-                    }
-                }
-            }
         } else {
+            // En la mirada de escenario el stream que se ve ocupa el lugar
+            // grande y el resto va en la tira de abajo.
+            let stage_mode = stage.is_some() && vs.focus;
+            let items = build_items(
+                &members,
+                my_id.as_deref(),
+                watching_user.as_deref(),
+                own_stream.is_some(),
+                stage.is_some(),
+                stage_mode,
+            );
             let tc = TileCtx {
                 my_id: my_id.as_deref(),
-                watching_user: None,
-                connected_here,
-                clickable: false,
-                grid_with_stream: false,
+                clickable: stage_mode,
                 playback: &playback,
             };
-            for (i, rect) in grid_layout(content, members.len()).iter().enumerate() {
-                draw_tile(ui, palette, *rect, &members[i], speaking[i], &tc, &mut ev);
+            let scene = Scene {
+                members: &members,
+                speaking: &speaking,
+                stage: stage.as_ref(),
+                own: own_stream.as_ref(),
+                previews: &previews,
+                connected_here,
+                video_paused,
+                tc: &tc,
+            };
+            match stage.as_ref().filter(|_| stage_mode) {
+                Some(stage) => {
+                    // Escenario + tira (ocultable).
+                    let strip = if vs.strip_hidden || items.is_empty() {
+                        Vec::new()
+                    } else {
+                        strip_layout(content, items.len())
+                    };
+                    let stage_bottom = strip
+                        .first()
+                        .map(|r| r.top() - TILE_GAP)
+                        .unwrap_or(content.bottom())
+                        .max(content.top() + 80.0);
+                    let stage_rect =
+                        Rect::from_min_max(content.min, Pos2::new(content.max.x, stage_bottom));
+                    draw_stream(ui, palette, stage_rect, stage, StreamMode::Stage, vs.strip_hidden, alpha, &mut ev);
+                    for (item, rect) in items.iter().zip(strip.iter()) {
+                        draw_item(ui, palette, *rect, *item, &scene, alpha, &mut ev);
+                    }
+                }
+                None => {
+                    // Grilla: cada integrante, su transmisión como otro tile
+                    // y, si se está viendo, el stream en vivo en su lugar.
+                    for (item, rect) in items.iter().zip(grid_layout(content, items.len()).iter()) {
+                        draw_item(ui, palette, *rect, *item, &scene, alpha, &mut ev);
+                    }
+                }
             }
         }
 
         // Barra inferior (en pantalla completa la dibuja el overlay).
         if !vs.fullscreen {
             if connected_here {
-                controls_bar(ui, palette, bar, self_mute, self_deaf, alpha, "base", &mut ev);
+                controls_bar(ui, palette, bar, self_mute, self_deaf, broadcasting, share_enabled, alpha, "base", &mut ev);
             } else if channel_id.is_some() {
                 // "Unirse" es la acción principal: no se desvanece.
                 let rect = Rect::from_center_size(bar.center(), Vec2::new(260.0, CONTROLS_H));
@@ -453,7 +563,7 @@ pub fn show(
                     ui.painter().rect_filled(screen, 0.0, Color32::BLACK);
                     draw_stream(ui, palette, screen, stage, StreamMode::Fullscreen, false, alpha, &mut ev);
                     if connected_here {
-                        controls_bar(ui, palette, bar, self_mute, self_deaf, alpha, "fs", &mut ev);
+                        controls_bar(ui, palette, bar, self_mute, self_deaf, broadcasting, share_enabled, alpha, "fs", &mut ev);
                     }
                 });
             ctx.request_repaint_after(Duration::from_millis(33));
@@ -492,12 +602,26 @@ pub fn show(
     if let Some(owner_id) = ev.stream_reset.as_ref() {
         app.reset_voice_stream_audio(owner_id);
     }
+    if ev.toggle_chat {
+        // El panel del chat de voz lo dibuja `ui::server` (abierto por defecto).
+        let chat_id = egui::Id::new("voice_chat_open");
+        ctx.data_mut(|d| {
+            let open = d.get_temp::<bool>(chat_id).unwrap_or(true);
+            d.insert_temp(chat_id, !open);
+        });
+        ctx.request_repaint();
+    }
+    if ev.open_settings {
+        app.settings_open = true;
+    }
     if ev.leave {
         app.leave_voice();
     } else if ev.toggle_deafen {
         app.toggle_self_deafen();
     } else if ev.toggle_mute {
         app.toggle_self_mute();
+    } else if ev.toggle_share {
+        app.toggle_broadcast();
     }
     if ev.join {
         if let Some(channel_id) = channel_id {
@@ -563,6 +687,7 @@ pub fn show_popup(app: &mut App, ui: &mut egui::Ui) {
         message: watched.message.clone(),
         frame_size: watched.frame_size,
         texture: watched.texture.clone(),
+        paused: watched.paused,
     };
     let stream_key = watched.stream_key.clone();
     let channel_id = watched.channel_id.clone();
@@ -638,6 +763,9 @@ pub fn show_popup(app: &mut App, ui: &mut egui::Ui) {
                     ui.painter()
                         .text(rect.center(), Align2::CENTER_CENTER, text, theme::regular(12.0), color);
                 }
+            }
+            if stage.paused {
+                paused_notice(ui, rect, radius, &palette);
             }
 
             // Barra superior que aparece al pasar el mouse.
@@ -915,62 +1043,16 @@ fn draw_tile(
         palette,
     );
 
+    // La transmisión de esta persona es un tile aparte (`draw_stream_card`):
+    // acá solo va la persona.
     let is_me = tc.my_id == Some(occ.user_id.as_str());
-    let is_watching = tc.watching_user == Some(occ.user_id.as_str());
     let small = rect.width() < 190.0;
-    // Con el tile de stream en la grilla, "EN VIVO"/"Viendo" sobran acá.
-    let show_stream_ui = occ.streaming && !(tc.grid_with_stream && is_watching);
-
-    if show_stream_ui {
-        let pill = Rect::from_min_size(rect.left_top() + Vec2::new(10.0, 10.0), Vec2::new(54.0, 18.0));
-        ui.painter().rect_filled(pill, 4.0, palette.danger);
-        ui.painter().text(
-            pill.center(),
-            Align2::CENTER_CENTER,
-            "EN VIVO",
-            theme::semibold(9.5),
-            palette.on_accent,
-        );
-    }
-
-    let has_action = show_stream_ui && !is_me && !small;
-    if has_action {
-        if is_watching {
-            ui.painter().text(
-                rect.right_bottom() - Vec2::new(12.0, 22.0),
-                Align2::RIGHT_CENTER,
-                "Viendo",
-                theme::medium(12.0),
-                palette.accent,
-            );
-        } else if tc.connected_here {
-            // Acción principal: no se desvanece con la inactividad.
-            let btn = Rect::from_min_size(
-                Pos2::new(rect.right() - 12.0 - 96.0, rect.bottom() - 10.0 - 26.0),
-                Vec2::new(96.0, 26.0),
-            );
-            let resp = ui.interact(btn, egui::Id::new(("call_watch", &occ.user_id)), Sense::click());
-            let bg = if resp.hovered() { palette.accent_hover } else { palette.accent };
-            ui.painter().rect_filled(btn, 13.0, bg);
-            ui.painter().text(
-                btn.center(),
-                Align2::CENTER_CENTER,
-                "Ver stream",
-                theme::semibold(12.0),
-                palette.on_accent,
-            );
-            if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                ev.watch = Some((occ.user_id.clone(), occ.name.clone()));
-            }
-        }
-    }
 
     // Chip con el nombre (+ ícono de mute/ensordecido) abajo a la izquierda.
     let font = theme::medium(if small { 11.5 } else { 13.0 });
     let has_badge = occ.self_deaf || occ.self_mute;
     let badge_w = if has_badge { 18.0 } else { 0.0 };
-    let reserved_right = if has_action { 118.0 } else { 0.0 };
-    let max_text_w = (rect.width() - 20.0 - 16.0 - badge_w - reserved_right).max(30.0);
+    let max_text_w = (rect.width() - 20.0 - 16.0 - badge_w).max(30.0);
     let (name, text_w) = fit_text(ui, &occ.name, &font, max_text_w);
     let chip_h = if small { 20.0 } else { 24.0 };
     let chip = Rect::from_min_size(
@@ -1016,6 +1098,156 @@ fn draw_tile(
     }
 }
 
+/// Dibuja un casillero de la grilla o de la tira.
+fn draw_item(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    rect: Rect,
+    item: Item,
+    sc: &Scene,
+    alpha: f32,
+    ev: &mut CallEvents,
+) {
+    match item {
+        Item::Member(i) => draw_tile(ui, palette, rect, &sc.members[i], sc.speaking[i], sc.tc, ev),
+        Item::Stream(i) => draw_stream_card(ui, palette, rect, &sc.members[i], sc, ev),
+        Item::Watched => {
+            if let Some(stage) = sc.stage {
+                draw_stream(ui, palette, rect, stage, StreamMode::GridTile, false, alpha, ev);
+            }
+        }
+    }
+}
+
+/// Tile de la transmisión de `owner`, separado del de la persona.
+///
+/// * De otra persona (todavía sin verla): la miniatura de fondo, si Discord la
+///   tiene, y el botón "Ver transmisión" en el centro.
+/// * Propia: lo que estás transmitiendo (vista previa local). Con la ventana
+///   en segundo plano no se procesa y se avisa.
+fn draw_stream_card(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    rect: Rect,
+    owner: &VoiceOccupant,
+    sc: &Scene,
+    ev: &mut CallEvents,
+) {
+    let radius = CornerRadius::same(TILE_RADIUS);
+    let is_me = sc.tc.my_id == Some(owner.user_id.as_str());
+    let small = rect.width() < 190.0;
+
+    ui.painter().rect_filled(
+        rect,
+        radius,
+        extra::blend(palette.window_solid, Color32::BLACK, 0.6),
+    );
+
+    if is_me {
+        match sc.own {
+            _ if sc.video_paused => paused_notice(ui, rect, radius, palette),
+            Some(own) => match own.texture.as_ref() {
+                Some(texture) if own.size[0] > 0 && own.size[1] > 0 => {
+                    let (fw, fh) = (own.size[0] as f32, own.size[1] as f32);
+                    let scale = (rect.width() / fw).min(rect.height() / fh);
+                    let video = Rect::from_center_size(rect.center(), Vec2::new(fw * scale, fh * scale));
+                    let fills = (video.width() - rect.width()).abs() < 1.0
+                        && (video.height() - rect.height()).abs() < 1.0;
+                    egui::Image::new(texture)
+                        .corner_radius(if fills { radius } else { CornerRadius::ZERO })
+                        .paint_at(ui, video);
+                }
+                _ => centered_text(ui, rect, "Iniciando la transmisión…", 13.0, palette.dim),
+            },
+            None => centered_text(ui, rect, "Iniciando la transmisión…", 13.0, palette.dim),
+        }
+    } else {
+        // Fondo: la miniatura (si hay) o el color de la persona, oscurecido
+        // para que el botón se lea.
+        ui.painter()
+            .rect_filled(rect, radius, extra::blend(palette.surface, owner.avatar_color, 0.30));
+        if let Some(url) = sc.previews.get(&owner.user_id).and_then(|url| url.as_deref()) {
+            paint_cover_image(ui, rect, radius, url);
+        }
+        ui.painter().rect_filled(rect, radius, Color32::from_black_alpha(120));
+
+        if sc.connected_here {
+            // Acción principal: no se desvanece con la inactividad.
+            let size = if small { Vec2::new(122.0, 28.0) } else { Vec2::new(156.0, 36.0) };
+            let btn = Rect::from_center_size(rect.center(), size);
+            let resp = ui.interact(btn, egui::Id::new(("call_watch", &owner.user_id)), Sense::click());
+            let bg = if resp.hovered() { palette.accent_hover } else { palette.accent };
+            ui.painter().rect_filled(btn, size.y / 2.0, bg);
+            ui.painter().text(
+                btn.center(),
+                Align2::CENTER_CENTER,
+                "Ver transmisión",
+                theme::semibold(if small { 11.5 } else { 13.0 }),
+                palette.on_accent,
+            );
+            if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                ev.watch = Some((owner.user_id.clone(), owner.name.clone()));
+            }
+        } else {
+            centered_text(
+                ui,
+                rect,
+                "Únete a la llamada para ver la transmisión",
+                if small { 11.5 } else { 13.0 },
+                Color32::WHITE,
+            );
+        }
+    }
+
+    // Título + "EN DIRECTO" arriba a la izquierda.
+    let font = theme::semibold(if small { 11.0 } else { 12.5 });
+    let title = if is_me {
+        "Tu transmisión".to_string()
+    } else {
+        format!("Stream de {}", owner.name)
+    };
+    let live = !is_me || sc.own.is_some_and(|own| own.status == StreamPublishStatus::Live);
+    let pill_w = if small { 0.0 } else { 74.0 };
+    let max_title = (rect.width() - 12.0 - 40.0 - 8.0 - pill_w - 12.0).max(40.0);
+    let (title, w) = fit_text(ui, &title, &font, max_title);
+    let chip_h = if small { 22.0 } else { 28.0 };
+    let chip = Rect::from_min_size(rect.left_top() + Vec2::new(10.0, 10.0), Vec2::new(w + 40.0, chip_h));
+    ui.painter().rect_filled(chip, chip_h / 2.0, Color32::from_black_alpha(150));
+    theme::paint_icon(
+        ui,
+        Icon::Monitor,
+        Rect::from_center_size(Pos2::new(chip.left() + 16.0, chip.center().y), Vec2::splat(14.0)),
+        14.0,
+        palette.accent,
+    );
+    ui.painter().text(
+        Pos2::new(chip.left() + 30.0, chip.center().y),
+        Align2::LEFT_CENTER,
+        title,
+        font,
+        Color32::WHITE,
+    );
+    if !small {
+        let pill = Rect::from_min_size(
+            Pos2::new(chip.right() + 8.0, chip.center().y - 10.0),
+            Vec2::new(pill_w, 20.0),
+        );
+        let (label, fill) = if live {
+            ("EN DIRECTO", palette.danger)
+        } else {
+            ("CONECTANDO", Color32::from_black_alpha(170))
+        };
+        ui.painter().rect_filled(pill, 5.0, fill);
+        ui.painter().text(
+            pill.center(),
+            Align2::CENTER_CENTER,
+            label,
+            theme::semibold(10.0),
+            palette.on_accent,
+        );
+    }
+}
+
 /// Menú de clic derecho sobre el video del stream: volumen del AUDIO DEL STREAM
 /// (0–200 %), silenciarlo y restablecer. Es aparte del volumen de esa persona en
 /// la llamada, igual que en el cliente oficial; se guarda en la cuenta
@@ -1056,6 +1288,54 @@ fn stream_audio_menu(resp: &egui::Response, stage: &StageData, ev: &mut CallEven
 }
 
 /// Recorta `text` con "…" hasta que entre en `max_w`. Devuelve el texto y su ancho.
+const PAUSED_TEXT: &str = "Para ahorrar recursos este video se pausó";
+
+/// Texto centrado en `rect`, partido en renglones si no entra.
+fn centered_text(ui: &egui::Ui, rect: Rect, text: &str, size: f32, color: Color32) {
+    let wrap = (rect.width() - 32.0).max(40.0);
+    let galley = ui
+        .painter()
+        .layout(text.to_string(), theme::medium(size), color, wrap);
+    let pos = Pos2::new(
+        rect.center().x - galley.size().x / 2.0,
+        rect.center().y - galley.size().y / 2.0,
+    );
+    ui.painter().galley(pos, galley, color);
+}
+
+/// Aviso de "video pausado" (ventana en segundo plano) encima de `rect`.
+fn paused_notice(ui: &egui::Ui, rect: Rect, radius: CornerRadius, palette: &Palette) {
+    ui.painter()
+        .rect_filled(rect, radius, Color32::from_black_alpha(190));
+    let size = if rect.width() < 260.0 { 11.5 } else { 13.5 };
+    centered_text(ui, rect, PAUSED_TEXT, size, palette.text);
+}
+
+/// Pinta la imagen de `url` cubriendo `rect` (recortada, sin deformarla).
+/// Mientras carga, o si falla, no pinta nada.
+fn paint_cover_image(ui: &mut egui::Ui, rect: Rect, radius: CornerRadius, url: &str) {
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let image = egui::Image::new(crate::ui::anim::plain(url)).show_loading_spinner(false);
+    if let Ok(egui::load::TexturePoll::Ready { texture }) = image.load_for_size(ui.ctx(), rect.size()) {
+        let tex = texture.size;
+        if tex.x <= 0.0 || tex.y <= 0.0 || rect.height() <= 0.0 {
+            return;
+        }
+        let tex_aspect = tex.x / tex.y;
+        let rect_aspect = rect.width() / rect.height();
+        let uv = if tex_aspect > rect_aspect {
+            let w = rect_aspect / tex_aspect;
+            Rect::from_min_max(Pos2::new((1.0 - w) / 2.0, 0.0), Pos2::new((1.0 + w) / 2.0, 1.0))
+        } else {
+            let h = tex_aspect / rect_aspect;
+            Rect::from_min_max(Pos2::new(0.0, (1.0 - h) / 2.0), Pos2::new(1.0, (1.0 + h) / 2.0))
+        };
+        image.uv(uv).corner_radius(radius).paint_at(ui, rect);
+    }
+}
+
 fn fit_text(ui: &egui::Ui, text: &str, font: &egui::FontId, max_w: f32) -> (String, f32) {
     let measure = |s: &str| {
         ui.painter()
@@ -1139,6 +1419,11 @@ fn draw_stream(
             ui.painter()
                 .text(rect.center(), Align2::CENTER_CENTER, text, theme::regular(13.0), color);
         }
+    }
+
+    // Ventana en segundo plano: el video no se procesa, se avisa.
+    if stage.paused {
+        paused_notice(ui, rect, radius, palette);
     }
 
     // Título + "EN DIRECTO" arriba a la izquierda (siempre visibles).
@@ -1246,6 +1531,8 @@ fn controls_bar(
     bar: Rect,
     self_mute: bool,
     self_deaf: bool,
+    broadcasting: bool,
+    share_enabled: bool,
     alpha: f32,
     salt: &str,
     ev: &mut CallEvents,
@@ -1292,6 +1579,70 @@ fn controls_bar(
     };
     if round_button(ui, ("deaf", salt), next(W_ROUND), deaf_icon, 20.0, deaf_fill, deaf_hover, deaf_fg, deaf_tip, alpha) {
         ev.toggle_deafen = true;
+    }
+
+    // Cámara: todavía sin función en el cliente, se dibuja apagada.
+    round_button(
+        ui,
+        ("camera", salt),
+        next(W_ROUND),
+        Icon::Video,
+        20.0,
+        palette.surface,
+        palette.surface,
+        palette.dim,
+        "Cámara (próximamente)",
+        alpha,
+    );
+
+    // Transmitir: con una transmisión en curso se pinta de rojo y la corta.
+    let (share_icon, share_fill, share_hover, share_fg, share_tip) = if broadcasting {
+        (
+            Icon::Monitor,
+            palette.danger,
+            extra::blend(palette.danger, Color32::WHITE, 0.15),
+            Color32::WHITE,
+            "Dejar de compartir pantalla",
+        )
+    } else if share_enabled {
+        (Icon::SquareArrowUp, palette.surface, palette.surface_hover, palette.text, "Compartir pantalla")
+    } else {
+        (Icon::SquareArrowUp, palette.surface, palette.surface, palette.dim, "Compartir pantalla")
+    };
+    let share_clicked =
+        round_button(ui, ("share", salt), next(W_ROUND), share_icon, 20.0, share_fill, share_hover, share_fg, share_tip, alpha);
+    if share_clicked && share_enabled {
+        ev.toggle_share = true;
+    }
+
+    if round_button(
+        ui,
+        ("chat", salt),
+        next(W_ROUND),
+        Icon::MessageCircle,
+        20.0,
+        palette.surface,
+        palette.surface_hover,
+        palette.text,
+        "Chat de voz",
+        alpha,
+    ) {
+        ev.toggle_chat = true;
+    }
+
+    if round_button(
+        ui,
+        ("settings", salt),
+        next(W_ROUND),
+        Icon::Settings,
+        20.0,
+        palette.surface,
+        palette.surface_hover,
+        palette.text,
+        "Ajustes",
+        alpha,
+    ) {
+        ev.open_settings = true;
     }
 
     if round_button(

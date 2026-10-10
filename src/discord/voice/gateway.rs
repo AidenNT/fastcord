@@ -58,20 +58,19 @@ pub(super) async fn connect_voice_gateway(
         participant_playback_rx,
     } = controls;
     let url = voice_gateway_url(&session.endpoint)?;
+    status_publisher
+        .publish_phase(session, VoiceConnectPhase::ConnectingRtc)
+        .await;
     logging::debug("voice", format!("connecting voice websocket: {url}"));
     let connect_started = Instant::now();
-    let (ws, response) = timeout(
-        VOICE_WEBSOCKET_CONNECT_TIMEOUT,
-        connect_async_tls_with_config(&url, None, false, None),
-    )
-    .await
-    .map_err(|_| "voice websocket connect timed out after 10s".to_owned())?
-    .map_err(|error| format!("voice websocket connect failed: {error}"))?;
+    let ws = timeout(VOICE_WEBSOCKET_CONNECT_TIMEOUT, websocket::connect(&url))
+        .await
+        .map_err(|_| "voice websocket connect timed out after 10s".to_owned())?
+        .map_err(|error| format!("voice websocket connect failed: {error}"))?;
     logging::debug(
         "voice",
         format!(
-            "voice websocket connected: status={} elapsed_ms={}",
-            response.status(),
+            "voice websocket connected: elapsed_ms={}",
             connect_started.elapsed().as_millis()
         ),
     );
@@ -131,6 +130,9 @@ pub(super) async fn connect_voice_gateway(
 
     let result: Result<VoiceConnectionEnd, String> = async {
     send_voice_text(&writer, voice_identify_payload(session)).await?;
+    status_publisher
+        .publish_phase(session, VoiceConnectPhase::Authenticating)
+        .await;
     logging::debug("voice", "voice identify sent");
     logging::debug("voice", "voice websocket read loop started");
     let mut resume_pending = false;
@@ -343,6 +345,9 @@ pub(super) async fn connect_voice_gateway(
                         send_requested_voice_heartbeat(&writer, &last_sequence).await?;
                     }
                     VOICE_OP_READY => {
+                        status_publisher
+                            .publish_phase(session, VoiceConnectPhase::Transport)
+                            .await;
                         let (socket, ready) =
                             establish_voice_transport(&value, &writer, &audio_handle).await?;
                         udp_socket = Some(socket);
@@ -388,6 +393,9 @@ pub(super) async fn connect_voice_gateway(
                                 continue;
                             }
                         }
+                        status_publisher
+                            .publish_phase(session, VoiceConnectPhase::Encrypting)
+                            .await;
                         if let Some(dave_protocol_version) = description.dave_protocol_version {
                             let dave_protocol_version = u16::try_from(dave_protocol_version)
                                 .map_err(|_| "DAVE protocol version does not fit u16".to_owned())?;
@@ -438,6 +446,9 @@ pub(super) async fn connect_voice_gateway(
                             },
                         );
                         current_session_description = Some(description);
+                        status_publisher
+                            .publish_phase(session, VoiceConnectPhase::Ready)
+                            .await;
                         if connection_stable_deadline.is_none() {
                             connection_stable_deadline =
                                 Some(Instant::now() + VOICE_CONNECTION_STABLE_INTERVAL);
@@ -513,14 +524,15 @@ pub(super) async fn connect_voice_gateway(
             WsMessage::Close(frame) => {
                 let close_action = frame
                     .as_ref()
-                    .map(|frame| voice_close_action(u16::from(frame.code)))
+                    .map(|frame| voice_close_action(u16::from(frame.code.clone())))
                     .unwrap_or(VoiceCloseAction::Resume);
                 if let Some(frame) = frame {
+                    let reason = frame.reason.to_string();
                     logging::debug(
                         "voice",
                         format!(
-                            "voice websocket closed: code={} reason={}",
-                            frame.code, frame.reason
+                            "voice websocket closed: code={} reason={reason}",
+                            u16::from(frame.code)
                         ),
                     );
                 } else {
@@ -557,7 +569,7 @@ pub(super) async fn connect_voice_gateway(
                     .handle_binary_frame(&writer, frame)
                     .await?;
             }
-            WsMessage::Pong(_) | WsMessage::Frame(_) => {}
+            _ => {}
         }
     }
 
@@ -606,20 +618,11 @@ async fn resume_voice_gateway(
     child_tasks.heartbeat.abort();
     heartbeat_ack.lock().await.reset();
 
-    let (ws, response) = timeout(
-        VOICE_WEBSOCKET_CONNECT_TIMEOUT,
-        connect_async_tls_with_config(url, None, false, None),
-    )
-    .await
-    .map_err(|_| "voice resume websocket connect timed out after 10s".to_owned())?
-    .map_err(|error| format!("voice resume websocket connect failed: {error}"))?;
-    logging::debug(
-        "voice",
-        format!(
-            "voice resume websocket connected: status={}",
-            response.status()
-        ),
-    );
+    let ws = timeout(VOICE_WEBSOCKET_CONNECT_TIMEOUT, websocket::connect(url))
+        .await
+        .map_err(|_| "voice resume websocket connect timed out after 10s".to_owned())?
+        .map_err(|error| format!("voice resume websocket connect failed: {error}"))?;
+    logging::debug("voice", "voice resume websocket connected");
 
     let (resumed_writer, reader) = ws.split();
     *writer.lock().await = resumed_writer;

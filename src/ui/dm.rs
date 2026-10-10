@@ -219,6 +219,11 @@ fn central_panel(app: &mut App, ui: &mut egui::Ui, index: usize) {
                 .iter()
                 .filter_map(|s| crate::lib::data::EmojiGroup::from_server(s, false, nitro_missing))
                 .collect();
+            // Límite de tamaño por archivo según el Nitro de la cuenta.
+            chat::set_next_limits(
+                ui.ctx(),
+                chat::ChatLimits { max_upload_bytes: app.upload_limit_bytes(false), ..Default::default() },
+            );
             let event = chat::show(
                 ui,
                 &palette,
@@ -238,6 +243,8 @@ fn central_panel(app: &mut App, ui: &mut egui::Ui, index: usize) {
                 loading_newer,
                 &mut app.pending_scroll_anchor,
                 &mut app.pending_jump,
+                app.unread_markers.get_mut(&dm_channel_id),
+                false,
             );
             match event {
                 chat::ChatEvent::ForwardRequested => {
@@ -249,6 +256,15 @@ fn central_panel(app: &mut App, ui: &mut egui::Ui, index: usize) {
                 }
                 chat::ChatEvent::LoadMoreRequested => app.load_more_messages(),
                 chat::ChatEvent::LoadNewerRequested => app.load_newer_messages(),
+                chat::ChatEvent::JumpToFirstUnread => app.jump_to_first_unread(),
+                chat::ChatEvent::MarkAsRead => app.mark_viewed_read(),
+                chat::ChatEvent::JumpToPresent => app.jump_to_present(),
+                chat::ChatEvent::MarkUnread { message_id } => app.mark_message_unread(&message_id),
+                chat::ChatEvent::Unavailable(what) => app.push_toast(
+                    crate::lib::state::ToastKind::Info,
+                    what,
+                    "Todavía no está disponible en esta versión.",
+                ),
                 chat::ChatEvent::JumpToMessage { message_id } => app.jump_to_message(&dm_channel_id, &message_id),
                 chat::ChatEvent::NitroRequired => app.open_modal(
                     "Necesitás Discord Nitro",

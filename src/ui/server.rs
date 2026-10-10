@@ -178,6 +178,8 @@ fn thread_side_panel(app: &mut App, ui: &mut egui::Ui, server_index: usize) {
                         false,
                         &mut panel.scroll_anchor,
                         &mut None,
+                        None,
+                        false,
                     )
                 });
             }
@@ -203,6 +205,11 @@ fn thread_side_panel(app: &mut App, ui: &mut egui::Ui, server_index: usize) {
         ),
         crate::ui::chat::ChatEvent::LoadMoreRequested
         | crate::ui::chat::ChatEvent::LoadNewerRequested
+        | crate::ui::chat::ChatEvent::JumpToFirstUnread
+        | crate::ui::chat::ChatEvent::MarkAsRead
+        | crate::ui::chat::ChatEvent::JumpToPresent
+        | crate::ui::chat::ChatEvent::MarkUnread { .. }
+        | crate::ui::chat::ChatEvent::Unavailable(_)
         | crate::ui::chat::ChatEvent::JumpToMessage { .. }
         | crate::ui::chat::ChatEvent::CreateThread { .. }
         | crate::ui::chat::ChatEvent::None => {}
@@ -785,6 +792,24 @@ fn channel_chat(
         groups
     };
 
+    // ¿Puede borrar mensajes ajenos / sacar reacciones de otros acá?
+    let can_manage_messages = {
+        let server = &app.servers[server_index];
+        let overwrites = server
+            .channel(cat, chan)
+            .map(|c| c.overwrites.as_slice())
+            .unwrap_or(&[]);
+        crate::lib::permissions::can_manage_messages(&server.guild_id, &server.access_ctx, &server.roles, overwrites)
+    };
+
+    // Permisos y modo lento de este canal para el chat (ver `chat::ChatLimits`).
+    let limits = app.servers[server_index]
+        .channel(cat, chan)
+        .map(crate::ui::chat::ChatLimits::from_channel)
+        .unwrap_or_default();
+    let limits = crate::ui::chat::ChatLimits { max_upload_bytes: app.upload_limit_bytes(true), ..limits };
+    crate::ui::chat::set_next_limits(ui.ctx(), limits);
+
     if let Some(channel) = app.servers[server_index].channel_mut(cat, chan) {
         let loading = channel.loading;
         let loading_more = channel.loading_more;
@@ -811,6 +836,8 @@ fn channel_chat(
             loading_newer,
             &mut app.pending_scroll_anchor,
             &mut app.pending_jump,
+            app.unread_markers.get_mut(&viewed_channel_id),
+            can_manage_messages,
         );
         match event {
             crate::ui::chat::ChatEvent::ForwardRequested => {
@@ -822,6 +849,15 @@ fn channel_chat(
             }
             crate::ui::chat::ChatEvent::LoadMoreRequested => app.load_more_messages(),
             crate::ui::chat::ChatEvent::LoadNewerRequested => app.load_newer_messages(),
+            crate::ui::chat::ChatEvent::JumpToFirstUnread => app.jump_to_first_unread(),
+            crate::ui::chat::ChatEvent::MarkAsRead => app.mark_viewed_read(),
+            crate::ui::chat::ChatEvent::JumpToPresent => app.jump_to_present(),
+            crate::ui::chat::ChatEvent::MarkUnread { message_id } => app.mark_message_unread(&message_id),
+            crate::ui::chat::ChatEvent::Unavailable(what) => app.push_toast(
+                crate::lib::state::ToastKind::Info,
+                what,
+                "Todavía no está disponible en esta versión.",
+            ),
             crate::ui::chat::ChatEvent::JumpToMessage { message_id } => {
                 app.jump_to_message(&viewed_channel_id, &message_id)
             }

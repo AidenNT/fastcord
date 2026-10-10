@@ -388,8 +388,6 @@ fn central_panel(app: &mut App, ui: &mut egui::Ui) {
             });
 
             if let Some(idx) = clicked_index {
-                // imprimir en consola el índice del amigo clicado
-                println!("Clicked on friend index: {}", idx);
                 app.open_dm(idx);
             }
         });

@@ -1008,6 +1008,147 @@ impl UwuRest {
         Ok(())
     }
 
+    /// Mensaje con archivos adjuntos, con el flujo del cliente oficial (ver
+    /// `discord::uploads`): pedir destinos de subida, `PUT` de cada archivo y
+    /// recién después crear el mensaje con `attachments`. `on_progress` recibe
+    /// cuántos archivos ya se subieron. Los archivos se leen del disco de a
+    /// uno (nunca todos juntos en RAM).
+    pub async fn send_message_with_files(
+        &self,
+        channel_id: &str,
+        guild_id: Option<&str>,
+        content: &str,
+        reply_to: Option<&str>,
+        files: &[super::uploads::UploadFile],
+        on_progress: impl Fn(usize) + Send,
+    ) -> anyhow::Result<()> {
+        if files.is_empty() {
+            anyhow::bail!("No hay archivos para subir");
+        }
+        let channel_id_num: u64 = channel_id.parse().map_err(err)?;
+        let guild_id_num: Option<u64> = guild_id
+            .filter(|g| !g.is_empty())
+            .map(str::parse::<u64>)
+            .transpose()
+            .map_err(err)?;
+
+        let referer: Referer = match guild_id_num {
+            Some(guild_id) => GuildChannelReferer { guild_id, channel_id: channel_id_num }.into(),
+            None => DmChannelReferer { channel_id: channel_id_num }.into(),
+        };
+        let props = RequestPropertiesBuilder::default()
+            .referer::<Referer>(referer)
+            .build()
+            .map_err(err)?;
+
+        // 1) Destinos de subida.
+        let request_files: Vec<Value> = files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| json!({ "filename": f.filename, "file_size": f.size, "id": i.to_string() }))
+            .collect();
+        let slots: Value = self
+            .client
+            .post::<Value, Value>(
+                &format!("channels/{channel_id}/attachments"),
+                Some(json!({ "files": request_files })),
+                Some(props.clone()),
+            )
+            .await
+            .map_err(err)?;
+        let slots = slots
+            .get("attachments")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("Discord no devolvió los destinos de subida"))?;
+
+        // 2) PUT de cada archivo (con un reintento si falla la red o el CDN
+        // responde 5xx). El archivo se vuelve a leer en cada intento para no
+        // tener dos copias en memoria.
+        let mut message_attachments: Vec<Value> = Vec::with_capacity(files.len());
+        for (i, file) in files.iter().enumerate() {
+            let slot = slots
+                .iter()
+                .find(|s| {
+                    s.get("id")
+                        .map(|id| id.as_u64().map(|n| n as usize) == Some(i) || id.as_str() == Some(&i.to_string()))
+                        .unwrap_or(false)
+                })
+                .or_else(|| slots.get(i))
+                .ok_or_else(|| anyhow::anyhow!("Discord no asignó destino para {}", file.filename))?;
+            let upload_url = slot
+                .get("upload_url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("Falta la URL de subida de {}", file.filename))?;
+            let upload_filename = slot
+                .get("upload_filename")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("Falta el nombre subido de {}", file.filename))?;
+
+            let mut last_error = String::new();
+            let mut uploaded = false;
+            for _attempt in 0..2 {
+                let bytes = std::fs::read(&file.path)
+                    .map_err(|e| anyhow::anyhow!("No se pudo leer {}: {e}", file.filename))?;
+                match self
+                    .get_http_client()
+                    .put(upload_url)
+                    .header("Content-Type", file.mime.as_str())
+                    .header("Origin", "https://discord.com")
+                    .header("Referer", "https://discord.com/")
+                    .body(bytes)
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        uploaded = true;
+                        break;
+                    }
+                    Ok(resp) => {
+                        let status = resp.status();
+                        last_error = format!("HTTP {status}");
+                        // 4xx (salvo 408/429): reintentar no va a cambiar nada.
+                        if status.is_client_error() && status.as_u16() != 408 && status.as_u16() != 429 {
+                            break;
+                        }
+                    }
+                    Err(e) => last_error = e.to_string(),
+                }
+            }
+            if !uploaded {
+                anyhow::bail!("La subida de {} falló ({last_error})", file.filename);
+            }
+            message_attachments.push(json!({
+                "id": i.to_string(),
+                "filename": file.filename,
+                "uploaded_filename": upload_filename,
+            }));
+            on_progress(i + 1);
+        }
+
+        // 3) El mensaje.
+        let mut body = json!({
+            "content": content,
+            "attachments": message_attachments,
+            "nonce": Self::interaction_nonce(),
+            "channel_id": channel_id,
+            "type": 0,
+            "sticker_ids": [],
+            "flags": 0,
+        });
+        if let Some(message_id) = reply_to {
+            body["message_reference"] = json!({
+                "message_id": message_id,
+                "channel_id": channel_id,
+            });
+        }
+        let _: Value = self
+            .client
+            .post::<Value, Value>(&format!("channels/{channel_id}/messages"), Some(body), Some(props))
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
+
     /// GIFs del selector: `GET /gifs/search?q=...` (Tenor, a través de
     /// Discord) o, con `query` vacío, `GET /gifs/trending`. Devuelve el JSON
     /// tal cual; `ui::compose_menus` se encarga de leerlo (puede ser una
@@ -1121,6 +1262,22 @@ impl UwuRest {
             .map_err(err)
     }
 
+    /// `GET /streams/{stream_key}/preview`: URL de la miniatura que sube quien
+    /// transmite (`None` si todavía no hay ninguna).
+    pub async fn stream_preview(&self, stream_key: &str) -> anyhow::Result<Option<String>> {
+        let path = format!("streams/{stream_key}/preview");
+        let value: Value = self
+            .client
+            .get(&path, None, Some(Self::home()))
+            .await
+            .map_err(err)?;
+        Ok(value
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|url| !url.is_empty())
+            .map(str::to_owned))
+    }
+
     /// `GET /users/@me/affinities/guilds`: qué servers usás más (puntaje
     /// relativo por server). Ver `discord::affinities`.
     pub async fn get_guild_affinities(&self) -> anyhow::Result<Value> {
@@ -1216,6 +1373,55 @@ impl UwuRest {
         let _: Value = self
             .client
             .post(&path, Some(body), Some(Self::home()))
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// "Marcar no leído": igual que `ack_message` pero `manual: true`, que es
+    /// lo que hace que Discord acepte un ack hacia atrás (deja el canal sin
+    /// leer desde ese mensaje).
+    pub async fn ack_message_manual(&self, channel_id: &str, message_id: &str) -> anyhow::Result<()> {
+        let body = json!({ "manual": true, "mention_count": 0 });
+        let path = format!("channels/{channel_id}/messages/{message_id}/ack");
+        let _: Value = self
+            .client
+            .post(&path, Some(body), Some(Self::home()))
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// `DELETE /channels/{id}/messages/{id}`: borra un mensaje (propio, o
+    /// ajeno si la cuenta puede administrar mensajes).
+    pub async fn delete_message(&self, channel_id: &str, message_id: &str) -> anyhow::Result<()> {
+        let path = format!("channels/{channel_id}/messages/{message_id}");
+        let _: Value = self
+            .client
+            .delete(&path, None::<()>, Some(Self::home()))
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// Saca las reacciones de un mensaje: todas (`emoji = None`) o solo las
+    /// de un emoji (`reactions/{emoji}`). Hace falta "Administrar mensajes".
+    pub async fn clear_reactions(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let path = match emoji {
+            Some(emoji) => format!(
+                "channels/{channel_id}/messages/{message_id}/reactions/{}",
+                percent_encode_emoji(emoji)
+            ),
+            None => format!("channels/{channel_id}/messages/{message_id}/reactions"),
+        };
+        let _: Value = self
+            .client
+            .delete(&path, None::<()>, Some(Self::home()))
             .await
             .map_err(err)?;
         Ok(())

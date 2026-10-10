@@ -63,16 +63,15 @@ env_logger = "0.11"
 # Gateway; eframe/egui siguen corriendo sync en el hilo principal.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net"] }
 # API REST (perfil, relaciones/amigos, guilds, canales, mensajes).
-#reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "system-proxy", "rustls-tls-native-roots"] }
 reqwest = { version = "0.12", features = [
     "json",
-    "blocking",       # ← http_cache.rs: descargas de imágenes en hilos aparte
-    "cookies",        # ← sin esto, `reqwest::cookie::CookieStore` no existe
+    "blocking",       # http_cache.rs: descargas de imágenes en hilos aparte
+    "cookies",        # sin esto, `reqwest::cookie::CookieStore` no existe
     "gzip",
-    "brotli",         # ← el header Accept-Encoding pide `br`
-    "zstd",           # ← y `zstd`
-    "rustls-tls",     # ← o `native-tls` si preferís OpenSSL/SChannel
-    "system-proxy",   # ← usa el proxy del sistema # ← usa el proxy del sistema para HTTPS
+    "brotli",         # el header Accept-Encoding pide `br`
+    "zstd",           # ... y `zstd`
+    "rustls-tls",     # (o `native-tls` si preferís OpenSSL/SChannel)
+    "system-proxy",   # usa el proxy del sistema (también para HTTPS)
     "rustls-tls-native-roots",
 ] }
 # 0.8 es la que depende de reqwest 0.12 y cookie_store 0.21 (la 0.10 pide
@@ -84,8 +83,8 @@ iana-time-zone = "0.1.65"
 chrono = "0.4"
 toml = "0.8"
 sys-locale = "0.3.2"
-# WebSocket del Gateway y del "remote auth" (login por QR).
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# `SinkExt`/`StreamExt` (split, send, next) sobre los WebSockets de `wreq`
+# (src/discord/websocket.rs: Gateway, login por QR y voz).
 futures-util = "0.3"
 # discord/gateway.rs: el Gateway real de Discord manda todo comprimido en
 # un único stream zlib de por vida de la conexión (`compress=zlib-stream`
@@ -146,6 +145,12 @@ url = "2.5.8"
 # H.264 que llega por RTP. Misma crate y versión que usa `vendor/egui-video`,
 # así que Cargo las unifica y no hay que instalar nada extra.
 ffmpeg-the-third = "6.0.0"
+# Transmitir pantalla (src/discord/voice/screen_capture.rs): captura (avdevice)
+# y codificación H.264 en este mismo proceso con la misma crate de arriba, sin
+# un `ffmpeg` aparte. Las libs de ffmpeg tienen que incluir `avdevice` y
+# `libx264`. `libc` solo da `EAGAIN` para distinguirlo de un error real al
+# leer del codificador (ya estaba en el árbol por `vendor/egui-video`).
+libc = "0.2"
 
 # --- REST "undetected" de UwUDev (vendorizado con su workspace completo:
 # discord_client_structs/macros/utils como hermanos bajo vendor/) ---
@@ -153,7 +158,13 @@ ffmpeg-the-third = "6.0.0"
 # y con el fingerprint compartido de fingerprint.rs.
 discord_client_rest = { path = "vendor/discord_client_rest" }
 discord_client_structs = { path = "vendor/discord_client_structs" }
-wreq = { version = "6.0.0-rc.29", features = ["gzip", "deflate", "zstd", "brotli", "json", "cookies", "socks"] }
+# `ws`: todos los WebSockets (Gateway, login por QR y voz, ver
+# src/discord/websocket.rs) salen por wreq, con la misma huella TLS de Chrome que
+# el REST. Reemplaza a tokio-tungstenite, que ya no es dependencia directa.
+wreq = { version = "6.0.0-rc.29", features = ["gzip", "deflate", "zstd", "brotli", "json", "cookies", "socks", "ws"] }
+# Misma versión que usa vendor/discord_client_rest: websocket.rs arma la misma emulación
+# (Chrome149 / Windows) para que REST y WebSockets se vean como un solo navegador.
+wreq-util = "3.0.0-rc.14"
 
 # --- Llamadas de voz (src/discord/voice/, portado de concord) ---
 # Cifrado RTP de extremo a extremo del canal de voz.
@@ -168,6 +179,15 @@ socket2 = "0.6"
 cpal = { version = "0.18", optional = true, features = ["pulseaudio", "realtime"] }
 # Supresión de ruido del micrófono (ajuste "Reducir ruido de fondo").
 nnnoiseless = { version = "0.5", default-features = false, optional = true }
+# Cancelación de eco (WebRTC AEC3, puro Rust) usada por voice/noise/echo.rs:
+# resta del micrófono lo que suena por los parlantes.
+sonora = { version = "0.2.0", optional = true }
+
+# --- Adjuntar archivos (src/ui/attachments.rs) ---
+# Selector de archivos nativo del SO (botón "+" del compositor).
+rfd = "0.15"
+# Pegar una captura / imagen del portapapeles como adjunto (Ctrl+V).
+arboard = "3"
 
 # --- Notificaciones de escritorio (src/lib/notifications.rs) ---
 # Notificación nativa del SO (D-Bus en Linux, centro de notificaciones en
@@ -183,18 +203,59 @@ opus = { version = "1.6.1", package = "opusic-c" }
 [target.'cfg(target_os = "linux")'.dependencies]
 alsa = { version = "0.11", optional = true }
 
+# --- Perfiles de compilación ---
+# Release: binario más chico y rápido. `lto = "thin"` + `codegen-units = 1`
+# alcanzan casi todo el beneficio de LTO completo con un tiempo de link
+# razonable (este proyecto arrastra egui, ffmpeg, wry, reqwest y wreq).
+# No se usa `panic = "abort"`: varios hilos de fondo (audio, captura, gateway)
+# dependen de que un panic quede contenido en su hilo.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+# Dev: las dependencias pesadas (egui, image, decodificación de video/audio,
+# DSP de ruido/eco) corren con optimizaciones, porque en debug sin optimizar
+# la UI y la reproducción de video van muy lentas. Tu propio código sigue en
+# opt-level 0 para que compilar y depurar sea rápido.
+[profile.dev.package."*"]
+opt-level = 3
+
 [features]
 default = ["voice-playback"]
 # Captura/reproducción real de audio de voz (micrófono y parlantes). Sin
 # este feature, el cliente igual puede unirse a canales de voz y ver quién
 # está hablando, pero no transmite ni reproduce audio (útil para compilar
 # en una plataforma sin `cpal`/ALSA andando, o para un build más liviano).
-voice-playback = ["dep:cpal", "dep:alsa", "dep:nnnoiseless"]
+voice-playback = ["dep:cpal", "dep:alsa", "dep:nnnoiseless", "dep:sonora"]
 
 # system_fonts.rs: lee el idioma de la UI de Windows para elegir la variante
 # de fuente CJK correcta.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Globalization", "Win32_UI_WindowsAndMessaging"] }
+# `Win32_Graphics_Dwm` y `Win32_System_Threading`: voice/window_list.rs (lista de
+# ventanas del selector de "Compartir pantalla": ventanas ocultas por DWM,
+# proceso dueño y nombre del ejecutable). `Win32_Graphics_Gdi` y `Win32_Storage_Xps`:
+# voice/source_thumbs.rs (miniaturas con PrintWindow/StretchBlt) y la lista de
+# pantallas (EnumDisplayMonitors).
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+# voice/window_capture.rs: captura de una ventana con Windows Graphics Capture
+# (WGC) + Direct3D 11 para leer los cuadros. Reemplaza al `gdigrab title=...`.
+windows = { version = "0.61", features = [
+    "Foundation",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 # --- Compilación del proto de settings de Discord (build.rs) ---
 [build-dependencies]

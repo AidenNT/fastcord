@@ -55,9 +55,9 @@ pub fn detect() -> Option<Dialog> {
     if insecure_tls {
         dialog = dialog.flag(
             "ECORD_INSECURE_TLS",
-            "La verificación de certificados TLS está desactivada. Cualquiera en tu red \
-             (Wi-Fi público, proxy, malware) puede hacerse pasar por Discord y leer tu \
-             token en tránsito.",
+            "La verificación de certificados TLS está desactivada (REST, Gateway, \
+             login por QR y voz). Cualquiera en tu red (Wi-Fi público, proxy, malware) \
+             puede hacerse pasar por Discord y leer tu token en tránsito.",
         );
     }
 

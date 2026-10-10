@@ -65,6 +65,10 @@ pub enum StreamWatchStatus {
 #[derive(Clone, Default)]
 pub struct StreamFrameSlot {
     inner: Arc<std::sync::Mutex<Option<StreamFrame>>>,
+    /// La UI pide no procesar el video (ventana en segundo plano). Lo mira la
+    /// tarea de recepción, que tira los paquetes de video sin descifrarlos ni
+    /// decodificarlos; el audio sigue sonando.
+    paused: Arc<AtomicBool>,
 }
 
 /// Un frame RGBA listo para subir a una textura.
@@ -76,9 +80,29 @@ pub struct StreamFrame {
 }
 
 impl StreamFrameSlot {
-    fn store(&self, frame: StreamFrame) {
+    pub(crate) fn store(&self, frame: StreamFrame) {
         let mut guard = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         *guard = Some(frame);
+    }
+
+    /// Pausa / reanuda el procesamiento del video de este stream.
+    pub(crate) fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, AtomicOrdering::Relaxed);
+    }
+
+    pub(crate) fn is_paused(&self) -> bool {
+        self.paused.load(AtomicOrdering::Relaxed)
+    }
+
+    /// El mismo interruptor, para pasárselo a la tarea de recepción.
+    fn pause_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.paused)
+    }
+
+    /// Tira el frame pendiente (si lo hay) sin pasarlo a la GPU.
+    pub(crate) fn discard(&self) {
+        let mut guard = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        guard.take();
     }
 
     /// Saca el frame nuevo, si llegó uno desde la última vez.
@@ -314,17 +338,11 @@ async fn watch_stream_session(
 ) -> Result<(), String> {
     let url = voice_gateway_url(&params.endpoint)?;
     logging::debug("stream", format!("connecting stream websocket: {url}"));
-    let (ws, response) = timeout(
-        VOICE_WEBSOCKET_CONNECT_TIMEOUT,
-        connect_async_tls_with_config(&url, None, false, None),
-    )
-    .await
-    .map_err(|_| "stream websocket connect timed out after 10s".to_owned())?
-    .map_err(|error| format!("stream websocket connect failed: {error}"))?;
-    logging::debug(
-        "stream",
-        format!("stream websocket connected: status={}", response.status()),
-    );
+    let ws = timeout(VOICE_WEBSOCKET_CONNECT_TIMEOUT, websocket::connect(&url))
+        .await
+        .map_err(|_| "stream websocket connect timed out after 10s".to_owned())?
+        .map_err(|error| format!("stream websocket connect failed: {error}"))?;
+    logging::debug("stream", "stream websocket connected");
 
     let (writer, mut reader) = ws.split();
     let writer: VoiceWriter = Arc::new(Mutex::new(writer));
@@ -465,6 +483,7 @@ async fn watch_stream_session(
                                 our_ssrc,
                                 decode_tx.clone(),
                                 stream_audio_sink.clone(),
+                                frames.pause_flag(),
                             )));
                             // "Quiero cualquier stream, calidad máxima."
                             send_voice_text(&writer, stream_sink_wants_payload()).await?;
@@ -510,11 +529,14 @@ async fn watch_stream_session(
             }
             WsMessage::Close(frame) => {
                 let detail = frame
-                    .map(|frame| format!("code={} reason={}", frame.code, frame.reason))
+                    .map(|frame| {
+                        let reason = frame.reason.to_string();
+                        format!("code={} reason={reason}", u16::from(frame.code))
+                    })
                     .unwrap_or_else(|| "no close frame".to_owned());
                 return Err(format!("stream websocket closed: {detail}"));
             }
-            WsMessage::Pong(_) | WsMessage::Frame(_) => {}
+            _ => {}
         }
     }
 }
@@ -594,6 +616,7 @@ async fn run_stream_video_receive(
     sender_ssrc: u32,
     decode_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
     audio_sink: StreamAudioSink,
+    video_paused: Arc<AtomicBool>,
 ) {
     let decryptor = match VoiceRtpDecryptor::new(&description.mode, &description.secret_key) {
         Ok(decryptor) => decryptor,
@@ -633,6 +656,7 @@ async fn run_stream_video_receive(
     let mut dave_failures = 0u64;
     let mut frames_sent = 0u64;
     let mut frames_dropped = 0u64;
+    let mut was_paused = false;
 
     loop {
         let len = match socket.recv(&mut packet).await {
@@ -675,6 +699,25 @@ async fn run_stream_video_receive(
                     header.ssrc, header.sequence, header.timestamp
                 ),
             );
+        }
+
+        // Ventana en segundo plano: el video no se descifra, ni se arma, ni se
+        // decodifica (el audio ya salió arriba y sigue sonando). Al volver se
+        // empieza de cero y se pide una keyframe, porque lo que se tiró era la
+        // referencia de los frames siguientes.
+        if video_paused.load(AtomicOrdering::Relaxed) {
+            if !was_paused {
+                was_paused = true;
+                logging::debug("stream", "stream video paused (window in background)");
+            }
+            continue;
+        }
+        if was_paused {
+            was_paused = false;
+            reorder = RtpReorderBuffer::default();
+            depacketizer = H264Depacketizer::default();
+            last_pli = None;
+            logging::debug("stream", "stream video resumed, asking for a keyframe");
         }
 
         // `decrypt_packet` solo acepta el payload type de audio; para video hay

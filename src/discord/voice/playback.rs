@@ -21,6 +21,8 @@ use super::VOICE_PULSE_OUTPUT_BUFFER_FRAMES;
 use super::audio_buffer::{VoiceAudioBuffer, VoiceAudioOutputStats};
 #[cfg(feature = "voice-playback")]
 use super::devices;
+#[cfg(feature = "voice-playback")]
+use super::echo_reference::EchoReferenceTap;
 #[cfg(all(feature = "voice-playback", target_os = "linux"))]
 use super::log_captured_alsa_errors;
 #[cfg(feature = "voice-playback")]
@@ -612,6 +614,7 @@ fn build_voice_output_stream(
             playback_volume,
             stats,
             last_callback_at: None,
+            echo_reference: EchoReferenceTap::new(config.sample_rate),
         },
         log_voice_output_stream_error,
         "voice audio output",
@@ -626,6 +629,8 @@ struct VoiceOutputSource {
     playback_volume: Arc<AtomicU8>,
     stats: Arc<VoiceAudioOutputStats>,
     last_callback_at: Option<Instant>,
+    /// Copia de lo que suena, como referencia de la cancelación de eco.
+    echo_reference: EchoReferenceTap,
 }
 
 #[cfg(feature = "voice-playback")]
@@ -657,8 +662,11 @@ impl F32OutputSource for VoiceOutputSource {
         let gain = VoiceVolumePercent::new(self.playback_volume.load(Ordering::Relaxed)).gain();
         for frame in output.chunks_mut(channels) {
             let [left, right] = self.buffer.next_stereo_frame().unwrap_or([0.0, 0.0]);
+            self.echo_reference
+                .feed(apply_voice_playback_gain_and_limit((left + right) * 0.5, gain));
             write_voice_output_frame(frame, left, right, gain, convert);
         }
+        self.echo_reference.flush();
     }
 }
 
