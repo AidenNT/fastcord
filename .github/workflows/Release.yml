@@ -165,23 +165,31 @@ jobs:
       - name: DLLs de FFmpeg para el instalador
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force packaging\windows\dlls | Out-Null
-          Copy-Item "$env:FFMPEG_DIR\bin\*.dll" packaging\windows\dlls   # solo DLLs
+          New-Item -ItemType Directory -Force packaging\bundle-libs | Out-Null
+          Copy-Item "$env:FFMPEG_DIR\bin\*.dll" packaging\bundle-libs   # solo DLLs
 
       - name: Generar .msi y .exe (setup)
         shell: pwsh
         run: |
-          # cargo-packager autodetecta packager.json en la raíz (evita --config)
-          Copy-Item packager.windows.json packager.json -Force
-          cargo packager --release
+          cargo packager --release --formats wix,nsis -vv
+          if ($LASTEXITCODE -ne 0) { throw "cargo packager falló (código $LASTEXITCODE)" }
+          if (-not (Test-Path dist-installers)) {
+            throw "cargo packager no creó dist-installers. ¿Está [package.metadata.packager] en el Cargo.toml commiteado?"
+          }
+          Write-Host "Contenido de dist-installers:"
+          Get-ChildItem dist-installers -Recurse | Format-Table FullName, Length
 
       - name: Reunir archivos
         shell: pwsh
         run: |
           $n = "ecord-$env:VERSION-windows-x64"
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item (Get-ChildItem dist-installers -Filter *.msi | Select-Object -First 1).FullName "dist\$n.msi"
-          Copy-Item (Get-ChildItem dist-installers -Filter *-setup.exe | Select-Object -First 1).FullName "dist\$n-setup.exe"
+          $msi = Get-ChildItem dist-installers -Recurse -Filter *.msi | Select-Object -First 1
+          $exe = Get-ChildItem dist-installers -Recurse -Filter *-setup.exe | Select-Object -First 1
+          if (-not $msi) { throw "No se generó ningún .msi en dist-installers (mirá el paso anterior)" }
+          if (-not $exe) { throw "No se generó el instalador -setup.exe en dist-installers (mirá el paso anterior)" }
+          Copy-Item $msi.FullName "dist\$n.msi"
+          Copy-Item $exe.FullName "dist\$n-setup.exe"
           # ZIP portable (exe + DLLs)
           $stage = "stage\$n"
           New-Item -ItemType Directory -Force $stage | Out-Null
@@ -219,7 +227,7 @@ jobs:
             libavfilter-dev libavdevice-dev \
             libasound2-dev libpulse-dev \
             libwebkit2gtk-4.1-dev libgtk-3-dev \
-            libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev libssl-dev
+            libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -268,16 +276,15 @@ jobs:
       # Mete las dylibs de FFmpeg dentro de la app para no exigirle Homebrew al usuario.
       - name: Embeber dylibs
         run: |
-          mkdir -p packaging/macos/libs
+          mkdir -p packaging/bundle-libs
           dylibbundler -od -b -x target/release/ecord \
-            -d packaging/macos/libs -p @executable_path/../Resources/libs/
+            -d packaging/bundle-libs -p @executable_path/../Resources/
           codesign --force --sign - target/release/ecord
 
       - name: Generar .dmg
         run: |
           cargo install cargo-packager --locked
-          cp packager.macos.json packager.json
-          cargo packager --release
+          cargo packager --release --formats dmg
           mkdir -p dist
           cp dist-installers/*.dmg "dist/ecord-${VERSION}-macos-arm64.dmg"
           (cd dist && shasum -a 256 *.dmg > "ecord-${VERSION}-macos-arm64.dmg.sha256")

@@ -63,16 +63,19 @@ env_logger = "0.11"
 # Gateway; eframe/egui siguen corriendo sync en el hilo principal.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net"] }
 # API REST (perfil, relaciones/amigos, guilds, canales, mensajes).
-reqwest = { version = "0.12", features = [
+reqwest = { version = "0.12", default-features = false, features = [
     "json",
-    "blocking",       # http_cache.rs: descargas de imágenes en hilos aparte
-    "cookies",        # sin esto, `reqwest::cookie::CookieStore` no existe
+    "blocking",
+    "cookies",
     "gzip",
-    "brotli",         # el header Accept-Encoding pide `br`
-    "zstd",           # ... y `zstd`
-    "rustls-tls",     # (o `native-tls` si preferís OpenSSL/SChannel)
-    "system-proxy",   # usa el proxy del sistema (también para HTTPS)
+    "brotli",
+    "zstd",
+    "rustls-tls",
+    "system-proxy",
     "rustls-tls-native-roots",
+    "http2",
+    "charset",
+    "macos-system-configuration",
 ] }
 # 0.8 es la que depende de reqwest 0.12 y cookie_store 0.21 (la 0.10 pide
 # reqwest 0.13 + cookie_store 0.22 y choca con las versiones de abajo).

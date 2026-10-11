@@ -34,6 +34,8 @@ fn main() {
     prost_build::Config::new()
         .compile_protos(&[proto_file, frecency_file], &["proto/"])
         .expect("no se pudieron compilar los .proto de settings de Discord");
+
+    // Ícono del .exe (Explorador, accesos directos e instalador). Solo Windows.
     #[cfg(windows)]
     {
         println!("cargo:rerun-if-changed=assets/packaging/icon.ico");
