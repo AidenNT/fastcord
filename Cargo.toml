@@ -1,6 +1,6 @@
 [package]
 name = "ecord"
-version = "0.0.1"
+version = "0.0.10"
 edition = "2024"
 # bidi.rs y system_fonts.rs usan let-chains ("if let ... && ...", estabilizado
 # en la edición 2024), así que hace falta un rustc razonablemente reciente.
