@@ -63,16 +63,19 @@ env_logger = "0.11"
 # Gateway; eframe/egui siguen corriendo sync en el hilo principal.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net"] }
 # API REST (perfil, relaciones/amigos, guilds, canales, mensajes).
+# default-features = false: quita `default-tls` (native-tls). En Linux eso arrastra
+# OpenSSL, que choca al enlazar con BoringSSL (btls-sys/wreq). Usamos solo rustls.
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
-    "blocking",
-    "cookies",
+    "blocking",       # http_cache.rs: descargas de imágenes en hilos aparte
+    "cookies",        # sin esto, `reqwest::cookie::CookieStore` no existe
     "gzip",
-    "brotli",
-    "zstd",
-    "rustls-tls",
-    "system-proxy",
+    "brotli",         # el header Accept-Encoding pide `br`
+    "zstd",           # ... y `zstd`
+    "rustls-tls",     # (o `native-tls` si preferís OpenSSL/SChannel)
+    "system-proxy",   # usa el proxy del sistema (también para HTTPS)
     "rustls-tls-native-roots",
+    # los demás defaults de reqwest, sin `default-tls`:
     "http2",
     "charset",
     "macos-system-configuration",
@@ -267,6 +270,7 @@ prost-build = "0.13"
 # compila, así `build.rs` no depende de tener `protoc` instalado a mano.
 protoc-bin-vendored = "3"
 
+# Incrusta assets/packaging/icon.ico en el .exe (ícono del acceso directo).
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 
@@ -286,7 +290,31 @@ assets = [
   ["target/release/ecord", "usr/bin/", "755"],
   ["packaging/linux/ecord.desktop", "usr/share/applications/", "644"],
   ["assets/packaging/icon-256.png", "usr/share/icons/hicolor/256x256/apps/ecord.png", "644"],
+  ["THIRD_PARTY_NOTICES.md", "usr/share/doc/ecord/", "644"],
+  ["assets/fonts/Inter-LICENSE.txt", "usr/share/doc/ecord/licenses/Inter-LICENSE.txt", "644"],
+  ["assets/fonts/NotoEmoji-LICENSE.txt", "usr/share/doc/ecord/licenses/NotoEmoji-LICENSE.txt", "644"],
+  ["assets/icons/LICENSE.txt", "usr/share/doc/ecord/licenses/Lucide-LICENSE.txt", "644"],
 ]
+
+# Variante con FFmpeg incluido (la usa el CI): `cargo deb --variant bundled`.
+# Necesita packaging/linux/ffmpeg-libs/ con las .so (el CI las prepara).
+# Sin --variant, `cargo deb` usa el FFmpeg del sistema (bloque de arriba).
+[package.metadata.deb.variants.bundled]
+assets = [
+  ["target/release/ecord", "usr/bin/", "755"],
+  ["packaging/linux/ecord.desktop", "usr/share/applications/", "644"],
+  ["assets/packaging/icon-256.png", "usr/share/icons/hicolor/256x256/apps/ecord.png", "644"],
+  ["THIRD_PARTY_NOTICES.md", "usr/share/doc/ecord/", "644"],
+  ["assets/fonts/Inter-LICENSE.txt", "usr/share/doc/ecord/licenses/Inter-LICENSE.txt", "644"],
+  ["assets/fonts/NotoEmoji-LICENSE.txt", "usr/share/doc/ecord/licenses/NotoEmoji-LICENSE.txt", "644"],
+  ["assets/icons/LICENSE.txt", "usr/share/doc/ecord/licenses/Lucide-LICENSE.txt", "644"],
+  ["packaging/linux/ffmpeg-libs/*", "usr/lib/ecord/", "755"],
+  ["packaging/linux/ffmpeg-LICENSE.txt", "usr/share/doc/ecord/ffmpeg-LICENSE.txt", "644"],
+]
+
+# --- Instaladores (.msi/.exe/.dmg) con cargo-packager ---
+# Uso: cargo packager --release --formats wix,nsis   (Windows)
+#      cargo packager --release --formats dmg        (macOS)
 [package.metadata.packager]
 product-name = "eCord"
 identifier = "dev.ecord.client"
@@ -297,5 +325,7 @@ category = "SocialNetworking"
 out-dir = "dist-installers"
 binaries-dir = "target/release"
 binaries = [{ path = "ecord", main = true }]
+# cargo-packager elige el ícono que corresponde a cada sistema.
 icons = ["assets/packaging/icon.ico", "assets/packaging/icon.icns", "assets/packaging/icon.png"]
+# DLLs (Windows) o dylibs (macOS) que el CI copia aquí antes de empaquetar.
 resources = [{ src = "packaging/bundle-libs/*", target = "." }]

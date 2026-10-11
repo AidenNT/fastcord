@@ -7,7 +7,8 @@
 #
 # Salidas:
 #   Windows : .msi (WiX) + .exe (NSIS) + .zip portable
-#   Linux   : .deb (cargo-deb, dependencias automáticas con dpkg-shlibdeps)
+#   Linux   : UN .deb con FFmpeg 8.1 incluido en /usr/lib/ecord (sirve en cualquier distro
+#             reciente); un job aparte lo instala en varias distros y comprueba las .so
 #   macOS   : .dmg (experimental: no bloquea el release si falla)
 #
 # Por qué un runner por sistema y no cross-compile: el proyecto enlaza FFmpeg,
@@ -162,11 +163,19 @@ jobs:
       - name: Instalar cargo-packager
         run: cargo install cargo-packager --locked
 
-      - name: DLLs de FFmpeg para el instalador
+      - name: DLLs de FFmpeg y avisos de licencias para el instalador
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force packaging\bundle-libs | Out-Null
-          Copy-Item "$env:FFMPEG_DIR\bin\*.dll" packaging\bundle-libs   # solo DLLs
+          Copy-Item "$env:FFMPEG_DIR\bin\*.dll" packaging\bundle-libs
+          # Avisos de licencias: viajan junto al .exe (instalador y zip portable).
+          New-Item -ItemType Directory -Force packaging\notices | Out-Null
+          Copy-Item THIRD_PARTY_NOTICES.md packaging\notices\
+          Copy-Item LICENSE packaging\notices\LICENSE.txt
+          Copy-Item assets\fonts\Inter-LICENSE.txt, assets\fonts\NotoEmoji-LICENSE.txt packaging\notices\
+          Copy-Item assets\icons\LICENSE.txt packaging\notices\Lucide-LICENSE.txt
+          if (Test-Path "$env:FFMPEG_DIR\LICENSE.txt") { Copy-Item "$env:FFMPEG_DIR\LICENSE.txt" packaging\notices\FFmpeg-LICENSE.txt }
+          Copy-Item packaging\notices\* packaging\bundle-libs\
 
       - name: Generar .msi y .exe (setup)
         shell: pwsh
@@ -195,6 +204,7 @@ jobs:
           New-Item -ItemType Directory -Force $stage | Out-Null
           Copy-Item target\release\ecord.exe $stage
           Copy-Item "$env:FFMPEG_DIR\bin\*.dll" $stage
+          Copy-Item packaging\notices\* $stage
           Compress-Archive -Path "$stage\*" -DestinationPath "dist\$n-portable.zip" -Force
           Get-ChildItem dist | ForEach-Object {
             $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
@@ -209,46 +219,137 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------- Linux
+  # Un solo .deb para todas las distros: FFmpeg (compilación de BtbN) viaja dentro
+  # del paquete, en /usr/lib/ecord, y el binario lo encuentra por rpath. Se compila
+  # en Ubuntu 22.04 (glibc 2.35) para que el binario corra también en distros nuevas.
   linux:
-    name: Linux x64 (.deb)
+    name: Linux x64 (.deb con FFmpeg incluido)
     needs: meta
-    runs-on: ubuntu-24.04     # FFmpeg 6.1 (libavcodec60); el .deb quedará atado a esa versión
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
     timeout-minutes: 120
     env:
       VERSION: ${{ needs.meta.outputs.version }}
+      DEBIAN_FRONTEND: noninteractive
+      # GPL = trae libx264 (hace falta para transmitir pantalla). Para una build
+      # LGPL, sin x264, cambiá "gpl" por "lgpl".
+      FFMPEG_ASSET: ffmpeg-n8.1-latest-linux64-gpl-shared-8.1
+      FFMPEG_DIR: /opt/ffmpeg
+      # Dónde buscará el binario las .so de FFmpeg una vez instalado el .deb.
+      RUSTFLAGS: -C link-arg=-Wl,-rpath,/usr/lib/ecord
     steps:
-      - uses: actions/checkout@v4
-
+      # Sin libav*-dev a propósito: FFmpeg sale del paquete de BtbN, no del sistema.
       - name: Dependencias del sistema
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake nasm pkg-config clang libclang-dev llvm \
-            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev \
-            libavfilter-dev libavdevice-dev \
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git xz-utils patchelf \
+            build-essential cmake nasm pkg-config clang libclang-dev llvm dpkg-dev \
             libasound2-dev libpulse-dev \
             libwebkit2gtk-4.1-dev libgtk-3-dev \
             libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4
+
+      - name: Instalar Rust
+        run: |
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-bundled-ffmpeg
+
+      - name: Descargar FFmpeg
+        run: |
+          curl -fL --retry 3 -o /tmp/ffmpeg.tar.xz \
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/${FFMPEG_ASSET}.tar.xz"
+          mkdir -p "$FFMPEG_DIR"
+          tar -xJf /tmp/ffmpeg.tar.xz -C "$FFMPEG_DIR" --strip-components=1
+          test -f "$FFMPEG_DIR/include/libavcodec/avcodec.h"
+          ls -l "$FFMPEG_DIR/lib" | head -40
 
       - name: cargo build --release
         run: cargo build --release --locked
 
+      - name: Preparar las bibliotecas de FFmpeg para el paquete
+        run: |
+          mkdir -p packaging/linux/ffmpeg-libs
+          # Solo los archivos con el nombre "soname" (libavcodec.so.62), copiando el
+          # contenido real: evita meter tres copias de cada biblioteca.
+          find "$FFMPEG_DIR/lib" -maxdepth 1 -regextype posix-extended \
+            -regex '.*/lib[a-z0-9_]+\.so\.[0-9]+' | while read -r f; do
+            cp -L "$f" "packaging/linux/ffmpeg-libs/$(basename "$f")"
+          done
+          # Que las bibliotecas se encuentren entre sí dentro de /usr/lib/ecord.
+          patchelf --set-rpath '$ORIGIN' packaging/linux/ffmpeg-libs/*.so.*
+          ls -l packaging/linux/ffmpeg-libs
+          cp "$FFMPEG_DIR/LICENSE.txt" packaging/linux/ffmpeg-LICENSE.txt 2>/dev/null \
+            || echo "FFmpeg (compilación GPL de BtbN): https://ffmpeg.org/legal.html" > packaging/linux/ffmpeg-LICENSE.txt
+
+      # Instala las .so donde las buscará el binario, para que dpkg-shlibdeps (cargo-deb)
+      # las encuentre al calcular las dependencias, y comprueba que no falte ninguna.
+      - name: Comprobar enlaces
+        run: |
+          mkdir -p /usr/lib/ecord
+          cp packaging/linux/ffmpeg-libs/* /usr/lib/ecord/
+          ldd target/release/ecord | tee /tmp/ldd.txt
+          for f in /usr/lib/ecord/*.so.*; do echo "== $f"; ldd "$f"; done | tee -a /tmp/ldd.txt
+          if grep -q "not found" /tmp/ldd.txt; then
+            echo "::error::Hay bibliotecas sin resolver"; grep -B1 "not found" /tmp/ldd.txt; exit 1
+          fi
+
       - name: Generar .deb
         run: |
-          cargo install cargo-deb --locked
-          cargo deb --no-build
+          RUSTFLAGS= cargo install cargo-deb --locked
+          cargo deb --no-build --variant bundled
           mkdir -p dist
           cp target/debian/*.deb "dist/ecord-${VERSION}-linux-amd64.deb"
           (cd dist && sha256sum *.deb > "ecord-${VERSION}-linux-amd64.deb.sha256")
-          dpkg-deb --info dist/*.deb | grep -i depends || true
+          dpkg-deb --info dist/*.deb
+          dpkg-deb --contents dist/*.deb | grep -E "usr/bin|usr/lib/ecord"
 
       - uses: actions/upload-artifact@v4
         with:
           name: ecord-${{ env.VERSION }}-linux-amd64
           path: dist/*
           if-no-files-found: error
+
+  # Instala el .deb en distros limpias y mira si queda alguna biblioteca sin resolver.
+  # Informa, pero no bloquea el release.
+  linux-verify:
+    name: Verificar .deb en ${{ matrix.image }}
+    needs: [meta, linux]
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    continue-on-error: true
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - ubuntu:22.04
+          - ubuntu:24.04
+          - debian:bookworm
+          - debian:trixie
+          - kalilinux/kali-rolling
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ecord-${{ needs.meta.outputs.version }}-linux-amd64
+          path: dist
+      - name: Instalar el .deb
+        run: |
+          apt-get update
+          apt-get install -y ./dist/*.deb
+      - name: Comprobar bibliotecas
+        run: |
+          ldd /usr/bin/ecord | tee /tmp/ldd.txt
+          for f in /usr/lib/ecord/*.so.*; do echo "== $f"; ldd "$f"; done | tee -a /tmp/ldd.txt
+          if grep -q "not found" /tmp/ldd.txt; then
+            echo "::error::Faltan bibliotecas en ${{ matrix.image }}"; grep -B1 "not found" /tmp/ldd.txt; exit 1
+          fi
 
   # ---------------------------------------------------------------- macOS
   macos:
@@ -280,6 +381,11 @@ jobs:
           dylibbundler -od -b -x target/release/ecord \
             -d packaging/bundle-libs -p @executable_path/../Resources/
           codesign --force --sign - target/release/ecord
+          # Avisos de licencias dentro de la app (mismo glob que las dylibs).
+          cp THIRD_PARTY_NOTICES.md packaging/bundle-libs/
+          cp LICENSE packaging/bundle-libs/LICENSE.txt
+          cp assets/fonts/Inter-LICENSE.txt assets/fonts/NotoEmoji-LICENSE.txt packaging/bundle-libs/
+          cp assets/icons/LICENSE.txt packaging/bundle-libs/Lucide-LICENSE.txt
 
       - name: Generar .dmg
         run: |
