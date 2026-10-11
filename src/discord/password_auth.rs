@@ -171,10 +171,18 @@ async fn post_json(
             if let Ok(value) = HeaderValue::from_str(&solution.token) {
                 headers.insert(HeaderName::from_static("x-captcha-key"), value);
             }
-            if let Some(value) = solution.rqtoken.as_deref().and_then(|token| HeaderValue::from_str(token).ok()) {
+            if let Some(value) = solution
+                .rqtoken
+                .as_deref()
+                .and_then(|token| HeaderValue::from_str(token).ok())
+            {
                 headers.insert(HeaderName::from_static("x-captcha-rqtoken"), value);
             }
-            if let Some(value) = solution.session_id.as_deref().and_then(|id| HeaderValue::from_str(id).ok()) {
+            if let Some(value) = solution
+                .session_id
+                .as_deref()
+                .and_then(|id| HeaderValue::from_str(id).ok())
+            {
                 headers.insert(HeaderName::from_static("x-captcha-session-id"), value);
             }
         }
@@ -322,7 +330,11 @@ fn parse_login_success(body: &str) -> Result<LoginOutcome, String> {
         if methods.is_empty() {
             return Err("Discord pide 2FA, pero con un método que este cliente no soporta (solo TOTP y SMS)".into());
         }
-        return Ok(LoginOutcome::MfaRequired(MfaChallenge { ticket, login_instance_id, methods }));
+        return Ok(LoginOutcome::MfaRequired(MfaChallenge {
+            ticket,
+            login_instance_id,
+            methods,
+        }));
     }
     Err("La respuesta de Discord no trajo ni token ni pedido de 2FA".into())
 }
@@ -335,7 +347,9 @@ fn mfa_token_from_body(body: &str) -> Result<String, String> {
 
     let response: MfaVerifyResponse =
         serde_json::from_str(body).map_err(|error| format!("No se pudo leer la respuesta de 2FA: {error}"))?;
-    response.token.ok_or_else(|| "La respuesta de 2FA no trajo un token".to_owned())
+    response
+        .token
+        .ok_or_else(|| "La respuesta de 2FA no trajo un token".to_owned())
 }
 
 fn format_login_error(status: reqwest::StatusCode, body: &str) -> String {
@@ -361,7 +375,9 @@ fn format_login_error(status: reqwest::StatusCode, body: &str) -> String {
         Some(20013) | Some(20011) => "Esta cuenta está deshabilitada o marcada para borrarse".to_string(),
         Some(70007) => "Discord pide verificar el teléfono antes de poder iniciar sesión".to_string(),
         Some(70009) => "Discord pide verificar el email antes de poder iniciar sesión".to_string(),
-        _ => error.message.unwrap_or_else(|| format!("El login falló (HTTP {status})")),
+        _ => error
+            .message
+            .unwrap_or_else(|| format!("El login falló (HTTP {status})")),
     }
 }
 
@@ -397,10 +413,9 @@ mod tests {
 
     #[test]
     fn parse_login_success_returns_supported_mfa_methods() {
-        let outcome = parse_login_success(
-            r#"{"mfa":true,"sms":true,"totp":true,"ticket":"ticket","login_instance_id":"login"}"#,
-        )
-        .expect("mfa should parse");
+        let outcome =
+            parse_login_success(r#"{"mfa":true,"sms":true,"totp":true,"ticket":"ticket","login_instance_id":"login"}"#)
+                .expect("mfa should parse");
 
         let LoginOutcome::MfaRequired(challenge) = outcome else {
             panic!("expected MFA challenge");
@@ -432,8 +447,16 @@ mod tests {
                 r#"{"captcha_key":["captcha-required"],"captcha_rqtoken":"secret"}"#,
                 "captcha",
             ),
-            (StatusCode::TOO_MANY_REQUESTS, "not json secret", "El login falló (HTTP 429 Too Many Requests)"),
-            (StatusCode::FORBIDDEN, r#"{"message":"suspended","suspended_user_token":"secret"}"#, "Safety Hub"),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "not json secret",
+                "El login falló (HTTP 429 Too Many Requests)",
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                r#"{"message":"suspended","suspended_user_token":"secret"}"#,
+                "Safety Hub",
+            ),
         ];
         for (status, body, expected) in cases {
             let message = format_login_error(status, body);

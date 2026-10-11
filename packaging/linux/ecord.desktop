@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=eCord
+Comment=Cliente de Discord no oficial
+Exec=ecord
+Icon=ecord
+Terminal=false
+Categories=Network;Chat;InstantMessaging;
+StartupWMClass=eCord

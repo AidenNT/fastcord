@@ -52,10 +52,7 @@ pub(super) struct InputReceiver<T: Send> {
     capacity: usize,
 }
 
-pub(super) fn channel<T: Copy + Send>(
-    sample_rate: u32,
-    channels: usize,
-) -> (InputSender<T>, InputReceiver<T>) {
+pub(super) fn channel<T: Copy + Send>(sample_rate: u32, channels: usize) -> (InputSender<T>, InputReceiver<T>) {
     let sample_rate = sample_rate.max(1);
     let channels = channels.max(1);
     let block_frames = usize::try_from(sample_rate.div_ceil(100)).unwrap_or(usize::MAX);
@@ -69,9 +66,7 @@ pub(super) fn channel<T: Copy + Send>(
             .try_send(Vec::with_capacity(block_samples))
             .expect("voice microphone input buffer pool has capacity");
     }
-    let pending = recycle_rx
-        .try_recv()
-        .expect("input buffer pool is populated");
+    let pending = recycle_rx.try_recv().expect("input buffer pool is populated");
     let overflow_epoch = Arc::new(AtomicU64::new(0));
 
     (
@@ -113,11 +108,7 @@ impl<T: Copy + Send> InputSender<T> {
             self.pending_discontinuity = true;
             (
                 &input[skipped_samples..],
-                add_audio_duration(
-                    captured_at,
-                    skipped_samples / self.channels,
-                    self.sample_rate,
-                ),
+                add_audio_duration(captured_at, skipped_samples / self.channels, self.sample_rate),
                 blocks_for_samples(skipped_samples, self.block_samples),
             )
         } else {
@@ -126,8 +117,7 @@ impl<T: Copy + Send> InputSender<T> {
         if self.pending.is_none() {
             let Some(buffer) = self.take_buffer() else {
                 self.begin_overflow();
-                return dropped_blocks
-                    .saturating_add(blocks_for_samples(input.len(), self.block_samples));
+                return dropped_blocks.saturating_add(blocks_for_samples(input.len(), self.block_samples));
             };
             self.pending = Some(buffer);
         }
@@ -151,10 +141,7 @@ impl<T: Copy + Send> InputSender<T> {
                 break;
             }
 
-            let samples = self
-                .pending
-                .take()
-                .expect("completed input block is available");
+            let samples = self.pending.take().expect("completed input block is available");
             let chunk = InputChunk {
                 samples,
                 captured_at: self.pending_at.take().unwrap_or(captured_at),
@@ -168,10 +155,8 @@ impl<T: Copy + Send> InputSender<T> {
                     if consumed < input.len() {
                         let Some(buffer) = self.take_buffer() else {
                             self.begin_overflow();
-                            return dropped_blocks.saturating_add(blocks_for_samples(
-                                input.len() - consumed,
-                                self.block_samples,
-                            ));
+                            return dropped_blocks
+                                .saturating_add(blocks_for_samples(input.len() - consumed, self.block_samples));
                         };
                         self.pending = Some(buffer);
                     }
@@ -182,8 +167,8 @@ impl<T: Copy + Send> InputSender<T> {
                     self.pending = Some(std::mem::take(&mut chunk.samples));
                     self.pending_at = None;
                     self.begin_overflow();
-                    dropped_blocks = dropped_blocks
-                        .saturating_add(blocks_for_samples(dropped_samples, self.block_samples));
+                    dropped_blocks =
+                        dropped_blocks.saturating_add(blocks_for_samples(dropped_samples, self.block_samples));
                     return dropped_blocks;
                 }
                 Err(TrySendError::Disconnected(mut chunk)) => {
@@ -191,8 +176,8 @@ impl<T: Copy + Send> InputSender<T> {
                     chunk.samples.clear();
                     self.pending = Some(std::mem::take(&mut chunk.samples));
                     self.pending_at = None;
-                    dropped_blocks = dropped_blocks
-                        .saturating_add(blocks_for_samples(dropped_samples, self.block_samples));
+                    dropped_blocks =
+                        dropped_blocks.saturating_add(blocks_for_samples(dropped_samples, self.block_samples));
                     return dropped_blocks;
                 }
             }
@@ -205,8 +190,7 @@ impl<T: Copy + Send> InputSender<T> {
             return;
         };
         let pending = self.pending.as_mut().expect("partial input buffer exists");
-        let expected_at =
-            add_audio_duration(pending_at, pending.len() / self.channels, self.sample_rate);
+        let expected_at = add_audio_duration(pending_at, pending.len() / self.channels, self.sample_rate);
         let timestamp_gap = if captured_at >= expected_at {
             captured_at.duration_since(expected_at)
         } else {
@@ -232,18 +216,12 @@ impl<T: Copy + Send> InputSender<T> {
         }
         self.pending_at = None;
         self.pending_discontinuity = true;
-        self.epoch = self
-            .overflow_epoch
-            .fetch_add(1, Ordering::AcqRel)
-            .saturating_add(1);
+        self.epoch = self.overflow_epoch.fetch_add(1, Ordering::AcqRel).saturating_add(1);
     }
 }
 
 impl<T: Send> InputReceiver<T> {
-    pub(super) fn recv_timeout(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<InputChunk<T>, RecvTimeoutError> {
+    pub(super) fn recv_timeout(&mut self, timeout: Duration) -> Result<InputChunk<T>, RecvTimeoutError> {
         let started_at = Instant::now();
         let mut discarded = 0;
         loop {
@@ -271,9 +249,7 @@ fn queue_capacity(budget: Duration, block_duration: Duration) -> usize {
     let budget_ns = budget.as_nanos();
     let block_ns = block_duration.as_nanos().max(1);
     let blocks = budget_ns.div_ceil(block_ns);
-    usize::try_from(blocks)
-        .unwrap_or(usize::MAX - 1)
-        .saturating_add(1)
+    usize::try_from(blocks).unwrap_or(usize::MAX - 1).saturating_add(1)
 }
 
 fn blocks_for_samples(samples: usize, block_samples: usize) -> u64 {
@@ -290,4 +266,3 @@ fn duration_for_audio_frames(frames: usize, sample_rate: u32) -> Duration {
     let nanos = numerator.div_ceil(u128::from(sample_rate));
     Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
 }
-

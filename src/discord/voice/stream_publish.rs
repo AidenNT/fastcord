@@ -23,18 +23,15 @@
 
 use super::dave::{VoiceDaveOutboundPayload, handles_gateway_json_op};
 use super::gateway::{
-    choose_encryption_mode, discover_voice_udp_address, parse_voice_binary_frame,
-    parse_voice_ready_payload, parse_voice_session_description, run_voice_heartbeat,
-    run_voice_udp_ping, send_voice_text, voice_gateway_opcode, voice_gateway_url,
+    choose_encryption_mode, discover_voice_udp_address, parse_voice_binary_frame, parse_voice_ready_payload,
+    parse_voice_session_description, run_voice_heartbeat, run_voice_udp_ping, send_voice_text, voice_gateway_opcode,
+    voice_gateway_url,
 };
 use super::h264::{
-    EncodedFrame, RTP_VIDEO_CLOCK_HZ, RTP_VIDEO_MAX_PAYLOAD, build_video_rtp_packet,
-    packetize_h264_access_unit,
+    EncodedFrame, RTP_VIDEO_CLOCK_HZ, RTP_VIDEO_MAX_PAYLOAD, build_video_rtp_packet, packetize_h264_access_unit,
 };
 use super::rtp::VoiceRtpDecryptor;
-use super::screen_capture::{
-    KeyframeRequest, ScreenCaptureConfig, ScreenEncoder, start_screen_encoder,
-};
+use super::screen_capture::{KeyframeRequest, ScreenCaptureConfig, ScreenEncoder, start_screen_encoder};
 use super::*;
 
 /// Payload types: los mismos que anuncia el visor y los clientes oficiales.
@@ -131,10 +128,7 @@ pub(crate) fn spawn_stream_publish(
     let spawned = std::thread::Builder::new()
         .name("stream-publish".to_owned())
         .spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
+            let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     publish_status(
@@ -156,10 +150,7 @@ pub(crate) fn spawn_stream_publish(
             Some(format!("could not start the stream thread: {error}")),
         );
     }
-    StreamPublishHandle {
-        stream_key,
-        stop_tx,
-    }
+    StreamPublishHandle { stream_key, stop_tx }
 }
 
 fn publish_status(
@@ -181,12 +172,7 @@ async fn run_stream_publish(
     stop_rx: watch::Receiver<bool>,
 ) {
     logging::debug("stream", format!("stream publish starting: {params:?}"));
-    publish_status(
-        &events,
-        &params.stream_key,
-        StreamPublishStatus::Connecting,
-        None,
-    );
+    publish_status(&events, &params.stream_key, StreamPublishStatus::Connecting, None);
     match publish_stream_session(&params, &events, stop_rx).await {
         Ok(()) => {
             logging::debug("stream", "stream publish ended");
@@ -194,12 +180,7 @@ async fn run_stream_publish(
         }
         Err(error) => {
             logging::error("stream", &error);
-            publish_status(
-                &events,
-                &params.stream_key,
-                StreamPublishStatus::Failed,
-                Some(error),
-            );
+            publish_status(&events, &params.stream_key, StreamPublishStatus::Failed, Some(error));
         }
     }
 }
@@ -284,8 +265,7 @@ async fn publish_stream_session(
     )?));
     let last_sequence: Arc<Mutex<Option<i64>>> = Arc::new(Mutex::new(None));
     let heartbeat_ack = Arc::new(Mutex::new(VoiceHeartbeatAckState::default()));
-    let (heartbeat_timeout_tx, mut heartbeat_timeout_rx) =
-        mpsc::unbounded_channel::<VoiceHeartbeatTimeout>();
+    let (heartbeat_timeout_tx, mut heartbeat_timeout_rx) = mpsc::unbounded_channel::<VoiceHeartbeatTimeout>();
 
     let mut udp_socket: Option<Arc<UdpSocket>> = None;
     // (audio, video, rtx) — se completan en READY.
@@ -359,50 +339,33 @@ async fn publish_stream_session(
                         ssrcs = Some((ready.ssrc, video_ssrc, rtx_ssrc));
                         let mode = choose_encryption_mode(&ready.modes)?;
                         let (socket, discovered) = discover_voice_udp_address(&ready).await?;
-                        send_voice_text(
-                            &writer,
-                            publish_select_protocol_payload(&discovered, &mode),
-                        )
-                        .await?;
+                        send_voice_text(&writer, publish_select_protocol_payload(&discovered, &mode)).await?;
                         tasks.push(tokio::spawn(run_voice_udp_ping(Arc::clone(&socket))));
                         udp_socket = Some(socket);
                     }
                     VOICE_OP_SESSION_DESCRIPTION => {
                         let description = parse_voice_session_description(&value)?;
-                        logging::debug(
-                            "stream",
-                            format!("stream publish session description: {description:?}"),
-                        );
+                        logging::debug("stream", format!("stream publish session description: {description:?}"));
                         dave_state
                             .lock()
                             .await
                             .apply_protocol_version(description.dave_protocol_version)?;
-                        let (Some(socket), Some((audio_ssrc, video_ssrc, rtx_ssrc))) =
-                            (udp_socket.as_ref(), ssrcs)
+                        let (Some(socket), Some((audio_ssrc, video_ssrc, rtx_ssrc))) = (udp_socket.as_ref(), ssrcs)
                         else {
-                            return Err(
-                                "stream session description arrived before the UDP transport"
-                                    .to_owned(),
-                            );
+                            return Err("stream session description arrived before the UDP transport".to_owned());
                         };
                         // Un session description repetido no reinicia el envío.
                         if sending {
                             continue;
                         }
                         sending = true;
-                        let encryptor =
-                            VoiceRtpEncryptor::new(&description.mode, &description.secret_key)?;
+                        let encryptor = VoiceRtpEncryptor::new(&description.mode, &description.secret_key)?;
 
                         // "Voy a mandar video con estos SSRC y esta resolución."
                         send_voice_text(&writer, publish_speaking_payload(audio_ssrc)).await?;
                         send_voice_text(
                             &writer,
-                            publish_video_payload(
-                                audio_ssrc,
-                                video_ssrc,
-                                rtx_ssrc,
-                                &params.capture,
-                            ),
+                            publish_video_payload(audio_ssrc, video_ssrc, rtx_ssrc, &params.capture),
                         )
                         .await?;
 
@@ -411,10 +374,7 @@ async fn publish_stream_session(
                         };
                         // Lo que llega por el UDP: respuestas al ping y RTCP de los
                         // espectadores (un PLI/FIR fuerza una IDR).
-                        let decryptor = VoiceRtpDecryptor::new(
-                            &description.mode,
-                            &description.secret_key,
-                        )?;
+                        let decryptor = VoiceRtpDecryptor::new(&description.mode, &description.secret_key)?;
                         tasks.push(tokio::spawn(run_feedback(
                             Arc::clone(socket),
                             decryptor,
@@ -430,23 +390,14 @@ async fn publish_stream_session(
                             events: events.clone(),
                             stream_key: params.stream_key.clone(),
                         })));
-                        publish_status(
-                            events,
-                            &params.stream_key,
-                            StreamPublishStatus::Connected,
-                            None,
-                        );
+                        publish_status(events, &params.stream_key, StreamPublishStatus::Connected, None);
                     }
                     VOICE_OP_VIDEO => {
                         logging::debug("stream", format!("stream video op: {value}"));
                     }
                     other => {
                         if handles_gateway_json_op(other) {
-                            dave_state
-                                .lock()
-                                .await
-                                .handle_json_op(&writer, other, &value)
-                                .await?;
+                            dave_state.lock().await.handle_json_op(&writer, other, &value).await?;
                         } else {
                             logging::debug("stream", format!("unhandled stream gateway op={other}"));
                         }
@@ -456,11 +407,7 @@ async fn publish_stream_session(
             WsMessage::Binary(payload) => {
                 let frame = parse_voice_binary_frame(&payload)?;
                 *last_sequence.lock().await = Some(frame.sequence);
-                dave_state
-                    .lock()
-                    .await
-                    .handle_binary_frame(&writer, frame)
-                    .await?;
+                dave_state.lock().await.handle_binary_frame(&writer, frame).await?;
             }
             WsMessage::Ping(payload) => {
                 let mut writer = writer.lock().await;
@@ -486,10 +433,7 @@ async fn publish_stream_session(
 /// Mantiene vivo el codificador mientras dure la sesión. Se aborta con el resto
 /// de las tareas, y al soltarse el `ScreenEncoder` se detiene su hilo.
 async fn hold_encoder(encoder: ScreenEncoder) {
-    logging::debug(
-        "stream",
-        format!("holding screen encoder {}", encoder.encoder_name()),
-    );
+    logging::debug("stream", format!("holding screen encoder {}", encoder.encoder_name()));
     std::future::pending::<()>().await;
     drop(encoder);
 }
@@ -583,12 +527,7 @@ fn publish_speaking_payload(audio_ssrc: u32) -> String {
 
 /// VIDEO (opcode 12): SSRC de video y de RTX, y la resolución/bitrate/fps que
 /// vamos a mandar.
-fn publish_video_payload(
-    audio_ssrc: u32,
-    video_ssrc: u32,
-    rtx_ssrc: u32,
-    capture: &ScreenCaptureConfig,
-) -> String {
+fn publish_video_payload(audio_ssrc: u32, video_ssrc: u32, rtx_ssrc: u32, capture: &ScreenCaptureConfig) -> String {
     json!({
         "op": VOICE_OP_VIDEO,
         "d": {
@@ -640,9 +579,7 @@ fn rtcp_requests_keyframe(packet: &[u8]) -> bool {
         if length > rest.len() {
             return false;
         }
-        if kind == RTCP_PAYLOAD_SPECIFIC_FEEDBACK
-            && (format == RTCP_FMT_PLI || format == RTCP_FMT_FIR)
-        {
+        if kind == RTCP_PAYLOAD_SPECIFIC_FEEDBACK && (format == RTCP_FMT_PLI || format == RTCP_FMT_FIR) {
             return true;
         }
         rest = &rest[length..];
@@ -653,11 +590,7 @@ fn rtcp_requests_keyframe(packet: &[u8]) -> bool {
 /// Lee lo que llega por el UDP (respuestas al ping, RTCP). Si un espectador
 /// manda un PLI/FIR (entró tarde o perdió paquetes), pide una IDR al
 /// codificador; el resto (NACK, receiver reports) se descarta.
-async fn run_feedback(
-    socket: Arc<UdpSocket>,
-    decryptor: VoiceRtpDecryptor,
-    keyframe: KeyframeRequest,
-) {
+async fn run_feedback(socket: Arc<UdpSocket>, decryptor: VoiceRtpDecryptor, keyframe: KeyframeRequest) {
     let mut packet = vec![0u8; 2048];
     let mut requests = 0u64;
     loop {
@@ -727,15 +660,9 @@ async fn send_frames(sender: &mut VideoSender) -> Result<(), String> {
             continue;
         }
 
-        let outbound = sender
-            .dave_state
-            .lock()
-            .await
-            .prepare_outbound_h264(&frame.data);
+        let outbound = sender.dave_state.lock().await.prepare_outbound_h264(&frame.data);
         let access_unit = match outbound {
-            VoiceDaveOutboundPayload::Plain(data) | VoiceDaveOutboundPayload::Encrypted(data) => {
-                data
-            }
+            VoiceDaveOutboundPayload::Plain(data) | VoiceDaveOutboundPayload::Encrypted(data) => data,
             VoiceDaveOutboundPayload::Blocked(reason) => {
                 // Típico al arrancar: el handshake MLS de DAVE todavía no terminó.
                 waiting_for_keyframe = true;
@@ -750,9 +677,8 @@ async fn send_frames(sender: &mut VideoSender) -> Result<(), String> {
             }
         };
 
-        let timestamp = base_timestamp.wrapping_add(
-            (started.elapsed().as_micros() as u64 * RTP_VIDEO_CLOCK_HZ / 1_000_000) as u32,
-        );
+        let timestamp =
+            base_timestamp.wrapping_add((started.elapsed().as_micros() as u64 * RTP_VIDEO_CLOCK_HZ / 1_000_000) as u32);
         let payloads = packetize_h264_access_unit(&access_unit, RTP_VIDEO_MAX_PAYLOAD);
         let count = payloads.len();
         for (index, payload) in payloads.iter().enumerate() {
@@ -792,12 +718,7 @@ async fn send_frames(sender: &mut VideoSender) -> Result<(), String> {
                     access_unit.len()
                 ),
             );
-            publish_status(
-                &sender.events,
-                &sender.stream_key,
-                StreamPublishStatus::Live,
-                None,
-            );
+            publish_status(&sender.events, &sender.stream_key, StreamPublishStatus::Live, None);
         }
     }
     Ok(())
@@ -813,9 +734,7 @@ mod tests {
         let pli = [0x81, 206, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2];
         assert!(rtcp_requests_keyframe(&pli));
         // FIR: FMT=4, con una entrada FCI de 8 bytes.
-        let fir = [
-            0x84, 206, 0, 4, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 0, 0,
-        ];
+        let fir = [0x84, 206, 0, 4, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 0, 0];
         assert!(rtcp_requests_keyframe(&fir));
         // Receiver report (PT 201) seguido de un PLI: se encuentra en el compuesto.
         let mut compound = vec![0x80, 201, 0, 1, 0, 0, 0, 1];
@@ -856,8 +775,7 @@ mod tests {
             bitrate_kbps: 2500,
             ..Default::default()
         };
-        let payload: Value =
-            serde_json::from_str(&publish_video_payload(1, 2, 3, &capture)).unwrap();
+        let payload: Value = serde_json::from_str(&publish_video_payload(1, 2, 3, &capture)).unwrap();
         let stream = &payload["d"]["streams"][0];
         assert_eq!(payload["d"]["video_ssrc"], 2);
         assert_eq!(stream["max_bitrate"], 2_500_000);

@@ -1,17 +1,33 @@
 use std::time::Instant;
 
+/// Cuánto dura un "está escribiendo" sin renovarse (Discord lo muestra ~10 s).
+const TYPING_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Alguien que está escribiendo en un canal.
+struct TypingUser {
+    user_id: String,
+    name: String,
+    avatar_url: Option<String>,
+    until: Instant,
+}
+
 use egui::Color32;
 
 use crate::discord::models::{PrivateChannel, User, UserProfileResponse};
 use crate::discord::voice::VoiceRuntimeEvent;
+use crate::discord::voice::{
+    CaptureMonitor, CaptureTarget, CaptureWindow, ScreenCaptureConfig, StreamPublishHandle, StreamPublishParams,
+    StreamQuality, list_capture_monitors, list_capture_windows, spawn_stream_publish,
+};
 use crate::discord::voice::{StreamWatchHandle, StreamWatchParams, spawn_stream_watch};
-use crate::discord::voice::{CaptureMonitor, CaptureTarget, CaptureWindow, ScreenCaptureConfig, StreamPublishHandle, StreamPublishParams, StreamQuality, list_capture_monitors, list_capture_windows, spawn_stream_publish};
-use crate::discord::{StreamPublishStatus, StreamWatchStatus};
 use crate::discord::voice::{VoiceAudioSourceOptions, VoiceAudioSources, list_voice_audio_sources};
 use crate::discord::{
     AppEvent, CurrentVoiceConnectionState, VoiceAudioSettings, VoiceCache, VoiceConnectPhase, VoiceConnectionStatus,
 };
-use crate::lib::data::{demo_activity, demo_friends, demo_servers, ActivityCard, ChatMessage, Friend, NameResolver, Server};
+use crate::discord::{StreamPublishStatus, StreamWatchStatus};
+use crate::lib::data::{
+    ActivityCard, ChatMessage, Friend, NameResolver, Server, demo_activity, demo_friends, demo_servers,
+};
 use crate::theme::{Backdrop, BackdropRuntime, Palette, ThemeDef, ThemeEditor, ThemeMode};
 use crate::ui::settings::SettingsTab;
 
@@ -31,15 +47,14 @@ fn merged_playback(
     )>,
     replace: bool,
 ) -> std::collections::HashMap<u64, crate::discord::VoiceParticipantPlaybackSettings> {
-    let mut next: std::collections::HashMap<u64, crate::discord::VoiceParticipantPlaybackSettings> =
-        if replace {
-            dirty
-                .iter()
-                .filter_map(|raw| current.get(raw).map(|playback| (*raw, *playback)))
-                .collect()
-        } else {
-            current.clone()
-        };
+    let mut next: std::collections::HashMap<u64, crate::discord::VoiceParticipantPlaybackSettings> = if replace {
+        dirty
+            .iter()
+            .filter_map(|raw| current.get(raw).map(|playback| (*raw, *playback)))
+            .collect()
+    } else {
+        current.clone()
+    };
     for (id, playback) in entries {
         let raw = id.get();
         if dirty.contains(&raw) {
@@ -80,9 +95,13 @@ pub enum AuthStatus {
     /// mandó el fingerprint para armar el QR.
     Starting,
     /// QR listo para escanear con el celular.
-    AwaitingScan { url: String },
+    AwaitingScan {
+        url: String,
+    },
     /// Escaneado; falta que el usuario confirme en el celular.
-    Confirming { username: String },
+    Confirming {
+        username: String,
+    },
     /// Login resuelto (QR o token guardado); esperando el `READY` del
     /// Gateway con los datos reales.
     Connecting,
@@ -111,7 +130,7 @@ pub enum ToastKind {
 }
 
 /// Notificación flotante apilada en una esquina de la ventana. Se
-/// autodescarta pasados unos segundos; ver `ui::overlay::show_toasts`.
+/// autodescarta pasados unos segundos; ver `ui::shell::overlay::show_toasts`.
 pub struct Toast {
     pub kind: ToastKind,
     pub title: String,
@@ -142,7 +161,7 @@ pub const UI_SCALE_MAX: f32 = 1.5;
 pub const UI_SCALE_DEFAULT: f32 = 0.85;
 
 /// De qué lado de la ventana se apilan las tarjetas de notificación
-/// (`ui::notifications::show_in_app`). Se elige en Ajustes → Apariencia y se
+/// (`ui::shell::notifications::show_in_app`). Se elige en Ajustes → Apariencia y se
 /// guarda en `web_local_storage_api` bajo `notification_side`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NotificationSide {
@@ -171,7 +190,7 @@ impl NotificationSide {
 /// Notificación de mención/DM que se muestra DENTRO de la app (en el lado
 /// elegido por `NotificationSide`) cuando la ventana tiene el foco; con la
 /// ventana sin foco se manda una del escritorio en su lugar. Ver
-/// `ui::notifications::show_in_app` y `App::notify_incoming`.
+/// `ui::shell::notifications::show_in_app` y `App::notify_incoming`.
 pub struct InAppNotification {
     pub title: String,
     pub body: String,
@@ -214,7 +233,7 @@ pub struct ModalField {
 }
 
 /// Formulario que un bot pidió tras apretar uno de sus botones (por ejemplo
-/// "Responder anónimo"). Se dibuja en `ui::overlay::show_component_modal`.
+/// "Responder anónimo"). Se dibuja en `ui::shell::overlay::show_component_modal`.
 pub struct ComponentModal {
     pub request: crate::discord::models::ModalRequest,
     pub fields: Vec<ModalField>,
@@ -243,7 +262,11 @@ impl ComponentModal {
                 })
             })
             .collect();
-        Self { request, fields, error: None }
+        Self {
+            request,
+            fields,
+            error: None,
+        }
     }
 
     /// Revisa los campos; si hay algún problema deja el aviso en `error` y
@@ -251,7 +274,11 @@ impl ComponentModal {
     pub fn validate(&mut self) -> bool {
         for field in &self.fields {
             let len = field.value.trim().chars().count();
-            let name = if field.label.is_empty() { "El campo" } else { field.label.as_str() };
+            let name = if field.label.is_empty() {
+                "El campo"
+            } else {
+                field.label.as_str()
+            };
             if field.required && len == 0 {
                 self.error = Some(format!("{name} es obligatorio."));
                 return false;
@@ -266,8 +293,28 @@ impl ComponentModal {
     }
 }
 
+/// Formulario de ingreso que pide un server (reglas / preguntas) justo después
+/// de unirte con una invitación. Se dibuja en `ui::shell::overlay::show_join_form`.
+pub struct JoinFormModal {
+    pub form: crate::discord::join_form::JoinForm,
+    /// Aviso de validación o de error de red.
+    pub error: Option<String>,
+    /// Ya se mandó y se espera la respuesta de Discord.
+    pub submitting: bool,
+}
+
+impl JoinFormModal {
+    pub fn new(form: crate::discord::join_form::JoinForm) -> Self {
+        Self {
+            form,
+            error: None,
+            submitting: false,
+        }
+    }
+}
+
 /// Popup modal centrado con fondo semi-transparente y un botón de
-/// confirmación. Ver `ui::overlay::show_modal`.
+/// confirmación. Ver `ui::shell::overlay::show_modal`.
 pub struct Modal {
     pub title: String,
     pub message: String,
@@ -275,7 +322,7 @@ pub struct Modal {
 }
 
 /// Lista de miembros de un rol, abierta al clickear una mención `@rol`
-/// (ver `ui::role_popup`).
+/// (ver `ui::server::role_popup`).
 pub struct RolePopup {
     pub role_id: String,
     pub name: String,
@@ -340,7 +387,7 @@ pub struct BroadcastStream {
     /// Detalle del error cuando `status == Failed`.
     pub message: Option<String>,
     /// Qué se transmite (toda la pantalla o una ventana). Se elige en
-    /// `ui::share_picker`; se usa recién cuando llegan los datos de media
+    /// `ui::chat::share_picker`; se usa recién cuando llegan los datos de media
     /// (`try_start_stream_publish`), por eso se guarda acá.
     capture_target: CaptureTarget,
     /// Conexión de media + captura. `None` hasta que llegan `rtc_server_id`,
@@ -424,8 +471,7 @@ pub struct App {
     /// cuenta: se llena con lo que trae `AppEvent::UserSettings`/`UserSettingsUpdate`
     /// y se manda de vuelta con `flush_participant_audio`. Solo guarda a quien
     /// se apartó de lo normal (100 %, sin silenciar). Clave: id de usuario.
-    participant_playback:
-        std::collections::HashMap<u64, crate::discord::VoiceParticipantPlaybackSettings>,
+    participant_playback: std::collections::HashMap<u64, crate::discord::VoiceParticipantPlaybackSettings>,
     /// Personas cuyo ajuste cambió acá y todavía no se mandó a la cuenta.
     participant_audio_dirty: std::collections::HashSet<u64>,
     /// Último cambio pendiente; el `PATCH` sale cuando pasa
@@ -435,19 +481,22 @@ pub struct App {
     /// Lo mismo para el AUDIO DE LOS STREAMS (clic derecho sobre el video):
     /// volumen y silencio por streamer, espejo de `audio_context_settings.stream`.
     /// Clave: id de usuario de quien transmite.
-    stream_playback:
-        std::collections::HashMap<u64, crate::discord::VoiceParticipantPlaybackSettings>,
+    stream_playback: std::collections::HashMap<u64, crate::discord::VoiceParticipantPlaybackSettings>,
     /// Streamers cuyo ajuste cambió acá y todavía no se mandó (comparte
     /// `participant_audio_dirty_at` con las personas).
     stream_audio_dirty: std::collections::HashSet<u64>,
     /// Relación con cada persona, por id: 1 amigo, 2 bloqueado, 3 solicitud
     /// recibida, 4 solicitud enviada. Sin entrada = sin relación. Alimenta el
-    /// menú de clic derecho (`ui::audio_menu`): "Añadir amigo" / "Desbloquear".
+    /// menú de clic derecho (`ui::call::audio_menu`): "Añadir amigo" / "Desbloquear".
     relationship_kinds: std::collections::HashMap<String, u8>,
     /// Solicitudes de amistad pendientes (tipos 3 y 4 de `relationship_kinds`,
     /// con los datos para dibujarlas). Alimenta la pestaña "Pendiente" del
     /// Inicio; se mantiene al día con `RELATIONSHIP_ADD`/`RELATIONSHIP_REMOVE`.
     pub pending_requests: Vec<crate::lib::data::PendingRequest>,
+    /// Solicitudes de ingreso a servers que esperan revisión de los moderadores
+    /// (`READY.guild_join_requests` y `GUILD_JOIN_REQUEST_*`). Se ven en la
+    /// pestaña "Pendiente" del Inicio.
+    pub pending_join_requests: Vec<crate::discord::join_form::JoinRequest>,
     /// Texto del campo de la pantalla "Añadir amigo".
     pub add_friend_input: String,
     /// Hay una solicitud por nombre de usuario en camino.
@@ -468,7 +517,7 @@ pub struct App {
     menu_ctx_rev: u64,
     menu_ctx_published: Option<(u64, usize)>,
     /// Ids de las carpetas de servers (`GuildFolder::id`) que están
-    /// expandidas en la barra lateral (`ui::rail`). Solo en memoria — no
+    /// expandidas en la barra lateral (`ui::shell::rail`). Solo en memoria — no
     /// se persiste entre sesiones a propósito, a diferencia del cliente
     /// oficial: implementarlo bien requeriría mandar un PATCH de
     /// `guild_folders` de vuelta a Discord cada vez que el usuario
@@ -529,7 +578,7 @@ pub struct App {
     /// `open_server_with`.
     pub pending_initial_channel: Option<String>,
     /// Si el panel de notificaciones de la barra superior está abierto
-    /// (ver `ui::inbox`).
+    /// (ver `ui::dm::inbox`).
     pub inbox_open: bool,
     /// Si falló un pedido `after`, hasta cuándo no se reintenta (la UI lo
     /// vuelve a pedir en cuanto el final de la lista queda a la vista, y sin
@@ -542,8 +591,21 @@ pub struct App {
     pub last_history_trim: f64,
     /// Formulario pedido por un bot (tras apretar uno de sus botones).
     pub component_modal: Option<ComponentModal>,
+    /// Formulario de ingreso de un server (ver [`JoinFormModal`]).
+    pub join_form: Option<JoinFormModal>,
+    /// Soundboard de la llamada: el popup está abierto.
+    pub soundboard_open: bool,
+    /// Botón de la barra de llamada que lo abrió (el popup se ubica encima y
+    /// ese clic no lo cierra).
+    pub soundboard_button: Option<egui::Rect>,
+    /// Se están pidiendo los sonidos.
+    pub soundboard_loading: bool,
+    /// Sonidos predeterminados de Discord.
+    pub soundboard_defaults: Vec<crate::discord::soundboard::SoundboardSound>,
+    /// Sonidos de cada server, por id de server.
+    pub soundboard_guild_sounds: std::collections::HashMap<String, Vec<crate::discord::soundboard::SoundboardSound>>,
     /// Botones de bots que ya mandaron su interacción y esperan respuesta:
-    /// se dibujan con un spinner adentro (ver `ui::components`).
+    /// se dibujan con un spinner adentro (ver `ui::shell::components`).
     pub pending_buttons: Vec<crate::lib::data::PendingButton>,
     /// El Gateway se cortó y `gateway::run` está reintentando: la barra
     /// superior muestra el spinner amarillo con un "!" hasta que vuelve
@@ -554,11 +616,11 @@ pub struct App {
     /// botones de bots lo piden.
     pub gateway_session_id: String,
     /// Catálogos de slash commands ya pedidos, por server (o por canal en un
-    /// DM). Ver `ui::slash` y `discord::slash`.
+    /// DM). Ver `ui::chat::slash` y `discord::slash`.
     pub slash_catalogs: std::collections::HashMap<String, crate::discord::slash::CachedCatalog>,
     /// Claves de `slash_catalogs` con un pedido en vuelo.
     pub slash_pending: std::collections::HashSet<String>,
-    /// Texto del buscador de la barra superior (`ui::topbar`); decorativo,
+    /// Texto del buscador de la barra superior (`ui::shell::topbar`); decorativo,
     /// no filtra nada todavía.
     pub top_search: String,
     /// Notificaciones flotantes en pantalla, más recientes al final.
@@ -580,6 +642,9 @@ pub struct App {
     /// Cuándo se mandó el último ack por canal, para no pegarle a la API en
     /// cada mensaje cuando el chat abierto recibe muchos seguidos.
     ack_sent_at: std::collections::HashMap<String, Instant>,
+    /// Quién está escribiendo ahora, por canal/DM (`TYPING_START`). Cada
+    /// entrada vence a los `TYPING_TTL` segundos si no se renueva.
+    typing: std::collections::HashMap<String, Vec<TypingUser>>,
     /// "N mensajes nuevos desde ..." del chat abierto (canal → marca). Ver
     /// `track_unread_marker`.
     pub unread_markers: std::collections::HashMap<String, crate::lib::data::UnreadMarker>,
@@ -628,11 +693,11 @@ pub struct App {
     /// Popup modal actualmente abierto, si hay alguno.
     pub modal: Option<Modal>,
     /// Cola de diálogos (avisos, confirmaciones, novedades, formularios) del
-    /// sistema `ui::dialog`; se muestra de a uno, el primero de la cola.
+    /// sistema `ui::shell::dialog`; se muestra de a uno, el primero de la cola.
     /// Usar `App::open_dialog`.
-    pub dialogs: std::collections::VecDeque<crate::ui::dialog::Dialog>,
+    pub dialogs: std::collections::VecDeque<crate::ui::shell::dialog::Dialog>,
     /// Token de la sesión guardada que NO se conectó al arrancar porque hay un
-    /// aviso de seguridad pendiente (ver `ui::security_warning`). Se usa (y se
+    /// aviso de seguridad pendiente (ver `ui::auth::security_warning`). Se usa (y se
     /// vacía) cuando la persona acepta el aviso; si cierra ecord, nunca se
     /// envía a ningún lado.
     pub pending_resume_token: Option<String>,
@@ -654,9 +719,9 @@ pub struct App {
     pub custom_themes: Vec<ThemeDef>,
     /// Si el panel de ajustes (`ui::settings`) está abierto.
     pub settings_open: bool,
-    /// Si el popup de micrófono y Clean Mic (`ui::clean_mic_popup`) está abierto.
+    /// Si el popup de micrófono y Clean Mic (`ui::call::clean_mic_popup`) está abierto.
     pub clean_mic_open: bool,
-    /// Si el selector de "Compartir pantalla" (`ui::share_picker`) está abierto.
+    /// Si el selector de "Compartir pantalla" (`ui::chat::share_picker`) está abierto.
     pub(crate) share_picker_open: bool,
     /// Ventanas que ofrece el selector; se vuelve a leer al abrirlo y con el
     /// botón de actualizar (`refresh_share_windows`).
@@ -667,7 +732,7 @@ pub struct App {
     /// del selector; se aplican al arrancar la transmisión.
     pub(crate) share_quality: StreamQuality,
     /// "Usar nueva interfaz" (Ajustes → Apariencia): la barra de llamada va a
-    /// todo el ancho abajo de la ventana (`ui::call_bar::show_bottom`) en vez
+    /// todo el ancho abajo de la ventana (`ui::call::call_bar::show_bottom`) en vez
     /// de la tarjeta chica del panel izquierdo. Se persiste solo; ver
     /// `set_new_call_ui`.
     pub new_call_ui: bool,
@@ -698,7 +763,7 @@ pub struct App {
     /// todo lo que dure la app (es barato: chequea cada pocos segundos y
     /// solo vuelve a decodificar la imagen si el wallpaper cambió).
     wallpaper_rx: Option<std::sync::mpsc::Receiver<[u8; 3]>>,
-    /// Buffers del formulario de usuario/contraseña (`ui::login`). Viven
+    /// Buffers del formulario de usuario/contraseña (`ui::auth::login`). Viven
     /// acá sueltos, igual que `compose_text`/`friends_search`, en vez de
     /// adentro de `AuthStatus`, para no mezclar "en qué paso del login
     /// estamos" con "qué hay tipeado ahora mismo".
@@ -765,7 +830,7 @@ pub struct App {
     pub voice_connect_phase: Option<VoiceConnectPhase>,
     /// Preferencia de mute/deafen del propio usuario, independiente de
     /// estar en una llamada o no — igual que en el cliente real, los
-    /// botones de mic/audífonos de la barra de usuario (`ui::friends_panel
+    /// botones de mic/audífonos de la barra de usuario (`ui::dm::friends_panel
     /// ::user_bar`) valen tanto para "pre-silenciarte" antes de unirte a
     /// una llamada como para silenciarte en una que ya está en curso. Se
     /// usa como valor inicial en `requested_voice_state` y se mantiene en
@@ -804,10 +869,10 @@ impl Default for App {
             Ok(Some(json)) => serde_json::from_str::<ThemeMode>(&json).unwrap_or(ThemeMode::Dark),
             _ => ThemeMode::Dark,
         };
-        // Modo de imágenes (diagnóstico de RAM), ver `ui::anim::ImageMode`.
+        // Modo de imágenes (diagnóstico de RAM), ver `ui::chat::anim::ImageMode`.
         if let Ok(Some(raw)) = web_local_storage_api::get_item("image_mode") {
             if let Ok(n) = raw.trim().parse::<u8>() {
-                crate::ui::anim::set_image_mode(crate::ui::anim::ImageMode::from_u8(n));
+                crate::ui::chat::anim::set_image_mode(crate::ui::chat::anim::ImageMode::from_u8(n));
             }
         }
         let notification_side = match web_local_storage_api::get_item("notification_side") {
@@ -866,6 +931,7 @@ impl Default for App {
             stream_audio_dirty: std::collections::HashSet::new(),
             relationship_kinds: std::collections::HashMap::new(),
             pending_requests: Vec::new(),
+            pending_join_requests: Vec::new(),
             add_friend_input: String::new(),
             add_friend_busy: false,
             add_friend_status: None,
@@ -899,6 +965,12 @@ impl Default for App {
             thread_panel: None,
             last_history_trim: 0.0,
             component_modal: None,
+            join_form: None,
+            soundboard_open: false,
+            soundboard_button: None,
+            soundboard_loading: false,
+            soundboard_defaults: Vec::new(),
+            soundboard_guild_sounds: std::collections::HashMap::new(),
             pending_buttons: Vec::new(),
             gateway_disconnected: false,
             gateway_session_id: String::new(),
@@ -911,6 +983,7 @@ impl Default for App {
             guild_mentions: std::collections::HashMap::new(),
             acked_messages: std::collections::HashMap::new(),
             ack_sent_at: std::collections::HashMap::new(),
+            typing: std::collections::HashMap::new(),
             unread_markers: std::collections::HashMap::new(),
             unread_tracked_channel: None,
             unread_hold: None,
@@ -986,7 +1059,7 @@ impl Default for App {
 
         // Si ya había una sesión guardada, nos saltamos el QR y vamos
         // directo al Gateway con ese token.
-        let security_dialog = crate::ui::security_warning::detect();
+        let security_dialog = crate::ui::auth::security_warning::detect();
         if let Some(token) = startup_token {
             if security_dialog.is_some() {
                 // Modo inseguro (mock / TLS sin verificar): NO se toca la
@@ -999,10 +1072,10 @@ impl Default for App {
         // El aviso de seguridad va primero en la cola; después, las novedades
         // si es la primera vez que se abre esta versión.
         if let Some(dialog) = security_dialog {
-            crate::ui::security_warning::play_alert();
+            crate::ui::auth::security_warning::play_alert();
             app.dialogs.push_back(dialog);
         }
-        crate::ui::changelog::queue_if_new(&mut app);
+        crate::ui::settings::changelog::queue_if_new(&mut app);
 
         app
     }
@@ -1045,7 +1118,7 @@ impl App {
 
     /// Conecta el Gateway con el token de la sesión guardada, saltándose el
     /// QR. Se llama al arrancar o, si había un aviso de seguridad pendiente,
-    /// cuando la persona lo acepta (ver `ui::security_warning`).
+    /// cuando la persona lo acepta (ver `ui::auth::security_warning`).
     pub fn resume_saved_session(&mut self, token: String) {
         let (tx, rx) = std::sync::mpsc::channel();
         self.discord_token = Some(token.clone());
@@ -1098,12 +1171,12 @@ impl App {
     /// aplicable (modo mock / TLS sin verificar) el token no sale hasta que la
     /// persona lo acepte, igual que al arrancar.
     fn connect_saved_token(&mut self, token: String) {
-        if let Some(dialog) = crate::ui::security_warning::detect() {
+        if let Some(dialog) = crate::ui::auth::security_warning::detect() {
             self.pending_resume_token = Some(token);
             // Solo suena si el diálogo realmente se va a mostrar (si ya hay
             // uno abierto, `open_dialog` lo ignora).
             if !self.dialogs.iter().any(|d| d.id == dialog.id) {
-                crate::ui::security_warning::play_alert();
+                crate::ui::auth::security_warning::play_alert();
             }
             self.open_dialog(dialog);
         } else {
@@ -1145,7 +1218,7 @@ impl App {
 
     /// Pide confirmación para cerrar la sesión de la cuenta abierta.
     pub fn ask_log_out(&mut self) {
-        use crate::ui::dialog::{Dialog, DialogKind};
+        use crate::ui::shell::dialog::{Dialog, DialogKind};
         let name = self
             .me
             .as_ref()
@@ -1188,7 +1261,7 @@ impl App {
 
     /// Pide confirmación para quitar una cuenta de la lista.
     pub fn ask_remove_account(&mut self, user_id: &str) {
-        use crate::ui::dialog::{Dialog, DialogKind};
+        use crate::ui::shell::dialog::{Dialog, DialogKind};
         let Some(account) = self.accounts.get(user_id).cloned() else {
             return;
         };
@@ -1274,11 +1347,13 @@ impl App {
         self.inbox_open = false;
         self.thread_panel = None;
         self.component_modal = None;
+        self.join_form = None;
         self.top_search.clear();
         self.unread_mentions.clear();
         self.guild_mentions.clear();
         self.acked_messages.clear();
         self.ack_sent_at.clear();
+        self.typing.clear();
         self.unread_markers.clear();
         self.unread_tracked_channel = None;
         self.unread_hold = None;
@@ -1307,7 +1382,11 @@ impl App {
         // preferencia de la persona: se conserva.
         let audio = std::mem::take(&mut self.voice.audio);
         let audio_sources = std::mem::take(&mut self.voice.audio_sources);
-        self.voice = VoiceCache { audio, audio_sources, ..VoiceCache::default() };
+        self.voice = VoiceCache {
+            audio,
+            audio_sources,
+            ..VoiceCache::default()
+        };
     }
 
     /// Corta lo que quede de la conexión actual y vuelve a la pantalla de
@@ -1371,7 +1450,7 @@ impl App {
     }
 
     /// Pasa de la pantalla de QR a la de usuario/contraseña (link "Usar
-    /// usuario y contraseña" en `ui::login`).
+    /// usuario y contraseña" en `ui::auth::login`).
     pub fn switch_to_password_form(&mut self) {
         self.login_error = None;
         self.auth = AuthStatus::PasswordForm;
@@ -1413,7 +1492,9 @@ impl App {
     /// para el método `method` (TOTP salvo que el usuario haya pedido
     /// SMS).
     pub fn submit_mfa_code(&mut self, method: crate::discord::password_auth::MfaMethod) {
-        let Some(challenge) = self.pending_mfa.clone() else { return };
+        let Some(challenge) = self.pending_mfa.clone() else {
+            return;
+        };
         if self.login_mfa_code.trim().is_empty() {
             self.login_error = Some("Escribí el código de verificación".to_owned());
             return;
@@ -1431,9 +1512,11 @@ impl App {
     }
 
     /// Pide que Discord mande el código de 2FA por SMS (botón "Enviar
-    /// SMS"/"Reenviar SMS" de `ui::login`).
+    /// SMS"/"Reenviar SMS" de `ui::auth::login`).
     pub fn request_mfa_sms(&mut self) {
-        let Some(challenge) = self.pending_mfa.clone() else { return };
+        let Some(challenge) = self.pending_mfa.clone() else {
+            return;
+        };
         let Some(tx) = self.event_tx.clone() else { return };
         crate::discord::password_auth::spawn_mfa_sms(challenge.ticket, tx);
     }
@@ -1514,8 +1597,31 @@ impl App {
     /// `self.friends`).
     pub fn open_dm_from_channel(&mut self, dm_index: usize) {
         let Some(dm) = self.dms.get(dm_index) else { return };
-        let Some(user_id) = dm.recipients.first().map(|r| r.id.clone()) else { return };
         let channel_id = dm.id.clone();
+
+        // DM grupal: no hay "la otra persona", así que no se busca por
+        // `user_id` (eso abría el DM 1:1 con el primer miembro). Se
+        // identifica por el id del canal.
+        if dm.is_group() {
+            let existing = self
+                .friends
+                .iter()
+                .position(|f| f.is_group && f.dm_channel_id.as_deref() == Some(channel_id.as_str()));
+            let index = match existing {
+                Some(i) => i,
+                None => {
+                    let friend = Friend::from_group_channel(dm);
+                    self.friends.push(friend);
+                    self.friends.len() - 1
+                }
+            };
+            self.open_dm(index);
+            return;
+        }
+
+        let Some(user_id) = dm.recipients.first().map(|r| r.id.clone()) else {
+            return;
+        };
 
         let existing = self.friends.iter().position(|f| f.user_id == user_id);
         let index = match existing {
@@ -1529,7 +1635,9 @@ impl App {
                 i
             }
             None => {
-                let Some(mut friend) = Friend::from_dm_channel(dm) else { return };
+                let Some(mut friend) = Friend::from_dm_channel(dm) else {
+                    return;
+                };
                 if let Some((status, subtitle)) = self.presences.get(&friend.user_id) {
                     friend.status = *status;
                     friend.subtitle = subtitle.clone();
@@ -1593,11 +1701,7 @@ impl App {
 
         if !server.guild_id.is_empty() && server.categories.is_empty() {
             if let (Some(token), Some(tx)) = (&self.discord_token, &self.event_tx) {
-                crate::discord::spawn_fetch_guild_channels(
-                    token.clone(),
-                    server.guild_id.clone(),
-                    tx.clone(),
-                );
+                crate::discord::spawn_fetch_guild_channels(token.clone(), server.guild_id.clone(), tx.clone());
             }
         }
         self.subscribe_member_list();
@@ -1622,7 +1726,9 @@ impl App {
         let Screen::Server(index) = self.screen else { return };
         let Some(server) = self.servers.get(index) else { return };
         let (category, channel) = self.current_channel;
-        let Some(ch) = server.channel(category, channel) else { return };
+        let Some(ch) = server.channel(category, channel) else {
+            return;
+        };
         if server.guild_id.is_empty() || ch.is_voice || ch.is_forum || ch.is_thread {
             return;
         }
@@ -1649,7 +1755,9 @@ impl App {
 
     /// (guild, canal) de texto abierto ahora mismo, si es un server real.
     fn current_member_list_key(&self) -> Option<(String, String)> {
-        let Screen::Server(index) = self.screen else { return None };
+        let Screen::Server(index) = self.screen else {
+            return None;
+        };
         let server = self.servers.get(index)?;
         if server.guild_id.is_empty() {
             return None;
@@ -1683,7 +1791,9 @@ impl App {
     ///   (`flush_member_subscription`), así que cambiar de canal varias
     ///   veces seguidas manda un solo pedido, el del canal donde se termina.
     pub fn subscribe_member_list(&mut self) {
-        let Some(key) = self.current_member_list_key() else { return };
+        let Some(key) = self.current_member_list_key() else {
+            return;
+        };
         if self.member_subscription.as_ref() == Some(&key) {
             self.pending_member_subscription = None;
             return;
@@ -1725,7 +1835,9 @@ impl App {
         if self.current_member_list_key().as_ref() != Some(&(guild_id.clone(), channel_id.clone())) {
             return;
         }
-        let Some(commands) = self.gateway_commands.clone() else { return };
+        let Some(commands) = self.gateway_commands.clone() else {
+            return;
+        };
         let command = crate::discord::gateway::GatewayCommand::SubscribeMemberList {
             guild_id: guild_id.clone(),
             channel_id: channel_id.clone(),
@@ -1757,7 +1869,9 @@ impl App {
             .filter(|a| a.kind != 4 && !a.name.is_empty())
             .cloned()
             .collect();
-        if activities.is_empty() || crate::lib::data::Status::from_gateway(&event.status) == crate::lib::data::Status::Offline {
+        if activities.is_empty()
+            || crate::lib::data::Status::from_gateway(&event.status) == crate::lib::data::Status::Offline
+        {
             // Con `guild_id` la presencia es de un miembro de un server: no
             // borra lo que ya sabíamos por la de amigo si esta viene vacía.
             if event.guild_id.is_none() {
@@ -1838,8 +1952,7 @@ impl App {
             for (ci, category) in server.categories.iter_mut().enumerate() {
                 for (hi, channel) in category.channels.iter_mut().enumerate() {
                     let is_open = Some(si) == open_server && open_channel == (ci, hi);
-                    let is_thread = channel.channel_id.is_some()
-                        && channel.channel_id == thread_id;
+                    let is_thread = channel.channel_id.is_some() && channel.channel_id == thread_id;
                     if is_open || is_thread || channel.channel_id.is_none() {
                         continue;
                     }
@@ -1860,8 +1973,13 @@ impl App {
     pub fn open_channel_by_id(&mut self, channel_id: &str) {
         let Screen::Server(index) = self.screen else { return };
         let Some(server) = self.servers.get(index) else { return };
-        let Some((category, channel)) = server.channel_position_by_id(channel_id) else { return };
-        if !server.channel(category, channel).is_some_and(|c| c.is_thread || c.access.can_view) {
+        let Some((category, channel)) = server.channel_position_by_id(channel_id) else {
+            return;
+        };
+        if !server
+            .channel(category, channel)
+            .is_some_and(|c| c.is_thread || c.access.can_view)
+        {
             return;
         }
         self.open_channel(category, channel);
@@ -1895,9 +2013,15 @@ impl App {
             return;
         }
 
-        let Screen::Server(server_index) = self.screen else { return };
-        let Some(server) = self.servers.get_mut(server_index) else { return };
-        let Some(ch) = server.channel_mut(category, channel) else { return };
+        let Screen::Server(server_index) = self.screen else {
+            return;
+        };
+        let Some(server) = self.servers.get_mut(server_index) else {
+            return;
+        };
+        let Some(ch) = server.channel_mut(category, channel) else {
+            return;
+        };
         // La ventana cargada quedó en el medio del historial (se saltó a un
         // mensaje con `around`): al abrir el canal a secas se vuelve al final.
         if ch.has_newer {
@@ -1910,7 +2034,9 @@ impl App {
         if ch.loaded {
             return;
         }
-        let Some(channel_id) = ch.channel_id.clone() else { return };
+        let Some(channel_id) = ch.channel_id.clone() else {
+            return;
+        };
         // Sin "Ver el historial de mensajes" Discord devuelve la lista vacía:
         // no se pide nada y el chat avisa (solo se ven los mensajes nuevos).
         if !ch.access.can_read_history {
@@ -1976,16 +2102,12 @@ impl App {
         if !reset && !channel.forum.has_more {
             return;
         }
-        let Some(channel_id) = channel.channel_id.clone() else { return };
+        let Some(channel_id) = channel.channel_id.clone() else {
+            return;
+        };
         let offset = if reset { 0 } else { channel.forum.next_offset };
         channel.forum.loading = true;
-        crate::discord::spawn_fetch_forum_posts(
-            token,
-            channel_id,
-            offset,
-            channel.forum.by_creation,
-            tx,
-        );
+        crate::discord::spawn_fetch_forum_posts(token, channel_id, offset, channel.forum.by_creation, tx);
     }
 
     /// Cambió el orden de los posts del foro abierto: se vacía la lista y se
@@ -2012,7 +2134,9 @@ impl App {
     pub fn open_forum_post(&mut self, thread_id: &str, title: &str) {
         let Screen::Server(index) = self.screen else { return };
         let (category, channel) = self.current_channel;
-        let Some(server) = self.servers.get_mut(index) else { return };
+        let Some(server) = self.servers.get_mut(index) else {
+            return;
+        };
         let forum_id = server.channel(category, channel).and_then(|c| c.channel_id.clone());
         let (thread_category, thread_channel) = server.open_thread(thread_id, title, forum_id);
         self.open_channel(thread_category, thread_channel);
@@ -2024,7 +2148,9 @@ impl App {
     pub fn open_thread_panel(&mut self, thread_id: &str, title: &str, owner_id: Option<String>) {
         let Screen::Server(index) = self.screen else { return };
         let (category, channel) = self.current_channel;
-        let Some(server) = self.servers.get_mut(index) else { return };
+        let Some(server) = self.servers.get_mut(index) else {
+            return;
+        };
         let parent_id = server.channel(category, channel).and_then(|c| c.channel_id.clone());
         let (thread_category, thread_channel) = server.open_thread(thread_id, title, parent_id);
         if let Some(ch) = server.channel_mut(thread_category, thread_channel) {
@@ -2059,7 +2185,11 @@ impl App {
             return;
         };
         let name: String = name.chars().take(100).collect();
-        let name = if name.trim().is_empty() { "Hilo".to_string() } else { name };
+        let name = if name.trim().is_empty() {
+            "Hilo".to_string()
+        } else {
+            name
+        };
         crate::discord::spawn_create_thread(token, channel_id.to_string(), message_id.to_string(), name, tx);
     }
 
@@ -2072,11 +2202,11 @@ impl App {
     }
 
     /// Publica el catálogo de slash commands del canal abierto para el
-    /// compositor (`ui::slash`) y, si el compositor está escribiendo un `/...`
+    /// compositor (`ui::chat::slash`) y, si el compositor está escribiendo un `/...`
     /// y falta (o venció), lo pide a Discord. Mientras llega uno nuevo se sigue
     /// mostrando el viejo.
     fn publish_slash_catalog(&mut self, ctx: &egui::Context) {
-        use crate::ui::slash;
+        use crate::ui::chat::slash;
 
         let wanted = slash::take_wanted(ctx);
         let Some((token, channel_id, guild_id)) = self.current_send_target() else {
@@ -2099,8 +2229,8 @@ impl App {
     }
 
     /// Ejecuta el slash command que el compositor dejó listo
-    /// (`ui::slash::take_invocation`).
-    fn run_slash_invocation(&mut self, invocation: crate::ui::slash::SlashInvocation) {
+    /// (`ui::chat::slash::take_invocation`).
+    fn run_slash_invocation(&mut self, invocation: crate::ui::chat::slash::SlashInvocation) {
         let Some((token, tx)) = self.discord_token.clone().zip(self.event_tx.clone()) else {
             return;
         };
@@ -2205,7 +2335,9 @@ impl App {
     /// Manda el formulario que pidió un bot. Si algún campo no cumple lo
     /// pedido queda el aviso en el propio modal y no se manda nada.
     pub fn submit_component_modal(&mut self) {
-        let Some(modal) = self.component_modal.as_mut() else { return };
+        let Some(modal) = self.component_modal.as_mut() else {
+            return;
+        };
         if !modal.validate() {
             return;
         }
@@ -2218,10 +2350,15 @@ impl App {
             .iter()
             .map(|f| (f.custom_id.clone(), f.value.trim().to_string()))
             .collect();
-        let Some(ctx) = self.interaction_context(&request.channel_id, &request.application_id, request.guild_id.clone())
+        let Some(ctx) =
+            self.interaction_context(&request.channel_id, &request.application_id, request.guild_id.clone())
         else {
             self.component_modal = None;
-            self.push_toast(ToastKind::Warning, "Formulario", "No se pudo enviar: falta la sesión de Discord.");
+            self.push_toast(
+                ToastKind::Warning,
+                "Formulario",
+                "No se pudo enviar: falta la sesión de Discord.",
+            );
             return;
         };
         self.component_modal = None;
@@ -2234,6 +2371,27 @@ impl App {
             fields,
             tx,
         );
+    }
+
+    /// Manda el formulario de ingreso de un server. Si falta algo obligatorio
+    /// queda el aviso en el propio formulario y no se manda nada; mientras
+    /// espera la respuesta de Discord el formulario sigue abierto.
+    pub fn submit_join_form(&mut self) {
+        let Some(modal) = self.join_form.as_mut() else { return };
+        if modal.submitting {
+            return;
+        }
+        if let Err(message) = modal.form.validate() {
+            modal.error = Some(message);
+            return;
+        }
+        let Some((token, tx)) = self.discord_token.clone().zip(self.event_tx.clone()) else {
+            modal.error = Some("No se pudo enviar: falta la sesión de Discord.".to_owned());
+            return;
+        };
+        modal.error = None;
+        modal.submitting = true;
+        crate::discord::spawn_submit_join_form(token, modal.form.clone(), tx);
     }
 
     /// Desde un post abierto, vuelve a la lista de posts de su foro.
@@ -2272,7 +2430,9 @@ impl App {
                     c.forum.draft_tags.clone(),
                 ))
             });
-        let Some((forum_id, title, body, tags)) = draft else { return };
+        let Some((forum_id, title, body, tags)) = draft else {
+            return;
+        };
         if title.is_empty() || body.is_empty() {
             self.push_toast(
                 ToastKind::Warning,
@@ -2293,7 +2453,9 @@ impl App {
 
     /// Id real de Discord del canal abierto ahora mismo, si es un server.
     fn current_channel_id(&self) -> Option<String> {
-        let Screen::Server(index) = self.screen else { return None };
+        let Screen::Server(index) = self.screen else {
+            return None;
+        };
         let (category, channel) = self.current_channel;
         self.servers.get(index)?.channel(category, channel)?.channel_id.clone()
     }
@@ -2334,11 +2496,15 @@ impl App {
         };
         match self.screen {
             Screen::Dm(index) => {
-                let Some(friend) = self.friends.get_mut(index) else { return };
+                let Some(friend) = self.friends.get_mut(index) else {
+                    return;
+                };
                 if friend.loading_more || friend.loading || !friend.has_more {
                     return;
                 }
-                let Some(channel_id) = friend.dm_channel_id.clone() else { return };
+                let Some(channel_id) = friend.dm_channel_id.clone() else {
+                    return;
+                };
                 let Some(oldest_id) = friend
                     .messages
                     .first()
@@ -2353,12 +2519,18 @@ impl App {
             }
             Screen::Server(server_index) => {
                 let (cat, chan) = self.current_channel;
-                let Some(server) = self.servers.get_mut(server_index) else { return };
-                let Some(channel) = server.channel_mut(cat, chan) else { return };
+                let Some(server) = self.servers.get_mut(server_index) else {
+                    return;
+                };
+                let Some(channel) = server.channel_mut(cat, chan) else {
+                    return;
+                };
                 if channel.loading_more || channel.loading || !channel.has_more {
                     return;
                 }
-                let Some(channel_id) = channel.channel_id.clone() else { return };
+                let Some(channel_id) = channel.channel_id.clone() else {
+                    return;
+                };
                 let Some(oldest_id) = channel
                     .messages
                     .first()
@@ -2424,7 +2596,9 @@ impl App {
     /// último leído (los nuevos quedan justo debajo).
     pub fn jump_to_first_unread(&mut self) {
         use crate::lib::notifications::snowflake;
-        let Some(channel_id) = self.viewed_channel_id() else { return };
+        let Some(channel_id) = self.viewed_channel_id() else {
+            return;
+        };
         let Some(last_read) = self.unread_markers.get(&channel_id).map(|m| m.last_read.clone()) else {
             return;
         };
@@ -2446,7 +2620,9 @@ impl App {
     /// marcar como leído solo hasta salir del canal o apretar "Marcar como leído".
     pub fn mark_message_unread(&mut self, message_id: &str) {
         use crate::lib::notifications::snowflake;
-        let Some(channel_id) = self.viewed_channel_id() else { return };
+        let Some(channel_id) = self.viewed_channel_id() else {
+            return;
+        };
         let n = snowflake(message_id);
         if n == 0 {
             return;
@@ -2487,7 +2663,9 @@ impl App {
                 if !friend.has_newer {
                     return;
                 }
-                let Some(channel_id) = friend.dm_channel_id.clone() else { return };
+                let Some(channel_id) = friend.dm_channel_id.clone() else {
+                    return;
+                };
                 friend.messages.clear();
                 friend.has_newer = false;
                 friend.has_more = true;
@@ -2501,17 +2679,15 @@ impl App {
             }
             Screen::Server(i) => {
                 let (category, channel) = self.current_channel;
-                let Some(ch) = self
-                    .servers
-                    .get_mut(i)
-                    .and_then(|s| s.channel_mut(category, channel))
-                else {
+                let Some(ch) = self.servers.get_mut(i).and_then(|s| s.channel_mut(category, channel)) else {
                     return;
                 };
                 if !ch.has_newer {
                     return;
                 }
-                let Some(channel_id) = ch.channel_id.clone() else { return };
+                let Some(channel_id) = ch.channel_id.clone() else {
+                    return;
+                };
                 ch.messages.clear();
                 ch.has_newer = false;
                 ch.has_more = true;
@@ -2566,11 +2742,7 @@ impl App {
             return;
         }
 
-        let Some(channel) = self
-            .servers
-            .iter_mut()
-            .find_map(|s| s.channel_by_id_mut(channel_id))
-        else {
+        let Some(channel) = self.servers.iter_mut().find_map(|s| s.channel_by_id_mut(channel_id)) else {
             return;
         };
         if channel.messages.iter().any(|m| m.id == message_id) {
@@ -2582,26 +2754,14 @@ impl App {
         channel.loading_more = false;
         channel.loading_newer = false;
         self.pending_jump = None;
-        crate::discord::spawn_fetch_messages_around(
-            token,
-            channel_id.to_string(),
-            message_id.to_string(),
-            true,
-            tx,
-        );
+        crate::discord::spawn_fetch_messages_around(token, channel_id.to_string(), message_id.to_string(), true, tx);
     }
 
     /// Abre `servers[server].categories[category].channels[channel]` en un
     /// mensaje puntual (o a secas si `message_id` es `None`). Es lo que usan
     /// los canales recientes del Inicio para abrir un canal donde se había
     /// quedado la lectura.
-    pub fn open_channel_at(
-        &mut self,
-        server: usize,
-        category: usize,
-        channel: usize,
-        message_id: Option<String>,
-    ) {
+    pub fn open_channel_at(&mut self, server: usize, category: usize, channel: usize, message_id: Option<String>) {
         self.open_server_with(server, false);
         let Some(message_id) = message_id else {
             self.open_channel(category, channel);
@@ -2654,7 +2814,9 @@ impl App {
     /// se está mirando (`?limit=30&after=<id>`). Solo corresponde cuando la
     /// ventana no llega hasta el final del canal (`has_newer`).
     pub fn load_newer_messages(&mut self) {
-        let Some(channel_id) = self.viewed_channel_id() else { return };
+        let Some(channel_id) = self.viewed_channel_id() else {
+            return;
+        };
         self.load_newer_for_channel(&channel_id);
     }
 
@@ -2667,13 +2829,7 @@ impl App {
         let Some((token, tx)) = self.discord_token.clone().zip(self.event_tx.clone()) else {
             return;
         };
-        let newest = |messages: &[ChatMessage]| {
-            messages
-                .iter()
-                .rev()
-                .find(|m| !m.id.is_empty())
-                .map(|m| m.id.clone())
-        };
+        let newest = |messages: &[ChatMessage]| messages.iter().rev().find(|m| !m.id.is_empty()).map(|m| m.id.clone());
         if let Some(friend) = self
             .friends
             .iter_mut()
@@ -2682,22 +2838,22 @@ impl App {
             if !friend.has_newer || friend.loading_newer || friend.loading {
                 return;
             }
-            let Some(newest_id) = newest(&friend.messages) else { return };
+            let Some(newest_id) = newest(&friend.messages) else {
+                return;
+            };
             friend.loading_newer = true;
             crate::discord::spawn_fetch_newer_channel_messages(token, channel_id.to_string(), newest_id, tx);
             return;
         }
-        let Some(channel) = self
-            .servers
-            .iter_mut()
-            .find_map(|s| s.channel_by_id_mut(channel_id))
-        else {
+        let Some(channel) = self.servers.iter_mut().find_map(|s| s.channel_by_id_mut(channel_id)) else {
             return;
         };
         if !channel.has_newer || channel.loading_newer || channel.loading {
             return;
         }
-        let Some(newest_id) = newest(&channel.messages) else { return };
+        let Some(newest_id) = newest(&channel.messages) else {
+            return;
+        };
         channel.loading_newer = true;
         crate::discord::spawn_fetch_newer_channel_messages(token, channel_id.to_string(), newest_id, tx);
     }
@@ -2734,9 +2890,9 @@ impl App {
     }
 
     /// Cierra el popup modal actualmente abierto, si hay alguno.
-    /// Encola un diálogo (ver `ui::dialog`). Si ya hay uno con el mismo `id`
+    /// Encola un diálogo (ver `ui::shell::dialog`). Si ya hay uno con el mismo `id`
     /// en la cola, se ignora para no apilar avisos repetidos.
-    pub fn open_dialog(&mut self, dialog: crate::ui::dialog::Dialog) {
+    pub fn open_dialog(&mut self, dialog: crate::ui::shell::dialog::Dialog) {
         if self.dialogs.iter().any(|d| d.id == dialog.id) {
             return;
         }
@@ -2748,7 +2904,7 @@ impl App {
 
     /// Abre el historial completo de novedades (Ajustes → Cuenta).
     pub fn open_changelog(&mut self) {
-        self.open_dialog(crate::ui::changelog::dialog(usize::MAX));
+        self.open_dialog(crate::ui::settings::changelog::dialog(usize::MAX));
     }
 
     pub fn close_modal(&mut self) {
@@ -2761,7 +2917,9 @@ impl App {
     /// real (no demo). `None` en Home/DM/un server de demo — la tarjeta
     /// de perfil que se abre ahí no tiene roles que mostrar.
     fn current_guild_id(&self) -> Option<String> {
-        let Screen::Server(index) = self.screen else { return None };
+        let Screen::Server(index) = self.screen else {
+            return None;
+        };
         let server = self.servers.get(index)?;
         (!server.guild_id.is_empty()).then(|| server.guild_id.clone())
     }
@@ -2851,7 +3009,10 @@ impl App {
     /// Abre el modal de perfil completo de `user_id` (su perfil ya tiene que
     /// estar cargado en `dm_profile` o `profile_popup`).
     pub fn open_full_profile(&mut self, user_id: impl Into<String>) {
-        self.profile_full = Some(FullProfile { user_id: user_id.into(), tab: 0 });
+        self.profile_full = Some(FullProfile {
+            user_id: user_id.into(),
+            tab: 0,
+        });
     }
 
     /// Cierra la tarjeta de perfil actualmente abierta, si hay alguna.
@@ -2896,6 +3057,7 @@ impl App {
                     loading_newer: false,
                     // Solo se abre el DM: no es (ni pasa a ser) un amigo.
                     is_friend: false,
+                    is_group: false,
                 });
                 self.friends.len() - 1
             }
@@ -2935,7 +3097,9 @@ impl App {
             ThemeMode::CreArts => Palette::crearts(),
             ThemeMode::Wallpaper => {
                 self.start_wallpaper_watch();
-                self.wallpaper_seed.map(Palette::from_seed).unwrap_or_else(Palette::dark)
+                self.wallpaper_seed
+                    .map(Palette::from_seed)
+                    .unwrap_or_else(Palette::dark)
             }
             ThemeMode::Custom(name) => self
                 .custom_themes
@@ -2947,9 +3111,9 @@ impl App {
     }
 
     /// Cambia el modo de imágenes (normal / solo estáticas / sin imágenes de
-    /// perfil) y lo persiste. Ver `ui::anim::ImageMode`.
-    pub fn set_image_mode(&mut self, mode: crate::ui::anim::ImageMode) {
-        crate::ui::anim::set_image_mode(mode);
+    /// perfil) y lo persiste. Ver `ui::chat::anim::ImageMode`.
+    pub fn set_image_mode(&mut self, mode: crate::ui::chat::anim::ImageMode) {
+        crate::ui::chat::anim::set_image_mode(mode);
         let _ = web_local_storage_api::set_item("image_mode", &mode.to_u8().to_string());
     }
 
@@ -2977,7 +3141,9 @@ impl App {
     /// Lleva a la pantalla de la llamada en curso: el canal de voz del server
     /// o el DM. Botón de "ir a la llamada" de la barra nueva.
     pub fn go_to_voice_call(&mut self) {
-        let Some(target) = self.voice_target.as_ref() else { return };
+        let Some(target) = self.voice_target.as_ref() else {
+            return;
+        };
         let channel_id = target.channel_id.to_string();
         let guild_id = match target.scope {
             crate::discord::VoiceScope::Guild(guild_id) => Some(guild_id.to_string()),
@@ -2999,6 +3165,11 @@ impl App {
                     .iter()
                     .position(|f| f.dm_channel_id.as_deref() == Some(channel_id.as_str()))
                 else {
+                    // Todavía no hay entrada en `friends` (un grupo que nunca
+                    // se abrió en esta sesión): se arma desde la lista de DMs.
+                    if let Some(dm_index) = self.dms.iter().position(|d| d.id == channel_id) {
+                        self.open_dm_from_channel(dm_index);
+                    }
                     return;
                 };
                 self.open_dm(index);
@@ -3119,8 +3290,10 @@ impl App {
         // `self.palette` puede traer la translucidez del tema activo (alfa
         // premultiplicado), que un color picker opaco no sabe editar: si el
         // activo es un tema propio se parte de sus colores originales.
-        let base = self.wallpaper_seed.map(Palette::from_seed).unwrap_or_else(|| {
-            match &self.theme_mode {
+        let base = self
+            .wallpaper_seed
+            .map(Palette::from_seed)
+            .unwrap_or_else(|| match &self.theme_mode {
                 ThemeMode::Custom(name) => self
                     .custom_themes
                     .iter()
@@ -3128,8 +3301,7 @@ impl App {
                     .map(Palette::from_def_opaque)
                     .unwrap_or(self.palette),
                 _ => self.palette,
-            }
-        });
+            });
         let mut editor = ThemeEditor::from_palette(&base, None, String::new());
         // Un tema nuevo hereda el fondo del activo.
         editor.backdrop = self.backdrop.clone();
@@ -3388,10 +3560,8 @@ impl App {
                         self.apply_theme_mode();
                     }
                 }
-                let participant_audio =
-                    crate::discord::user_settings::participant_playback_from_settings(&settings);
-                let stream_audio =
-                    crate::discord::user_settings::stream_playback_from_settings(&settings);
+                let participant_audio = crate::discord::user_settings::participant_playback_from_settings(&settings);
+                let stream_audio = crate::discord::user_settings::stream_playback_from_settings(&settings);
                 self.discord_settings = Some(*settings);
                 self.ingest_stream_audio(stream_audio, true);
                 // Volumen/silencio por persona: la cuenta manda (salvo lo que
@@ -3421,11 +3591,9 @@ impl App {
                 // Volumen/silencio por persona cambiado desde otro dispositivo
                 // (o el eco de nuestro propio guardado). En un update parcial
                 // vienen solo las personas que cambiaron.
-                let participant_audio =
-                    crate::discord::user_settings::participant_playback_from_settings(&settings);
+                let participant_audio = crate::discord::user_settings::participant_playback_from_settings(&settings);
                 self.ingest_participant_audio(participant_audio, !partial);
-                let stream_audio =
-                    crate::discord::user_settings::stream_playback_from_settings(&settings);
+                let stream_audio = crate::discord::user_settings::stream_playback_from_settings(&settings);
                 self.ingest_stream_audio(stream_audio, !partial);
                 let mut merged = false;
                 if partial {
@@ -3449,6 +3617,10 @@ impl App {
                     self.accounts.attach_profile(&token, &ready.user);
                     self.accounts.save();
                 }
+                self.pending_join_requests = crate::discord::join_form::parse_join_requests(&ready.guild_join_requests)
+                    .into_iter()
+                    .filter(|r| r.is_pending())
+                    .collect();
                 self.me = Some(ready.user);
                 self.friends = ready
                     .relationships
@@ -3456,11 +3628,7 @@ impl App {
                     .filter(|r| r.kind == 1) // 1 = amistad confirmada
                     .map(Friend::from_relationship)
                     .collect();
-                self.relationship_kinds = ready
-                    .relationships
-                    .iter()
-                    .map(|r| (r.id.clone(), r.kind))
-                    .collect();
+                self.relationship_kinds = ready.relationships.iter().map(|r| (r.id.clone(), r.kind)).collect();
                 // Solicitudes de amistad entrantes (3) y salientes (4).
                 self.pending_requests = ready
                     .relationships
@@ -3476,9 +3644,7 @@ impl App {
                 self.menu_ctx_rev += 1;
                 self.servers = ready.guilds.iter().map(Server::from_guild).collect();
                 // Para la tarjeta de invitación ("Ir al servidor" vs "Unirse").
-                crate::discord::invites::set_joined_guilds(
-                    self.servers.iter().map(|s| s.guild_id.clone()),
-                );
+                crate::discord::invites::set_joined_guilds(self.servers.iter().map(|s| s.guild_id.clone()));
                 // Afinidades (amigos y servers) para ordenar el Inicio nuevo.
                 if let Some((token, tx)) = self.discord_token.clone().zip(self.event_tx.clone()) {
                     crate::discord::spawn_fetch_affinities(token, tx);
@@ -3487,8 +3653,7 @@ impl App {
                 // El `READY` no manda los DMs en orden: se ordenan por el
                 // último mensaje, como el cliente oficial.
                 self.sort_dms();
-                self.mute_rules =
-                    crate::lib::notifications::MuteRules::from_ready(&ready.user_guild_settings);
+                self.mute_rules = crate::lib::notifications::MuteRules::from_ready(&ready.user_guild_settings);
                 // No leídos reales de la cuenta (guardados por Discord): así
                 // sobreviven a reiniciar el cliente.
                 self.apply_ready_read_state(&ready.read_state);
@@ -3586,11 +3751,9 @@ impl App {
                 // (las categorías estaban vacías), así que no se disparó el
                 // pedido de su historial. Lo intentamos de nuevo acá.
                 if let Screen::Server(index) = self.screen {
-                    if self.servers.get(index).map(|s| s.guild_id.as_str()) == Some(guild_id.as_str())
-                    {
+                    if self.servers.get(index).map(|s| s.guild_id.as_str()) == Some(guild_id.as_str()) {
                         let (mut cat, mut chan) = self.current_channel;
-                        let pick_initial =
-                            self.pending_initial_channel.as_deref() == Some(guild_id.as_str());
+                        let pick_initial = self.pending_initial_channel.as_deref() == Some(guild_id.as_str());
                         if let Some(server) = self.servers.get(index) {
                             if pick_initial {
                                 // Recién abierto: último canal de texto
@@ -3701,7 +3864,12 @@ impl App {
                     self.request_members(&guild_id, user_ids);
                 }
             }
-            AppEvent::AroundChannelMessages { channel_id, target_id, jump, messages } => {
+            AppEvent::AroundChannelMessages {
+                channel_id,
+                target_id,
+                jump,
+                messages,
+            } => {
                 use crate::lib::notifications::{dm_sort_key, snowflake};
                 let my_id = self.me.as_ref().map(|m| m.id.clone()).unwrap_or_default();
                 // Chronological (la API los manda del más nuevo al más viejo).
@@ -3719,9 +3887,7 @@ impl App {
                     // más cercano en vez de quedar esperándolo para siempre.
                     let mut jump_id = target_id.clone();
                     if !sorted.iter().any(|m| m.id == target_id) {
-                        if let Some(nearest) =
-                            sorted.iter().min_by_key(|m| snowflake(&m.id).abs_diff(target_n))
-                        {
+                        if let Some(nearest) = sorted.iter().min_by_key(|m| snowflake(&m.id).abs_diff(target_n)) {
                             jump_id = nearest.id.clone();
                             crate::lib::last_view::retarget_restore(&channel_id, &jump_id);
                         }
@@ -3742,10 +3908,7 @@ impl App {
                         .map(dm_sort_key)
                         .unwrap_or(0);
                     let at_latest = latest_known != 0 && newest_n >= latest_known;
-                    friend.messages = sorted
-                        .iter()
-                        .map(|m| ChatMessage::from_discord(m, &my_id))
-                        .collect();
+                    friend.messages = sorted.iter().map(|m| ChatMessage::from_discord(m, &my_id)).collect();
                     friend.loaded = true;
                     friend.loading = false;
                     friend.loading_more = false;
@@ -3844,11 +4007,7 @@ impl App {
                 {
                     friend.loading = false;
                     friend.loading_newer = false;
-                } else if let Some(channel) = self
-                    .servers
-                    .iter_mut()
-                    .find_map(|s| s.channel_by_id_mut(&channel_id))
-                {
+                } else if let Some(channel) = self.servers.iter_mut().find_map(|s| s.channel_by_id_mut(&channel_id)) {
                     channel.loading = false;
                     channel.loading_newer = false;
                 }
@@ -3922,7 +4081,12 @@ impl App {
             AppEvent::OwnActivities(activities) => {
                 self.own_activities = activities;
             }
-            AppEvent::MessageAck { channel_id, message_id, mention_count } => {
+            AppEvent::TypingStart(ev) => self.on_typing_start(ev),
+            AppEvent::MessageAck {
+                channel_id,
+                message_id,
+                mention_count,
+            } => {
                 self.apply_remote_ack(&channel_id, &message_id, mention_count);
             }
             AppEvent::ReactionAdd {
@@ -3947,7 +4111,12 @@ impl App {
                     apply_remote_reaction(msg, emoji.kind(), is_me, false);
                 }
             }
-            AppEvent::UserActionDone { user_id, action, error, needs_stranger_confirm } => {
+            AppEvent::UserActionDone {
+                user_id,
+                action,
+                error,
+                needs_stranger_confirm,
+            } => {
                 use crate::discord::UserAction;
                 match error {
                     Some(error) => {
@@ -3955,24 +4124,17 @@ impl App {
                         // `confirm_stranger_request: false`: se pide confirmación y,
                         // si la dan, se reintenta con `true`. Cualquier otro error
                         // sale como toast normal.
-                        if needs_stranger_confirm
-                            && matches!(action, UserAction::AcceptFriend { confirm: false })
-                        {
+                        if needs_stranger_confirm && matches!(action, UserAction::AcceptFriend { confirm: false }) {
                             self.confirm_accept_friend(user_id.clone(), error);
                         } else {
-                            self.push_toast(
-                                ToastKind::Warning,
-                                "No se pudo completar la acción",
-                                error,
-                            );
+                            self.push_toast(ToastKind::Warning, "No se pudo completar la acción", error);
                         }
                     }
                     None => {
                         let (title, text): (&str, String) = match &action {
                             UserAction::AddFriend | UserAction::AcceptFriend { .. } => {
                                 // Si ella ya había mandado la solicitud, ahora son amigos.
-                                let became_friends =
-                                    self.relationship_kinds.get(&user_id) == Some(&3);
+                                let became_friends = self.relationship_kinds.get(&user_id) == Some(&3);
                                 let kind = if became_friends { 1 } else { 4 };
                                 self.relationship_kinds.insert(user_id.clone(), kind);
                                 if became_friends {
@@ -4041,7 +4203,10 @@ impl App {
                 self.add_friend_status = Some(match error {
                     None => {
                         self.add_friend_input.clear();
-                        (true, format!("¡Listo! Tu solicitud de amistad para {username} fue enviada."))
+                        (
+                            true,
+                            format!("¡Listo! Tu solicitud de amistad para {username} fue enviada."),
+                        )
                     }
                     Some(error) => (false, error),
                 });
@@ -4182,6 +4347,27 @@ impl App {
                 }
                 self.restore_current_channel(&guild_id, previous);
             }
+            AppEvent::DmChannelUpsert(dm) => {
+                let dm = PrivateChannel::from_dm(&dm);
+                self.upsert_dm_channel(dm);
+            }
+            AppEvent::DmChannelDelete { channel_id } => self.remove_dm_channel(&channel_id),
+            AppEvent::DmRecipientAdd { channel_id, user } => {
+                if let Some(dm) = self.dms.iter_mut().find(|d| d.id == channel_id) {
+                    if !dm.recipients.iter().any(|r| r.id == user.id) {
+                        dm.recipients.push(user);
+                    }
+                    dm.refresh_group_labels();
+                }
+                self.sync_group_friend(&channel_id);
+            }
+            AppEvent::DmRecipientRemove { channel_id, user_id } => {
+                if let Some(dm) = self.dms.iter_mut().find(|d| d.id == channel_id) {
+                    dm.recipients.retain(|r| r.id != user_id);
+                    dm.refresh_group_labels();
+                }
+                self.sync_group_friend(&channel_id);
+            }
             // Cambió un rol (sobre todo sus permisos): cambia qué canales se
             // ven, y el color de los nombres.
             AppEvent::GuildRoleUpsert { guild_id, role } => {
@@ -4196,7 +4382,12 @@ impl App {
                 }
                 self.fix_hidden_current_channel();
             }
-            AppEvent::ForumPosts { channel_id, offset, by_creation, page } => {
+            AppEvent::ForumPosts {
+                channel_id,
+                offset,
+                by_creation,
+                page,
+            } => {
                 if let Some(server) = self.servers.iter_mut().find(|s| s.has_channel(&channel_id)) {
                     server.apply_forum_page(&channel_id, offset, by_creation, page);
                 }
@@ -4216,8 +4407,7 @@ impl App {
                 }
             }
             AppEvent::ForumPostCreated { forum_id, thread } => {
-                let Some(server_index) = self.servers.iter().position(|s| s.has_channel(&forum_id))
-                else {
+                let Some(server_index) = self.servers.iter().position(|s| s.has_channel(&forum_id)) else {
                     return;
                 };
                 let title = thread.name.clone().unwrap_or_else(|| "Publicación".to_string());
@@ -4262,6 +4452,106 @@ impl App {
             AppEvent::InteractionSucceeded => {
                 self.pending_buttons.clear();
             }
+            AppEvent::JoinFormSubmitted { guild_name, outcome } => {
+                use crate::discord::join_form::JoinOutcome;
+                if let Some(modal) = self.join_form.take() {
+                    self.pending_join_requests.retain(|r| r.guild_id != modal.form.guild_id);
+                    if outcome == JoinOutcome::PendingReview {
+                        self.pending_join_requests.push(crate::discord::join_form::JoinRequest {
+                            id: modal.form.guild_id.clone(),
+                            guild_id: modal.form.guild_id.clone(),
+                            guild_name: Some(modal.form.guild_name.clone()),
+                            guild_icon: None,
+                            status: crate::discord::join_form::JoinRequestStatus::Pending,
+                            rejection_reason: None,
+                        });
+                    }
+                }
+                match outcome {
+                    JoinOutcome::Approved | JoinOutcome::Unknown => self.push_toast(
+                        ToastKind::Success,
+                        "Formulario enviado",
+                        format!("Listo, ya puedes participar en {guild_name}."),
+                    ),
+                    JoinOutcome::PendingReview => self.push_toast(
+                        ToastKind::Info,
+                        "Solicitud enviada",
+                        format!("Los moderadores de {guild_name} revisarán tus respuestas."),
+                    ),
+                    JoinOutcome::Rejected => self.push_toast(
+                        ToastKind::Warning,
+                        "Solicitud rechazada",
+                        format!("{guild_name} no aceptó tu solicitud para unirte."),
+                    ),
+                }
+            }
+            AppEvent::SoundboardLoaded {
+                guild_id,
+                defaults,
+                guild_sounds,
+            } => {
+                self.soundboard_loading = false;
+                if !defaults.is_empty() {
+                    self.soundboard_defaults = defaults;
+                }
+                if let Some(guild_id) = guild_id {
+                    self.soundboard_guild_sounds.insert(guild_id, guild_sounds);
+                }
+            }
+            AppEvent::SoundboardFailed { message } => {
+                self.soundboard_loading = false;
+                self.push_toast(ToastKind::Warning, "Soundboard", message);
+            }
+            AppEvent::SoundboardEffect {
+                channel_id,
+                user_id: _,
+                sound_id,
+                volume,
+            } => {
+                // Solo suena si estás en ese canal de voz y no ensordeciste.
+                let in_channel = self
+                    .voice_target
+                    .as_ref()
+                    .is_some_and(|t| t.channel_id.to_string() == channel_id && !t.self_deaf);
+                if in_channel {
+                    let own = self.find_soundboard_sound(&sound_id).map(|s| s.volume);
+                    crate::discord::spawn_play_soundboard_sound(sound_id, volume.or(own).unwrap_or(1.0));
+                }
+            }
+            AppEvent::GuildJoinRequestUpsert(request) => {
+                self.pending_join_requests.retain(|r| r.guild_id != request.guild_id);
+                if request.is_pending() {
+                    self.pending_join_requests.push(request);
+                } else if request.status == crate::discord::join_form::JoinRequestStatus::Rejected {
+                    let name = self.join_request_guild_name(&request);
+                    self.push_toast(
+                        ToastKind::Warning,
+                        "Solicitud rechazada",
+                        format!("{name} no aceptó tu solicitud para unirte."),
+                    );
+                } else if request.status == crate::discord::join_form::JoinRequestStatus::Approved {
+                    let name = self.join_request_guild_name(&request);
+                    self.push_toast(
+                        ToastKind::Success,
+                        "Solicitud aprobada",
+                        format!("Ya puedes participar en {name}."),
+                    );
+                }
+            }
+            AppEvent::GuildJoinRequestDelete { guild_id } => {
+                self.pending_join_requests.retain(|r| r.guild_id != guild_id);
+            }
+            AppEvent::JoinFormFailed { guild_name, message } => {
+                // Con el formulario abierto, el error se ve ahí mismo y se puede
+                // reintentar; si ya lo cerraron, va como aviso.
+                match self.join_form.as_mut() {
+                    Some(modal) => {
+                        modal.submitting = false;
+                        modal.error = Some(message);
+                    }
+                    None => self.push_toast(ToastKind::Warning, guild_name, message),
+                }
+            }
             AppEvent::ThreadOpened { thread } => {
                 let title = thread.name.clone().unwrap_or_else(|| "Hilo".to_string());
                 let owner = thread.owner_id.clone();
@@ -4274,7 +4564,8 @@ impl App {
             }
             AppEvent::SlashCatalogLoaded { key, catalog } => {
                 self.slash_pending.remove(&key);
-                self.slash_catalogs.insert(key, crate::discord::slash::CachedCatalog::new(catalog));
+                self.slash_catalogs
+                    .insert(key, crate::discord::slash::CachedCatalog::new(catalog));
                 // Pocos catálogos en memoria: el de los servers que se dejaron
                 // de visitar se va (se vuelve a pedir si hace falta).
                 while self.slash_catalogs.len() > 12 {
@@ -4291,7 +4582,8 @@ impl App {
             }
             AppEvent::SlashCatalogFailed { key } => {
                 self.slash_pending.remove(&key);
-                self.slash_catalogs.insert(key, crate::discord::slash::CachedCatalog::failed());
+                self.slash_catalogs
+                    .insert(key, crate::discord::slash::CachedCatalog::failed());
             }
             AppEvent::PresenceUpdate(event) => self.apply_presence_event(&event),
             AppEvent::PresenceSnapshot(events) => {
@@ -4399,12 +4691,10 @@ impl App {
             AppEvent::StreamCreate(create) => {
                 let key = create.stream_key.clone();
                 if self.watching_stream.as_ref().is_some_and(|w| w.stream_key == key) {
-                    self.stream_sessions.entry(key.clone()).or_default().rtc_server_id =
-                        create.rtc_server_id.clone();
+                    self.stream_sessions.entry(key.clone()).or_default().rtc_server_id = create.rtc_server_id.clone();
                     self.try_start_stream_watch(&key);
                 } else if self.broadcasting_stream.as_ref().is_some_and(|b| b.stream_key == key) {
-                    self.stream_sessions.entry(key.clone()).or_default().rtc_server_id =
-                        create.rtc_server_id.clone();
+                    self.stream_sessions.entry(key.clone()).or_default().rtc_server_id = create.rtc_server_id.clone();
                     // Un stream propio nace pausado: hay que reanudarlo.
                     if create.paused
                         && let Some(commands) = self.gateway_commands.clone()
@@ -4448,7 +4738,11 @@ impl App {
                         "Dejaste de compartir tu pantalla".to_string(),
                     );
                 }
-                if self.watching_stream.as_ref().is_some_and(|w| w.stream_key == delete.stream_key) {
+                if self
+                    .watching_stream
+                    .as_ref()
+                    .is_some_and(|w| w.stream_key == delete.stream_key)
+                {
                     let name = self
                         .watching_stream
                         .as_ref()
@@ -4464,7 +4758,11 @@ impl App {
                     );
                 }
             }
-            AppEvent::StreamPublishStatus { stream_key, status, message } => {
+            AppEvent::StreamPublishStatus {
+                stream_key,
+                status,
+                message,
+            } => {
                 let mut failed = false;
                 if let Some(broadcast) = self.broadcasting_stream.as_mut()
                     && broadcast.stream_key == stream_key
@@ -4486,10 +4784,17 @@ impl App {
             AppEvent::StreamPreview { stream_key, url } => {
                 self.stream_previews.insert(
                     stream_key,
-                    StreamPreviewEntry { url, requested_at: Instant::now() },
+                    StreamPreviewEntry {
+                        url,
+                        requested_at: Instant::now(),
+                    },
                 );
             }
-            AppEvent::StreamWatchStatus { stream_key, status, message } => {
+            AppEvent::StreamWatchStatus {
+                stream_key,
+                status,
+                message,
+            } => {
                 if let Some(watched) = self.watching_stream.as_mut()
                     && watched.stream_key == stream_key
                 {
@@ -4512,7 +4817,10 @@ impl App {
                 // también lo que habíamos pedido, para que la barra de
                 // llamada y el botón "Unirse" vuelvan a su estado normal en
                 // vez de quedarse mostrando una llamada que ya no existe.
-                if matches!(status, VoiceConnectionStatus::Disconnected | VoiceConnectionStatus::Failed) {
+                if matches!(
+                    status,
+                    VoiceConnectionStatus::Disconnected | VoiceConnectionStatus::Failed
+                ) {
                     self.voice_target = None;
                     self.voice_connect_phase = None;
                     self.stop_broadcast();
@@ -4537,11 +4845,7 @@ impl App {
             // `App`).
             AppEvent::VoiceSpeakingUpdate { .. } => {}
             AppEvent::VoiceAudioSourcesApplyFailed { message, .. } => {
-                self.push_toast(
-                    ToastKind::Warning,
-                    "Dispositivo de audio no disponible",
-                    message,
-                );
+                self.push_toast(ToastKind::Warning, "Dispositivo de audio no disponible", message);
             }
         }
     }
@@ -4552,6 +4856,63 @@ impl App {
     /// el mensaje más reciente (los DMs sin mensajes, por fecha de creación).
     /// Es seguro reordenar en cualquier momento: `Screen::Dm` indexa
     /// `self.friends`, no `self.dms`.
+    /// `CHANNEL_CREATE` / `CHANNEL_UPDATE` de un DM: si ya está en la lista se
+    /// actualizan nombre, ícono, dueño y miembros; si no (un grupo recién
+    /// creado, o al que te agregaron) se suma.
+    fn upsert_dm_channel(&mut self, incoming: PrivateChannel) {
+        let channel_id = incoming.id.clone();
+        match self.dms.iter_mut().find(|d| d.id == channel_id) {
+            Some(existing) => {
+                existing.name = incoming.name;
+                existing.icon = incoming.icon;
+                existing.owner_id = incoming.owner_id;
+                if !incoming.recipients.is_empty() {
+                    existing.recipients = incoming.recipients;
+                }
+                existing.refresh_group_labels();
+            }
+            None => {
+                self.dms.push(incoming);
+                self.sort_dms();
+            }
+        }
+        self.sync_group_friend(&channel_id);
+    }
+
+    /// `CHANNEL_DELETE` de un DM. La entrada de `friends` se deja (sacarla
+    /// correría los índices de `Screen::Dm`); solo se la deja de listar y,
+    /// si se estaba mirando, se vuelve al Inicio.
+    fn remove_dm_channel(&mut self, channel_id: &str) {
+        let viewing = match self.screen {
+            Screen::Dm(i) => self.friends.get(i).and_then(|f| f.dm_channel_id.as_deref()) == Some(channel_id),
+            _ => false,
+        };
+        self.dms.retain(|d| d.id != channel_id);
+        if viewing {
+            self.go_home();
+        }
+    }
+
+    /// Copia nombre e ícono del DM grupal `channel_id` a su entrada de
+    /// `friends` (la que usa la pantalla del chat), si ya existe.
+    fn sync_group_friend(&mut self, channel_id: &str) {
+        let Some(dm) = self.dms.iter().find(|d| d.id == channel_id) else {
+            return;
+        };
+        if !dm.is_group() {
+            return;
+        }
+        let (name, avatar_url) = (dm.username.clone(), dm.avatar_url.clone());
+        if let Some(friend) = self
+            .friends
+            .iter_mut()
+            .find(|f| f.is_group && f.dm_channel_id.as_deref() == Some(channel_id))
+        {
+            friend.name = name;
+            friend.avatar_url = avatar_url;
+        }
+    }
+
     fn sort_dms(&mut self) {
         self.dms
             .sort_by_key(|dm| std::cmp::Reverse(crate::lib::notifications::dm_sort_key(dm)));
@@ -4561,7 +4922,9 @@ impl App {
     /// sube al tope. Corre también con los mensajes propios (el eco del
     /// Gateway), así mandar un mensaje también sube la conversación.
     fn bump_dm_order(&mut self, msg: &crate::discord::models::GatewayMessage) {
-        let Some(dm) = self.dms.iter_mut().find(|dm| dm.id == msg.channel_id) else { return };
+        let Some(dm) = self.dms.iter_mut().find(|dm| dm.id == msg.channel_id) else {
+            return;
+        };
         let newest = crate::lib::notifications::snowflake(&msg.id);
         if newest >= crate::lib::notifications::dm_sort_key(dm) {
             dm.last_message_id = Some(msg.id.clone());
@@ -4640,7 +5003,9 @@ impl App {
         if !self.window_focused {
             return;
         }
-        let Some(channel_id) = self.viewed_channel_id() else { return };
+        let Some(channel_id) = self.viewed_channel_id() else {
+            return;
+        };
         self.clear_mentions(&channel_id);
     }
 
@@ -4717,24 +5082,27 @@ impl App {
                 .find(|dm| dm.id == channel_id)
                 .map(|dm| dm.is_message_request || dm.is_spam);
             if let Some(hidden) = dm_hidden {
-                let allowed = self.mute_rules.passes(
-                    None,
-                    &channel_id,
-                    crate::lib::notifications::Mention::default(),
-                );
+                let allowed = self
+                    .mute_rules
+                    .passes(None, &channel_id, crate::lib::notifications::Mention::default());
                 self.pending_mentions.remove(&channel_id);
                 if !hidden && allowed {
                     self.set_mention_count(&channel_id, count);
                 }
                 continue;
             }
-            let Some(guild_id) = self.guild_of_channel(&channel_id) else { continue };
+            let Some(guild_id) = self.guild_of_channel(&channel_id) else {
+                continue;
+            };
             // Discord solo cuenta menciones reales en los canales de server,
             // así que alcanza con tratarlo como mención directa.
             let allowed = self.mute_rules.passes(
                 Some(&guild_id),
                 &channel_id,
-                crate::lib::notifications::Mention { direct: true, ..Default::default() },
+                crate::lib::notifications::Mention {
+                    direct: true,
+                    ..Default::default()
+                },
             );
             self.pending_mentions.remove(&channel_id);
             if allowed {
@@ -4750,12 +5118,20 @@ impl App {
         let (channel_id, messages, loading) = match self.screen {
             Screen::Dm(i) => {
                 let friend = self.friends.get(i)?;
-                (friend.dm_channel_id.clone()?, &friend.messages, friend.loading || friend.has_newer)
+                (
+                    friend.dm_channel_id.clone()?,
+                    &friend.messages,
+                    friend.loading || friend.has_newer,
+                )
             }
             Screen::Server(i) => {
                 let (category, channel) = self.current_channel;
                 let channel = self.servers.get(i)?.channel(category, channel)?;
-                (channel.channel_id.clone()?, &channel.messages, channel.loading || channel.has_newer)
+                (
+                    channel.channel_id.clone()?,
+                    &channel.messages,
+                    channel.loading || channel.has_newer,
+                )
             }
             _ => return None,
         };
@@ -4784,8 +5160,12 @@ impl App {
         if !self.window_focused {
             return;
         }
-        let Some(token) = self.discord_token.clone() else { return };
-        let Some((channel_id, latest)) = self.viewed_latest_message() else { return };
+        let Some(token) = self.discord_token.clone() else {
+            return;
+        };
+        let Some((channel_id, latest)) = self.viewed_latest_message() else {
+            return;
+        };
         if self.unread_hold.as_deref() == Some(channel_id.as_str()) {
             return;
         }
@@ -4820,7 +5200,8 @@ impl App {
         let acked_n = snowflake(message_id);
         let known = self.acked_messages.get(channel_id).map(|id| snowflake(id)).unwrap_or(0);
         if acked_n > known {
-            self.acked_messages.insert(channel_id.to_string(), message_id.to_string());
+            self.acked_messages
+                .insert(channel_id.to_string(), message_id.to_string());
         }
         // El eco de un ack viejo no debe borrar una mención que llegó
         // después: en un DM se sabe cuál es el mensaje más nuevo.
@@ -4862,7 +5243,9 @@ impl App {
             }
         }
         for friend in self.friends.iter().filter(|f| f.is_friend) {
-            let Some(activities) = self.user_activities.get(&friend.user_id) else { continue };
+            let Some(activities) = self.user_activities.get(&friend.user_id) else {
+                continue;
+            };
             // Un tarjeta por amigo: la primera actividad (Discord ordena la
             // más relevante primero).
             let Some(activity) = activities.first() else { continue };
@@ -4883,7 +5266,11 @@ impl App {
     /// estado personalizado. `None` si no está haciendo nada.
     /// Título ("Jugando X") y detalle de la primera actividad de `user_id`.
     fn activity_texts_of(&self, user_id: &str) -> (Option<String>, Option<String>) {
-        let Some(a) = self.user_activities.get(user_id).and_then(|v| v.iter().find(|a| a.kind != 4)) else {
+        let Some(a) = self
+            .user_activities
+            .get(user_id)
+            .and_then(|v| v.iter().find(|a| a.kind != 4))
+        else {
             return (None, None);
         };
         let verb = match a.kind {
@@ -4894,7 +5281,11 @@ impl App {
             5 => "Compitiendo en",
             _ => "",
         };
-        let title = if verb.is_empty() { a.name.clone() } else { format!("{verb} {}", a.name) };
+        let title = if verb.is_empty() {
+            a.name.clone()
+        } else {
+            format!("{verb} {}", a.name)
+        };
         let parts: Vec<&str> = [a.details.as_deref(), a.state.as_deref()]
             .into_iter()
             .flatten()
@@ -4908,7 +5299,11 @@ impl App {
         let activity = self.user_activities.get(user_id)?.iter().find(|a| a.kind != 4)?;
         let pick = |s: &Option<String>| s.clone().filter(|s| !s.trim().is_empty());
         // Escuchando: la canción; el resto: el nombre del juego/app.
-        let song = if activity.kind == 2 { pick(&activity.details) } else { None };
+        let song = if activity.kind == 2 {
+            pick(&activity.details)
+        } else {
+            None
+        };
         let text = song.unwrap_or_else(|| activity.name.clone());
         (!text.trim().is_empty()).then_some(text)
     }
@@ -4931,7 +5326,11 @@ impl App {
                 avatar_url: f.avatar_url.clone(),
                 avatar_color: f.avatar_color,
                 status: f.status,
-                activity: if f.status == Status::Offline { None } else { self.short_activity_of(&f.user_id) },
+                activity: if f.status == Status::Offline {
+                    None
+                } else {
+                    self.short_activity_of(&f.user_id)
+                },
                 affinity: self.affinity_users.pct(&f.user_id),
                 user_id: f.user_id.clone(),
                 handle: {
@@ -4958,7 +5357,10 @@ impl App {
                 .collect();
             v.sort_by(|a, b| b.1.total_cmp(&a.1));
             let total = v.len();
-            v.into_iter().enumerate().map(|(i, (idx, _))| (idx, (i + 1, total))).collect()
+            v.into_iter()
+                .enumerate()
+                .map(|(i, (idx, _))| (idx, (i + 1, total)))
+                .collect()
         };
         let all = rank_where(&|_| true);
         let doing = rank_where(&|f| f.activity.is_some());
@@ -5076,49 +5478,50 @@ impl App {
     fn notify_incoming(&mut self, msg: &crate::discord::models::GatewayMessage) {
         use crate::lib::notifications as notif;
 
-        let Some(my_id) = self.me.as_ref().map(|m| m.id.clone()) else { return };
+        let Some(my_id) = self.me.as_ref().map(|m| m.id.clone()) else {
+            return;
+        };
         if msg.author.id == my_id {
             return;
         }
 
         let author = notif::author_name(msg);
-        let (guild_id, mention, title) =
-            if let Some(dm) = self.dms.iter().find(|dm| dm.id == msg.channel_id) {
-                if dm.is_message_request || dm.is_spam {
-                    return;
-                }
-                (None, notif::Mention::default(), author)
+        let (guild_id, mention, title) = if let Some(dm) = self.dms.iter().find(|dm| dm.id == msg.channel_id) {
+            if dm.is_message_request || dm.is_spam {
+                return;
+            }
+            let title = if dm.is_group() {
+                format!("{author} · {}", dm.username)
             } else {
-                let Some(server) = self.servers.iter().find(|s| s.has_channel(&msg.channel_id))
-                else {
-                    return;
-                };
-                let my_roles = server.access_ctx.my_roles.as_deref().unwrap_or(&[]);
-                let mention = notif::Mention {
-                    direct: msg.mentions.iter().any(|u| u.id == my_id),
-                    everyone: msg.mention_everyone,
-                    role: msg.mention_roles.iter().any(|r| my_roles.contains(r)),
-                };
-                let channel_name = server
-                    .categories
-                    .iter()
-                    .flat_map(|c| c.channels.iter())
-                    .find(|ch| ch.channel_id.as_deref() == Some(msg.channel_id.as_str()))
-                    .map(|ch| ch.name.as_str())
-                    .unwrap_or("canal");
-                let title = format!("{author} · #{channel_name} ({})", server.name);
-                (Some(server.guild_id.clone()), mention, title)
+                author
             };
+            (None, notif::Mention::default(), title)
+        } else {
+            let Some(server) = self.servers.iter().find(|s| s.has_channel(&msg.channel_id)) else {
+                return;
+            };
+            let my_roles = server.access_ctx.my_roles.as_deref().unwrap_or(&[]);
+            let mention = notif::Mention {
+                direct: msg.mentions.iter().any(|u| u.id == my_id),
+                everyone: msg.mention_everyone,
+                role: msg.mention_roles.iter().any(|r| my_roles.contains(r)),
+            };
+            let channel_name = server
+                .categories
+                .iter()
+                .flat_map(|c| c.channels.iter())
+                .find(|ch| ch.channel_id.as_deref() == Some(msg.channel_id.as_str()))
+                .map(|ch| ch.name.as_str())
+                .unwrap_or("canal");
+            let title = format!("{author} · #{channel_name} ({})", server.name);
+            (Some(server.guild_id.clone()), mention, title)
+        };
 
-        if !self
-            .mute_rules
-            .passes(guild_id.as_deref(), &msg.channel_id, mention)
-        {
+        if !self.mute_rules.passes(guild_id.as_deref(), &msg.channel_id, mention) {
             return;
         }
 
-        let viewing = self.window_focused
-            && self.viewed_channel_id().as_deref() == Some(msg.channel_id.as_str());
+        let viewing = self.window_focused && self.viewed_channel_id().as_deref() == Some(msg.channel_id.as_str());
         if viewing {
             return;
         }
@@ -5134,7 +5537,9 @@ impl App {
                         guild_id,
                         channel_id: msg.channel_id.clone(),
                     },
-                    None => NotificationTarget::Dm { channel_id: msg.channel_id.clone() },
+                    None => NotificationTarget::Dm {
+                        channel_id: msg.channel_id.clone(),
+                    },
                 };
                 let avatar_url = msg.author.avatar_url();
                 let initial = author_initial(&notif::author_name(msg));
@@ -5195,8 +5600,7 @@ impl App {
                 }
             }
             NotificationTarget::Channel { guild_id, channel_id } => {
-                let Some(server_index) = self.servers.iter().position(|s| &s.guild_id == guild_id)
-                else {
+                let Some(server_index) = self.servers.iter().position(|s| &s.guild_id == guild_id) else {
                     return;
                 };
                 self.open_server_with(server_index, false);
@@ -5226,8 +5630,158 @@ impl App {
             return;
         }
         self.shown_title_count = Some(total);
-        let title = if total > 0 { format!("({total}) eCord") } else { "eCord".to_string() };
+        let title = if total > 0 {
+            format!("({total}) eCord")
+        } else {
+            "eCord".to_string()
+        };
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+    }
+
+    /// `TYPING_START`: anota (o renueva) a quien escribe. Se ignora a uno
+    /// mismo (por si otro dispositivo nuestro escribe) y a los bloqueados.
+    fn on_typing_start(&mut self, ev: crate::discord::models::TypingStart) {
+        let my_id = self.me.as_ref().map(|m| m.id.as_str()).unwrap_or("");
+        if ev.user_id == my_id {
+            return;
+        }
+        let name = self.typing_name(&ev);
+        let avatar_url = self.typing_avatar(&ev);
+        let until = Instant::now() + TYPING_TTL;
+        let list = self.typing.entry(ev.channel_id).or_default();
+        if let Some(index) = list.iter().position(|t| t.user_id == ev.user_id) {
+            list[index].until = until;
+            list[index].name = name;
+            if avatar_url.is_some() {
+                list[index].avatar_url = avatar_url;
+            }
+        } else {
+            list.push(TypingUser {
+                user_id: ev.user_id,
+                name,
+                avatar_url,
+                until,
+            });
+        }
+    }
+
+    /// Nombre para "X está escribiendo": apodo del server, nombre global o
+    /// usuario. Primero lo que trae el propio evento, después lo que ya se
+    /// sabe del server o del DM.
+    fn typing_name(&self, ev: &crate::discord::models::TypingStart) -> String {
+        if let Some(member) = &ev.member {
+            if let Some(nick) = member.nick.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+                return nick.to_string();
+            }
+            if let Some(user) = member.user.as_ref().filter(|u| !u.username.is_empty()) {
+                return user.display_name().to_string();
+            }
+        }
+        if let Some(server) = self.servers.iter().find(|s| s.has_channel(&ev.channel_id)) {
+            if let Some(nick) = server.member_info.get(&ev.user_id).and_then(|m| m.nick.as_deref()) {
+                return nick.to_string();
+            }
+            if let Some(known) = server.known_users.get(&ev.user_id) {
+                return known.name.clone();
+            }
+        }
+        if let Some(user) = self
+            .dms
+            .iter()
+            .filter(|d| d.id == ev.channel_id)
+            .flat_map(|d| d.recipients.iter())
+            .find(|u| u.id == ev.user_id)
+        {
+            return user.display_name().to_string();
+        }
+        if let Some(friend) = self
+            .friends
+            .iter()
+            .find(|f| f.dm_channel_id.as_deref() == Some(ev.channel_id.as_str()))
+        {
+            return friend.name.clone();
+        }
+        "Alguien".to_string()
+    }
+
+    /// Avatar de quien escribe (para el circulito junto al "escribiendo…"):
+    /// el del propio evento, o el que ya se conoce del server / DM / amigos.
+    fn typing_avatar(&self, ev: &crate::discord::models::TypingStart) -> Option<String> {
+        if let Some(url) = ev
+            .member
+            .as_ref()
+            .and_then(|m| m.user.as_ref())
+            .and_then(|u| u.avatar_url())
+        {
+            return Some(url);
+        }
+        if let Some(server) = self.servers.iter().find(|s| s.has_channel(&ev.channel_id)) {
+            if let Some(url) = server.known_users.get(&ev.user_id).and_then(|k| k.avatar_url.clone()) {
+                return Some(url);
+            }
+        }
+        if let Some(url) = self
+            .dms
+            .iter()
+            .filter(|d| d.id == ev.channel_id)
+            .flat_map(|d| d.recipients.iter())
+            .find(|u| u.id == ev.user_id)
+            .and_then(|u| u.avatar_url())
+        {
+            return Some(url);
+        }
+        self.friends
+            .iter()
+            .find(|f| f.user_id == ev.user_id)
+            .and_then(|f| f.avatar_url.clone())
+    }
+
+    /// Saca a `user_id` de los que escriben en `channel_id` (mandó su mensaje).
+    fn stop_typing(&mut self, channel_id: &str, user_id: &str) {
+        if let Some(list) = self.typing.get_mut(channel_id) {
+            list.retain(|t| t.user_id != user_id);
+            if list.is_empty() {
+                self.typing.remove(channel_id);
+            }
+        }
+    }
+
+    /// Texto "X está escribiendo…" para el canal abierto (`None` si nadie).
+    /// También deja agendado un repintado para cuando venza el próximo, así
+    /// el aviso se apaga solo aunque no llegue ningún evento más.
+    pub fn typing_line(&mut self, ctx: &egui::Context, channel_id: &str) -> Option<crate::ui::chat::TypingLine> {
+        let now = Instant::now();
+        self.typing.retain(|_, list| {
+            list.retain(|t| t.until > now);
+            !list.is_empty()
+        });
+        let list = self.typing.get(channel_id)?;
+        if let Some(next) = list.iter().map(|t| t.until).min() {
+            ctx.request_repaint_after(next.saturating_duration_since(now) + std::time::Duration::from_millis(50));
+        }
+        let names: Vec<&str> = list.iter().map(|t| t.name.as_str()).collect();
+        let text = match names.as_slice() {
+            [a] => format!("{a} está escribiendo…"),
+            [a, b] => format!("{a} y {b} están escribiendo…"),
+            [a, b, c] => format!("{a}, {b} y {c} están escribiendo…"),
+            _ => "Varias personas están escribiendo…".to_string(),
+        };
+        // Hasta 3 circulitos (url del avatar + inicial de respaldo).
+        let avatars = list
+            .iter()
+            .take(3)
+            .map(|t| {
+                (
+                    t.avatar_url.clone(),
+                    t.name
+                        .chars()
+                        .next()
+                        .map(|c| c.to_uppercase().collect::<String>())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        Some(crate::ui::chat::TypingLine { text, avatars })
     }
 
     fn handle_incoming_message(&mut self, msg: crate::discord::models::GatewayMessage) {
@@ -5235,6 +5789,8 @@ impl App {
         // el DM al tope de la lista y avisa si corresponde.
         self.bump_dm_order(&msg);
         self.notify_incoming(&msg);
+        // Si mandó el mensaje, ya no está "escribiendo".
+        self.stop_typing(&msg.channel_id, &msg.author.id);
 
         let my_id = self.me.as_ref().map(|m| m.id.clone()).unwrap_or_default();
 
@@ -5296,7 +5852,9 @@ impl App {
             return;
         }
         // Sin conexión no se marca nada como pedido.
-        let Some(commands) = self.gateway_commands.clone() else { return };
+        let Some(commands) = self.gateway_commands.clone() else {
+            return;
+        };
         let Some(server) = self.servers.iter_mut().find(|s| s.guild_id == guild_id) else {
             return;
         };
@@ -5311,7 +5869,7 @@ impl App {
     }
 
     /// Arma los candidatos del menú de menciones (`@`) para la consulta que el
-    /// compositor está tipeando ahora (ver `ui::compose_menus`) y los publica.
+    /// compositor está tipeando ahora (ver `ui::chat::compose_menus`) y los publica.
     /// No hace nada si no hay una mención en curso.
     ///
     /// Orden: primero quienes hablaron hace poco en el canal abierto, después
@@ -5320,7 +5878,7 @@ impl App {
     /// coincidencia (empieza igual / una palabra empieza igual / contiene) se
     /// respeta ese orden. En un DM son solo los dos participantes.
     fn publish_mention_results(&mut self, ctx: &egui::Context) {
-        use crate::ui::compose_menus::{self as menus, MentionCandidate, MentionKind};
+        use crate::ui::chat::compose_menus::{self as menus, MentionCandidate, MentionKind};
 
         let Some(query) = menus::active_query(ctx) else { return };
         let needle = menus::fold(&query);
@@ -5330,26 +5888,27 @@ impl App {
         let mut users: Vec<(u8, usize, MentionCandidate)> = Vec::new();
         let mut checked: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut order = 0usize;
-        let mut add_user = |id: &str, name: &str, avatar_url: Option<&str>, avatar_color: Color32, color: Option<Color32>| {
-            order += 1;
-            if id.is_empty() || name.is_empty() || !checked.insert(id.to_string()) {
-                return;
-            }
-            if let Some(rank) = menus::match_rank(name, &needle) {
-                users.push((
-                    rank,
-                    order,
-                    MentionCandidate {
-                        kind: MentionKind::User,
-                        id: id.to_string(),
-                        name: name.to_string(),
-                        avatar_url: avatar_url.map(str::to_string),
-                        avatar_color,
-                        color,
-                    },
-                ));
-            }
-        };
+        let mut add_user =
+            |id: &str, name: &str, avatar_url: Option<&str>, avatar_color: Color32, color: Option<Color32>| {
+                order += 1;
+                if id.is_empty() || name.is_empty() || !checked.insert(id.to_string()) {
+                    return;
+                }
+                if let Some(rank) = menus::match_rank(name, &needle) {
+                    users.push((
+                        rank,
+                        order,
+                        MentionCandidate {
+                            kind: MentionKind::User,
+                            id: id.to_string(),
+                            name: name.to_string(),
+                            avatar_url: avatar_url.map(str::to_string),
+                            avatar_color,
+                            color,
+                        },
+                    ));
+                }
+            };
 
         let mut roles_out: Vec<MentionCandidate> = Vec::new();
         let mut special: Vec<MentionCandidate> = Vec::new();
@@ -5361,13 +5920,25 @@ impl App {
                     let (category, channel) = self.current_channel;
                     if let Some(channel) = server.channel(category, channel) {
                         for msg in channel.messages.iter().rev() {
-                            add_user(&msg.author_id, &msg.author, msg.avatar_url.as_deref(), msg.avatar_color, msg.author_color);
+                            add_user(
+                                &msg.author_id,
+                                &msg.author,
+                                msg.avatar_url.as_deref(),
+                                msg.avatar_color,
+                                msg.author_color,
+                            );
                         }
                     }
                     // 2) La lista de miembros que ya llegó.
                     for group in &server.member_groups {
                         for member in &group.members {
-                            add_user(&member.user_id, &member.name, member.avatar_url.as_deref(), member.avatar_color, member.name_color);
+                            add_user(
+                                &member.user_id,
+                                &member.name,
+                                member.avatar_url.as_deref(),
+                                member.avatar_color,
+                                member.name_color,
+                            );
                         }
                     }
                     // 3) Cualquier otro usuario ya visto. Se ordena por nombre para que
@@ -5377,7 +5948,11 @@ impl App {
                         .iter()
                         .map(|(id, user)| {
                             let nick = server.member_info.get(id).and_then(|info| info.nick.as_deref());
-                            (nick.unwrap_or(user.name.as_str()).to_string(), id, user.avatar_url.as_deref())
+                            (
+                                nick.unwrap_or(user.name.as_str()).to_string(),
+                                id,
+                                user.avatar_url.as_deref(),
+                            )
                         })
                         .filter(|(name, _, _)| menus::match_rank(name, &needle).is_some())
                         .collect();
@@ -5408,7 +5983,11 @@ impl App {
                                 avatar_url: None,
                                 avatar_color: fallback_bg,
                                 color: (role.color != 0).then(|| {
-                                    Color32::from_rgb((role.color >> 16) as u8, (role.color >> 8) as u8, role.color as u8)
+                                    Color32::from_rgb(
+                                        (role.color >> 16) as u8,
+                                        (role.color >> 8) as u8,
+                                        role.color as u8,
+                                    )
                                 }),
                             });
                         }
@@ -5431,7 +6010,13 @@ impl App {
             }
             Screen::Dm(index) => {
                 if let Some(friend) = self.friends.get(index) {
-                    add_user(&friend.user_id, &friend.name, friend.avatar_url.as_deref(), friend.avatar_color, None);
+                    add_user(
+                        &friend.user_id,
+                        &friend.name,
+                        friend.avatar_url.as_deref(),
+                        friend.avatar_color,
+                        None,
+                    );
                 }
                 if let Some(me) = self.me.as_ref() {
                     let avatar = me.avatar_url();
@@ -5442,21 +6027,26 @@ impl App {
         }
 
         users.sort_by_key(|(rank, order, _)| (*rank, *order));
-        let mut items: Vec<MentionCandidate> =
-            users.into_iter().map(|(_, _, cand)| cand).take(menus::MAX_USERS).collect();
+        let mut items: Vec<MentionCandidate> = users
+            .into_iter()
+            .map(|(_, _, cand)| cand)
+            .take(menus::MAX_USERS)
+            .collect();
         items.extend(roles_out.into_iter().take(menus::MAX_ROLES));
         items.extend(special);
         menus::publish_results(ctx, query, items);
     }
 
     /// Arma los canales que coinciden con lo que el formulario de un slash
-    /// command está buscando en una opción de tipo canal (ver `ui::slash`).
+    /// command está buscando en una opción de tipo canal (ver `ui::chat::slash`).
     /// Solo canales visibles del server abierto (sin los hilos de foro).
     fn publish_channel_results(&mut self, ctx: &egui::Context) {
-        use crate::ui::compose_menus as menus;
-        use crate::ui::slash::{self, ChannelCandidate};
+        use crate::ui::chat::compose_menus as menus;
+        use crate::ui::chat::slash::{self, ChannelCandidate};
 
-        let Some(query) = slash::take_channel_query(ctx) else { return };
+        let Some(query) = slash::take_channel_query(ctx) else {
+            return;
+        };
         let needle = menus::fold(&query);
         let mut found: Vec<(u8, usize, ChannelCandidate)> = Vec::new();
         if let Screen::Server(index) = self.screen {
@@ -5469,11 +6059,17 @@ impl App {
                             continue;
                         }
                         let Some(id) = channel.channel_id.clone() else { continue };
-                        let Some(rank) = menus::match_rank(&channel.name, &needle) else { continue };
+                        let Some(rank) = menus::match_rank(&channel.name, &needle) else {
+                            continue;
+                        };
                         found.push((
                             rank,
                             order,
-                            ChannelCandidate { id, name: channel.name.clone(), category: category.name.clone() },
+                            ChannelCandidate {
+                                id,
+                                name: channel.name.clone(),
+                                category: category.name.clone(),
+                            },
                         ));
                     }
                 }
@@ -5489,7 +6085,9 @@ impl App {
     /// esos usuarios disponibles para el menú de menciones). No aplica en DMs.
     fn search_guild_members(&mut self, query: &str) {
         let Screen::Server(index) = self.screen else { return };
-        let Some(commands) = self.gateway_commands.clone() else { return };
+        let Some(commands) = self.gateway_commands.clone() else {
+            return;
+        };
         let Some(server) = self.servers.get(index) else { return };
         if server.guild_id.is_empty() {
             return;
@@ -5537,10 +6135,7 @@ impl App {
     /// Ajuste local de una persona de las llamadas. Por defecto (nunca se tocó):
     /// 100 % y sin silenciar. Solo afecta lo que ESTE cliente reproduce de esa
     /// persona; ella no se entera.
-    pub fn voice_participant_playback(
-        &self,
-        user_id: &str,
-    ) -> crate::discord::VoiceParticipantPlaybackSettings {
+    pub fn voice_participant_playback(&self, user_id: &str) -> crate::discord::VoiceParticipantPlaybackSettings {
         user_id
             .parse::<u64>()
             .ok()
@@ -5564,10 +6159,7 @@ impl App {
 
     /// Vuelve a una persona a 100 % y sin silenciar.
     pub fn reset_voice_participant_audio(&mut self, user_id: &str) {
-        self.apply_participant_playback(
-            user_id,
-            crate::discord::VoiceParticipantPlaybackSettings::default(),
-        );
+        self.apply_participant_playback(user_id, crate::discord::VoiceParticipantPlaybackSettings::default());
     }
 
     /// Aplica el cambio ya (el runtime lo toma en el siguiente bloque de audio)
@@ -5578,8 +6170,7 @@ impl App {
         playback: crate::discord::VoiceParticipantPlaybackSettings,
     ) {
         let Some(raw) = user_id.parse::<u64>().ok() else { return };
-        let Some(id) = crate::discord::ids::Id::<crate::discord::ids::marker::UserMarker>::new_checked(raw)
-        else {
+        let Some(id) = crate::discord::ids::Id::<crate::discord::ids::marker::UserMarker>::new_checked(raw) else {
             return;
         };
         if self.voice_participant_playback(user_id) == playback {
@@ -5604,10 +6195,7 @@ impl App {
 
     /// Ajuste local del audio del stream de `owner_id` (por defecto: 100 %, sin
     /// silenciar). Es independiente del volumen de esa persona en la llamada.
-    pub fn voice_stream_playback(
-        &self,
-        owner_id: &str,
-    ) -> crate::discord::VoiceParticipantPlaybackSettings {
+    pub fn voice_stream_playback(&self, owner_id: &str) -> crate::discord::VoiceParticipantPlaybackSettings {
         owner_id
             .parse::<u64>()
             .ok()
@@ -5628,20 +6216,15 @@ impl App {
     }
 
     pub fn reset_voice_stream_audio(&mut self, owner_id: &str) {
-        self.apply_stream_playback(
-            owner_id,
-            crate::discord::VoiceParticipantPlaybackSettings::default(),
-        );
+        self.apply_stream_playback(owner_id, crate::discord::VoiceParticipantPlaybackSettings::default());
     }
 
     /// Guarda el cambio y deja marcado que falta mandarlo a la cuenta. El audio
     /// lo toma `pump_stream_frames` en el siguiente frame de UI.
-    fn apply_stream_playback(
-        &mut self,
-        owner_id: &str,
-        playback: crate::discord::VoiceParticipantPlaybackSettings,
-    ) {
-        let Some(raw) = owner_id.parse::<u64>().ok().filter(|id| *id != 0) else { return };
+    fn apply_stream_playback(&mut self, owner_id: &str, playback: crate::discord::VoiceParticipantPlaybackSettings) {
+        let Some(raw) = owner_id.parse::<u64>().ok().filter(|id| *id != 0) else {
+            return;
+        };
         if self.voice_stream_playback(owner_id) == playback {
             return;
         }
@@ -5664,8 +6247,7 @@ impl App {
         )>,
         replace: bool,
     ) {
-        let next =
-            merged_playback(&self.stream_playback, &self.stream_audio_dirty, entries, replace);
+        let next = merged_playback(&self.stream_playback, &self.stream_audio_dirty, entries, replace);
         if next != self.stream_playback {
             self.stream_playback = next;
         }
@@ -5715,7 +6297,9 @@ impl App {
     /// el cliente oficial y los demás dispositivos lo vean igual. Devuelve
     /// `true` mientras quede algo esperando el temporizador.
     fn flush_participant_audio(&mut self, force: bool) -> bool {
-        let Some(at) = self.participant_audio_dirty_at else { return false };
+        let Some(at) = self.participant_audio_dirty_at else {
+            return false;
+        };
         if !force && at.elapsed() < PARTICIPANT_AUDIO_SYNC_DELAY {
             return true;
         }
@@ -5744,11 +6328,8 @@ impl App {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let partial = crate::discord::user_settings::partial_with_participant_audio(
-            &entries,
-            &stream_entries,
-            modified_at_ms,
-        );
+        let partial =
+            crate::discord::user_settings::partial_with_participant_audio(&entries, &stream_entries, modified_at_ms);
         crate::discord::spawn_patch_user_settings(token, partial);
         false
     }
@@ -5833,7 +6414,9 @@ impl App {
         if let Some(tx) = &self.voice_runtime_tx {
             let _ = tx.send(VoiceRuntimeEvent::Requested(self.voice_target.clone()));
         }
-        let Some(commands) = self.gateway_commands.clone() else { return };
+        let Some(commands) = self.gateway_commands.clone() else {
+            return;
+        };
         let command = match &self.voice_target {
             Some(target) => crate::discord::gateway::GatewayCommand::UpdateVoiceState {
                 guild_id: target.scope.guild_id().map(|id| id.to_string()),
@@ -5852,15 +6435,11 @@ impl App {
         // encontrado el llamador repetido. `n` es un contador global (no
         // por-instancia) para poder ver en el log cuántas veces se llamó
         // `sync_voice_target` en total y con qué frecuencia.
-        static SYNC_VOICE_TARGET_CALLS: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
+        static SYNC_VOICE_TARGET_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SYNC_VOICE_TARGET_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         crate::logging::debug(
             "voice",
-            format!(
-                "sync_voice_target call #{n}: target={:?}",
-                self.voice_target
-            ),
+            format!("sync_voice_target call #{n}: target={:?}", self.voice_target),
         );
         let _ = commands.send(command);
     }
@@ -5881,7 +6460,7 @@ impl App {
     }
 
     // -----------------------------------------------------------------
-    // Menú de clic derecho sobre una persona (ver `ui::audio_menu`)
+    // Menú de clic derecho sobre una persona (ver `ui::call::audio_menu`)
     // -----------------------------------------------------------------
 
     /// Marca (o desmarca) como amigo a la entrada de `friends`, si existe, sin
@@ -5890,6 +6469,66 @@ impl App {
         if let Some(friend) = self.friends.iter_mut().find(|f| f.user_id == user_id) {
             friend.is_friend = is_friend;
         }
+    }
+
+    /// Server de la llamada en curso (`None` en una llamada privada).
+    pub fn voice_guild_id(&self) -> Option<String> {
+        match self.voice_target.as_ref()?.scope {
+            crate::discord::VoiceScope::Guild(guild_id) => Some(guild_id.to_string()),
+            crate::discord::VoiceScope::Private(_) => None,
+        }
+    }
+
+    /// Un sonido ya cargado, por id (predeterminados y de cualquier server).
+    pub fn find_soundboard_sound(&self, sound_id: &str) -> Option<&crate::discord::soundboard::SoundboardSound> {
+        self.soundboard_defaults
+            .iter()
+            .chain(self.soundboard_guild_sounds.values().flatten())
+            .find(|s| s.sound_id == sound_id)
+    }
+
+    /// Abre o cierra el soundboard (botón de la barra de llamada). Al abrir
+    /// pide los sonidos, así se ven los cambios del server.
+    pub fn toggle_soundboard(&mut self, button: egui::Rect) {
+        if self.soundboard_open {
+            self.soundboard_open = false;
+            return;
+        }
+        self.soundboard_open = true;
+        self.soundboard_button = Some(button);
+        let Some((token, tx)) = self.discord_token.clone().zip(self.event_tx.clone()) else {
+            return;
+        };
+        self.soundboard_loading = true;
+        crate::discord::spawn_fetch_soundboard(token, self.voice_guild_id(), tx);
+    }
+
+    /// Toca un sonido en el canal de voz actual.
+    pub fn send_soundboard_sound(&mut self, sound: &crate::discord::soundboard::SoundboardSound) {
+        let Some(channel_id) = self.voice_target.as_ref().map(|t| t.channel_id.to_string()) else {
+            return;
+        };
+        let Some((token, tx)) = self.discord_token.clone().zip(self.event_tx.clone()) else {
+            return;
+        };
+        crate::discord::spawn_send_soundboard_sound(
+            token,
+            channel_id,
+            sound.sound_id.clone(),
+            sound.guild_id.clone(),
+            tx,
+        );
+    }
+
+    /// Nombre con el que se muestra una solicitud de ingreso: el del server si
+    /// la cuenta ya lo tiene, si no el que trajo la solicitud.
+    pub fn join_request_guild_name(&self, request: &crate::discord::join_form::JoinRequest) -> String {
+        self.servers
+            .iter()
+            .find(|s| s.guild_id == request.guild_id)
+            .map(|s| s.name.clone())
+            .or_else(|| request.guild_name.clone())
+            .unwrap_or_else(|| format!("Servidor {}", request.guild_id))
     }
 
     /// Cuántas solicitudes de amistad recibidas esperan respuesta (globito rojo
@@ -5902,8 +6541,10 @@ impl App {
     /// llega como `AppEvent::FriendRequestSent` y se muestra bajo el campo.
     pub fn send_friend_request(&mut self, username: String) {
         let Some((token, tx)) = self.discord_token.clone().zip(self.event_tx.clone()) else {
-            self.add_friend_status =
-                Some((false, "Necesitas iniciar sesión en Discord para añadir amigos.".to_string()));
+            self.add_friend_status = Some((
+                false,
+                "Necesitas iniciar sesión en Discord para añadir amigos.".to_string(),
+            ));
             return;
         };
         self.add_friend_busy = true;
@@ -5984,7 +6625,7 @@ impl App {
     }
 
     fn show_note_dialog(&mut self, user_id: String, name: String, note: Option<String>) {
-        use crate::ui::dialog::{ButtonStyle, Dialog, DialogKind, FormField};
+        use crate::ui::shell::dialog::{ButtonStyle, Dialog, DialogKind, FormField};
         self.open_dialog(
             Dialog::new("user_note", DialogKind::Question, format!("Nota sobre {name}"))
                 .subtitle("Solo visible para ti")
@@ -6012,7 +6653,7 @@ impl App {
     /// confirmación (`confirm_stranger_request`). Al confirmar se reenvía con
     /// `true`.
     fn confirm_accept_friend(&mut self, user_id: String, reason: String) {
-        use crate::ui::dialog::{Dialog, DialogKind};
+        use crate::ui::shell::dialog::{Dialog, DialogKind};
         let name = self
             .friends
             .iter()
@@ -6040,10 +6681,7 @@ impl App {
             .note(format!("Respuesta de Discord: {reason}"))
             .on_result(move |app, _ctx, result| {
                 if result.is("confirm") {
-                    app.run_user_action(
-                        user_id,
-                        crate::discord::UserAction::AcceptFriend { confirm: true },
-                    );
+                    app.run_user_action(user_id, crate::discord::UserAction::AcceptFriend { confirm: true });
                 }
             }),
         );
@@ -6063,13 +6701,7 @@ impl App {
                     .find(|d| d.recipients.len() == 1 && d.recipients[0].id == user_id)
                     .map(|d| d.id.clone())
             });
-        self.message_user_from_profile(
-            user_id,
-            name,
-            None,
-            crate::lib::data::color_from_id(user_id),
-            None,
-        );
+        self.message_user_from_profile(user_id, name, None, crate::lib::data::color_from_id(user_id), None);
         match known {
             Some(channel_id) => self.start_dm_call(&channel_id),
             None => self.pending_call_user = Some(user_id.to_string()),
@@ -6084,9 +6716,9 @@ impl App {
             return;
         }
         self.menu_ctx_published = Some(fingerprint);
-        crate::ui::audio_menu::publish_context(
+        crate::ui::call::audio_menu::publish_context(
             ctx,
-            crate::ui::audio_menu::MenuContext {
+            crate::ui::call::audio_menu::MenuContext {
                 relationships: self.relationship_kinds.clone(),
                 ignored: self.ignored_users.clone(),
                 video_disabled: self.video_disabled_users.clone(),
@@ -6111,7 +6743,9 @@ impl App {
     /// de un canal de server, acá no hay `guild_id`: Discord indexa la
     /// llamada por el `channel_id` del propio DM (ver `VoiceScope::Private`).
     pub fn start_dm_call(&mut self, channel_id: &str) {
-        let Some(id) = crate::discord::voice::parse_channel_id(channel_id) else { return };
+        let Some(id) = crate::discord::voice::parse_channel_id(channel_id) else {
+            return;
+        };
         let scope = crate::discord::VoiceScope::Private(id);
         let target = self.requested_voice_state(scope, id);
         self.set_voice_target(target);
@@ -6165,7 +6799,7 @@ impl App {
     /// A diferencia de antes, esto ya NO depende de estar en una llamada:
     /// `self.self_mute` es la preferencia persistida que se usa tanto para
     /// pre-silenciarte antes de unirte (ver `requested_voice_state`) como
-    /// para el botón de la barra de usuario (`ui::friends_panel::user_bar`)
+    /// para el botón de la barra de usuario (`ui::dm::friends_panel::user_bar`)
     /// estando fuera de una llamada. Si hay una llamada en curso
     /// (`voice_target`), además se actualiza en vivo y se sincroniza con
     /// el Gateway/runtime, igual que hacía la barra de llamada.
@@ -6197,7 +6831,7 @@ impl App {
         }
     }
 
-    /// Nombre para mostrar en la barra de llamada (`ui::call_bar`): el
+    /// Nombre para mostrar en la barra de llamada (`ui::call::call_bar`): el
     /// canal de voz si es una llamada de server, o el nombre del
     /// amigo/DM si es privada. `None` si todavía no encontramos el
     /// canal/amigo correspondiente (por ejemplo mientras `self.servers`
@@ -6209,17 +6843,14 @@ impl App {
         match target.scope {
             crate::discord::VoiceScope::Guild(guild_id) => {
                 let guild_id = guild_id.to_string();
-                self.servers
-                    .iter()
-                    .find(|s| s.guild_id == guild_id)
-                    .and_then(|server| {
-                        server
-                            .categories
-                            .iter()
-                            .flat_map(|category| category.channels.iter())
-                            .find(|c| c.channel_id.as_deref() == Some(channel_id.as_str()))
-                            .map(|c| c.name.clone())
-                    })
+                self.servers.iter().find(|s| s.guild_id == guild_id).and_then(|server| {
+                    server
+                        .categories
+                        .iter()
+                        .flat_map(|category| category.channels.iter())
+                        .find(|c| c.channel_id.as_deref() == Some(channel_id.as_str()))
+                        .map(|c| c.name.clone())
+                })
             }
             crate::discord::VoiceScope::Private(_) => self
                 .friends
@@ -6239,10 +6870,7 @@ impl App {
         match list_voice_audio_sources() {
             Ok(options) => self.voice_audio_source_options = options,
             Err(error) => {
-                crate::logging::debug(
-                    "voice",
-                    format!("voice audio source enumeration failed: {error}"),
-                );
+                crate::logging::debug("voice", format!("voice audio source enumeration failed: {error}"));
             }
         }
     }
@@ -6285,9 +6913,7 @@ impl App {
     fn publish_voice_audio_sources(&mut self) {
         self.ensure_voice_runtime_started();
         if let Some(tx) = &self.voice_runtime_tx {
-            let _ = tx.send(VoiceRuntimeEvent::AudioSourcesChanged(
-                self.voice.audio_sources.clone(),
-            ));
+            let _ = tx.send(VoiceRuntimeEvent::AudioSourcesChanged(self.voice.audio_sources.clone()));
         }
     }
 
@@ -6522,9 +7148,15 @@ impl App {
         }
         let guild_id = voice.scope.guild_id().map(|id| id.to_string());
         let channel_id = voice.channel_id.to_string();
-        let Some(me_id) = self.me.as_ref().map(|me| me.id.clone()) else { return };
+        let Some(me_id) = self.me.as_ref().map(|me| me.id.clone()) else {
+            return;
+        };
         let Some(commands) = self.gateway_commands.clone() else {
-            self.push_toast(ToastKind::Warning, "Sin conexión", "Todavía no hay conexión con Discord".to_string());
+            self.push_toast(
+                ToastKind::Warning,
+                "Sin conexión",
+                "Todavía no hay conexión con Discord".to_string(),
+            );
             return;
         };
         let stream_key = match &guild_id {
@@ -6543,16 +7175,15 @@ impl App {
             preview_texture: None,
             preview_size: [0, 0],
         });
-        let _ = commands.send(crate::discord::gateway::GatewayCommand::StreamCreate {
-            guild_id,
-            channel_id,
-        });
+        let _ = commands.send(crate::discord::gateway::GatewayCommand::StreamCreate { guild_id, channel_id });
     }
 
     /// Deja de transmitir: le avisa al Gateway (opcode 19) y corta la conexión
     /// y la captura.
     pub fn stop_broadcast(&mut self) {
-        let Some(broadcast) = self.broadcasting_stream.take() else { return };
+        let Some(broadcast) = self.broadcasting_stream.take() else {
+            return;
+        };
         self.stream_sessions.remove(&broadcast.stream_key);
         if let Some(commands) = self.gateway_commands.clone() {
             let _ = commands.send(crate::discord::gateway::GatewayCommand::StreamDelete {
@@ -6565,13 +7196,21 @@ impl App {
     /// Si ya se juntaron `rtc_server_id`, endpoint y token de nuestro stream,
     /// abre la conexión de media y arranca la captura.
     fn try_start_stream_publish(&mut self, stream_key: &str) {
-        let Some(pending) = self.stream_sessions.get(stream_key) else { return };
-        let (Some(rtc_server_id), Some(endpoint), Some(token)) =
-            (pending.rtc_server_id.clone(), pending.endpoint.clone(), pending.token.clone())
-        else {
+        let Some(pending) = self.stream_sessions.get(stream_key) else {
             return;
         };
-        let Some(user_id) = self.me.as_ref().and_then(|me| crate::discord::voice::parse_user_id(&me.id)) else {
+        let (Some(rtc_server_id), Some(endpoint), Some(token)) = (
+            pending.rtc_server_id.clone(),
+            pending.endpoint.clone(),
+            pending.token.clone(),
+        ) else {
+            return;
+        };
+        let Some(user_id) = self
+            .me
+            .as_ref()
+            .and_then(|me| crate::discord::voice::parse_user_id(&me.id))
+        else {
             return;
         };
         let Some(event_tx) = self.event_tx.clone() else { return };
@@ -6579,7 +7218,9 @@ impl App {
             return;
         }
         let session_id = self.gateway_session_id.clone();
-        let Some(broadcast) = self.broadcasting_stream.as_mut() else { return };
+        let Some(broadcast) = self.broadcasting_stream.as_mut() else {
+            return;
+        };
         if broadcast.stream_key != stream_key || broadcast.handle.is_some() {
             return;
         }
@@ -6608,13 +7249,21 @@ impl App {
     /// en ese caso.
     pub fn watch_stream(&mut self, guild_id: &str, channel_id: &str, owner_user_id: &str, owner_name: &str) {
         let stream_key = format!("guild:{guild_id}:{channel_id}:{owner_user_id}");
-        if self.watching_stream.as_ref().is_some_and(|w| w.stream_key == stream_key) {
+        if self
+            .watching_stream
+            .as_ref()
+            .is_some_and(|w| w.stream_key == stream_key)
+        {
             return;
         }
         // Solo se ve un stream a la vez: se deja el anterior primero.
         self.stop_watching_stream();
         let Some(commands) = self.gateway_commands.clone() else {
-            self.push_toast(ToastKind::Warning, "Sin conexión", "Todavía no hay conexión con Discord");
+            self.push_toast(
+                ToastKind::Warning,
+                "Sin conexión",
+                "Todavía no hay conexión con Discord",
+            );
             return;
         };
         self.stream_sessions.remove(&stream_key);
@@ -6636,7 +7285,9 @@ impl App {
     /// Deja de ver el stream actual (botón de cerrar del visor, o al salir de
     /// la llamada): le avisa al Gateway (opcode 19) y corta la conexión.
     pub fn stop_watching_stream(&mut self) {
-        let Some(watched) = self.watching_stream.take() else { return };
+        let Some(watched) = self.watching_stream.take() else {
+            return;
+        };
         self.stream_sessions.remove(&watched.stream_key);
         if let Some(commands) = self.gateway_commands.clone() {
             let _ = commands.send(crate::discord::gateway::GatewayCommand::StreamDelete {
@@ -6649,13 +7300,19 @@ impl App {
     /// Si ya se juntaron `rtc_server_id`, endpoint y token del stream que se
     /// quiere ver, abre la conexión de media.
     fn try_start_stream_watch(&mut self, stream_key: &str) {
-        let Some(pending) = self.stream_sessions.get(stream_key) else { return };
-        let (Some(rtc_server_id), Some(endpoint), Some(token)) =
-            (pending.rtc_server_id.clone(), pending.endpoint.clone(), pending.token.clone())
-        else {
+        let Some(pending) = self.stream_sessions.get(stream_key) else {
             return;
         };
-        let Some(watched) = self.watching_stream.as_mut() else { return };
+        let (Some(rtc_server_id), Some(endpoint), Some(token)) = (
+            pending.rtc_server_id.clone(),
+            pending.endpoint.clone(),
+            pending.token.clone(),
+        ) else {
+            return;
+        };
+        let Some(watched) = self.watching_stream.as_mut() else {
+            return;
+        };
         if watched.stream_key != stream_key || watched.handle.is_some() {
             return;
         }
@@ -6665,7 +7322,10 @@ impl App {
             .rsplit(':')
             .next()
             .and_then(crate::discord::voice::parse_user_id);
-        let user_id = self.me.as_ref().and_then(|me| crate::discord::voice::parse_user_id(&me.id));
+        let user_id = self
+            .me
+            .as_ref()
+            .and_then(|me| crate::discord::voice::parse_user_id(&me.id));
         let (Some(owner_user_id), Some(user_id)) = (owner_user_id, user_id) else {
             watched.status = StreamWatchStatus::Failed;
             watched.message = Some("No se pudo identificar al usuario del stream".to_string());
@@ -6721,7 +7381,9 @@ impl App {
     /// Sube a la GPU el último frame de la vista previa de NUESTRA transmisión
     /// (el tile propio de la llamada). Pausada, no hace nada.
     fn pump_broadcast_preview(&mut self, ctx: &egui::Context, paused: bool) {
-        let Some(broadcast) = self.broadcasting_stream.as_mut() else { return };
+        let Some(broadcast) = self.broadcasting_stream.as_mut() else {
+            return;
+        };
         broadcast.preview.set_paused(paused);
         if paused {
             broadcast.preview.discard();
@@ -6730,7 +7392,9 @@ impl App {
         // El hilo de captura no despierta la UI: mientras se transmite y la
         // ventana está al frente se repinta unas 8 veces por segundo.
         ctx.request_repaint_after(std::time::Duration::from_millis(125));
-        let Some(frame) = broadcast.preview.take_new() else { return };
+        let Some(frame) = broadcast.preview.take_new() else {
+            return;
+        };
         let size = [frame.width as usize, frame.height as usize];
         if size[0] == 0 || size[1] == 0 || frame.rgba.len() != size[0] * size[1] * 4 {
             return;
@@ -6761,7 +7425,10 @@ impl App {
             let previous = self.stream_previews.get(stream_key).and_then(|entry| entry.url.clone());
             self.stream_previews.insert(
                 stream_key.to_string(),
-                StreamPreviewEntry { url: previous, requested_at: Instant::now() },
+                StreamPreviewEntry {
+                    url: previous,
+                    requested_at: Instant::now(),
+                },
             );
             if let (Some(token), Some(tx)) = (&self.discord_token, &self.event_tx) {
                 crate::discord::spawn_fetch_stream_preview(token.clone(), stream_key.to_string(), tx.clone());
@@ -6778,8 +7445,14 @@ impl App {
         let paused = self.update_video_pause(ctx);
         self.pump_broadcast_preview(ctx, paused);
         // Ensordecerte también calla el audio del stream.
-        let deaf = self.voice_target.as_ref().map(|t| t.self_deaf).unwrap_or(self.self_deaf);
-        let Some(watched) = self.watching_stream.as_mut() else { return };
+        let deaf = self
+            .voice_target
+            .as_ref()
+            .map(|t| t.self_deaf)
+            .unwrap_or(self.self_deaf);
+        let Some(watched) = self.watching_stream.as_mut() else {
+            return;
+        };
         watched.paused = paused;
         // Respaldo: aunque el hilo de video no logre despertar la UI, mientras
         // se mira un stream se repinta unas 10 veces por segundo (una por
@@ -6820,7 +7493,10 @@ impl App {
         if watched.frames_shown == 1 {
             crate::logging::debug(
                 "stream",
-                format!("first stream frame uploaded to the viewer texture: {}x{}", size[0], size[1]),
+                format!(
+                    "first stream frame uploaded to the viewer texture: {}x{}",
+                    size[0], size[1]
+                ),
             );
         }
     }
@@ -6878,7 +7554,7 @@ impl eframe::App for App {
         // oscuro ya frena los clics, pero el login lee Enter y el texto
         // directo del teclado. Se quita el foco y se aparta el teclado ANTES
         // de dibujar cualquier pantalla (el diálogo lo recupera al dibujarse).
-        crate::ui::dialog::begin_frame(ui.ctx(), self);
+        crate::ui::shell::dialog::begin_frame(ui.ctx(), self);
 
         // eframe limpia el framebuffer de verdad a transparente (no hay
         // `with_transparent(true)` en el viewport, así que ese
@@ -6896,17 +7572,24 @@ impl eframe::App for App {
         // `theme::Backdrop`). Con `background_opacity < 1` deja este mismo
         // hueco transparente a propósito para que se vea el escritorio.
         let full_rect = ui.max_rect();
-        self.backdrop_rt.paint(ui.ctx(), ui.painter(), full_rect, &self.backdrop, &self.palette);
+        self.backdrop_rt
+            .paint(ui.ctx(), ui.painter(), full_rect, &self.backdrop, &self.palette);
 
         // Foco de la ventana ANTES de procesar eventos: decide si un mensaje
         // nuevo se avisa dentro de la app o en el escritorio.
         self.window_focused = ui.ctx().input(|i| i.viewport().focused.unwrap_or(true));
         self.poll_discord_events(ui.ctx());
-        // "Ir al servidor" de una tarjeta de invitación (`ui::invite_card`).
-        if let Some(index) = crate::discord::invites::poll_goto(|guild_id| {
-            self.servers.iter().position(|s| s.guild_id == guild_id)
-        }) {
+        // "Ir al servidor" de una tarjeta de invitación (`ui::server::invite_card`).
+        if let Some(index) =
+            crate::discord::invites::poll_goto(|guild_id| self.servers.iter().position(|s| s.guild_id == guild_id))
+        {
             self.open_server(index);
+        }
+        // Formulario de ingreso que pidió el server al que acabas de unirte.
+        if self.join_form.is_none() {
+            if let Some(form) = crate::discord::invites::take_join_form() {
+                self.join_form = Some(JoinFormModal::new(form));
+            }
         }
         self.tick_pending_buttons(ui.ctx());
         self.pump_stream_frames(ui.ctx());
@@ -6929,17 +7612,18 @@ impl eframe::App for App {
             let overlay_open = !self.dialogs.is_empty()
                 || self.modal.is_some()
                 || self.component_modal.is_some()
+                || self.join_form.is_some()
                 || self.profile_popup.is_some()
                 || self.role_popup.is_some()
                 || self.profile_full.is_some()
                 || self.settings_open
                 || self.theme_editor.is_some()
-                || crate::ui::media_viewer::is_open()
-                || crate::ui::video_player::is_fullscreen();
+                || crate::ui::chat::media_viewer::is_open()
+                || crate::ui::chat::video_player::is_fullscreen();
             crate::ui::chat::set_type_to_focus_allowed(ui.ctx(), !overlay_open);
         }
         // Recorta las imágenes decodificadas si se pasan de su tope.
-        crate::ui::anim::maintain(ui.ctx());
+        crate::ui::chat::anim::maintain(ui.ctx());
         // Al cambiar de chat, suelta las imágenes decodificadas del anterior.
         let view_key = match self.screen {
             Screen::Dm(i) => 2 + ((i as u64) << 8),
@@ -6949,17 +7633,17 @@ impl eframe::App for App {
             }
             _ => 1,
         };
-        crate::ui::anim::on_view_change(ui.ctx(), view_key);
+        crate::ui::chat::anim::on_view_change(ui.ctx(), view_key);
         self.trim_inactive_history(ui.ctx().input(|i| i.time));
         // Roles del server abierto para las menciones `@rol` del chat, y
-        // clics en menciones de canal/rol (ver `ui::markdown`).
+        // clics en menciones de canal/rol (ver `ui::chat::markdown`).
         {
             let ctx = ui.ctx().clone();
             let roles: &[crate::discord::models::Role] = match self.screen {
                 Screen::Server(index) => self.servers.get(index).map(|s| s.roles.as_slice()).unwrap_or(&[]),
                 _ => &[],
             };
-            crate::ui::markdown::publish_roles(&ctx, roles);
+            crate::ui::chat::markdown::publish_roles(&ctx, roles);
             // Menú de menciones (`@`) del compositor: candidatos para lo que se
             // está tipeando y, si hacen falta más, búsqueda en el Gateway.
             self.publish_mention_results(&ctx);
@@ -6968,16 +7652,16 @@ impl eframe::App for App {
             // Slash commands (`/`): catálogo del canal abierto y, si el
             // compositor dejó uno listo, ejecutarlo.
             self.publish_slash_catalog(&ctx);
-            if let Some(invocation) = crate::ui::slash::take_invocation(&ctx) {
+            if let Some(invocation) = crate::ui::chat::slash::take_invocation(&ctx) {
                 self.run_slash_invocation(invocation);
             }
-            if let Some(query) = crate::ui::compose_menus::take_member_search(&ctx) {
+            if let Some(query) = crate::ui::chat::compose_menus::take_member_search(&ctx) {
                 self.search_guild_members(&query);
             }
-            if let Some(channel_id) = crate::ui::markdown::take_channel_request(&ctx) {
+            if let Some(channel_id) = crate::ui::chat::markdown::take_channel_request(&ctx) {
                 self.open_channel_by_id(&channel_id);
             }
-            if let Some(click) = crate::ui::markdown::take_role_request(&ctx) {
+            if let Some(click) = crate::ui::chat::markdown::take_role_request(&ctx) {
                 if matches!(self.screen, Screen::Server(_)) {
                     self.role_popup = Some(RolePopup {
                         role_id: click.id,
@@ -6990,23 +7674,21 @@ impl eframe::App for App {
         }
         // Alguien clickeó un avatar/nombre en algún lado (chat, DM, panel
         // de amigos) — ver `ui::profile_popup::request_open`.
-        // Menú de clic derecho de volumen por persona (ver `ui::audio_menu`).
+        // Menú de clic derecho de volumen por persona (ver `ui::call::audio_menu`).
         self.publish_menu_context(ui.ctx());
-        for change in crate::ui::audio_menu::take_changes(ui.ctx()) {
+        for change in crate::ui::call::audio_menu::take_changes(ui.ctx()) {
             match change {
-                crate::ui::audio_menu::AudioChange::Volume(id, percent) => {
+                crate::ui::call::audio_menu::AudioChange::Volume(id, percent) => {
                     self.set_voice_participant_volume(&id, percent)
                 }
-                crate::ui::audio_menu::AudioChange::Muted(id, muted) => {
+                crate::ui::call::audio_menu::AudioChange::Muted(id, muted) => {
                     self.set_voice_participant_muted(&id, muted)
                 }
-                crate::ui::audio_menu::AudioChange::Reset(id) => {
-                    self.reset_voice_participant_audio(&id)
-                }
-                crate::ui::audio_menu::AudioChange::SoundboardMuted(id, muted) => {
+                crate::ui::call::audio_menu::AudioChange::Reset(id) => self.reset_voice_participant_audio(&id),
+                crate::ui::call::audio_menu::AudioChange::SoundboardMuted(id, muted) => {
                     self.set_voice_participant_soundboard_muted(&id, muted)
                 }
-                crate::ui::audio_menu::AudioChange::VideoDisabled(id, disabled) => {
+                crate::ui::call::audio_menu::AudioChange::VideoDisabled(id, disabled) => {
                     if disabled {
                         self.video_disabled_users.insert(id);
                     } else {
@@ -7014,27 +7696,27 @@ impl eframe::App for App {
                     }
                     self.menu_ctx_rev += 1;
                 }
-                crate::ui::audio_menu::AudioChange::Profile(id, name) => {
+                crate::ui::call::audio_menu::AudioChange::Profile(id, name) => {
                     let color = crate::lib::data::color_from_id(&id);
                     self.open_user_profile(id, name, None, color);
                 }
-                crate::ui::audio_menu::AudioChange::Mention(id) => {
+                crate::ui::call::audio_menu::AudioChange::Mention(id) => {
                     self.compose_text.push_str(&format!("<@{id}> "));
                 }
-                crate::ui::audio_menu::AudioChange::Message(id, name) => {
+                crate::ui::call::audio_menu::AudioChange::Message(id, name) => {
                     let color = crate::lib::data::color_from_id(&id);
                     self.message_user_from_profile(&id, &name, None, color, None);
                 }
-                crate::ui::audio_menu::AudioChange::Call(id, name) => self.call_user(&id, &name),
-                crate::ui::audio_menu::AudioChange::Note(id, name) => self.open_note_editor(id, name),
-                crate::ui::audio_menu::AudioChange::VerificationCode(_) => {
-                    self.open_dialog(crate::ui::dialog::Dialog::info(
+                crate::ui::call::audio_menu::AudioChange::Call(id, name) => self.call_user(&id, &name),
+                crate::ui::call::audio_menu::AudioChange::Note(id, name) => self.open_note_editor(id, name),
+                crate::ui::call::audio_menu::AudioChange::VerificationCode(_) => {
+                    self.open_dialog(crate::ui::shell::dialog::Dialog::info(
                         "verification_code",
                         "Código de verificación",
                         "Esta función todavía no está disponible en ecord.",
                     ));
                 }
-                crate::ui::audio_menu::AudioChange::Api(id, action) => self.run_user_action(id, action),
+                crate::ui::call::audio_menu::AudioChange::Api(id, action) => self.run_user_action(id, action),
             }
         }
         if let Some(request) = crate::ui::profile_popup::take_requested(ui.ctx()) {
@@ -7051,10 +7733,10 @@ impl eframe::App for App {
         // muestra una versión mínima: solo arrastre y controles de ventana,
         // porque la ventana no tiene decoraciones nativas.
         if matches!(self.screen, Screen::Login) {
-            crate::ui::topbar::show_login(self, ui);
+            crate::ui::shell::topbar::show_login(self, ui);
         }
         if !matches!(self.screen, Screen::Login) {
-            crate::ui::topbar::show(self, ui);
+            crate::ui::shell::topbar::show(self, ui);
             // Interfaz nueva: franja vacía en el borde derecho para que la
             // última tarjeta no quede pegada a la ventana (GAP/2 de la
             // tarjeta + esta franja = GAP, igual que a la izquierda).
@@ -7071,42 +7753,44 @@ impl eframe::App for App {
         // pantallas para que su panel reserve el borde inferior y los paneles
         // laterales y el central se repartan lo que queda.
         if self.new_call_ui && self.voice_target.is_some() && !matches!(self.screen, Screen::Login) {
-            crate::ui::call_bar::show_bottom(self, ui);
+            crate::ui::call::call_bar::show_bottom(self, ui);
         }
 
         match self.screen {
-            Screen::Login => crate::ui::login::show(self, ui),
+            Screen::Login => crate::ui::auth::login::show(self, ui),
             Screen::Home => crate::ui::home::show(self, ui),
             Screen::Dm(_) => crate::ui::dm::show(self, ui),
             Screen::Server(_) => crate::ui::server::show(self, ui),
         }
 
         // Popup del stream que se está viendo cuando no estás en la vista de la llamada.
-        crate::ui::call_view::show_popup(self, ui);
+        crate::ui::call::call_view::show_popup(self, ui);
         // Overlays flotantes, siempre por encima de todo lo demás:
         // notificaciones apiladas en una esquina y el popup modal actual.
-        crate::ui::overlay::show_toasts(self, ui);
-        crate::ui::notifications::show_in_app(self, ui);
-        crate::ui::overlay::show_modal(self, ui);
-        crate::ui::overlay::show_component_modal(self, ui);
+        crate::ui::shell::overlay::show_toasts(self, ui);
+        crate::ui::shell::notifications::show_in_app(self, ui);
+        crate::ui::shell::overlay::show_modal(self, ui);
+        crate::ui::shell::overlay::show_component_modal(self, ui);
+        crate::ui::shell::overlay::show_join_form(self, ui);
+        crate::ui::call::soundboard::show_popup(self, ui);
         crate::ui::profile_popup::show(self, ui);
-        crate::ui::role_popup::show(self, ui);
+        crate::ui::server::role_popup::show(self, ui);
         crate::ui::profile_popup::show_full(self, ui);
         crate::ui::settings::show(self, ui);
-        crate::ui::clean_mic_popup::show(self, ui);
-        crate::ui::share_picker::show(self, ui);
+        crate::ui::call::clean_mic_popup::show(self, ui);
+        crate::ui::chat::share_picker::show(self, ui);
         // Cola de diálogos (aviso de seguridad, novedades, confirmaciones...):
         // va al final para quedar por encima de todo, incluida la pantalla de
         // login (donde se escribe el token).
-        crate::ui::dialog::show(self, ui);
+        crate::ui::shell::dialog::show(self, ui);
         // Visor multimedia (imágenes/GIFs a pantalla completa).
-        crate::ui::media_viewer::show(self, ui);
-        crate::ui::video_player::show_fullscreen(ui.ctx());
+        crate::ui::chat::media_viewer::show(self, ui);
+        crate::ui::chat::video_player::show_fullscreen(ui.ctx());
         // Suelta los players de GIF (embeds `gifv`) que ya no se dibujan.
-        crate::ui::video_player::end_frame(ui.ctx());
+        crate::ui::chat::video_player::end_frame(ui.ctx());
         // Si la vista de llamada quedó en pantalla completa pero ya no se dibuja,
         // saca la ventana de pantalla completa.
-        crate::ui::call_view::end_frame(ui.ctx());
+        crate::ui::call::call_view::end_frame(ui.ctx());
     }
 }
 
@@ -7115,6 +7799,6 @@ impl eframe::App for App {
 fn author_initial(name: &str) -> String {
     name.chars()
         .find(|c| !c.is_whitespace())
-        .map(|c| c.to_uppercase().collect())
+        .map(|c| c.to_uppercase().collect::<String>())
         .unwrap_or_else(|| "?".to_string())
 }

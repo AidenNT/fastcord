@@ -1,5 +1,5 @@
 //! Miniaturas de las ventanas y pantallas del selector de "Compartir pantalla"
-//! (`ui::share_picker`), como las del selector de Discord.
+//! (`ui::chat::share_picker`), como las del selector de Discord.
 //!
 //! Un hilo suelto (`share-thumbs`) saca una captura chica de cada fuente, una
 //! tras otra, y las manda por un canal en cuanto están listas; la UI las sube
@@ -86,9 +86,9 @@ mod imp {
 
     use windows_sys::Win32::Foundation::RECT;
     use windows_sys::Win32::Graphics::Gdi::{
-        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CAPTUREBLT, CreateCompatibleDC, CreateDIBSection,
-        DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HALFTONE, HBITMAP, HDC, HGDIOBJ, ReleaseDC,
-        SRCCOPY, SelectObject, SetStretchBltMode, StretchBlt,
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CAPTUREBLT, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS,
+        DeleteDC, DeleteObject, GetDC, HALFTONE, HBITMAP, HDC, HGDIOBJ, ReleaseDC, SRCCOPY, SelectObject,
+        SetStretchBltMode, StretchBlt,
     };
     use windows_sys::Win32::Storage::Xps::PrintWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsIconic};
@@ -220,7 +220,17 @@ mod imp {
             let small = Dib::new(screen, thumb_w, thumb_h)?;
             SetStretchBltMode(small.dc, HALFTONE);
             if StretchBlt(
-                small.dc, 0, 0, thumb_w as i32, thumb_h as i32, full.dc, 0, 0, width, height, SRCCOPY,
+                small.dc,
+                0,
+                0,
+                thumb_w as i32,
+                thumb_h as i32,
+                full.dc,
+                0,
+                0,
+                width,
+                height,
+                SRCCOPY,
             ) == 0
             {
                 return None;

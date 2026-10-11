@@ -60,21 +60,6 @@ impl VoiceAudioSourceOptions {
         adjust_source(selected, &self.inputs, delta)
     }
 
-    pub(crate) fn adjust_output(&self, selected: &mut Option<String>, delta: i8) -> bool {
-        adjust_source(selected, &self.outputs, delta)
-    }
-
-    pub(crate) fn into_parts(self) -> (VoiceAudioSourceList, VoiceAudioSourceList) {
-        (source_parts(self.inputs), source_parts(self.outputs))
-    }
-
-    pub(crate) fn from_parts(inputs: VoiceAudioSourceList, outputs: VoiceAudioSourceList) -> Self {
-        Self {
-            inputs: sources_from_parts(inputs),
-            outputs: sources_from_parts(outputs),
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn test(inputs: &[(&str, &str)], outputs: &[(&str, &str)]) -> Self {
         Self {
@@ -88,12 +73,16 @@ impl VoiceAudioSourceOptions {
     /// `adjust_input` (pensados para cablear un valor ya elegido), esto es
     /// lo que hace falta para pintar la lista completa de opciones.
     pub(crate) fn inputs(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.inputs.iter().map(|source| (source.id.as_str(), source.label.as_str()))
+        self.inputs
+            .iter()
+            .map(|source| (source.id.as_str(), source.label.as_str()))
     }
 
     /// Igual que [`Self::inputs`] pero para el `ComboBox` de salida.
     pub(crate) fn outputs(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.outputs.iter().map(|source| (source.id.as_str(), source.label.as_str()))
+        self.outputs
+            .iter()
+            .map(|source| (source.id.as_str(), source.label.as_str()))
     }
 }
 
@@ -128,10 +117,7 @@ pub(crate) fn list_voice_audio_sources() -> Result<VoiceAudioSourceOptions, Stri
 }
 
 #[cfg(feature = "voice-playback")]
-pub(super) fn resolve_input_device(
-    host: &cpal::Host,
-    selected: Option<&str>,
-) -> Result<cpal::Device, String> {
+pub(super) fn resolve_input_device(host: &cpal::Host, selected: Option<&str>) -> Result<cpal::Device, String> {
     resolve_device(
         host,
         selected,
@@ -142,10 +128,7 @@ pub(super) fn resolve_input_device(
 }
 
 #[cfg(feature = "voice-playback")]
-pub(super) fn resolve_output_device(
-    host: &cpal::Host,
-    selected: Option<&str>,
-) -> Result<cpal::Device, String> {
+pub(super) fn resolve_output_device(host: &cpal::Host, selected: Option<&str>) -> Result<cpal::Device, String> {
     resolve_device(
         host,
         selected,
@@ -241,10 +224,7 @@ fn sanitize_audio_source_label(label: &str) -> String {
 }
 
 fn source_parts(sources: Vec<VoiceAudioSource>) -> Vec<(String, String)> {
-    sources
-        .into_iter()
-        .map(|source| (source.id, source.label))
-        .collect()
+    sources.into_iter().map(|source| (source.id, source.label)).collect()
 }
 
 fn sources_from_parts(parts: Vec<(String, String)>) -> Vec<VoiceAudioSource> {
@@ -290,4 +270,3 @@ fn test_sources(sources: &[(&str, &str)]) -> Vec<VoiceAudioSource> {
         })
         .collect()
 }
-

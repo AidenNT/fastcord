@@ -26,7 +26,7 @@
 /// Alertas sonoras disponibles.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SoundAlert {
-    /// Aviso "Conexión no segura" (`ui::security_warning`).
+    /// Aviso "Conexión no segura" (`ui::auth::security_warning`).
     SecurityWarning,
 }
 
@@ -62,19 +62,42 @@ impl SoundAlert {
 pub fn play(alert: SoundAlert) {
     #[cfg(feature = "voice-playback")]
     {
-        let spawned = std::thread::Builder::new()
-            .name("sound-alert".into())
-            .spawn(move || {
-                if let Err(error) = imp::play_blocking(alert) {
-                    log::warn!("No se pudo reproducir la alerta {alert:?}: {error}");
-                }
-            });
+        let spawned = std::thread::Builder::new().name("sound-alert".into()).spawn(move || {
+            if let Err(error) = imp::play_blocking(alert) {
+                log::warn!("No se pudo reproducir la alerta {alert:?}: {error}");
+            }
+        });
         if let Err(error) = spawned {
             log::warn!("No se pudo crear el hilo de la alerta {alert:?}: {error}");
         }
     }
     #[cfg(not(feature = "voice-playback"))]
     log::debug!("Alerta {alert:?} omitida: build sin el feature `voice-playback`");
+}
+
+/// Reproduce un audio ya descargado (mp3, ogg/opus...) a `volume` (0.0 a 1.0)
+/// una vez, sin bloquear al que llama. Es lo que usa el soundboard de la
+/// llamada. ffmpeg detecta el formato por el contenido; varios a la vez se
+/// mezclan (cada uno abre su propio stream de salida).
+pub fn play_clip(bytes: Vec<u8>, volume: f32) {
+    #[cfg(feature = "voice-playback")]
+    {
+        let spawned = std::thread::Builder::new()
+            .name("soundboard-clip".into())
+            .spawn(move || {
+                if let Err(error) = imp::play_clip_blocking(&bytes, volume.clamp(0.0, 1.0)) {
+                    log::warn!("No se pudo reproducir el sonido del soundboard: {error}");
+                }
+            });
+        if let Err(error) = spawned {
+            log::warn!("No se pudo crear el hilo del soundboard: {error}");
+        }
+    }
+    #[cfg(not(feature = "voice-playback"))]
+    {
+        let _ = (bytes, volume);
+        log::debug!("Soundboard omitido: build sin el feature `voice-playback`");
+    }
 }
 
 #[cfg(feature = "voice-playback")]
@@ -90,8 +113,8 @@ mod imp {
     };
 
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-    use ffmpeg_the_third as ffmpeg;
     use ffmpeg::{ChannelLayout, format::sample::Type as SampleType, media::Type as MediaType};
+    use ffmpeg_the_third as ffmpeg;
 
     use super::SoundAlert;
     use crate::support::{
@@ -108,6 +131,35 @@ mod imp {
     const POLL: Duration = Duration::from_millis(20);
 
     pub(super) fn play_blocking(alert: SoundAlert) -> Result<(), String> {
+        let path = materialize(alert)?;
+        play_file(&path, alert.gain())
+    }
+
+    /// Un audio descargado (soundboard): se vuelca a la caché con un nombre
+    /// único, se reproduce y se borra.
+    pub(super) fn play_clip_blocking(bytes: &[u8], volume: f32) -> Result<(), String> {
+        use std::sync::atomic::AtomicU64;
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let dir =
+            crate::paths::sound_cache_dir().ok_or_else(|| "no se pudo resolver la carpeta de caché".to_owned())?;
+        fs::create_dir_all(&dir).map_err(|error| format!("crear {}: {error}", dir.display()))?;
+        let _ = private_file::set_private_dir_permissions(&dir);
+        let path = dir.join(format!(
+            "clip-{}-{}.audio",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        private_file::write_private_file(&path, bytes)
+            .map_err(|error| format!("escribir {}: {error}", path.display()))?;
+        let result = play_file(&path, volume);
+        let _ = fs::remove_file(&path);
+        result
+    }
+
+    /// Decodifica `path` y lo reproduce una vez con `gain`, bloqueando hasta
+    /// que termina.
+    fn play_file(path: &std::path::Path, gain: f32) -> Result<(), String> {
         // ALSA escribe sus errores directo a stderr; el mismo handler local
         // que usa la voz los captura mientras dura la reproducción.
         #[cfg(target_os = "linux")]
@@ -123,9 +175,8 @@ mod imp {
         let sample_format = supported.sample_format();
         let config = supported.config();
 
-        let path = materialize(alert)?;
         let max_samples = MAX_ALERT_SECONDS * config.sample_rate as usize * 2;
-        let samples = decode_stereo_f32(&path, config.sample_rate, max_samples)?;
+        let samples = decode_stereo_f32(path, config.sample_rate, max_samples)?;
         if samples.is_empty() {
             return Err("el archivo no tiene audio".into());
         }
@@ -139,7 +190,7 @@ mod imp {
             AlertSource {
                 samples,
                 position: 0,
-                gain: alert.gain(),
+                gain,
                 finished: Arc::clone(&finished),
             },
             |error| {
@@ -168,8 +219,8 @@ mod imp {
     /// ffmpeg abre por ruta, así que el audio embebido se escribe una vez en
     /// la caché. Si ya está idéntico no se vuelve a escribir.
     fn materialize(alert: SoundAlert) -> Result<PathBuf, String> {
-        let dir = crate::paths::sound_cache_dir()
-            .ok_or_else(|| "no se pudo resolver la carpeta de caché".to_owned())?;
+        let dir =
+            crate::paths::sound_cache_dir().ok_or_else(|| "no se pudo resolver la carpeta de caché".to_owned())?;
         fs::create_dir_all(&dir).map_err(|error| format!("crear {}: {error}", dir.display()))?;
         let _ = private_file::set_private_dir_permissions(&dir);
 
@@ -186,11 +237,7 @@ mod imp {
     /// Decodifica el primer stream de audio de `path` y lo deja como f32
     /// intercalado estéreo a `out_rate` Hz (`[L, R, L, R, ...]`), cortado a
     /// `max_samples` muestras.
-    fn decode_stereo_f32(
-        path: &std::path::Path,
-        out_rate: u32,
-        max_samples: usize,
-    ) -> Result<Vec<f32>, String> {
+    fn decode_stereo_f32(path: &std::path::Path, out_rate: u32, max_samples: usize) -> Result<Vec<f32>, String> {
         let err = |context: &str, error: ffmpeg::Error| format!("{context}: {error}");
 
         ffmpeg::init().map_err(|e| err("ffmpeg init", e))?;
@@ -227,9 +274,7 @@ mod imp {
             if stream.index() != stream_index {
                 continue;
             }
-            decoder
-                .send_packet(&packet)
-                .map_err(|e| err("enviar paquete", e))?;
+            decoder.send_packet(&packet).map_err(|e| err("enviar paquete", e))?;
             drain_decoder(&mut decoder, &mut resampler, &mut samples, max_samples)?;
             if samples.len() >= max_samples {
                 break;

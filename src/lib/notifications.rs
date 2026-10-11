@@ -53,7 +53,10 @@ pub struct Policy {
 /// se permite todo: mejor avisar de más que perder una mención.
 pub fn policy(settings: Option<&PreloadedUserSettings>) -> Policy {
     let Some(settings) = settings else {
-        return Policy { in_app: true, desktop: true };
+        return Policy {
+            in_app: true,
+            desktop: true,
+        };
     };
 
     let mut show_in_app = true;
@@ -62,11 +65,7 @@ pub fn policy(settings: Option<&PreloadedUserSettings>) -> Policy {
         show_in_app = n.show_in_app_notifications.unwrap_or(true);
         quiet = n.quiet_mode.unwrap_or(false) || n.focus_mode_expires_at_ms > now_ms();
     }
-    let dnd = settings
-        .status
-        .as_ref()
-        .and_then(|s| s.status.as_deref())
-        == Some("dnd");
+    let dnd = settings.status.as_ref().and_then(|s| s.status.as_deref()) == Some("dnd");
 
     let suppressed = quiet || dnd;
     Policy {
@@ -133,11 +132,7 @@ impl MuteRules {
 
         let mut guilds = HashMap::new();
         for entry in entries.into_iter().flatten() {
-            let key = entry
-                .get("guild_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            let key = entry.get("guild_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
             let mut rule = GuildRule {
                 muted: muted_now(entry),
@@ -146,10 +141,7 @@ impl MuteRules {
                     .get("suppress_everyone")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
-                suppress_roles: entry
-                    .get("suppress_roles")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
+                suppress_roles: entry.get("suppress_roles").and_then(|v| v.as_bool()).unwrap_or(false),
                 channels: HashMap::new(),
             };
 
@@ -180,10 +172,7 @@ impl MuteRules {
     ///   canal o server silenciado (o en nivel "nada") nunca cuenta.
     pub fn passes(&self, guild_id: Option<&str>, channel_id: &str, mention: Mention) -> bool {
         let default_rule = GuildRule::default();
-        let rule = self
-            .guilds
-            .get(guild_id.unwrap_or(""))
-            .unwrap_or(&default_rule);
+        let rule = self.guilds.get(guild_id.unwrap_or("")).unwrap_or(&default_rule);
         let channel = rule.channels.get(channel_id);
 
         if channel.is_some_and(|c| c.muted) {
@@ -389,12 +378,14 @@ mod tests {
     }
 
     fn dm(id: &str, last: Option<&str>) -> PrivateChannel {
-        serde_json::from_value(json!({ "type": 1, "id": id, "last_message_id": last }))
-            .expect("dm válido")
+        serde_json::from_value(json!({ "type": 1, "id": id, "last_message_id": last })).expect("dm válido")
     }
 
     fn direct() -> Mention {
-        Mention { direct: true, ..Default::default() }
+        Mention {
+            direct: true,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -409,7 +400,14 @@ mod tests {
     fn server_without_rules_only_counts_mentions() {
         let rules = MuteRules::default();
         assert!(rules.passes(Some("g"), "c", direct()));
-        assert!(rules.passes(Some("g"), "c", Mention { everyone: true, ..Default::default() }));
+        assert!(rules.passes(
+            Some("g"),
+            "c",
+            Mention {
+                everyone: true,
+                ..Default::default()
+            }
+        ));
         assert!(!rules.passes(Some("g"), "c", Mention::default()));
         // Un DM siempre cuenta.
         assert!(rules.passes(None, "c", Mention::default()));
@@ -426,7 +424,14 @@ mod tests {
         assert!(!rules.passes(Some("g1"), "c", direct()));
         assert!(!rules.passes(Some("g2"), "c9", direct()));
         assert!(rules.passes(Some("g2"), "c", direct()));
-        assert!(!rules.passes(Some("g2"), "c", Mention { everyone: true, ..Default::default() }));
+        assert!(!rules.passes(
+            Some("g2"),
+            "c",
+            Mention {
+                everyone: true,
+                ..Default::default()
+            }
+        ));
         assert!(!rules.passes(None, "dm1", Mention::default()));
         assert!(rules.passes(None, "dm2", Mention::default()));
     }

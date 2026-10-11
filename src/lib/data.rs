@@ -1,9 +1,8 @@
 use egui::Color32;
 
-use crate::theme::Icon::User;
 use crate::discord::models::{Attachment, Component, Embed, MessageUpdate, PrivateChannel, StickerItem};
-use crate::ui::media::gif_safe_url;
-
+use crate::theme::Icon::User;
+use crate::ui::chat::media::gif_safe_url;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -37,7 +36,11 @@ pub enum ReactionKind {
     /// `guild.emojis` y en el shape recortado de una reacción puntual) y
     /// decide si el ícono se pide como `.gif` o `.png` al CDN — ver
     /// `ui::chat::reaction_pill_custom`.
-    Custom { id: String, name: String, animated: bool },
+    Custom {
+        id: String,
+        name: String,
+        animated: bool,
+    },
 }
 
 impl ReactionKind {
@@ -71,11 +74,7 @@ impl CustomEmoji {
     pub fn url(&self) -> String {
         let ext = if self.animated { "gif" } else { "png" };
         let url = format!("https://cdn.discordapp.com/emojis/{}.{ext}?size=48", self.id);
-        if self.animated {
-            gif_safe_url(&url)
-        } else {
-            url
-        }
+        if self.animated { gif_safe_url(&url) } else { url }
     }
 }
 
@@ -91,7 +90,7 @@ pub struct EmojiGroup {
     pub icon_color: Color32,
     pub emojis: Vec<CustomEmoji>,
     /// Stickers personalizados del server, para la pestaña "Stickers" del
-    /// selector (ver `ui::compose_menus::show_emoji_picker`).
+    /// selector (ver `ui::chat::compose_menus::show_emoji_picker`).
     pub stickers: Vec<StickerItem>,
     /// Es el server del canal que se está mirando (no un server "externo").
     /// En un DM ningún grupo es `home`.
@@ -196,6 +195,34 @@ pub struct RepliedMessage {
     /// mandó el original embebido (se borró, o es muy viejo) — en ese
     /// caso se avisa en vez de mostrar un autor/preview que no tenemos.
     pub deleted: bool,
+}
+
+/// Lo que se muestra de un mensaje de llamada (tipo 3).
+#[derive(Clone, Debug, Default)]
+pub struct CallLine {
+    /// La llamada ya terminó.
+    pub ended: bool,
+    /// Duración, si terminó y se pudo calcular.
+    pub duration_secs: Option<u64>,
+    /// Terminó sin que la cuenta propia participara (y no la inició).
+    pub missed: bool,
+}
+
+impl CallLine {
+    fn from_discord(call: &crate::discord::models::MessageCall, started: &str, author_id: &str, my_id: &str) -> Self {
+        let ended = call.ended_timestamp.is_some();
+        let duration_secs = call.ended_timestamp.as_deref().and_then(|end| {
+            let start = chrono::DateTime::parse_from_rfc3339(started).ok()?;
+            let end = chrono::DateTime::parse_from_rfc3339(end).ok()?;
+            u64::try_from((end - start).num_seconds()).ok()
+        });
+        let took_part = author_id == my_id || call.participants.iter().any(|p| p == my_id);
+        Self {
+            ended,
+            duration_secs,
+            missed: ended && !took_part,
+        }
+    }
 }
 
 /// Copia de UN mensaje reenviado (un `message_snapshots[]` de Discord): lo
@@ -363,12 +390,12 @@ pub struct ChatMessage {
     /// poder mostrar `<@id>` como "@Nombre" en vez del id pelado.
     pub mentions: Vec<(String, String)>,
     pub reactions: Vec<Reaction>,
-    /// Archivos adjuntos (imágenes/videos/audio/otros) — ver `ui::media`.
+    /// Archivos adjuntos (imágenes/videos/audio/otros) — ver `ui::chat::media`.
     pub attachments: Vec<Attachment>,
     /// Embeds del mensaje (de bots/webhooks o generados por Discord a
-    /// partir de links) — ver `ui::media`.
+    /// partir de links) — ver `ui::chat::media`.
     pub embeds: Vec<Embed>,
-    /// Stickers del mensaje — ver `ui::media::show_stickers`.
+    /// Stickers del mensaje — ver `ui::chat::media::show_stickers`.
     pub stickers: Vec<StickerItem>,
     /// Si este mensaje es una respuesta a otro, la vista previa de ese
     /// original para mostrar arriba (ver `ui::chat::message_row`). `None`
@@ -384,6 +411,8 @@ pub struct ChatMessage {
     pub kind: u8,
     /// Botones y demás componentes que un bot le puso al mensaje.
     pub components: Vec<Component>,
+    /// Datos de un mensaje de llamada (tipo 3).
+    pub call: Option<CallLine>,
     /// Hilo que nació de este mensaje (tarjeta "Hilo de respuestas · N
     /// mensajes" debajo del mensaje).
     pub thread: Option<ThreadCard>,
@@ -413,7 +442,7 @@ pub struct InteractionLine {
     pub command: String,
 }
 
-/// Un botón apretado en un mensaje (`ui::components` → `App::press_component`).
+/// Un botón apretado en un mensaje (`ui::shell::components` → `App::press_component`).
 #[derive(Clone, Debug)]
 pub struct ComponentClick {
     pub message_id: String,
@@ -425,7 +454,7 @@ pub struct ComponentClick {
 }
 
 /// Un botón de bot al que se le mandó la interacción y que todavía no
-/// contestó: se dibuja con un spinner adentro (`ui::components`) hasta que
+/// contestó: se dibuja con un spinner adentro (`ui::shell::components`) hasta que
 /// llega la respuesta, falla, o vence el respaldo de `App::tick_pending_buttons`.
 #[derive(Clone, Debug)]
 pub struct PendingButton {
@@ -493,6 +522,29 @@ impl ThreadCard {
 }
 
 impl ChatMessage {
+    /// ¿Se dibuja como línea de sistema ("X se unió al servidor", llamada,
+    /// fijado...) en vez de como un mensaje con avatar? Incluye el "empezó
+    /// un hilo" (18). Un tipo desconocido sin contenido tampoco se esconde:
+    /// sale como línea genérica (ver `ui::chat::system_line`).
+    pub fn is_system(&self) -> bool {
+        match self.kind {
+            0 | 19 | 20 | 21 | 23 | 24 | 46 => false,
+            1..=18 | 22 | 27..=29 | 31 | 36..=39 | 67 => true,
+            // Solicitud de ingreso a un server (52 aceptada, 53 rechazada, 54
+            // retirada): línea de sistema, salvo que traiga embeds o botones,
+            // que se dibujan como un mensaje común para no perderlos.
+            52..=54 => self.embeds.is_empty() && self.components.is_empty(),
+            _ => {
+                self.content.is_empty()
+                    && self.embeds.is_empty()
+                    && self.attachments.is_empty()
+                    && self.stickers.is_empty()
+                    && self.components.is_empty()
+                    && self.forwarded.is_none()
+            }
+        }
+    }
+
     pub fn them(author: &str, time: &str, content: &str, avatar_color: Color32) -> Self {
         Self {
             id: String::new(),
@@ -514,6 +566,7 @@ impl ChatMessage {
             forwarded: None,
             kind: 0,
             components: Vec::new(),
+            call: None,
             thread: None,
             channel_id: String::new(),
             application_id: None,
@@ -545,6 +598,7 @@ impl ChatMessage {
             forwarded: None,
             kind: 0,
             components: Vec::new(),
+            call: None,
             thread: None,
             channel_id: String::new(),
             application_id: None,
@@ -621,6 +675,10 @@ impl ChatMessage {
             forwarded: Forward::from_discord(msg),
             kind: msg.kind,
             components: msg.components.clone(),
+            call: msg
+                .call
+                .as_ref()
+                .map(|c| CallLine::from_discord(c, &msg.timestamp, &msg.author.id, my_user_id)),
             thread: msg.thread.as_ref().map(ThreadCard::from_thread).or_else(|| {
                 // "X empezó un hilo" (tipo 18): el hilo es el canal al que
                 // apunta la referencia del mensaje, y su nombre es el
@@ -629,7 +687,11 @@ impl ChatMessage {
                     return None;
                 }
                 let id = msg.message_reference.as_ref()?.channel_id.clone()?;
-                Some(ThreadCard { id, name: msg.content.clone(), ..Default::default() })
+                Some(ThreadCard {
+                    id,
+                    name: msg.content.clone(),
+                    ..Default::default()
+                })
             }),
             channel_id: msg.channel_id.clone(),
             application_id,
@@ -755,7 +817,10 @@ impl ChatMessage {
             });
         }
         msg.message_reference.as_ref()?.message_id.as_ref()?;
-        Some(RepliedMessage { deleted: true, ..Default::default() })
+        Some(RepliedMessage {
+            deleted: true,
+            ..Default::default()
+        })
     }
 
     /// Aplica un `MESSAGE_UPDATE` (payload parcial): solo pisa lo que el
@@ -895,6 +960,11 @@ pub struct Friend {
     /// de DMs o desde un perfil): no se muestra en la lista de amigos ni
     /// cuenta en el contador de "Amigos".
     pub is_friend: bool,
+    /// `true` si es un DM grupal (tipo 3). Entonces `user_id` es el id del
+    /// CANAL (no hay una persona del otro lado, y así no choca con ningún DM
+    /// 1:1) y nombre/avatar son los del grupo; los miembros se leen de
+    /// `App::dms` por `dm_channel_id`.
+    pub is_group: bool,
 }
 
 const AIDEN: &str = "Aiden";
@@ -904,18 +974,16 @@ impl Friend {
     fn new(name: &str, status: Status, subtitle: Option<&str>, avatar_color: Color32) -> Self {
         let handle = format!(
             "{}{:02}",
-            name.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect::<String>(),
+            name.to_lowercase()
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect::<String>(),
             (name.len() * 7) % 90 + 10
         );
         let messages = vec![
             ChatMessage::them(name, "ayer a las 20:08", "Hola! ¿todo bien por ahí?", avatar_color),
             ChatMessage::own(AIDEN, "ayer a las 20:09", "Sí, todo tranqui por acá 🙂", AIDEN_COLOR),
-            ChatMessage::them(
-                name,
-                "ayer a las 20:10",
-                "Dale, cualquier cosa avisame",
-                avatar_color,
-            ),
+            ChatMessage::them(name, "ayer a las 20:10", "Dale, cualquier cosa avisame", avatar_color),
         ];
         Self {
             name: name.to_string(),
@@ -936,6 +1004,7 @@ impl Friend {
             has_newer: false,
             loading_newer: false,
             is_friend: true,
+            is_group: false,
         }
     }
 
@@ -968,11 +1037,7 @@ impl Friend {
             avatar_url: user.avatar_url(),
             user_id: user.id.clone(),
             dm_channel_id: None,
-            handle: format!(
-                "{}#{}",
-                user.username,
-                user.discriminator.as_deref().unwrap_or("0000")
-            ),
+            handle: format!("{}#{}", user.username, user.discriminator.as_deref().unwrap_or("0000")),
             member_since: String::new(),
             mutual_servers: 0,
             messages: Vec::new(),
@@ -983,6 +1048,7 @@ impl Friend {
             has_newer: false,
             loading_newer: false,
             is_friend: true,
+            is_group: false,
         }
     }
 
@@ -993,6 +1059,9 @@ impl Friend {
     /// — por eso esto vive aparte y se usa como fallback cuando el
     /// `user_id` del DM no matchea ningún `Friend` ya cargado.
     pub fn from_dm_channel(dm: &crate::discord::models::PrivateChannel) -> Option<Self> {
+        if dm.is_group() {
+            return Some(Self::from_group_channel(dm));
+        }
         let recipient = dm.recipients.first()?;
         Some(Self {
             name: if dm.username.is_empty() {
@@ -1021,7 +1090,33 @@ impl Friend {
             has_newer: false,
             loading_newer: false,
             is_friend: false,
+            is_group: false,
         })
+    }
+
+    /// A partir de un DM grupal de la lista de DMs (`App::dms`).
+    pub fn from_group_channel(dm: &crate::discord::models::PrivateChannel) -> Self {
+        Self {
+            name: dm.group_display_name(),
+            status: Status::Offline,
+            subtitle: None,
+            avatar_color: color_from_id(&dm.id),
+            avatar_url: dm.group_icon_url(),
+            user_id: dm.id.clone(),
+            dm_channel_id: Some(dm.id.clone()),
+            handle: String::new(),
+            member_since: String::new(),
+            mutual_servers: 0,
+            messages: Vec::new(),
+            loaded: false,
+            loading: false,
+            loading_more: false,
+            has_more: true,
+            has_newer: false,
+            loading_newer: false,
+            is_friend: false,
+            is_group: true,
+        }
     }
 }
 
@@ -1078,7 +1173,8 @@ impl PendingRequest {
 /// la imagen todavía no terminó de cargar.
 pub fn color_from_id(id: &str) -> Color32 {
     let hash: u64 = id.parse().unwrap_or_else(|_| {
-        id.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64))
+        id.bytes()
+            .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64))
     });
     let hue = (hash % 360) as f32;
     let (r, g, b) = hsl_to_rgb(hue, 0.55, 0.55);
@@ -1276,13 +1372,7 @@ pub struct ActivityCard {
 }
 
 impl ActivityCard {
-    fn new(
-        name: &str,
-        detail: &str,
-        time: &str,
-        avatar_color: Color32,
-        connect_label: Option<&str>,
-    ) -> Self {
+    fn new(name: &str, detail: &str, time: &str, avatar_color: Color32, connect_label: Option<&str>) -> Self {
         Self {
             name: name.to_string(),
             detail: detail.to_string(),
@@ -1325,13 +1415,7 @@ pub fn demo_activity() -> Vec<ActivityCard> {
             Color32::from_rgb(90, 170, 210),
             Some("Conecta..."),
         ),
-        ActivityCard::new(
-            "FruntiN",
-            "Roblox · 1 h",
-            "",
-            Color32::from_rgb(200, 170, 60),
-            None,
-        ),
+        ActivityCard::new("FruntiN", "Roblox · 1 h", "", Color32::from_rgb(200, 170, 60), None),
         ActivityCard::new(
             "Ignacio",
             "Dead by Daylight · 43 min",
@@ -1929,8 +2013,7 @@ impl Server {
         // a voz, posts de foro y posts abiertos se conservan (ver más abajo).
         let previous = std::mem::take(&mut self.categories);
 
-        let mut categories: HashMap<Option<String>, Vec<crate::discord::models::Channel>> =
-            HashMap::new();
+        let mut categories: HashMap<Option<String>, Vec<crate::discord::models::Channel>> = HashMap::new();
         // Se arma un `Channel` de la UI conservando los overwrites, para
         // poder recalcular el acceso cuando llegan los roles más tarde.
         fn build(c: crate::discord::models::Channel) -> Channel {
@@ -2029,7 +2112,10 @@ impl Server {
             }
         }
         if !open_threads.is_empty() {
-            result.push(ChannelCategory { name: String::new(), channels: open_threads });
+            result.push(ChannelCategory {
+                name: String::new(),
+                channels: open_threads,
+            });
         }
 
         self.categories = result;
@@ -2079,12 +2165,7 @@ impl Server {
     /// estaba abierto (se conservan sus mensajes) devuelve el mismo lugar.
     /// Los posts abiertos viven en una categoría al final, que la barra
     /// lateral no dibuja porque ninguno de sus canales es visible ahí.
-    pub fn open_thread(
-        &mut self,
-        thread_id: &str,
-        title: &str,
-        forum_id: Option<String>,
-    ) -> (usize, usize) {
+    pub fn open_thread(&mut self, thread_id: &str, title: &str, forum_id: Option<String>) -> (usize, usize) {
         if let Some(position) = self.channel_position_by_id(thread_id) {
             return position;
         }
@@ -2099,7 +2180,10 @@ impl Server {
         {
             Some(index) => index,
             None => {
-                self.categories.push(ChannelCategory { name: String::new(), channels: Vec::new() });
+                self.categories.push(ChannelCategory {
+                    name: String::new(),
+                    channels: Vec::new(),
+                });
                 self.categories.len() - 1
             }
         };
@@ -2129,7 +2213,9 @@ impl Server {
                 .collect()
         };
         let received = page.threads.len() as u32;
-        let Some(channel) = self.channel_by_id_mut(forum_id) else { return };
+        let Some(channel) = self.channel_by_id_mut(forum_id) else {
+            return;
+        };
         let forum = &mut channel.forum;
         // Respuesta de un pedido con otro orden: ya no vale.
         if forum.by_creation != by_creation {
@@ -2157,9 +2243,15 @@ impl Server {
     /// tenía tarjeta todavía (el hilo se acaba de crear) se la agrega. No
     /// hace nada si el mensaje no está cargado.
     pub fn refresh_thread_card(&mut self, thread: &crate::discord::models::ThreadChannel) {
-        let Some(parent_id) = thread.parent_id.clone() else { return };
-        let Some(parent) = self.channel_by_id_mut(&parent_id) else { return };
-        let Some(message) = parent.messages.iter_mut().find(|m| m.id == thread.id) else { return };
+        let Some(parent_id) = thread.parent_id.clone() else {
+            return;
+        };
+        let Some(parent) = self.channel_by_id_mut(&parent_id) else {
+            return;
+        };
+        let Some(message) = parent.messages.iter_mut().find(|m| m.id == thread.id) else {
+            return;
+        };
         match message.thread.as_mut() {
             Some(card) => {
                 if let Some(name) = thread.name.as_ref() {
@@ -2182,7 +2274,9 @@ impl Server {
         let Some(parent_id) = self.channel_by_id_mut(thread_id).and_then(|c| c.parent_id.clone()) else {
             return;
         };
-        let Some(parent) = self.channel_by_id_mut(&parent_id) else { return };
+        let Some(parent) = self.channel_by_id_mut(&parent_id) else {
+            return;
+        };
         if let Some(card) = parent
             .messages
             .iter_mut()
@@ -2199,7 +2293,9 @@ impl Server {
     /// abierto. Los hilos de canales que no son foros se ignoran.
     pub fn upsert_thread(&mut self, thread: &crate::discord::models::ThreadChannel) {
         self.refresh_thread_card(thread);
-        let Some(forum_id) = thread.parent_id.clone() else { return };
+        let Some(forum_id) = thread.parent_id.clone() else {
+            return;
+        };
         let fresh = {
             let resolver = NameResolver::new(&self.member_info, &self.roles);
             ForumPost::from_thread(thread, None, &resolver)
@@ -2267,8 +2363,7 @@ impl Server {
     /// desconocido". Los estados de canales que todavía no conocemos quedan
     /// pendientes hasta que lleguen los canales.
     pub fn apply_voice_snapshot(&mut self, states: &[crate::discord::models::VoiceState]) {
-        let mut known: std::collections::HashMap<String, VoiceOccupant> =
-            std::collections::HashMap::new();
+        let mut known: std::collections::HashMap<String, VoiceOccupant> = std::collections::HashMap::new();
         for category in &mut self.categories {
             for channel in &mut category.channels {
                 for occupant in channel.voice_members.drain(..) {
@@ -2281,7 +2376,9 @@ impl Server {
         self.pending_voice_states.clear();
 
         for state in states {
-            let Some(channel_id) = state.channel_id.as_deref() else { continue };
+            let Some(channel_id) = state.channel_id.as_deref() else {
+                continue;
+            };
             let mut occupant = self.resolved_voice_occupant(state);
             if !occupant.known {
                 if let Some(previous) = known.get(&occupant.user_id) {
@@ -2312,7 +2409,9 @@ impl Server {
     /// los canales.
     fn place_pending_voice_states(&mut self) {
         for state in std::mem::take(&mut self.pending_voice_states) {
-            let Some(channel_id) = state.channel_id.clone() else { continue };
+            let Some(channel_id) = state.channel_id.clone() else {
+                continue;
+            };
             let occupant = self.resolved_voice_occupant(&state);
             let placed = if let Some(channel) = self.channel_by_id_mut(&channel_id) {
                 channel.voice_members.push(occupant);
@@ -2331,10 +2430,7 @@ impl Server {
     /// `user_id`, pero si esa persona ya pasó por la lista de miembros (o
     /// escribió en el chat) tenemos su apodo, su nombre y su avatar, y no
     /// hace falta ir a buscarla por REST.
-    pub fn resolved_voice_occupant(
-        &self,
-        state: &crate::discord::models::VoiceState,
-    ) -> VoiceOccupant {
+    pub fn resolved_voice_occupant(&self, state: &crate::discord::models::VoiceState) -> VoiceOccupant {
         let mut occupant = VoiceOccupant::from_voice_state(state);
         let nick = self
             .member_info
@@ -2361,16 +2457,14 @@ impl Server {
     /// (conectados a voz que llegan solo como `user_id`) y actualiza ya mismo
     /// a quien de él esté en un canal de voz. Devuelve `true` si cambiaron
     /// apodo o roles, o sea si conviene repintar los mensajes.
-    pub fn learn_member(
-        &mut self,
-        user: &crate::discord::models::User,
-        nick: Option<&str>,
-        roles: &[String],
-    ) -> bool {
+    pub fn learn_member(&mut self, user: &crate::discord::models::User, nick: Option<&str>, roles: &[String]) -> bool {
         if user_is_named(user) {
             self.known_users.insert(
                 user.id.clone(),
-                KnownUser { name: user.display_name().to_string(), avatar_url: user.avatar_url() },
+                KnownUser {
+                    name: user.display_name().to_string(),
+                    avatar_url: user.avatar_url(),
+                },
             );
             self.apply_member_to_voice(user, nick);
         }
@@ -2393,11 +2487,7 @@ impl Server {
     /// Actualiza nombre y avatar de un conectado a voz con los datos reales
     /// del miembro (llegan por `GUILD_MEMBERS_CHUNK`/`GUILD_MEMBER_UPDATE`):
     /// el apodo del server si tiene, si no su nombre global.
-    pub fn apply_member_to_voice(
-        &mut self,
-        user: &crate::discord::models::User,
-        nick: Option<&str>,
-    ) {
+    pub fn apply_member_to_voice(&mut self, user: &crate::discord::models::User, nick: Option<&str>) {
         if !user_is_named(user) {
             return;
         }
@@ -2479,7 +2569,11 @@ impl Server {
                 .iter()
                 .filter_map(|e| {
                     let name = e.name.clone().filter(|n| !n.is_empty())?;
-                    Some(CustomEmoji { id: e.id.clone(), name, animated: e.animated })
+                    Some(CustomEmoji {
+                        id: e.id.clone(),
+                        name,
+                        animated: e.animated,
+                    })
                 })
                 .collect(),
             custom_stickers: guild
@@ -2514,7 +2608,7 @@ impl PrivateChannel {
         // reventaba toda la carga de `READY`. Con `.first()` nos
         // quedamos con placeholders en vez de tirar abajo la conexión.
         let recipient = dm.recipients.first();
-        Self {
+        let mut out = Self {
             channel_type: dm.channel_type,
             safety_warnings: dm.safety_warnings.clone(),
             recipients: dm.recipients.clone(),
@@ -2528,6 +2622,21 @@ impl PrivateChannel {
             username: recipient.map(|r| r.username.clone()).unwrap_or_default(),
             avatar: recipient.and_then(|r| r.avatar.clone()),
             avatar_url: recipient.and_then(crate::discord::models::User::avatar_url),
+            name: dm.name.clone(),
+            icon: dm.icon.clone(),
+            owner_id: dm.owner_id.clone(),
+        };
+        out.refresh_group_labels();
+        out
+    }
+
+    /// En un DM grupal, `username` y `avatar_url` (lo que muestra la lista de
+    /// DMs) salen del nombre y el ícono del grupo, no del primer miembro.
+    /// Llamarlo cada vez que cambian `name`, `icon` o `recipients`.
+    pub fn refresh_group_labels(&mut self) {
+        if self.is_group() {
+            self.username = self.group_display_name();
+            self.avatar_url = self.group_icon_url();
         }
     }
 }
@@ -2699,12 +2808,7 @@ fn demo_small_server(initial: &str, name: &str, color: Color32) -> Server {
             channels: vec![
                 Channel::new(
                     "general",
-                    vec![ChatMessage::them(
-                        name,
-                        "hoy",
-                        "¡Bienvenido al servidor!",
-                        color,
-                    )],
+                    vec![ChatMessage::them(name, "hoy", "¡Bienvenido al servidor!", color)],
                 ),
                 Channel::new("random", vec![]),
             ],
@@ -2731,7 +2835,7 @@ fn demo_small_server(initial: &str, name: &str, color: Color32) -> Server {
         pending_voice_states: Vec::new(),
         known_users: std::collections::HashMap::new(),
         access_ctx: Default::default(),
-            raw_channels: Vec::new(),
+        raw_channels: Vec::new(),
     }
 }
 
@@ -2776,10 +2880,7 @@ fn role_color(color: u32) -> Option<Color32> {
 /// Color del rol MÁS ALTO (mayor `position`) entre los roles con color de un
 /// miembro — la regla de Discord para pintar un nombre. `None` si ninguno de
 /// sus roles tiene color (o si no conocemos los roles del server).
-fn top_role_color(
-    roles: &[crate::discord::models::Role],
-    member_roles: &[String],
-) -> Option<Color32> {
+fn top_role_color(roles: &[crate::discord::models::Role], member_roles: &[String]) -> Option<Color32> {
     member_roles
         .iter()
         .filter_map(|id| roles.iter().find(|role| &role.id == id))
@@ -2810,8 +2911,7 @@ pub struct KnownUser {
 /// Discord pueden venir sin `username`.)
 fn user_is_named(user: &crate::discord::models::User) -> bool {
     !user.id.is_empty()
-        && (!user.username.is_empty()
-            || user.global_name.as_deref().is_some_and(|name| !name.is_empty()))
+        && (!user.username.is_empty() || user.global_name.as_deref().is_some_and(|name| !name.is_empty()))
 }
 
 /// Resuelve el nombre a mostrar y el color de un autor a partir de lo que un
@@ -2928,9 +3028,11 @@ impl Server {
 
     /// ¿Este server tiene un canal con ese id?
     pub fn has_channel(&self, channel_id: &str) -> bool {
-        self.categories
-            .iter()
-            .any(|cat| cat.channels.iter().any(|ch| ch.channel_id.as_deref() == Some(channel_id)))
+        self.categories.iter().any(|cat| {
+            cat.channels
+                .iter()
+                .any(|ch| ch.channel_id.as_deref() == Some(channel_id))
+        })
     }
 
     /// Guarda apodo y roles de un miembro. Devuelve `true` si algo cambió
@@ -2941,10 +3043,7 @@ impl Server {
             return false;
         }
         let info = MemberInfo {
-            nick: nick
-                .map(str::trim)
-                .filter(|nick| !nick.is_empty())
-                .map(str::to_owned),
+            nick: nick.map(str::trim).filter(|nick| !nick.is_empty()).map(str::to_owned),
             roles: roles.to_vec(),
         };
         if self.member_info.get(user_id) == Some(&info) {
@@ -2956,10 +3055,7 @@ impl Server {
 
     /// De `user_ids`, los que todavía no conocemos y no se pidieron antes.
     /// Los devuelve y los deja marcados como pedidos.
-    pub fn take_unresolved_members<'a>(
-        &mut self,
-        user_ids: impl IntoIterator<Item = &'a str>,
-    ) -> Vec<String> {
+    pub fn take_unresolved_members<'a>(&mut self, user_ids: impl IntoIterator<Item = &'a str>) -> Vec<String> {
         let mut missing = Vec::new();
         for id in user_ids {
             if id.is_empty() || self.member_info.contains_key(id) {
@@ -3028,8 +3124,7 @@ impl Server {
         let mut names_changed = false;
         for item in update.ops.iter().flat_map(|op| op.items.iter().chain(op.item.iter())) {
             if let Some(member) = &item.member {
-                names_changed |=
-                    self.learn_member(&member.user, member.nick.as_deref(), &member.roles);
+                names_changed |= self.learn_member(&member.user, member.nick.as_deref(), &member.roles);
             }
         }
         if names_changed {
@@ -3306,7 +3401,10 @@ mod member_list_tests {
         })));
         assert!(server.pending_list_channel.is_none());
         assert!(server.channel_shares_active_list("chan-1"));
-        assert!(!server.channel_shares_active_list("chan-2"), "un canal desconocido hay que pedirlo");
+        assert!(
+            !server.channel_shares_active_list("chan-2"),
+            "un canal desconocido hay que pedirlo"
+        );
     }
 }
 
@@ -3317,7 +3415,15 @@ mod chat_names_tests {
     use serde_json::json;
 
     fn role(id: &str, color: u32, position: i64) -> Role {
-        Role { id: id.into(), name: id.into(), color, position, hoist: false, permissions: None, mentionable: false }
+        Role {
+            id: id.into(),
+            name: id.into(),
+            color,
+            position,
+            hoist: false,
+            permissions: None,
+            mentionable: false,
+        }
     }
 
     fn server() -> Server {
@@ -3348,7 +3454,10 @@ mod chat_names_tests {
             "content": "",
             "author": { "id": "10", "username": "ana_user", "global_name": "Ana" }
         });
-        value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
         serde_json::from_value(value).expect("mensaje válido")
     }
 
@@ -3540,8 +3649,7 @@ mod voice_snapshot_tests {
 
     /// Estado de voz como llega en `READY_SUPPLEMENTAL`: solo ids, sin `member`.
     fn bare_state(user_id: &str, channel_id: &str) -> VoiceState {
-        serde_json::from_value(json!({ "user_id": user_id, "channel_id": channel_id }))
-            .expect("estado válido")
+        serde_json::from_value(json!({ "user_id": user_id, "channel_id": channel_id })).expect("estado válido")
     }
 
     fn state_with_member(user_id: &str, channel_id: &str, nick: &str) -> VoiceState {

@@ -137,10 +137,7 @@ impl VoiceVolumePercent {
     }
 
     fn from_raw_percent(value: i64) -> Self {
-        Self(value.clamp(
-            i64::from(MIN_VOICE_VOLUME_PERCENT),
-            i64::from(MAX_VOICE_VOLUME_PERCENT),
-        ) as u8)
+        Self(value.clamp(i64::from(MIN_VOICE_VOLUME_PERCENT), i64::from(MAX_VOICE_VOLUME_PERCENT)) as u8)
     }
 
     pub fn value(self) -> u8 {
@@ -210,10 +207,7 @@ impl MicrophoneBufferMs {
     }
 
     fn from_raw_ms(value: i64) -> Self {
-        Self(value.clamp(
-            i64::from(MIN_MICROPHONE_BUFFER_MS),
-            i64::from(MAX_MICROPHONE_BUFFER_MS),
-        ) as u16)
+        Self(value.clamp(i64::from(MIN_MICROPHONE_BUFFER_MS), i64::from(MAX_MICROPHONE_BUFFER_MS)) as u16)
     }
 
     pub fn value(self) -> u16 {
@@ -221,9 +215,6 @@ impl MicrophoneBufferMs {
     }
 
     pub fn frames(self, sample_rate: u32) -> u32 {
-        u32::from(self.0)
-            .saturating_mul(sample_rate)
-            .saturating_add(500)
-            / 1_000
+        u32::from(self.0).saturating_mul(sample_rate).saturating_add(500) / 1_000
     }
 }

@@ -262,8 +262,7 @@ mod tests {
     const ME: &str = "42";
     /// Lo que un @everyone normal puede hacer en el chat (sin saltarse el
     /// modo lento).
-    const CHAT_PERMS: u64 =
-        SEND_MESSAGES | ATTACH_FILES | EMBED_LINKS | READ_MESSAGE_HISTORY | ADD_REACTIONS;
+    const CHAT_PERMS: u64 = SEND_MESSAGES | ATTACH_FILES | EMBED_LINKS | READ_MESSAGE_HISTORY | ADD_REACTIONS;
 
     fn role(id: &str, perms: u64) -> Role {
         Role {
@@ -395,10 +394,7 @@ mod tests {
         assert!(a.can_view && !a.can_send && !a.can_attach && !a.can_read_history && !a.can_react);
         assert!(a.can_embed);
         // Un rol que lo vuelve a permitir.
-        let overwrites = [
-            ow(GUILD, 0, 0, SEND_MESSAGES),
-            ow("mod", 0, SEND_MESSAGES, 0),
-        ];
+        let overwrites = [ow(GUILD, 0, 0, SEND_MESSAGES), ow("mod", 0, SEND_MESSAGES, 0)];
         let a = channel_access(GUILD, &ctx(Some(vec!["mod"])), &roles(), &overwrites, false);
         assert!(a.can_send);
     }

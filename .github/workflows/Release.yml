@@ -1,15 +1,18 @@
-# Compila ecord para Windows x64 y lo publica como release de GitHub.
+# Compila eCord para Windows, Linux y macOS y publica todo en UN release de GitHub.
 #
-#   * Tag `v*`  (git tag v0.1.0 && git push origin v0.1.0)  -> compila y crea el release.
+#   * Tag `v*` (git tag v0.1.0 && git push origin v0.1.0) -> compila todo y crea el release.
 #   * A mano (Actions > Release > Run workflow):
 #       - con "tag" -> compila y crea/actualiza ese release;
-#       - sin "tag" -> solo compila y deja el zip como artefacto de la ejecución.
+#       - sin "tag" -> solo compila y deja los archivos como artefactos.
 #
-# El proyecto necesita FFmpeg (dev libs), LLVM (bindgen),
-# NASM + CMake (BoringSSL / opus) y MSVC. Es lo mismo que resuelve build.ps1,
-# pero con FFmpeg precompilado de BtbN (build "shared" LGPL, con include/ lib/
-# bin/) en vez de compilarlo con vcpkg: baja en segundos.
-# OJO: BtbN ya no publica la 7.0 (solo 8.1, 9.0 y master), asi que se usa la 8.1.
+# Salidas:
+#   Windows : .msi (WiX) + .exe (NSIS) + .zip portable
+#   Linux   : .deb (cargo-deb, dependencias automáticas con dpkg-shlibdeps)
+#   macOS   : .dmg (experimental: no bloquea el release si falla)
+#
+# Por qué un runner por sistema y no cross-compile: el proyecto enlaza FFmpeg,
+# WebKitGTK/WebView2, ALSA/Pulse y BoringSSL (nasm/cmake). Todo eso se compila
+# mucho más fácil de forma nativa.
 
 name: Release
 
@@ -32,46 +35,58 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # FFmpeg de BtbN (https://github.com/BtbN/FFmpeg-Builds/releases/tag/latest).
-  # Para cambiar de version: otro nombre de la lista de esa pagina (sin `.zip`),
-  # p. ej. ffmpeg-n9.0-latest-win64-lgpl-shared-9.0. "lgpl-shared" = DLLs + headers
-  # + .lib, sin GPL.
-  FFMPEG_ASSET: ffmpeg-n8.1-latest-win64-lgpl-shared-8.1
-  FFMPEG_DIR: C:\ffmpeg
 
 jobs:
-  windows:
-    name: Windows x64
-    runs-on: windows-latest
-    timeout-minutes: 120
+  # ---------------------------------------------------------------- versión
+  meta:
+    name: Versión
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release: ${{ steps.v.outputs.release }}
     steps:
       - uses: actions/checkout@v4
-
-      # ---- Versión / ¿hay que publicar release? ----
-      - name: Versión
-        shell: pwsh
+      - id: v
         env:
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
           INPUT_TAG: ${{ inputs.tag }}
         run: |
-          if ($env:REF_TYPE -eq 'tag') { $version = $env:REF_NAME; $release = 'true' }
-          elseif ($env:INPUT_TAG)      { $version = $env:INPUT_TAG.Trim(); $release = 'true' }
-          else                         { $version = "dev-$($env:GITHUB_SHA.Substring(0,7))"; $release = 'false' }
-          "VERSION=$version" >> $env:GITHUB_ENV
-          "RELEASE=$release" >> $env:GITHUB_ENV
-          Write-Host "Versión: $version (release: $release)"
+          if [ "$REF_TYPE" = tag ]; then v="$REF_NAME"; rel=true
+          elif [ -n "$INPUT_TAG" ]; then v="$INPUT_TAG"; rel=true
+          else v="dev-${GITHUB_SHA::7}"; rel=false; fi
+          echo "version=$v"  >> "$GITHUB_OUTPUT"
+          echo "release=$rel" >> "$GITHUB_OUTPUT"
+          # MSI/deb toman la versión de Cargo.toml: tiene que coincidir con el tag.
+          if [ "$rel" = true ]; then
+            cargo_v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+            if [ "v$cargo_v" != "$v" ]; then
+              echo "::error::El tag es $v pero Cargo.toml dice version = \"$cargo_v\". Subí la versión en Cargo.toml."
+              exit 1
+            fi
+          fi
 
-      # ---- Rust ----
+  # ---------------------------------------------------------------- Windows
+  windows:
+    name: Windows x64
+    needs: meta
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      # FFmpeg de BtbN (build "shared" LGPL con include/ lib/ bin/).
+      FFMPEG_ASSET: ffmpeg-n8.1-latest-win64-lgpl-shared-8.1
+      FFMPEG_DIR: C:\ffmpeg
+    steps:
+      - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      # ---- MSVC (INCLUDE/LIB/PATH) ----
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      # ---- FFmpeg de BtbN (con caché) ----
       - name: Caché de FFmpeg
         id: ffmpeg-cache
         uses: actions/cache@v4
@@ -88,7 +103,6 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
           $tmp = "C:\ffmpeg_tmp"
           Expand-Archive -Path $zip -DestinationPath $tmp -Force
-          # Adentro viene una carpeta con bin/ include/ lib/.
           $inner = Get-ChildItem $tmp -Directory | Select-Object -First 1
           Move-Item $inner.FullName $env:FFMPEG_DIR
           Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
@@ -97,16 +111,13 @@ jobs:
         shell: pwsh
         run: |
           foreach ($f in @("include\libavcodec\avcodec.h", "lib\avcodec.lib")) {
-            if (-not (Test-Path "$env:FFMPEG_DIR\$f")) { throw "Falta $f en $env:FFMPEG_DIR (¿cambió el layout del zip?)" }
+            if (-not (Test-Path "$env:FFMPEG_DIR\$f")) { throw "Falta $f en $env:FFMPEG_DIR" }
           }
           if (-not (Get-ChildItem "$env:FFMPEG_DIR\bin" -Filter "avcodec-*.dll")) { throw "Faltan las DLL en $env:FFMPEG_DIR\bin" }
-          Get-Content "$env:FFMPEG_DIR\include\libavutil\ffversion.h" | Select-String FFMPEG_VERSION
 
-      # ---- NASM (BoringSSL), LLVM (libclang para bindgen) y variables de build ----
       - name: Herramientas y entorno de compilación
         shell: pwsh
         run: |
-          # NASM
           $nasm = Get-Command nasm -ErrorAction SilentlyContinue
           if (-not $nasm) {
             choco install nasm -y --no-progress
@@ -117,28 +128,18 @@ jobs:
           "ASM_NASM=$($nasm.Source)" >> $env:GITHUB_ENV
           "CMAKE_ASM_NASM_COMPILER=$($nasm.Source)" >> $env:GITHUB_ENV
 
-          # LLVM / libclang
           $llvm = "C:\Program Files\LLVM\bin"
-          if (-not (Test-Path "$llvm\libclang.dll")) {
-            choco install llvm -y --no-progress
-          }
+          if (-not (Test-Path "$llvm\libclang.dll")) { choco install llvm -y --no-progress }
           if (-not (Test-Path "$llvm\libclang.dll")) { throw "No se encontró libclang.dll en $llvm" }
           "LIBCLANG_PATH=$llvm" >> $env:GITHUB_ENV
 
-          # CMake: Ninja en vez de "Visual Studio NN": el runner ya trae VS 18 (2026)
-          # y el generador de VS 17 no lo encuentra. Con el entorno de MSVC cargado
-          # por msvc-dev-cmd, Ninja usa el mismo cl.exe sin depender de la versión.
-          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
-            choco install ninja -y --no-progress
-          }
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
           "CMAKE_GENERATOR=Ninja" >> $env:GITHUB_ENV
 
-          # FFmpeg: include al frente y DLLs en el PATH
           $ffInclude = "$env:FFMPEG_DIR\include"
           "INCLUDE=$ffInclude;$env:INCLUDE" >> $env:GITHUB_ENV
           "$env:FFMPEG_DIR\bin" >> $env:GITHUB_PATH
 
-          # bindgen: mismos defines/rutas que cl.exe (ver build.ps1)
           $inc = $env:INCLUDE -split ';' | Where-Object { $_ }
           $msvcInc = $inc | Where-Object { $_ -match 'VC\\Tools\\MSVC' } | Select-Object -First 1
           $sdkInc  = $inc | Where-Object { $_ -match 'Windows Kits' }
@@ -151,26 +152,46 @@ jobs:
           foreach ($p in $sdkInc) { $clangArgs += "-I`"$p`"" }
           "BINDGEN_EXTRA_CLANG_ARGS=$($clangArgs -join ' ')" >> $env:GITHUB_ENV
 
-      # ---- Compilar ----
       - name: cargo build --release
         shell: pwsh
         run: |
-          if (Test-Path Cargo.lock) { cargo build --release --locked } else { cargo build --release }
+          cargo build --release --locked
           if ($LASTEXITCODE -ne 0) { throw "cargo build falló" }
 
-      # ---- Empaquetar: exe + DLLs de FFmpeg (y sus dependencias) ----
-      - name: Empaquetar
+      # ---- Instaladores ----
+      - name: Instalar cargo-packager
+        run: cargo install cargo-packager --locked
+
+      - name: DLLs de FFmpeg para el instalador
         shell: pwsh
         run: |
-          $name = "ecord-$env:VERSION-windows-x64"
-          $stage = "dist\$name"
+          New-Item -ItemType Directory -Force packaging\windows\dlls | Out-Null
+          Copy-Item "$env:FFMPEG_DIR\bin\*.dll" packaging\windows\dlls   # solo DLLs
+
+      - name: Generar .msi y .exe (setup)
+        shell: pwsh
+        run: |
+          # cargo-packager autodetecta packager.json en la raíz (evita --config)
+          Copy-Item packager.windows.json packager.json -Force
+          cargo packager --release
+
+      - name: Reunir archivos
+        shell: pwsh
+        run: |
+          $n = "ecord-$env:VERSION-windows-x64"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item (Get-ChildItem dist-installers -Filter *.msi | Select-Object -First 1).FullName "dist\$n.msi"
+          Copy-Item (Get-ChildItem dist-installers -Filter *-setup.exe | Select-Object -First 1).FullName "dist\$n-setup.exe"
+          # ZIP portable (exe + DLLs)
+          $stage = "stage\$n"
           New-Item -ItemType Directory -Force $stage | Out-Null
           Copy-Item target\release\ecord.exe $stage
-          Copy-Item "$env:FFMPEG_DIR\bin\*.dll" $stage  # solo DLLs (sin ffmpeg.exe/ffplay.exe)
-          Compress-Archive -Path "$stage\*" -DestinationPath "dist\$name.zip" -Force
-          $hash = (Get-FileHash "dist\$name.zip" -Algorithm SHA256).Hash.ToLower()
-          "$hash  $name.zip" | Out-File "dist\$name.zip.sha256" -Encoding ascii
-          Remove-Item $stage -Recurse -Force
+          Copy-Item "$env:FFMPEG_DIR\bin\*.dll" $stage
+          Compress-Archive -Path "$stage\*" -DestinationPath "dist\$n-portable.zip" -Force
+          Get-ChildItem dist | ForEach-Object {
+            $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$h  $($_.Name)" | Out-File "$($_.FullName).sha256" -Encoding ascii
+          }
           Get-ChildItem dist | Format-Table Name, Length
 
       - uses: actions/upload-artifact@v4
@@ -179,16 +200,112 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-      # ---- Release ----
-      - name: Publicar release
-        if: env.RELEASE == 'true'
-        uses: softprops/action-gh-release@v2
+  # ---------------------------------------------------------------- Linux
+  linux:
+    name: Linux x64 (.deb)
+    needs: meta
+    runs-on: ubuntu-24.04     # FFmpeg 6.1 (libavcodec60); el .deb quedará atado a esa versión
+    timeout-minutes: 120
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencias del sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake nasm pkg-config clang libclang-dev llvm \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev \
+            libavfilter-dev libavdevice-dev \
+            libasound2-dev libpulse-dev \
+            libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --release
+        run: cargo build --release --locked
+
+      - name: Generar .deb
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb --no-build
+          mkdir -p dist
+          cp target/debian/*.deb "dist/ecord-${VERSION}-linux-amd64.deb"
+          (cd dist && sha256sum *.deb > "ecord-${VERSION}-linux-amd64.deb.sha256")
+          dpkg-deb --info dist/*.deb | grep -i depends || true
+
+      - uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ env.VERSION }}
-          name: ecord ${{ env.VERSION }}
+          name: ecord-${{ env.VERSION }}-linux-amd64
+          path: dist/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- macOS
+  macos:
+    name: macOS arm64 (.dmg, experimental)
+    needs: meta
+    runs-on: macos-14
+    continue-on-error: true   # que un fallo acá no frene Windows/Linux
+    timeout-minutes: 120
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencias
+        run: |
+          brew install ffmpeg@7 nasm cmake pkg-config dylibbundler
+          echo "PKG_CONFIG_PATH=$(brew --prefix ffmpeg@7)/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --release
+        run: cargo build --release --locked
+
+      # Mete las dylibs de FFmpeg dentro de la app para no exigirle Homebrew al usuario.
+      - name: Embeber dylibs
+        run: |
+          mkdir -p packaging/macos/libs
+          dylibbundler -od -b -x target/release/ecord \
+            -d packaging/macos/libs -p @executable_path/../Resources/libs/
+          codesign --force --sign - target/release/ecord
+
+      - name: Generar .dmg
+        run: |
+          cargo install cargo-packager --locked
+          cp packager.macos.json packager.json
+          cargo packager --release
+          mkdir -p dist
+          cp dist-installers/*.dmg "dist/ecord-${VERSION}-macos-arm64.dmg"
+          (cd dist && shasum -a 256 *.dmg > "ecord-${VERSION}-macos-arm64.dmg.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ecord-${{ env.VERSION }}-macos-arm64
+          path: dist/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- Release
+  publish:
+    name: Publicar release
+    needs: [meta, windows, linux, macos]
+    if: needs.meta.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ecord-*
+          merge-multiple: true
+          path: dist
+      - run: ls -l dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.version }}
+          name: ecord ${{ needs.meta.outputs.version }}
           generate_release_notes: true
-          prerelease: ${{ contains(env.VERSION, '-') }}
+          prerelease: ${{ contains(needs.meta.outputs.version, '-') }}
           fail_on_unmatched_files: true
-          files: |
-            dist/*.zip
-            dist/*.sha256
+          files: dist/*

@@ -3,7 +3,7 @@
 //! Antes esto era solo RNNoise. Ahora pasa cada frame por la cadena completa de
 //! Clean Mic (`chain.rs`): pasa-altos, RNNoise, compuerta de voz, volumen
 //! automático, EQ, compresor y limitador (todo ajustable en vivo desde
-//! `ui::clean_mic_popup`, vía `discord::clean_mic`), precedida por cancelación de eco
+//! `ui::call::clean_mic_popup`, vía `discord::clean_mic`), precedida por cancelación de eco
 //! (AEC3, `echo.rs`). La API hacia `microphone.rs` no cambió.
 
 mod chain;
@@ -59,10 +59,8 @@ impl VoiceNoiseSuppressor {
             let mono_start = frame_index * FRAME;
             for sample_index in 0..FRAME {
                 let stereo_index = (mono_start + sample_index) * 2;
-                self.mono[sample_index] = (f32::from(samples[stereo_index])
-                    + f32::from(samples[stereo_index + 1]))
-                    * 0.5
-                    / 32768.0;
+                self.mono[sample_index] =
+                    (f32::from(samples[stereo_index]) + f32::from(samples[stereo_index + 1])) * 0.5 / 32768.0;
             }
 
             // Primero el eco (necesita la señal cruda), después la cadena.
@@ -78,8 +76,7 @@ impl VoiceNoiseSuppressor {
                 let stereo_index = (mono_start + sample_index) * 2;
                 let sample = (self.mono[sample_index] * 32768.0)
                     .round()
-                    .clamp(f32::from(i16::MIN), f32::from(i16::MAX))
-                    as i16;
+                    .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16;
                 samples[stereo_index] = sample;
                 samples[stereo_index + 1] = sample;
             }

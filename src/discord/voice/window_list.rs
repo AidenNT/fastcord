@@ -1,6 +1,6 @@
 //! Ventanas que se pueden transmitir con "Compartir pantalla".
 //!
-//! El selector de `ui::share_picker` las muestra y `CaptureTarget::Window`
+//! El selector de `ui::chat::share_picker` las muestra y `CaptureTarget::Window`
 //! (`screen_capture.rs`) captura por `HWND` con Windows Graphics Capture.
 //! Hoy solo hay lista en Windows; en el resto de sistemas queda vacía y el
 //! selector ofrece únicamente la pantalla completa.
@@ -85,18 +85,14 @@ mod imp {
     use std::path::Path;
 
     use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT};
-    use windows_sys::Win32::Graphics::Gdi::{
-        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
-    };
     use windows_sys::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
+    use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-        QueryFullProcessImageNameW,
+        GetCurrentProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GW_OWNER, GWL_EXSTYLE, GetWindow, GetWindowLongW, GetWindowTextLengthW,
-        GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, WS_EX_APPWINDOW,
-        WS_EX_TOOLWINDOW,
+        EnumWindows, GW_OWNER, GWL_EXSTYLE, GetWindow, GetWindowLongW, GetWindowTextLengthW, GetWindowTextW,
+        GetWindowThreadProcessId, IsIconic, IsWindowVisible, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
     };
 
     use super::{CaptureMonitor, CaptureWindow};

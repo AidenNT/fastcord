@@ -18,8 +18,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use crate::discord::fingerprint::{
-    CLIENT_BUILD_NUMBER, ClientFingerprint, discord_http_client_with_cookie_path,
-    discord_rest_headers,
+    CLIENT_BUILD_NUMBER, ClientFingerprint, discord_http_client_with_cookie_path, discord_rest_headers,
 };
 use crate::discord::models::{Channel, GatewayMessage, User, UserProfileResponse};
 use crate::paths;
@@ -79,11 +78,7 @@ impl RestClient {
     /// `RestClient::with_http` y pasale el mismo cliente que usa la
     /// sesión de auth — así las cookies que setea `/experiments` están
     /// disponibles para el REST sin esperar al debounce de persistencia.
-    pub fn new(
-        token: String,
-        fingerprint: Arc<ClientFingerprint>,
-        cookie_path: Option<PathBuf>,
-    ) -> Self {
+    pub fn new(token: String, fingerprint: Arc<ClientFingerprint>, cookie_path: Option<PathBuf>) -> Self {
         let http = discord_http_client_with_cookie_path(&fingerprint, cookie_path);
         Self::with_http(token, fingerprint, http)
     }
@@ -91,11 +86,7 @@ impl RestClient {
     /// Igual que `new`, pero reusando un `reqwest::Client` ya armado
     /// (típicamente el de `DiscordAuthSession::http()`), para que ambos
     /// compartan el mismo cookie jar.
-    pub fn with_http(
-        token: String,
-        fingerprint: Arc<ClientFingerprint>,
-        http: reqwest::Client,
-    ) -> Self {
+    pub fn with_http(token: String, fingerprint: Arc<ClientFingerprint>, http: reqwest::Client) -> Self {
         Self {
             http,
             fingerprint,
@@ -127,11 +118,7 @@ impl RestClient {
 
     /// Últimos mensajes de un canal o de un DM (`channel_id` es el mismo
     /// concepto para los dos casos en la API de Discord).
-    pub async fn channel_messages(
-        &self,
-        channel_id: &str,
-        limit: u8,
-    ) -> reqwest::Result<Vec<GatewayMessage>> {
+    pub async fn channel_messages(&self, channel_id: &str, limit: u8) -> reqwest::Result<Vec<GatewayMessage>> {
         self.request(
             reqwest::Method::GET,
             &format!("/channels/{channel_id}/messages?limit={limit}"),
@@ -186,24 +173,16 @@ impl RestClient {
     /// `message_reference` — es lo que hace que el mensaje aparezca en el
     /// cliente real como "respondiendo a" ese otro (ver el botón
     /// "Responder" de la barra al pasar el mouse, en `ui::chat`).
-    pub async fn send_message(
-        &self,
-        channel_id: &str,
-        content: &str,
-        reply_to: Option<&str>,
-    ) -> reqwest::Result<()> {
+    pub async fn send_message(&self, channel_id: &str, content: &str, reply_to: Option<&str>) -> reqwest::Result<()> {
         let mut body = serde_json::json!({ "content": content });
         if let Some(message_id) = reply_to {
             body["message_reference"] = serde_json::json!({ "message_id": message_id });
         }
-        self.request(
-            reqwest::Method::POST,
-            &format!("/channels/{channel_id}/messages"),
-        )
-        .json(&body)
-        .send()
-        .await?
-        .error_for_status()?;
+        self.request(reqwest::Method::POST, &format!("/channels/{channel_id}/messages"))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(())
     }
 
@@ -224,34 +203,19 @@ impl RestClient {
     /// amigos en común, y — si se pasa `guild_id` — su apodo y roles en
     /// ESE server puntual (Discord no los manda si no le decís desde
     /// dónde se está mirando el perfil).
-    pub async fn user_profile(
-        &self,
-        user_id: &str,
-        guild_id: Option<&str>,
-    ) -> reqwest::Result<UserProfileResponse> {
-        let mut path = format!(
-            "/users/{user_id}/profile?with_mutual_guilds=true&with_mutual_friends=true"
-        );
+    pub async fn user_profile(&self, user_id: &str, guild_id: Option<&str>) -> reqwest::Result<UserProfileResponse> {
+        let mut path = format!("/users/{user_id}/profile?with_mutual_guilds=true&with_mutual_friends=true");
         if let Some(guild_id) = guild_id {
             path.push_str(&format!("&guild_id={guild_id}"));
         }
-        self.request(reqwest::Method::GET, &path)
-            .send()
-            .await?
-            .json()
-            .await
+        self.request(reqwest::Method::GET, &path).send().await?.json().await
     }
 
     /// Pone la reacción propia con `emoji` en un mensaje
     /// (`PUT .../reactions/{emoji}/@me`). `emoji` es el emoji unicode tal
     /// cual (p.ej. "👍"); para uno personalizado del server Discord espera
     /// `nombre:id`.
-    pub async fn add_reaction(
-        &self,
-        channel_id: &str,
-        message_id: &str,
-        emoji: &str,
-    ) -> reqwest::Result<()> {
+    pub async fn add_reaction(&self, channel_id: &str, message_id: &str, emoji: &str) -> reqwest::Result<()> {
         let encoded = percent_encode_emoji(emoji);
         self.request(
             reqwest::Method::PUT,
@@ -264,12 +228,7 @@ impl RestClient {
     }
 
     /// Saca la reacción propia con `emoji` de un mensaje.
-    pub async fn remove_reaction(
-        &self,
-        channel_id: &str,
-        message_id: &str,
-        emoji: &str,
-    ) -> reqwest::Result<()> {
+    pub async fn remove_reaction(&self, channel_id: &str, message_id: &str, emoji: &str) -> reqwest::Result<()> {
         let encoded = percent_encode_emoji(emoji);
         self.request(
             reqwest::Method::DELETE,

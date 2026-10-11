@@ -36,14 +36,29 @@ struct Biquad {
 
 impl Biquad {
     fn new(b0: f32, b1: f32, b2: f32, a0: f32, a1: f32, a2: f32) -> Self {
-        Self { b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0, z1: 0.0, z2: 0.0 }
+        Self {
+            b0: b0 / a0,
+            b1: b1 / a0,
+            b2: b2 / a0,
+            a1: a1 / a0,
+            a2: a2 / a0,
+            z1: 0.0,
+            z2: 0.0,
+        }
     }
 
     fn highpass(freq: f32, q: f32) -> Self {
         let w = 2.0 * PI * freq / SAMPLE_RATE;
         let (s, c) = w.sin_cos();
         let alpha = s / (2.0 * q);
-        Self::new((1.0 + c) / 2.0, -(1.0 + c), (1.0 + c) / 2.0, 1.0 + alpha, -2.0 * c, 1.0 - alpha)
+        Self::new(
+            (1.0 + c) / 2.0,
+            -(1.0 + c),
+            (1.0 + c) / 2.0,
+            1.0 + alpha,
+            -2.0 * c,
+            1.0 - alpha,
+        )
     }
 
     fn peaking(freq: f32, q: f32, gain_db: f32) -> Self {
@@ -51,7 +66,14 @@ impl Biquad {
         let w = 2.0 * PI * freq / SAMPLE_RATE;
         let (s, c) = w.sin_cos();
         let alpha = s / (2.0 * q);
-        Self::new(1.0 + alpha * a, -2.0 * c, 1.0 - alpha * a, 1.0 + alpha / a, -2.0 * c, 1.0 - alpha / a)
+        Self::new(
+            1.0 + alpha * a,
+            -2.0 * c,
+            1.0 - alpha * a,
+            1.0 + alpha / a,
+            -2.0 * c,
+            1.0 - alpha / a,
+        )
     }
 
     fn low_shelf(freq: f32, gain_db: f32) -> Self {
@@ -205,7 +227,11 @@ impl Chain {
 
         // track the background level: falls fast, rises ~10 dB/s (so speech bursts barely move it)
         if self.noise_floor == 0.0 || level < self.noise_floor {
-            self.noise_floor = if self.noise_floor == 0.0 { level } else { self.noise_floor * 0.8 + level * 0.2 };
+            self.noise_floor = if self.noise_floor == 0.0 {
+                level
+            } else {
+                self.noise_floor * 0.8 + level * 0.2
+            };
         } else {
             self.noise_floor *= 1.0116;
         }

@@ -1,6 +1,6 @@
 //! Slash commands (comandos de aplicación `CHAT_INPUT`): modelos, catálogo y
 //! armado de la interacción. Sin UI ni red: lo que habla con Discord vive en
-//! `uwu_rest` y lo que se dibuja en `ui::slash`.
+//! `uwu_rest` y lo que se dibuja en `ui::chat::slash`.
 //!
 //! Flujo completo:
 //! 1. `GET /guilds/{id}/application-command-index` (o `/channels/{id}/...`
@@ -199,7 +199,10 @@ pub fn parse_index(value: &Value) -> CommandIndex {
                 .filter_map(|app| {
                     let id = app.get("id")?.as_str()?.to_string();
                     let text = |key: &str| {
-                        app.get(key).and_then(Value::as_str).filter(|s| !s.trim().is_empty()).map(str::to_string)
+                        app.get(key)
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.trim().is_empty())
+                            .map(str::to_string)
                     };
                     let icon_url = text("icon")
                         .map(|hash| format!("https://cdn.discordapp.com/app-icons/{id}/{hash}.png?size=64"))
@@ -209,7 +212,9 @@ pub fn parse_index(value: &Value) -> CommandIndex {
                             let bot_id = bot.get("id")?.as_str()?;
                             let hash = bot.get("avatar")?.as_str().filter(|s| !s.is_empty())?;
                             let ext = if hash.starts_with("a_") { "gif" } else { "png" };
-                            Some(format!("https://cdn.discordapp.com/avatars/{bot_id}/{hash}.{ext}?size=64"))
+                            Some(format!(
+                                "https://cdn.discordapp.com/avatars/{bot_id}/{hash}.{ext}?size=64"
+                            ))
                         });
                     Some(IndexApplication {
                         name: app.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
@@ -308,12 +313,19 @@ pub fn build_catalog(index: CommandIndex) -> SlashCatalog {
             continue;
         }
         let app = AppInfo {
-            name: apps.get(command.application_id.as_str()).map(|a| a.name.clone()).unwrap_or_default(),
-            icon_url: apps.get(command.application_id.as_str()).and_then(|a| a.icon_url.clone()),
+            name: apps
+                .get(command.application_id.as_str())
+                .map(|a| a.name.clone())
+                .unwrap_or_default(),
+            icon_url: apps
+                .get(command.application_id.as_str())
+                .and_then(|a| a.icon_url.clone()),
         };
         let command = Arc::new(command);
-        let has_subcommands =
-            command.options.iter().any(|o| o.kind == opt::SUB_COMMAND || o.kind == opt::SUB_COMMAND_GROUP);
+        let has_subcommands = command
+            .options
+            .iter()
+            .any(|o| o.kind == opt::SUB_COMMAND || o.kind == opt::SUB_COMMAND_GROUP);
         if !has_subcommands {
             entries.push(entry(
                 &command,
@@ -370,13 +382,21 @@ pub struct CachedCatalog {
 
 impl CachedCatalog {
     pub fn new(catalog: Arc<SlashCatalog>) -> Self {
-        Self { catalog, fetched: Instant::now(), ttl: Duration::from_secs(600) }
+        Self {
+            catalog,
+            fetched: Instant::now(),
+            ttl: Duration::from_secs(600),
+        }
     }
 
     /// Catálogo vacío por un pedido que falló: se reintenta en un rato corto
     /// en vez de dejar al usuario sin comandos por diez minutos.
     pub fn failed() -> Self {
-        Self { catalog: Arc::new(SlashCatalog::default()), fetched: Instant::now(), ttl: Duration::from_secs(30) }
+        Self {
+            catalog: Arc::new(SlashCatalog::default()),
+            fetched: Instant::now(),
+            ttl: Duration::from_secs(30),
+        }
     }
 
     pub fn expired(&self) -> bool {
@@ -390,7 +410,10 @@ impl CachedCatalog {
 
 /// `<@123>`, `<@!123>`, `<@&123>`, `<#123>` o `123` -> `123`.
 pub fn extract_id(raw: &str) -> Option<String> {
-    let id: String = raw.trim().trim_matches(|c: char| matches!(c, '<' | '>' | '@' | '!' | '&' | '#')).to_string();
+    let id: String = raw
+        .trim()
+        .trim_matches(|c: char| matches!(c, '<' | '>' | '@' | '!' | '&' | '#'))
+        .to_string();
     (!id.is_empty() && id.chars().all(|c| c.is_ascii_digit())).then_some(id)
 }
 
@@ -399,7 +422,11 @@ pub fn extract_id(raw: &str) -> Option<String> {
 pub fn option_value(option: &CommandOption, raw: &str) -> Result<Option<Value>, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return if option.required { Err(format!("Falta completar «{}».", option.name)) } else { Ok(None) };
+        return if option.required {
+            Err(format!("Falta completar «{}».", option.name))
+        } else {
+            Ok(None)
+        };
     }
     let value = match option.kind {
         opt::STRING => {
@@ -420,7 +447,9 @@ pub fn option_value(option: &CommandOption, raw: &str) -> Result<Option<Value>, 
             json!(n)
         }
         opt::NUMBER => {
-            let n: f64 = trimmed.parse().map_err(|_| format!("«{}» tiene que ser un número.", option.name))?;
+            let n: f64 = trimmed
+                .parse()
+                .map_err(|_| format!("«{}» tiene que ser un número.", option.name))?;
             check_range(option, n)?;
             serde_json::Number::from_f64(n)
                 .map(Value::Number)
@@ -431,9 +460,14 @@ pub fn option_value(option: &CommandOption, raw: &str) -> Result<Option<Value>, 
             "false" | "falso" | "no" => Value::Bool(false),
             _ => return Err(format!("«{}» tiene que ser verdadero o falso.", option.name)),
         },
-        opt::USER | opt::CHANNEL | opt::ROLE | opt::MENTIONABLE => Value::String(extract_id(trimmed).ok_or_else(|| {
-            format!("Elige uno de la lista en «{}» (o escribe su ID o una mención, ej. <@123…>).", option.name)
-        })?),
+        opt::USER | opt::CHANNEL | opt::ROLE | opt::MENTIONABLE => {
+            Value::String(extract_id(trimmed).ok_or_else(|| {
+                format!(
+                    "Elige uno de la lista en «{}» (o escribe su ID o una mención, ej. <@123…>).",
+                    option.name
+                )
+            })?)
+        }
         opt::ATTACHMENT => return Err("Los adjuntos de comandos todavía no están soportados.".to_string()),
         _ => Value::String(raw.to_string()),
     };
@@ -553,7 +587,11 @@ mod tests {
     #[test]
     fn options_are_nested_under_group_and_subcommand() {
         let catalog = build_catalog(index());
-        let leaf = catalog.entries.iter().find(|e| e.display == "permisos usuario ver").unwrap();
+        let leaf = catalog
+            .entries
+            .iter()
+            .find(|e| e.display == "permisos usuario ver")
+            .unwrap();
         let options = build_options(leaf, &["<@123>".to_string()]).unwrap();
         assert_eq!(
             options,

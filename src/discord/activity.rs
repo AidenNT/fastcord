@@ -1,6 +1,6 @@
 //! Cuántas requests a la API REST de Discord hay "en vuelo" ahora mismo.
 //!
-//! Lo usa la barra superior (`ui::topbar`) para mostrar un spinner mientras
+//! Lo usa la barra superior (`ui::shell::topbar`) para mostrar un spinner mientras
 //! se le está hablando a Discord. Las requests nacen en hilos de fondo
 //! (cada `spawn_*` tiene el suyo), así que el contador es global y atómico:
 //!

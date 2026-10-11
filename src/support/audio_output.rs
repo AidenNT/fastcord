@@ -124,9 +124,7 @@ where
             f32_sample_to_u64,
             build_context,
         ),
-        other => Err(format!(
-            "unsupported {unsupported_context} sample format: {other:?}"
-        )),
+        other => Err(format!("unsupported {unsupported_context} sample format: {other:?}")),
     }
 }
 
@@ -221,9 +219,9 @@ pub(crate) fn f32_sample_to_u64(sample: f32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        f32_sample_to_f64, f32_sample_to_i8, f32_sample_to_i16, f32_sample_to_i24,
-        f32_sample_to_i32, f32_sample_to_i64, f32_sample_to_u8, f32_sample_to_u16,
-        f32_sample_to_u24, f32_sample_to_u32, f32_sample_to_u64,
+        f32_sample_to_f64, f32_sample_to_i8, f32_sample_to_i16, f32_sample_to_i24, f32_sample_to_i32,
+        f32_sample_to_i64, f32_sample_to_u8, f32_sample_to_u16, f32_sample_to_u24, f32_sample_to_u32,
+        f32_sample_to_u64,
     };
 
     #[test]

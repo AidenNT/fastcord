@@ -101,10 +101,7 @@ impl AccountStore {
             if let Some(token) = legacy.token.filter(|t| legacy.logged_in && !t.is_empty()) {
                 store.upsert_token(&token);
                 if store.save() {
-                    let _ = web_local_storage_api::set_item(
-                        "current_user",
-                        r#"{"logged_in":false,"token":null}"#,
-                    );
+                    let _ = web_local_storage_api::set_item("current_user", r#"{"logged_in":false,"token":null}"#);
                 }
             }
         }
@@ -134,7 +131,9 @@ impl AccountStore {
             last_used: self.last_used.clone(),
         };
         // Una cuenta sin id ni token no sirve para nada.
-        to_write.accounts.retain(|a| !(a.user_id.is_empty() && a.token.is_none()));
+        to_write
+            .accounts
+            .retain(|a| !(a.user_id.is_empty() && a.token.is_none()));
         match serde_json::to_string_pretty(&to_write) {
             Ok(json) => crate::support::private_file::write_private_file(&path, json).is_ok(),
             Err(_) => false,

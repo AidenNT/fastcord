@@ -34,4 +34,12 @@ fn main() {
     prost_build::Config::new()
         .compile_protos(&[proto_file, frecency_file], &["proto/"])
         .expect("no se pudieron compilar los .proto de settings de Discord");
+    #[cfg(windows)]
+    {
+        println!("cargo:rerun-if-changed=assets/packaging/icon.ico");
+        let mut res = winresource::WindowsResource::new();
+        res.set_icon("assets/packaging/icon.ico");
+        res.compile()
+            .expect("no se pudo incrustar el ícono en el .exe (winresource / rc.exe)");
+    }
 }

@@ -104,7 +104,12 @@ impl Full {
                     .collect()
             })
             .unwrap_or_default();
-        Some(Self { base, activities, friends, guilds })
+        Some(Self {
+            base,
+            activities,
+            friends,
+            guilds,
+        })
     }
 }
 
@@ -133,11 +138,17 @@ pub fn show_full(app: &mut App, ui: &mut egui::Ui) {
     };
     let l_rect = Rect::from_min_max(
         pos2(modal.left() + MODAL_PAD + pad_side, modal.top() + MODAL_PAD + pad_top),
-        pos2(modal.left() + MODAL_PAD + pad_side + left_w, modal.bottom() - MODAL_PAD - pad_bottom),
+        pos2(
+            modal.left() + MODAL_PAD + pad_side + left_w,
+            modal.bottom() - MODAL_PAD - pad_bottom,
+        ),
     );
     let r_rect = Rect::from_min_max(
         pos2(l_rect.right() + pad_side + 32.0, modal.top() + MODAL_PAD + 8.0),
-        pos2((modal.right() - 72.0).max(l_rect.right() + 160.0), modal.bottom() - MODAL_PAD),
+        pos2(
+            (modal.right() - 72.0).max(l_rect.right() + 160.0),
+            modal.bottom() - MODAL_PAD,
+        ),
     );
     let radius: u8 = 18;
 
@@ -162,7 +173,8 @@ pub fn show_full(app: &mut App, ui: &mut egui::Ui) {
             let back_idx = wide.add(Shape::Noop);
 
             // -- Tarjeta izquierda --
-            ui.painter().rect_filled(l_rect, CornerRadius::same(radius), tone.bottom);
+            ui.painter()
+                .rect_filled(l_rect, CornerRadius::same(radius), tone.bottom);
             let gradient = Rect::from_min_max(
                 pos2(l_rect.left(), l_rect.top() + FULL_BANNER_H),
                 pos2(
@@ -171,9 +183,7 @@ pub fn show_full(app: &mut App, ui: &mut egui::Ui) {
                 ),
             );
             ui.painter().add(gradient_mesh(gradient, tone.top, tone.bottom));
-            let mut l_ui = ui.new_child(
-                UiBuilder::new().max_rect(l_rect).layout(Layout::top_down(Align::Min)),
-            );
+            let mut l_ui = ui.new_child(UiBuilder::new().max_rect(l_rect).layout(Layout::top_down(Align::Min)));
             l_ui.set_clip_rect(l_rect);
             egui::ScrollArea::vertical()
                 .id_salt("profile_full_left")
@@ -185,9 +195,7 @@ pub fn show_full(app: &mut App, ui: &mut egui::Ui) {
                 });
 
             // -- Columna derecha --
-            let mut r_ui = ui.new_child(
-                UiBuilder::new().max_rect(r_rect).layout(Layout::top_down(Align::Min)),
-            );
+            let mut r_ui = ui.new_child(UiBuilder::new().max_rect(r_rect).layout(Layout::top_down(Align::Min)));
             draw_right(&mut r_ui, &full, &tone, &palette, tab, r_rect.width(), &mut action);
 
             // Frame: `back` debajo de la tarjeta, `front` encima.
@@ -273,7 +281,15 @@ fn draw_left(
     let center = pos2(banner.left() + FULL_PAD + FULL_AVATAR_R + 6.0, banner.bottom());
     ui.painter().circle_filled(center, FULL_AVATAR_R + 8.0, tone.top);
     let initial = v.display_name.chars().next().unwrap_or('?').to_uppercase().to_string();
-    extra::avatar(ui, center, FULL_AVATAR_R, v.avatar_url.as_deref(), v.avatar_color, &initial, palette);
+    extra::avatar(
+        ui,
+        center,
+        FULL_AVATAR_R,
+        v.avatar_url.as_deref(),
+        v.avatar_color,
+        &initial,
+        palette,
+    );
     if let Some(url) = v.decoration_url.as_ref().filter(|_| !anim::hide_profile_images()) {
         let size = Vec2::splat(FULL_AVATAR_R * 2.0 * DECORATION_SCALE);
         let source = anim::source_animated(ui.ctx(), url, 160, None);
@@ -286,109 +302,111 @@ fn draw_left(
     }
     ui.add_space(FULL_AVATAR_R + 14.0);
 
-    Frame::new().inner_margin(Margin::symmetric(FULL_PAD as i8, 0)).show(ui, |ui| {
-        ui.set_width(w - FULL_PAD * 2.0);
+    Frame::new()
+        .inner_margin(Margin::symmetric(FULL_PAD as i8, 0))
+        .show(ui, |ui| {
+            ui.set_width(w - FULL_PAD * 2.0);
 
-        if v.loading {
-            ui.horizontal(|ui| {
-                theme::spinner(ui, 14.0, tone.dim);
-                theme::text(ui, "Cargando perfil...", theme::regular(13.0), tone.dim);
-            });
-            ui.add_space(8.0);
-        }
+            if v.loading {
+                ui.horizontal(|ui| {
+                    theme::spinner(ui, 14.0, tone.dim);
+                    theme::text(ui, "Cargando perfil...", theme::regular(13.0), tone.dim);
+                });
+                ui.add_space(8.0);
+            }
 
-        // -- Nombre, usuario, pronombres, etiqueta e insignias --
-        let name_color = v
-            .name_color
-            .map(|c| readable_on(c, tone.top, tone.text, 4.5))
-            .unwrap_or(tone.text);
-        theme::text(ui, &v.display_name, theme::bold(28.0), name_color);
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
-            if let Some(username) = &v.username_line {
-                theme::text(ui, username, theme::regular(15.0), tone.text);
-            }
-            if let Some(pronouns) = &v.pronouns {
-                if v.username_line.is_some() {
-                    theme::text(ui, "•", theme::regular(15.0), tone.dim);
-                }
-                theme::text(ui, pronouns, theme::regular(15.0), tone.text);
-            }
-            if let Some(clan) = &v.clan {
-                clan_chip(ui, tone, clan);
-            }
-            if !v.badges.is_empty() {
-                badges_pill(ui, tone, &v.badges);
-            }
-        });
-
-        // -- Botones --
-        ui.add_space(14.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            if v.is_me {
-                if solid_button(ui, tone, "Editar perfil", 130.0).clicked() {
-                    *action = Some(FullAction::EditProfile);
-                }
-            } else if solid_button(ui, tone, "Mensaje", 110.0).clicked() {
-                *action = Some(FullAction::Message);
-            }
-            let (rect, response) = ui.allocate_exact_size(Vec2::splat(38.0), Sense::click());
-            let fill = if response.hovered() { tone.stroke } else { tone.panel };
-            ui.painter().rect_filled(rect, 8.0, fill);
-            theme::paint_icon(ui, Icon::Ellipsis, rect, 16.0, tone.text);
-            let response = response
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text("Copiar ID de usuario");
-            if response.clicked() {
-                *action = Some(FullAction::CopyId);
-            }
-        });
-
-        // -- Bio --
-        if let Some(bio) = &v.bio {
-            ui.add_space(18.0);
-            markdown::show(ui, palette, bio, 14.5, tone.text, &MentionCtx::none());
-        }
-
-        // -- Miembro desde --
-        if let Some(since) = &v.member_since {
-            ui.add_space(18.0);
-            theme::text(ui, "Miembro desde", theme::semibold(13.5), tone.text);
-            ui.add_space(2.0);
-            theme::text(ui, since, theme::regular(15.0), tone.text);
-        }
-
-        // -- Roles --
-        if !v.roles.is_empty() {
-            ui.add_space(18.0);
+            // -- Nombre, usuario, pronombres, etiqueta e insignias --
+            let name_color = v
+                .name_color
+                .map(|c| readable_on(c, tone.top, tone.text, 4.5))
+                .unwrap_or(tone.text);
+            theme::text(ui, &v.display_name, theme::bold(28.0), name_color);
             ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
-                for role in &v.roles {
-                    role_chip(ui, tone, role);
+                ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
+                if let Some(username) = &v.username_line {
+                    theme::text(ui, username, theme::regular(15.0), tone.text);
+                }
+                if let Some(pronouns) = &v.pronouns {
+                    if v.username_line.is_some() {
+                        theme::text(ui, "•", theme::regular(15.0), tone.dim);
+                    }
+                    theme::text(ui, pronouns, theme::regular(15.0), tone.text);
+                }
+                if let Some(clan) = &v.clan {
+                    clan_chip(ui, tone, clan);
+                }
+                if !v.badges.is_empty() {
+                    badges_pill(ui, tone, &v.badges);
                 }
             });
-        }
 
-        // -- Conexiones --
-        if !v.connections.is_empty() {
-            ui.add_space(18.0);
-            panel(ui, tone, |ui| {
-                theme::text(ui, "CONEXIONES", theme::semibold(10.5), tone.dim);
-                ui.add_space(4.0);
-                for connection in &v.connections {
-                    ui.horizontal(|ui| {
-                        theme::icon(ui, Icon::Globe, 14.0, tone.dim);
-                        theme::text(ui, connection.name.clone(), theme::medium(13.0), tone.text);
-                        theme::text(ui, format!("· {}", connection.kind), theme::regular(12.0), tone.dim);
-                        if connection.verified {
-                            theme::icon(ui, Icon::BadgeCheck, 13.0, STATUS_ONLINE);
-                        }
-                    });
+            // -- Botones --
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if v.is_me {
+                    if solid_button(ui, tone, "Editar perfil", 130.0).clicked() {
+                        *action = Some(FullAction::EditProfile);
+                    }
+                } else if solid_button(ui, tone, "Mensaje", 110.0).clicked() {
+                    *action = Some(FullAction::Message);
+                }
+                let (rect, response) = ui.allocate_exact_size(Vec2::splat(38.0), Sense::click());
+                let fill = if response.hovered() { tone.stroke } else { tone.panel };
+                ui.painter().rect_filled(rect, 8.0, fill);
+                theme::paint_icon(ui, Icon::Ellipsis, rect, 16.0, tone.text);
+                let response = response
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text("Copiar ID de usuario");
+                if response.clicked() {
+                    *action = Some(FullAction::CopyId);
                 }
             });
-        }
-    });
+
+            // -- Bio --
+            if let Some(bio) = &v.bio {
+                ui.add_space(18.0);
+                markdown::show(ui, palette, bio, 14.5, tone.text, &MentionCtx::none());
+            }
+
+            // -- Miembro desde --
+            if let Some(since) = &v.member_since {
+                ui.add_space(18.0);
+                theme::text(ui, "Miembro desde", theme::semibold(13.5), tone.text);
+                ui.add_space(2.0);
+                theme::text(ui, since, theme::regular(15.0), tone.text);
+            }
+
+            // -- Roles --
+            if !v.roles.is_empty() {
+                ui.add_space(18.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                    for role in &v.roles {
+                        role_chip(ui, tone, role);
+                    }
+                });
+            }
+
+            // -- Conexiones --
+            if !v.connections.is_empty() {
+                ui.add_space(18.0);
+                panel(ui, tone, |ui| {
+                    theme::text(ui, "CONEXIONES", theme::semibold(10.5), tone.dim);
+                    ui.add_space(4.0);
+                    for connection in &v.connections {
+                        ui.horizontal(|ui| {
+                            theme::icon(ui, Icon::Globe, 14.0, tone.dim);
+                            theme::text(ui, connection.name.clone(), theme::medium(13.0), tone.text);
+                            theme::text(ui, format!("· {}", connection.kind), theme::regular(12.0), tone.dim);
+                            if connection.verified {
+                                theme::icon(ui, Icon::BadgeCheck, 13.0, STATUS_ONLINE);
+                            }
+                        });
+                    }
+                });
+            }
+        });
     ui.add_space(FULL_PAD);
 }
 
@@ -465,9 +483,15 @@ fn draw_right(
 
 /// Pestaña con subrayado cuando está seleccionada.
 fn tab_button(ui: &mut egui::Ui, tone: &Tone, label: &str, selected: bool) -> egui::Response {
-    let galley = ui.painter().layout_no_wrap(label.to_string(), theme::semibold(15.0), tone.text);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), theme::semibold(15.0), tone.text);
     let (rect, response) = ui.allocate_exact_size(vec2(galley.size().x, 30.0), Sense::click());
-    let color = if selected || response.hovered() { tone.text } else { tone.dim };
+    let color = if selected || response.hovered() {
+        tone.text
+    } else {
+        tone.dim
+    };
     ui.painter().galley(pos2(rect.left(), rect.top() + 2.0), galley, color);
     if selected {
         ui.painter().rect_filled(
@@ -524,7 +548,15 @@ fn friends_tab(ui: &mut egui::Ui, full: &Full, tone: &Tone, palette: &Palette, w
                 ui.spacing_mut().item_spacing.x = 12.0;
                 let (rect, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
                 let initial = friend.name.chars().next().unwrap_or('?').to_uppercase().to_string();
-                extra::avatar(ui, rect.center(), 20.0, friend.avatar_url.as_deref(), placeholder, &initial, palette);
+                extra::avatar(
+                    ui,
+                    rect.center(),
+                    20.0,
+                    friend.avatar_url.as_deref(),
+                    placeholder,
+                    &initial,
+                    palette,
+                );
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
                     theme::text(ui, &friend.name, theme::semibold(14.5), tone.text);

@@ -50,10 +50,17 @@ static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 enum Entry {
     Pending,
-    Ready { bytes: Arc<[u8]>, mime: Option<String> },
+    Ready {
+        bytes: Arc<[u8]>,
+        mime: Option<String>,
+    },
     /// `permanent` = el servidor dijo 404/410: ese archivo no existe (p. ej.
     /// Fluent no tiene ese emoji), así que no se vuelve a pedir en la sesión.
-    Failed { at: Instant, msg: String, permanent: bool },
+    Failed {
+        at: Instant,
+        msg: String,
+        permanent: bool,
+    },
 }
 
 #[derive(Default)]
@@ -147,7 +154,14 @@ impl BytesLoader for DiskCachedHttpLoader {
                     }
                     Err((msg, permanent)) => {
                         log::debug!("no se pudo bajar {url}: {msg}");
-                        inner.map.insert(url, Entry::Failed { at: Instant::now(), msg, permanent });
+                        inner.map.insert(
+                            url,
+                            Entry::Failed {
+                                at: Instant::now(),
+                                msg,
+                                permanent,
+                            },
+                        );
                     }
                 }
             }
@@ -251,7 +265,7 @@ const MAX_DECODE_PIXELS: u64 = 120_000_000;
 
 /// Si `data` es una imagen FIJA (PNG/JPEG/WebP) con un lado mayor a
 /// [`MAX_STATIC_SIDE`], la reduce y devuelve los bytes nuevos con su mime. Los
-/// GIF, APNG, WebP animados y SVG no se tocan (`ui::anim` necesita los bytes
+/// GIF, APNG, WebP animados y SVG no se tocan (`ui::chat::anim` necesita los bytes
 /// originales para animarlos), ni lo que ya es chico: en ese caso es solo
 /// mirar el encabezado. Corre en el hilo de descarga, nunca en el de la UI.
 fn shrink_if_huge(data: &[u8], mime: Option<&str>) -> Option<(Vec<u8>, String)> {
@@ -291,7 +305,9 @@ fn shrink_if_huge(data: &[u8], mime: Option<&str>) -> Option<(Vec<u8>, String)> 
                 .ok()?;
             Some((out, "image/jpeg".to_string()))
         } else {
-            small.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png).ok()?;
+            small
+                .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
+                .ok()?;
             Some((out, "image/png".to_string()))
         }
     }))
@@ -411,7 +427,9 @@ pub fn json_read(key: &str, ttl: Duration) -> Option<serde_json::Value> {
 }
 
 pub fn json_write(key: &str, value: &serde_json::Value) {
-    let Some(dir) = crate::paths::json_cache_dir() else { return };
+    let Some(dir) = crate::paths::json_cache_dir() else {
+        return;
+    };
     if let Ok(body) = serde_json::to_vec(value) {
         write_disk(&file_for(&dir, key), "", &body);
     }
@@ -419,13 +437,14 @@ pub fn json_write(key: &str, value: &serde_json::Value) {
 
 #[cfg(test)]
 mod shrink_tests {
-    use super::{shrink_if_huge, MAX_STATIC_SIDE};
+    use super::{MAX_STATIC_SIDE, shrink_if_huge};
     use std::io::Cursor;
 
     fn png(w: u32, h: u32) -> Vec<u8> {
         let img = image::RgbaImage::from_pixel(w, h, image::Rgba([10, 20, 30, 255]));
         let mut out = Vec::new();
-        img.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png).unwrap();
+        img.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
+            .unwrap();
         out
     }
 
@@ -433,7 +452,9 @@ mod shrink_tests {
     fn shrinks_big_static_images_keeping_aspect() {
         let (bytes, mime) = shrink_if_huge(&png(2048, 512), Some("image/png")).unwrap();
         assert_eq!(mime, "image/png");
-        let (w, h) = image::load_from_memory(&bytes).map(|i| (i.width(), i.height())).unwrap();
+        let (w, h) = image::load_from_memory(&bytes)
+            .map(|i| (i.width(), i.height()))
+            .unwrap();
         assert_eq!(w, MAX_STATIC_SIDE);
         assert_eq!(h, MAX_STATIC_SIDE / 4);
     }

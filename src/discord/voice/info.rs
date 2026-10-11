@@ -23,13 +23,6 @@ impl VoiceScope {
         }
     }
 
-    pub fn private_channel_id(self) -> Option<Id<ChannelMarker>> {
-        match self {
-            Self::Private(channel_id) => Some(channel_id),
-            Self::Guild(_) => None,
-        }
-    }
-
     /// `server_id` de IDENTIFY: el guild id para voz de servidor, el channel
     /// id del DM para una llamada privada.
     pub fn server_id_string(self) -> String {
@@ -42,10 +35,7 @@ impl VoiceScope {
     /// Deriva un scope de un par `(guild_id, channel_id)`. Un guild gana; una
     /// llamada privada se indexa por su canal; ninguno presente (salida de
     /// un DM) da `None`.
-    fn from_ids(
-        guild_id: Option<Id<GuildMarker>>,
-        channel_id: Option<Id<ChannelMarker>>,
-    ) -> Option<Self> {
+    fn from_ids(guild_id: Option<Id<GuildMarker>>, channel_id: Option<Id<ChannelMarker>>) -> Option<Self> {
         match (guild_id, channel_id) {
             (Some(guild_id), _) => Some(Self::Guild(guild_id)),
             (None, Some(channel_id)) => Some(Self::Private(channel_id)),
@@ -84,10 +74,7 @@ impl fmt::Debug for VoiceStateInfo {
             .field("guild_id", &self.guild_id)
             .field("channel_id", &self.channel_id)
             .field("user_id", &self.user_id)
-            .field(
-                "session_id",
-                &self.session_id.as_ref().map(|_| "<redacted>"),
-            )
+            .field("session_id", &self.session_id.as_ref().map(|_| "<redacted>"))
             .field("member", &self.member)
             .field("deaf", &self.deaf)
             .field("mute", &self.mute)

@@ -88,7 +88,9 @@ fn load() -> Option<Store> {
 }
 
 fn write(store: &Store) {
-    let Some(path) = crate::paths::last_view_file() else { return };
+    let Some(path) = crate::paths::last_view_file() else {
+        return;
+    };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -183,7 +185,11 @@ pub fn record_position(channel_id: &str, pos: Option<(String, f32)>) {
             }
             rt.store.positions.insert(
                 channel_id.to_string(),
-                Position { message_id, offset, at: now_secs() },
+                Position {
+                    message_id,
+                    offset,
+                    at: now_secs(),
+                },
             );
             if rt.store.positions.len() > MAX_POSITIONS {
                 // Se descartan las más viejas.

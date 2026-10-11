@@ -1,0 +1,14 @@
+{
+  "productName": "eCord",
+  "identifier": "dev.ecord.client",
+  "description": "Cliente de Discord no oficial hecho en Rust con egui",
+  "authors": ["eCord contributors"],
+  "licenseFile": "LICENSE",
+  "category": "SocialNetworking",
+  "outDir": "dist-installers",
+  "binariesDir": "target/release",
+  "binaries": [{ "path": "ecord", "main": true }],
+  "icons": ["assets/packaging/icon.icns"],
+  "formats": ["dmg"],
+  "resources": [{ "src": "packaging/macos/libs/*.dylib", "target": "libs" }]
+}

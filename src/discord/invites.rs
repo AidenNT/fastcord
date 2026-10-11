@@ -6,7 +6,7 @@
 //! si la invitación venció o no existe, la tarjeta "Invitación no válida".
 //!
 //! Este módulo hace la parte de datos (la parte visual vive en
-//! `ui::invite_card`):
+//! `ui::server::invite_card`):
 //!
 //! * [`extract_codes`] saca los códigos de invitación de un texto.
 //! * [`lookup`] devuelve el estado de un código desde una caché global y,
@@ -77,6 +77,9 @@ static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 static SESSION_ID: Mutex<Option<String>> = Mutex::new(None);
 static JOINS: OnceLock<Mutex<HashMap<String, JoinState>>> = OnceLock::new();
 static GOTO: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+/// Formulario de ingreso que el server pide tras unirte (reglas / preguntas),
+/// esperando a que `App` lo muestre (ver [`take_join_form`]).
+static JOIN_FORM: Mutex<Option<super::join_form::JoinForm>> = Mutex::new(None);
 /// Cuánto se espera a que un server recién unido aparezca en la lista
 /// (llega por el gateway, `GUILD_CREATE`) antes de abandonar el "ir a".
 const GOTO_TIMEOUT: Duration = Duration::from_secs(15);
@@ -102,6 +105,13 @@ pub fn poll_goto(find: impl FnOnce(&str) -> Option<usize>) -> Option<usize> {
         *guard = None;
     }
     None
+}
+
+/// Si el server al que acabas de unirte pide un formulario de ingreso, lo
+/// entrega (una sola vez). `App` lo consulta en cada frame y lo muestra en
+/// `ui::shell::overlay::show_join_form`.
+pub fn take_join_form() -> Option<super::join_form::JoinForm> {
+    JOIN_FORM.lock().unwrap_or_else(|p| p.into_inner()).take()
 }
 
 /// Estado del botón de la tarjeta.
@@ -134,6 +144,8 @@ pub fn join_state(code: &str) -> JoinState {
 /// pide captcha, `UwuRest` abre la ventana y espera a la persona; al
 /// terminar bien, `is_joined` pasa a `true` y la tarjeta dice "Ir al
 /// servidor".
+/// Si el server pide un formulario de ingreso, queda disponible en
+/// [`take_join_form`].
 pub fn start_join(ctx: &egui::Context, info: &InviteInfo) {
     if join_state(&info.code) == JoinState::Joining {
         return;
@@ -160,14 +172,34 @@ pub fn start_join(ctx: &egui::Context, info: &InviteInfo) {
             rt.block_on(async {
                 let rest = super::uwu_rest::UwuRest::for_token(token).await?;
                 rest.join_invite(&info.code, &session_id, guild_id, channel_id, info.channel_type)
-                    .await
-                    .map(|_| ())
+                    .await?;
+                // Ya estás adentro. Si el server pide aceptar reglas o contestar
+                // preguntas antes de dejarte participar, se pide el formulario
+                // para mostrarlo; si falla o no hay, igual quedaste unido.
+                match rest.get_join_form(&info.guild_id, &info.code).await {
+                    Ok(Some(value)) => {
+                        let form = super::join_form::JoinForm::from_value(
+                            &value,
+                            &info.guild_id,
+                            &info.name,
+                            info.icon_url.clone(),
+                        );
+                        if let Some(form) = form {
+                            *JOIN_FORM.lock().unwrap_or_else(|p| p.into_inner()) = Some(form);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => log::warn!("No se pudo pedir el formulario de ingreso de {}: {e}", info.guild_id),
+                }
+                Ok::<(), anyhow::Error>(())
             })
         })();
         match result {
             Ok(()) => {
                 let cell = JOINED.get_or_init(|| Mutex::new(HashSet::new()));
-                cell.lock().unwrap_or_else(|p| p.into_inner()).insert(info.guild_id.clone());
+                cell.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(info.guild_id.clone());
                 joins().remove(&info.code);
             }
             Err(e) => {
@@ -283,7 +315,10 @@ pub fn lookup(ctx: &egui::Context, code: &str) -> InviteState {
 
     cache().insert(
         code.to_string(),
-        Entry { state: InviteState::Loading, at: Instant::now() },
+        Entry {
+            state: InviteState::Loading,
+            at: Instant::now(),
+        },
     );
     IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
 
@@ -291,7 +326,13 @@ pub fn lookup(ctx: &egui::Context, code: &str) -> InviteState {
     let ctx = ctx.clone();
     std::thread::spawn(move || {
         let state = fetch(token, &code);
-        cache().insert(code, Entry { state, at: Instant::now() });
+        cache().insert(
+            code,
+            Entry {
+                state,
+                at: Instant::now(),
+            },
+        );
         IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
         ctx.request_repaint();
     });
@@ -307,7 +348,9 @@ fn fetch(token: String, code: &str) -> InviteState {
         rest.get_invite(code).await
     });
     match result {
-        Ok(value) => parse_invite(&value).map(InviteState::Ready).unwrap_or(InviteState::Invalid),
+        Ok(value) => parse_invite(&value)
+            .map(InviteState::Ready)
+            .unwrap_or(InviteState::Invalid),
         Err(e) => {
             if is_unknown_invite(&e) {
                 InviteState::Invalid

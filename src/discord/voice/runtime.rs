@@ -49,9 +49,7 @@ impl VoiceRuntimeState {
         match event {
             VoiceRuntimeEvent::Requested(requested) => {
                 let target_changed = match (self.requested, requested) {
-                    (Some(current), Some(next)) => {
-                        current.scope != next.scope || current.channel_id != next.channel_id
-                    }
+                    (Some(current), Some(next)) => current.scope != next.scope || current.channel_id != next.channel_id,
                     (None, None) => false,
                     _ => true,
                 };
@@ -62,9 +60,9 @@ impl VoiceRuntimeState {
                     self.blocked = None;
                 }
                 if let Some(next) = requested
-                    && self.requested.is_some_and(|current| {
-                        current.scope != next.scope || current.channel_id != next.channel_id
-                    })
+                    && self
+                        .requested
+                        .is_some_and(|current| current.scope != next.scope || current.channel_id != next.channel_id)
                 {
                     self.server = None;
                 }
@@ -99,8 +97,7 @@ impl VoiceRuntimeState {
                     };
                 }
                 self.audio_sources = sources;
-                self.audio_sources_generation =
-                    self.audio_sources_generation.wrapping_add(1).max(1);
+                self.audio_sources_generation = self.audio_sources_generation.wrapping_add(1).max(1);
                 return VoiceRuntimeApplyResult {
                     action: None,
                     participant_playback_changed,
@@ -139,23 +136,17 @@ impl VoiceRuntimeState {
             VoiceRuntimeEvent::ReplaceParticipantPlaybackSettings(settings) => {
                 let settings = settings
                     .into_iter()
-                    .filter(|(_, settings)| {
-                        *settings != VoiceParticipantPlaybackSettings::default()
-                    })
+                    .filter(|(_, settings)| *settings != VoiceParticipantPlaybackSettings::default())
                     .collect();
                 participant_playback_changed = self.participant_playback_settings != settings;
                 self.participant_playback_settings = settings;
             }
             VoiceRuntimeEvent::UpdateParticipantPlaybackSettings { user_id, settings } => {
                 if settings == VoiceParticipantPlaybackSettings::default() {
-                    participant_playback_changed = self
-                        .participant_playback_settings
-                        .remove(&user_id)
-                        .is_some();
+                    participant_playback_changed = self.participant_playback_settings.remove(&user_id).is_some();
                 } else {
                     participant_playback_changed =
-                        self.participant_playback_settings.insert(user_id, settings)
-                            != Some(settings);
+                        self.participant_playback_settings.insert(user_id, settings) != Some(settings);
                 }
             }
             VoiceRuntimeEvent::CurrentUserReady(user_id) => {
@@ -205,13 +196,7 @@ impl VoiceRuntimeState {
                     .active
                     .as_ref()
                     .filter(|active| {
-                        active.matches_connection_end(
-                            connection_id,
-                            scope,
-                            channel_id,
-                            &session_id,
-                            &endpoint,
-                        )
+                        active.matches_connection_end(connection_id, scope, channel_id, &session_id, &endpoint)
                     })
                     .cloned()
                 {
@@ -279,9 +264,7 @@ impl VoiceRuntimeState {
         if state.scope() != Some(requested.scope) {
             return None;
         }
-        let session_id = state
-            .session_id
-            .filter(|session_id| !session_id.is_empty())?;
+        let session_id = state.session_id.filter(|session_id| !session_id.is_empty())?;
         self.current_voice = Some(ObservedSelfVoiceState {
             scope: requested.scope,
             channel_id,
@@ -373,29 +356,19 @@ impl VoiceRuntimeState {
     }
 }
 
-pub(crate) fn forward_app_event(
-    sender: &mpsc::UnboundedSender<VoiceRuntimeEvent>,
-    event: &AppEvent,
-) {
+pub(crate) fn forward_app_event(sender: &mpsc::UnboundedSender<VoiceRuntimeEvent>, event: &AppEvent) {
     let runtime_event = match event {
-        AppEvent::Ready(ready) => {
-            VoiceRuntimeEvent::CurrentUserReady(state::parse_user_id(&ready.user.id))
-        }
+        AppEvent::Ready(ready) => VoiceRuntimeEvent::CurrentUserReady(state::parse_user_id(&ready.user.id)),
         AppEvent::VoiceStateUpdate(state) => match voice_state_info_from_wire(state) {
             Some(info) => VoiceRuntimeEvent::VoiceState(info),
             None => return,
         },
-        AppEvent::VoiceServerUpdate(server) => {
-            VoiceRuntimeEvent::VoiceServer(VoiceServerInfo {
-                guild_id: server.guild_id.as_deref().and_then(state::parse_guild_id),
-                channel_id: server
-                    .channel_id
-                    .as_deref()
-                    .and_then(state::parse_channel_id),
-                endpoint: server.endpoint.clone(),
-                token: server.token.clone(),
-            })
-        }
+        AppEvent::VoiceServerUpdate(server) => VoiceRuntimeEvent::VoiceServer(VoiceServerInfo {
+            guild_id: server.guild_id.as_deref().and_then(state::parse_guild_id),
+            channel_id: server.channel_id.as_deref().and_then(state::parse_channel_id),
+            endpoint: server.endpoint.clone(),
+            token: server.token.clone(),
+        }),
         _ => return,
     };
     let _ = sender.send(runtime_event);
@@ -413,10 +386,7 @@ fn voice_state_info_from_wire(state: &crate::discord::models::VoiceState) -> Opt
         channel_id: state.channel_id.as_deref().and_then(state::parse_channel_id),
         user_id,
         session_id: state.session_id.clone(),
-        member: Some(MemberInfo {
-            user_id,
-            display_name,
-        }),
+        member: Some(MemberInfo { user_id, display_name }),
         deaf: state.deaf,
         mute: state.mute,
         self_deaf: state.self_deaf,
@@ -436,9 +406,8 @@ pub(crate) async fn run_voice_runtime(
     let mut audio_sources_tx: Option<watch::Sender<VoiceAudioSourceSelection>> = None;
     let mut capture_gate_tx: Option<mpsc::UnboundedSender<VoiceCaptureGate>> = None;
     let mut playback_gate_tx: Option<mpsc::UnboundedSender<VoicePlaybackGate>> = None;
-    let mut participant_playback_tx: Option<
-        watch::Sender<HashMap<Id<UserMarker>, VoiceParticipantPlaybackSettings>>,
-    > = None;
+    let mut participant_playback_tx: Option<watch::Sender<HashMap<Id<UserMarker>, VoiceParticipantPlaybackSettings>>> =
+        None;
 
     while let Some(event) = events.recv().await {
         let shutdown = matches!(event, VoiceRuntimeEvent::Shutdown);
@@ -459,11 +428,7 @@ pub(crate) async fn run_voice_runtime(
                     .as_ref()
                     .is_some_and(|active| active.connection_id == *connection_id) =>
             {
-                Some((
-                    requested_sources.clone(),
-                    active_sources.clone(),
-                    message.clone(),
-                ))
+                Some((requested_sources.clone(), active_sources.clone(), message.clone()))
             }
             _ => None,
         };
@@ -496,8 +461,7 @@ pub(crate) async fn run_voice_runtime(
                     }
                     let (next_capture_gate_tx, capture_gate_rx) = mpsc::unbounded_channel();
                     let (next_playback_gate_tx, playback_gate_rx) = mpsc::unbounded_channel();
-                    let (next_audio_sources_tx, audio_sources_rx) =
-                        watch::channel(state.audio_source_selection());
+                    let (next_audio_sources_tx, audio_sources_rx) = watch::channel(state.audio_source_selection());
                     let (next_participant_playback_tx, participant_playback_rx) =
                         watch::channel(state.participant_playback_settings.clone());
                     capture_gate_tx = Some(next_capture_gate_tx);
@@ -514,11 +478,10 @@ pub(crate) async fn run_voice_runtime(
                         microphone_sensitivity: MicrophoneSensitivityDb::default(),
                         microphone_volume: VoiceVolumePercent::default(),
                     });
-                    let initial_playback_gate =
-                        state.playback_gate().unwrap_or(VoicePlaybackGate {
-                            enabled: true,
-                            volume: VoiceVolumePercent::default(),
-                        });
+                    let initial_playback_gate = state.playback_gate().unwrap_or(VoicePlaybackGate {
+                        enabled: true,
+                        volume: VoiceVolumePercent::default(),
+                    });
                     connection_session = Some(session.clone());
                     connection_task = Some(tokio::spawn(run_voice_gateway_session(
                         session,
@@ -559,14 +522,10 @@ pub(crate) async fn run_voice_runtime(
             playback_gate_tx = None;
             participant_playback_tx = None;
         }
-        if let (Some(capture_gate_tx), Some(capture_gate)) =
-            (capture_gate_tx.as_ref(), state.capture_gate())
-        {
+        if let (Some(capture_gate_tx), Some(capture_gate)) = (capture_gate_tx.as_ref(), state.capture_gate()) {
             let _ = capture_gate_tx.send(capture_gate);
         }
-        if let (Some(playback_gate_tx), Some(playback_gate)) =
-            (playback_gate_tx.as_ref(), state.playback_gate())
-        {
+        if let (Some(playback_gate_tx), Some(playback_gate)) = (playback_gate_tx.as_ref(), state.playback_gate()) {
             let _ = playback_gate_tx.send(playback_gate);
         }
         if !connected_this_event
@@ -632,4 +591,3 @@ pub(super) async fn stop_voice_connection_task(
         }
     }
 }
-

@@ -1,3 +1,8 @@
 target/
-Cargo.lock
 vcpkg_*
+dist/
+dist-installers/
+packaging/windows/dlls/
+packaging/bundle-libs/
+packaging/macos/libs/
+stage/

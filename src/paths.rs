@@ -16,11 +16,7 @@ const APP_NAME: &str = "ecord";
 
 fn state_dir() -> Option<PathBuf> {
     let dirs = ProjectDirs::from("", "", APP_NAME)?;
-    Some(
-        dirs.state_dir()
-            .unwrap_or_else(|| dirs.data_local_dir())
-            .to_path_buf(),
-    )
+    Some(dirs.state_dir().unwrap_or_else(|| dirs.data_local_dir()).to_path_buf())
 }
 
 /// Carpeta de caché (borrable sin perder nada): imágenes y JSON bajados.
@@ -29,7 +25,7 @@ fn cache_dir() -> Option<PathBuf> {
 }
 
 /// Videos cortos (GIFs de Tenor/Giphy en mp4) ya bajados, listos para que
-/// ffmpeg los abra desde disco (`ui::video_player::local_video`).
+/// ffmpeg los abra desde disco (`ui::chat::video_player::local_video`).
 pub fn video_cache_dir() -> Option<PathBuf> {
     cache_dir().map(|dir| dir.join("video"))
 }

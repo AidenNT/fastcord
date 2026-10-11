@@ -54,7 +54,10 @@ fn client() -> Result<&'static wreq::Client, wreq::Error> {
     if let Some(client) = CLIENT.get() {
         return Ok(client);
     }
-    let emulation = Emulation::builder().profile(Profile::Chrome149).platform(Platform::Windows).build();
+    let emulation = Emulation::builder()
+        .profile(Profile::Chrome149)
+        .platform(Platform::Windows)
+        .build();
     let mut builder = wreq::Client::builder()
         .emulation(emulation)
         .gzip(true)

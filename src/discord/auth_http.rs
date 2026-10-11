@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use super::fingerprint::{
-    CLIENT_BUILD_NUMBER, ClientFingerprint, DISCORD_ORIGIN, discord_api_request_headers,
-    discord_http_client, insert_fingerprint_header,
+    CLIENT_BUILD_NUMBER, ClientFingerprint, DISCORD_ORIGIN, discord_api_request_headers, discord_http_client,
+    insert_fingerprint_header,
 };
 
 pub(super) const DISCORD_LOGIN_REFERER: &str = "https://discord.com/login";
@@ -29,10 +29,6 @@ impl DiscordAuthSession {
 
     pub(crate) fn fingerprint(&self) -> &ClientFingerprint {
         &self.fingerprint
-    }
-
-    pub(crate) fn fingerprint_arc(&self) -> Arc<ClientFingerprint> {
-        Arc::clone(&self.fingerprint)
     }
 
     pub(crate) fn http(&self) -> reqwest::Client {
@@ -82,9 +78,7 @@ mod tests {
             Some(DISCORD_ORIGIN)
         );
         assert_eq!(
-            login
-                .get(CACHE_CONTROL)
-                .and_then(|value| value.to_str().ok()),
+            login.get(CACHE_CONTROL).and_then(|value| value.to_str().ok()),
             Some("no-cache")
         );
         assert_eq!(

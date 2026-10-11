@@ -17,8 +17,8 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Puerto local reservado para esto.
@@ -58,9 +58,7 @@ pub fn acquire() -> Role {
             if ask_running_instance_to_focus() {
                 Role::Secondary
             } else {
-                log::warn!(
-                    "el puerto {PORT} está ocupado por otro programa: ecord arranca sin límite de instancias"
-                );
+                log::warn!("el puerto {PORT} está ocupado por otro programa: ecord arranca sin límite de instancias");
                 Role::Primary
             }
         }

@@ -19,18 +19,17 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering as AtomicOrdering};
 
 use super::dave::handles_gateway_json_op;
 use super::gateway::{
-    choose_encryption_mode, discover_voice_udp_address, parse_udp_ping_response,
-    parse_voice_binary_frame, parse_voice_ready_payload, parse_voice_session_description,
-    run_voice_heartbeat, run_voice_udp_ping, send_voice_text, voice_gateway_opcode,
-    voice_gateway_url,
+    choose_encryption_mode, discover_voice_udp_address, parse_udp_ping_response, parse_voice_binary_frame,
+    parse_voice_ready_payload, parse_voice_session_description, run_voice_heartbeat, run_voice_udp_ping,
+    send_voice_text, voice_gateway_opcode, voice_gateway_url,
 };
 use super::h264::{H264Depacketizer, RtpReorderBuffer, RtpVideoPacket};
-use super::video_decode::H264Decoder;
-use super::*;
 #[cfg(feature = "voice-playback")]
 use super::opus::VoiceDecodedAudioOutput;
 #[cfg(feature = "voice-playback")]
 use super::playback::VoiceAudioOutput;
+use super::video_decode::H264Decoder;
+use super::*;
 
 /// Payload types que se anuncian en `SELECT_PROTOCOL`. Coinciden con los que
 /// anuncian los clientes oficiales para Opus (120) y H.264 (101, RTX 102).
@@ -222,10 +221,7 @@ pub(crate) fn spawn_stream_watch(
     let spawned = std::thread::Builder::new()
         .name("stream-watch".to_owned())
         .spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
+            let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     publish_status(
@@ -285,12 +281,7 @@ async fn run_stream_watch(
     stop_rx: watch::Receiver<bool>,
 ) {
     logging::debug("stream", format!("stream watch starting: {params:?}"));
-    publish_status(
-        &events,
-        &params.stream_key,
-        StreamWatchStatus::Connecting,
-        None,
-    );
+    publish_status(&events, &params.stream_key, StreamWatchStatus::Connecting, None);
     match watch_stream_session(&params, &events, &frames, &audio, &repaint, stop_rx).await {
         Ok(()) => {
             logging::debug("stream", "stream watch ended");
@@ -298,12 +289,7 @@ async fn run_stream_watch(
         }
         Err(error) => {
             logging::error("stream", &error);
-            publish_status(
-                &events,
-                &params.stream_key,
-                StreamWatchStatus::Failed,
-                Some(error),
-            );
+            publish_status(&events, &params.stream_key, StreamWatchStatus::Failed, Some(error));
         }
     }
 }
@@ -354,8 +340,7 @@ async fn watch_stream_session(
     )?));
     let last_sequence: Arc<Mutex<Option<i64>>> = Arc::new(Mutex::new(None));
     let heartbeat_ack = Arc::new(Mutex::new(VoiceHeartbeatAckState::default()));
-    let (heartbeat_timeout_tx, mut heartbeat_timeout_rx) =
-        mpsc::unbounded_channel::<VoiceHeartbeatTimeout>();
+    let (heartbeat_timeout_tx, mut heartbeat_timeout_rx) = mpsc::unbounded_channel::<VoiceHeartbeatTimeout>();
 
     // Decodificación en un hilo de SO aparte: es CPU pesado y no debe frenar
     // la lectura del socket. Termina sola cuando se sueltan todos los
@@ -375,8 +360,7 @@ async fn watch_stream_session(
     // mientras dure la sesión (si se suelta, se corta el sonido), y vive acá
     // —no en la tarea de recepción— porque el stream de cpal no es `Send`.
     #[cfg(feature = "voice-playback")]
-    let (_stream_audio_output, stream_audio_sink) =
-        open_stream_audio(audio, params.output_source.as_deref());
+    let (_stream_audio_output, stream_audio_sink) = open_stream_audio(audio, params.output_source.as_deref());
     #[cfg(not(feature = "voice-playback"))]
     let (stream_audio_sink, _) = ((), audio);
 
@@ -447,29 +431,19 @@ async fn watch_stream_session(
                         our_ssrc = ready.ssrc;
                         let mode = choose_encryption_mode(&ready.modes)?;
                         let (socket, discovered) = discover_voice_udp_address(&ready).await?;
-                        send_voice_text(
-                            &writer,
-                            stream_select_protocol_payload(&discovered, &mode),
-                        )
-                        .await?;
+                        send_voice_text(&writer, stream_select_protocol_payload(&discovered, &mode)).await?;
                         tasks.push(tokio::spawn(run_voice_udp_ping(Arc::clone(&socket))));
                         udp_socket = Some(socket);
                     }
                     VOICE_OP_SESSION_DESCRIPTION => {
                         let description = parse_voice_session_description(&value)?;
-                        logging::debug(
-                            "stream",
-                            format!("stream session description: {description:?}"),
-                        );
+                        logging::debug("stream", format!("stream session description: {description:?}"));
                         dave_state
                             .lock()
                             .await
                             .apply_protocol_version(description.dave_protocol_version)?;
                         let Some(socket) = udp_socket.as_ref() else {
-                            return Err(
-                                "stream session description arrived before the UDP transport"
-                                    .to_owned(),
-                            );
+                            return Err("stream session description arrived before the UDP transport".to_owned());
                         };
                         // Un session description repetido no reinicia la
                         // recepción: solo el primero arranca la tarea.
@@ -487,12 +461,7 @@ async fn watch_stream_session(
                             )));
                             // "Quiero cualquier stream, calidad máxima."
                             send_voice_text(&writer, stream_sink_wants_payload()).await?;
-                            publish_status(
-                                events,
-                                &params.stream_key,
-                                StreamWatchStatus::Connected,
-                                None,
-                            );
+                            publish_status(events, &params.stream_key, StreamWatchStatus::Connected, None);
                         }
                     }
                     VOICE_OP_VIDEO => {
@@ -500,11 +469,7 @@ async fn watch_stream_session(
                     }
                     other => {
                         if handles_gateway_json_op(other) {
-                            dave_state
-                                .lock()
-                                .await
-                                .handle_json_op(&writer, other, &value)
-                                .await?;
+                            dave_state.lock().await.handle_json_op(&writer, other, &value).await?;
                         } else {
                             logging::debug("stream", format!("unhandled stream gateway op={other}"));
                         }
@@ -514,11 +479,7 @@ async fn watch_stream_session(
             WsMessage::Binary(payload) => {
                 let frame = parse_voice_binary_frame(&payload)?;
                 *last_sequence.lock().await = Some(frame.sequence);
-                dave_state
-                    .lock()
-                    .await
-                    .handle_binary_frame(&writer, frame)
-                    .await?;
+                dave_state.lock().await.handle_binary_frame(&writer, frame).await?;
             }
             WsMessage::Ping(payload) => {
                 let mut writer = writer.lock().await;
@@ -749,19 +710,13 @@ async fn run_stream_video_receive(
             let Some(access_unit) = depacketizer.push(&video_packet) else {
                 continue;
             };
-            let decrypted = dave_state
-                .lock()
-                .await
-                .decrypt_video_frame(owner_user_id, &access_unit);
+            let decrypted = dave_state.lock().await.decrypt_video_frame(owner_user_id, &access_unit);
             let frame = match decrypted {
                 Ok(Some(frame)) => frame,
                 Ok(None) => {
                     dave_pending = dave_pending.saturating_add(1);
                     if dave_pending == 1 || dave_pending.is_multiple_of(200) {
-                        logging::debug(
-                            "stream",
-                            format!("stream frame waiting for DAVE: count={dave_pending}"),
-                        );
+                        logging::debug("stream", format!("stream frame waiting for DAVE: count={dave_pending}"));
                     }
                     continue;
                 }
@@ -782,10 +737,7 @@ async fn run_stream_video_receive(
                     if frames_sent == 1 {
                         logging::debug("stream", "first stream frame queued for decoding");
                     } else if frames_sent.is_multiple_of(300) {
-                        logging::debug(
-                            "stream",
-                            format!("stream frames queued for decoding: {frames_sent}"),
-                        );
+                        logging::debug("stream", format!("stream frames queued for decoding: {frames_sent}"));
                     }
                 }
                 Err(std::sync::mpsc::TrySendError::Full(_)) => {
@@ -810,17 +762,13 @@ async fn run_stream_video_receive(
             && last_pli.is_none_or(|at| at.elapsed() >= PLI_MIN_INTERVAL)
         {
             last_pli = Some(Instant::now());
-            match send_keyframe_request(&socket, encryptor, &mut rtcp_nonce, sender_ssrc, video_ssrc)
-                .await
-            {
+            match send_keyframe_request(&socket, encryptor, &mut rtcp_nonce, sender_ssrc, video_ssrc).await {
                 Ok(()) => {
                     plis_sent = plis_sent.saturating_add(1);
                     if plis_sent <= 5 || plis_sent.is_multiple_of(20) {
                         logging::debug(
                             "stream",
-                            format!(
-                                "keyframe requested (PLI): count={plis_sent} frames_sent={frames_sent}"
-                            ),
+                            format!("keyframe requested (PLI): count={plis_sent} frames_sent={frames_sent}"),
                         );
                     }
                 }
@@ -841,11 +789,8 @@ fn open_stream_audio(
     output_source: Option<&str>,
 ) -> (Option<VoiceAudioOutput>, VoiceDecodedAudioOutput) {
     let sink = VoiceDecodedAudioOutput::default();
-    let output = match VoiceAudioOutput::start(
-        Arc::clone(&control.enabled),
-        Arc::clone(&control.volume),
-        output_source,
-    ) {
+    let output = match VoiceAudioOutput::start(Arc::clone(&control.enabled), Arc::clone(&control.volume), output_source)
+    {
         Ok(output) => Some(output),
         Err(error) => {
             logging::error("stream", format!("stream audio output unavailable: {error}"));
@@ -895,7 +840,10 @@ impl StreamAudioPlayer {
         if self.packets == 1 {
             logging::debug(
                 "stream",
-                format!("first stream audio packet: ssrc={} seq={}", header.ssrc, header.sequence),
+                format!(
+                    "first stream audio packet: ssrc={} seq={}",
+                    header.ssrc, header.sequence
+                ),
             );
         }
         let payload = match decryptor.decrypt_packet_any(datagram, header) {
@@ -928,7 +876,10 @@ impl StreamAudioPlayer {
                 if self.failures == 1 || self.failures.is_multiple_of(200) {
                     logging::debug(
                         "stream",
-                        format!("stream audio DAVE decrypt failed: count={} error={message}", self.failures),
+                        format!(
+                            "stream audio DAVE decrypt failed: count={} error={message}",
+                            self.failures
+                        ),
                     );
                 }
                 return;
@@ -1001,10 +952,7 @@ async fn send_keyframe_request(
     if media_ssrc == 0 {
         return Err("no video SSRC known yet".to_owned());
     }
-    let datagram = encryptor.encrypt_rtcp_feedback(
-        &build_pli_packet(sender_ssrc, media_ssrc),
-        nonce.to_be_bytes(),
-    )?;
+    let datagram = encryptor.encrypt_rtcp_feedback(&build_pli_packet(sender_ssrc, media_ssrc), nonce.to_be_bytes())?;
     *nonce = nonce.wrapping_add(1);
     socket
         .send(&datagram)
@@ -1025,12 +973,7 @@ fn run_decode_thread(
         Ok(decoder) => decoder,
         Err(error) => {
             logging::error("stream", &error);
-            publish_status(
-                &events,
-                &stream_key,
-                StreamWatchStatus::Failed,
-                Some(error),
-            );
+            publish_status(&events, &stream_key, StreamWatchStatus::Failed, Some(error));
             return;
         }
     };
@@ -1116,11 +1059,8 @@ mod tests {
             address: "1.2.3.4".to_owned(),
             port: 5000,
         };
-        let payload: Value = serde_json::from_str(&stream_select_protocol_payload(
-            &discovered,
-            AEAD_AES256_GCM_RTPSIZE,
-        ))
-        .unwrap();
+        let payload: Value =
+            serde_json::from_str(&stream_select_protocol_payload(&discovered, AEAD_AES256_GCM_RTPSIZE)).unwrap();
         let codecs = payload["d"]["codecs"].as_array().unwrap();
         let h264 = codecs.iter().find(|c| c["name"] == "H264").unwrap();
         assert_eq!(h264["payload_type"], STREAM_H264_PAYLOAD_TYPE);

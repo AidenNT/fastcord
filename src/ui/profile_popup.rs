@@ -15,26 +15,25 @@
 //! * abajo, "Editar perfil" si es el propio, o la cajita de mensaje rápido.
 //!
 //! Se abre con `App::open_user_profile` (llamado desde `ui::chat`, `ui::dm` o
-//! `ui::friends_panel` al clickear un avatar/nombre) y este módulo solo se
+//! `ui::dm::friends_panel` al clickear un avatar/nombre) y este módulo solo se
 //! encarga de DIBUJARLA.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use egui::load::{SizeHint, TexturePoll};
 use egui::{
-    Area, Color32, CornerRadius, Frame, Id, Margin, Order, Pos2, Rect, Sense, Shape, Stroke, TextureId,
-    TextureOptions, Vec2, pos2, vec2,
+    Area, Color32, CornerRadius, Frame, Id, Margin, Order, Pos2, Rect, Sense, Shape, Stroke, TextureId, TextureOptions,
+    Vec2, pos2, vec2,
 };
 
 use crate::discord::models::{
-    ClanTag, FrameLayerAnchor, FrameLayerKind, FrameLayerOrder, PresenceActivity, ProfileEffect,
-    ProfileFrame, Role,
+    ClanTag, FrameLayerAnchor, FrameLayerKind, FrameLayerOrder, PresenceActivity, ProfileEffect, ProfileFrame, Role,
 };
 use crate::lib::data::Status;
 use crate::lib::state::{App, ProfilePopup};
-use crate::ui::markdown::{self, MentionCtx};
+use crate::ui::chat::markdown::{self, MentionCtx};
 use crate::ui::theme::{self, Icon, Palette};
-use crate::ui::{anim, extra};
+use crate::ui::{chat::anim, shell::extra};
 
 mod full;
 pub use full::show_full;
@@ -80,7 +79,7 @@ fn click_request_id() -> egui::Id {
 
 /// Marca a `user_id` para que se le abra la tarjeta de perfil. Se llama
 /// desde cualquier avatar/nombre clickeable (`ui::chat`, `ui::dm`,
-/// `ui::friends_panel`) — como esos lugares solo tienen `&Palette`/datos
+/// `ui::dm::friends_panel`) — como esos lugares solo tienen `&Palette`/datos
 /// puntuales a mano, no un `&mut App` entero (sobre todo `ui::chat`,
 /// fuertemente virtualizado, donde agregarle un parámetro más a cada capa
 /// de la lista de mensajes sería un cambio mucho más grande y arriesgado
@@ -100,7 +99,13 @@ pub fn request_open(
         return;
     }
     let anchor = ctx.input(|i| i.pointer.latest_pos());
-    let request = ProfileClickRequest { user_id, name: name.into(), avatar_url, avatar_color, anchor };
+    let request = ProfileClickRequest {
+        user_id,
+        name: name.into(),
+        avatar_url,
+        avatar_color,
+        anchor,
+    };
     ctx.memory_mut(|m| m.data.insert_temp(click_request_id(), request));
 }
 
@@ -123,7 +128,9 @@ pub fn take_requested(ctx: &egui::Context) -> Option<ProfileClickRequest> {
 /// afuera y closures anidados adentro que también lo quieren tocar.
 enum Action {
     Close,
-    SendMessage { prefill: Option<String> },
+    SendMessage {
+        prefill: Option<String>,
+    },
     ToggleBio,
     EditProfile,
     CopyId,
@@ -273,7 +280,9 @@ impl View {
         let roles: Vec<Role> = profile
             .and_then(|p| p.guild_member.as_ref())
             .map(|member| {
-                let Some(guild_id) = &popup.guild_id else { return Vec::new() };
+                let Some(guild_id) = &popup.guild_id else {
+                    return Vec::new();
+                };
                 let Some(server) = app.servers.iter().find(|s| &s.guild_id == guild_id) else {
                     return Vec::new();
                 };
@@ -389,9 +398,23 @@ impl Tone {
                 // Botones y borde toman el color del perfil (primario), no
                 // un gris derivado del fondo.
                 let accent = extra::blend(primary, veil, 0.25);
-                let on_accent = if luma(accent) > 0.6 { Color32::BLACK } else { Color32::WHITE };
+                let on_accent = if luma(accent) > 0.6 {
+                    Color32::BLACK
+                } else {
+                    Color32::WHITE
+                };
                 let border = extra::blend(primary, veil, 0.10);
-                Self { top, bottom, text, dim, panel, stroke, border, accent, on_accent }
+                Self {
+                    top,
+                    bottom,
+                    text,
+                    dim,
+                    panel,
+                    stroke,
+                    border,
+                    accent,
+                    on_accent,
+                }
             }
             None => Self {
                 top: palette.overlay,
@@ -413,7 +436,9 @@ impl Tone {
 // ---------------------------------------------------------------------
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
-    let Some(popup) = app.profile_popup.as_ref() else { return };
+    let Some(popup) = app.profile_popup.as_ref() else {
+        return;
+    };
     let Some(view) = View::build(app, popup) else { return };
     let palette = app.palette;
     let tone = Tone::for_view(&view, &palette);
@@ -454,7 +479,16 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         .fixed_pos(pos)
         .show(&ctx, |ui| {
             draw_card_with_frame(
-                ui, &view, &tone, &palette, card_w, max_h, &mut quick_message, &mut action, false, screen,
+                ui,
+                &view,
+                &tone,
+                &palette,
+                card_w,
+                max_h,
+                &mut quick_message,
+                &mut action,
+                false,
+                screen,
             )
         });
     let card_rect = inner.response.rect;
@@ -574,15 +608,21 @@ pub fn show_panel(app: &mut App, ui: &mut egui::Ui) {
     let top = base + pad_top;
     let bottom = base + pad_bottom;
     let max_h = (avail.height() - top - bottom).max(240.0);
-    let rect = Rect::from_min_size(
-        pos2(avail.left() + margin, avail.top() + top),
-        vec2(card_w, max_h),
-    );
+    let rect = Rect::from_min_size(pos2(avail.left() + margin, avail.top() + top), vec2(card_w, max_h));
 
     let card_rect = ui
         .scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
             draw_card_with_frame(
-                ui, &view, &tone, &palette, card_w, max_h, &mut quick_message, &mut action, true, avail,
+                ui,
+                &view,
+                &tone,
+                &palette,
+                card_w,
+                max_h,
+                &mut quick_message,
+                &mut action,
+                true,
+                avail,
             )
         })
         .inner;
@@ -655,7 +695,12 @@ fn draw_card(
         .shadow(if panel {
             egui::epaint::Shadow::NONE
         } else {
-            egui::epaint::Shadow { offset: [0, 16], blur: 40, spread: 0, color: palette.shadow }
+            egui::epaint::Shadow {
+                offset: [0, 16],
+                blur: 40,
+                spread: 0,
+                color: palette.shadow,
+            }
         })
         .show(ui, |ui| {
             ui.set_width(card_w);
@@ -703,7 +748,13 @@ fn draw_card(
             // -- Avatar (con anillo del color del fondo), decoración, estado --
             let center = pos2(banner_rect.left() + PAD + AVATAR_RADIUS + 2.0, banner_rect.bottom());
             ui.painter().circle_filled(center, AVATAR_RADIUS + 6.0, tone.top);
-            let initial = view.display_name.chars().next().unwrap_or('?').to_uppercase().to_string();
+            let initial = view
+                .display_name
+                .chars()
+                .next()
+                .unwrap_or('?')
+                .to_uppercase()
+                .to_string();
             extra::avatar(
                 ui,
                 center,
@@ -804,19 +855,14 @@ fn draw_card(
                     (bottom - f32::from(radius)).max(banner_rect.bottom() + 1.0),
                 ),
             );
-            ui.painter().set(gradient_idx, gradient_mesh(gradient, tone.top, tone.bottom));
+            ui.painter()
+                .set(gradient_idx, gradient_mesh(gradient, tone.top, tone.bottom));
         })
         .response
         .rect
 }
 
-fn draw_body(
-    ui: &mut egui::Ui,
-    view: &View,
-    tone: &Tone,
-    palette: &Palette,
-    action: &mut Option<Action>,
-) {
+fn draw_body(ui: &mut egui::Ui, view: &View, tone: &Tone, palette: &Palette, action: &mut Option<Action>) {
     if view.loading {
         padded(ui, |ui| {
             ui.horizontal(|ui| {
@@ -828,7 +874,12 @@ fn draw_body(
     }
     if view.failed {
         padded(ui, |ui| {
-            theme::text(ui, "No se pudo cargar el perfil completo.", theme::regular(12.5), tone.dim);
+            theme::text(
+                ui,
+                "No se pudo cargar el perfil completo.",
+                theme::regular(12.5),
+                tone.dim,
+            );
         });
         ui.add_space(6.0);
     }
@@ -969,7 +1020,12 @@ fn panel<R>(ui: &mut egui::Ui, tone: &Tone, add: impl FnOnce(&mut egui::Ui) -> R
 
 /// Banner que CUBRE todo el ancho (recorta lo que sobra, no lo deforma).
 fn paint_banner(ui: &mut egui::Ui, view: &View, palette: &Palette, rect: Rect, radius: u8) {
-    let top_round = CornerRadius { nw: radius, ne: radius, sw: 0, se: 0 };
+    let top_round = CornerRadius {
+        nw: radius,
+        ne: radius,
+        sw: 0,
+        se: 0,
+    };
     let fill = view
         .banner_color
         .or(view.theme.map(|(top, _)| top))
@@ -977,13 +1033,17 @@ fn paint_banner(ui: &mut egui::Ui, view: &View, palette: &Palette, rect: Rect, r
         .unwrap_or_else(|| extra::blend(view.avatar_color, palette.overlay, 0.35));
     ui.painter().rect_filled(rect, top_round, fill);
 
-    let Some(url) = view.banner_url.as_ref().filter(|_| !anim::hide_profile_images()) else { return };
+    let Some(url) = view.banner_url.as_ref().filter(|_| !anim::hide_profile_images()) else {
+        return;
+    };
     let source = if ui.is_rect_visible(rect) {
         anim::source_banner(ui.ctx(), url, rect.width() * ui.ctx().pixels_per_point())
     } else {
         anim::plain(url)
     };
-    let image = egui::Image::new(source).corner_radius(top_round).show_loading_spinner(false);
+    let image = egui::Image::new(source)
+        .corner_radius(top_round)
+        .show_loading_spinner(false);
     // Hasta que la imagen carga no se sabe su proporción: se ve el color liso.
     let uv = match image.load_for_size(ui.ctx(), rect.size()) {
         Ok(egui::load::TexturePoll::Ready { texture }) => cover_uv(texture.size, rect.size()),
@@ -1030,13 +1090,7 @@ fn round_button(ui: &mut egui::Ui, rect: Rect, icon: Icon, tooltip: &str, id: Id
 }
 
 /// Punto de estado en la esquina del avatar (con anillo del color del fondo).
-fn paint_status_badge(
-    ui: &mut egui::Ui,
-    avatar_center: Pos2,
-    avatar_radius: f32,
-    status: Status,
-    tone: &Tone,
-) {
+fn paint_status_badge(ui: &mut egui::Ui, avatar_center: Pos2, avatar_radius: f32, status: Status, tone: &Tone) {
     let c = avatar_center + Vec2::splat(avatar_radius * 0.72);
     // El punto crece con el avatar (9.5 px para el de 40 px de radio).
     let r = 9.5 * avatar_radius / AVATAR_RADIUS;
@@ -1071,13 +1125,13 @@ fn paint_status_bubble(ui: &mut egui::Ui, tone: &Tone, banner: Rect, avatar_cent
         return;
     }
     let fill = extra::blend(tone.top, Color32::BLACK, 0.4);
-    let text_color = if luma(fill) > 0.6 { Color32::BLACK } else { Color32::WHITE };
-    let mut job = egui::text::LayoutJob::simple(
-        text.trim().to_string(),
-        theme::regular(12.5),
-        text_color,
-        width - 22.0,
-    );
+    let text_color = if luma(fill) > 0.6 {
+        Color32::BLACK
+    } else {
+        Color32::WHITE
+    };
+    let mut job =
+        egui::text::LayoutJob::simple(text.trim().to_string(), theme::regular(12.5), text_color, width - 22.0);
     job.wrap.max_rows = 2;
     let galley = ui.painter().layout_job(job);
     let height = galley.size().y + 16.0;
@@ -1103,7 +1157,9 @@ fn clan_chip(ui: &mut egui::Ui, tone: &Tone, clan: &ClanTag) {
     let mut x = rect.left() + 8.0;
     if let Some(url) = &clan.badge_url {
         let icon_rect = Rect::from_min_size(pos2(x, rect.center().y - icon / 2.0), Vec2::splat(icon));
-        egui::Image::new(anim::plain(url)).show_loading_spinner(false).paint_at(ui, icon_rect);
+        egui::Image::new(anim::plain(url))
+            .show_loading_spinner(false)
+            .paint_at(ui, icon_rect);
         x += icon + 4.0;
     }
     let text_pos = pos2(x, rect.center().y - galley.size().y / 2.0);
@@ -1292,7 +1348,9 @@ fn quick_message_box(
             );
             let enter = response.lost_focus() && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter));
             if enter && !quick_message.trim().is_empty() {
-                *action = Some(Action::SendMessage { prefill: Some(quick_message.trim().to_string()) });
+                *action = Some(Action::SendMessage {
+                    prefill: Some(quick_message.trim().to_string()),
+                });
             }
         });
 }
@@ -1361,14 +1419,22 @@ fn draw_effect(
 /// Px de pantalla por px del arte original: el arte se diseñó para una
 /// tarjeta de `inner_width` px de ancho.
 fn frame_scale(frame: &ProfileFrame, card_w: f32) -> f32 {
-    if frame.inner_width > 0.0 { card_w / frame.inner_width } else { 1.0 }
+    if frame.inner_width > 0.0 {
+        card_w / frame.inner_width
+    } else {
+        1.0
+    }
 }
 
 /// Cuánto sobresale el frame de la tarjeta, en px de pantalla:
 /// `(arriba, abajo, cada lado)`.
 fn frame_padding(frame: &ProfileFrame, card_w: f32) -> (f32, f32, f32) {
     let s = frame_scale(frame, card_w);
-    (frame.overflow_top * s, frame.overflow_bottom * s, frame.overflow_horizontal * s)
+    (
+        frame.overflow_top * s,
+        frame.overflow_bottom * s,
+        frame.overflow_horizontal * s,
+    )
 }
 
 /// Arma las capas del profile frame alrededor de `card`. Devuelve
@@ -1384,7 +1450,10 @@ fn frame_padding(frame: &ProfileFrame, card_w: f32) -> (f32, f32, f32) {
 fn frame_shapes(ctx: &egui::Context, frame: &ProfileFrame, card: Rect) -> (Vec<Shape>, Vec<Shape>) {
     let scale = frame_scale(frame, card.width());
     let canvas = Rect::from_min_max(
-        pos2(card.left() - frame.overflow_horizontal * scale, card.top() - frame.overflow_top * scale),
+        pos2(
+            card.left() - frame.overflow_horizontal * scale,
+            card.top() - frame.overflow_top * scale,
+        ),
         pos2(
             card.right() + frame.overflow_horizontal * scale,
             card.bottom() + frame.overflow_bottom * scale,
@@ -1419,20 +1488,10 @@ fn frame_shapes(ctx: &egui::Context, frame: &ProfileFrame, card: Rect) -> (Vec<S
         Some(w) => canvas.width() / w,
         None => scale,
     };
-    // El lienzo (tarjeta + `overflow_*`) es, por definición, lo más ancho que
-    // puede ser el arte. Si el borde no abarca todo el lienzo (su PNG es más
-    // angosto), `px` sale demasiado grande y las capas sueltas (el arco de
-    // arriba, el adorno de abajo) se dibujan MÁS GRANDES que el espacio que se
-    // les reservó: tapan la parte de arriba de la tarjeta y se pasan del borde
-    // de la ventana. Se acota `px` para que la capa más ancha entre justo.
-    let widest = frame
-        .layers
-        .iter()
-        .zip(&loaded)
-        .filter(|(l, _)| l.kind != FrameLayerKind::Border && !l.responsive)
-        .filter_map(|(_, t)| t.map(|(_, size)| size.x))
-        .fold(0.0_f32, f32::max);
-    let px = if widest > 0.0 { px.min(canvas.width() / widest) } else { px };
+    // OJO: no se acota `px` con el ancho de las demás capas. Discord entrega
+    // cada PNG con su lado mayor limitado a 1024 px, así que las capas anchas
+    // (arcos, adornos) vienen reducidas y no se pueden medir contra el borde:
+    // se dimensionan aparte, más abajo.
     debug_frame(frame, card, canvas, scale, px, &loaded);
     // Píxeles de la imagen por px del arte (1.0 si el PNG es de tamaño de diseño).
     let src_per_art = match border_w {
@@ -1459,7 +1518,20 @@ fn frame_shapes(ctx: &egui::Context, frame: &ProfileFrame, card: Rect) -> (Vec<S
             );
         } else {
             // `responsive`: se estira al ancho del lienzo manteniendo la proporción.
-            let mut dest_size = size * px;
+            // Un PNG con el ancho en el tope de 1024 px es una capa que abarca
+            // todo el lienzo (reducida por Discord): se estira al ancho del
+            // lienzo conservando la proporción. Si el tope lo alcanza solo el
+            // alto, se usa la escala del borde. Los PNG chicos vienen a tamaño
+            // de diseño y escalan con la tarjeta.
+            let capped_w = size.x >= 1023.0;
+            let capped_h = size.y >= 1023.0;
+            let mut dest_size = if capped_w {
+                vec2(canvas.width(), canvas.width() * size.y / size.x)
+            } else if capped_h && border_w.is_some() {
+                size * px
+            } else {
+                size * scale
+            };
             if layer.responsive {
                 dest_size = vec2(canvas.width(), canvas.width() * size.y / size.x);
             }
@@ -1482,13 +1554,25 @@ fn frame_shapes(ctx: &egui::Context, frame: &ProfileFrame, card: Rect) -> (Vec<S
 
 /// Con `ECORD_DEBUG_FRAME=1` imprime (una vez por frame de arte) los números
 /// con los que se arma el marco, para poder ajustarlo mirando el arte real.
-fn debug_frame(frame: &ProfileFrame, card: Rect, canvas: Rect, scale: f32, px: f32, loaded: &[Option<(TextureId, Vec2)>]) {
+fn debug_frame(
+    frame: &ProfileFrame,
+    card: Rect,
+    canvas: Rect,
+    scale: f32,
+    px: f32,
+    loaded: &[Option<(TextureId, Vec2)>],
+) {
     use std::cell::RefCell;
     use std::collections::HashSet;
     thread_local! {
         static SEEN: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
     }
     if std::env::var_os("ECORD_DEBUG_FRAME").is_none() {
+        return;
+    }
+    // Recién se imprime cuando bajaron TODAS las capas: antes salían con
+    // `png=None` y no servían para ajustar nada.
+    if loaded.iter().any(Option::is_none) {
         return;
     }
     if !SEEN.with_borrow_mut(|s| s.insert(frame.sku_id.clone())) {
@@ -1601,7 +1685,11 @@ fn rgb(c: u32) -> Color32 {
 fn rel_luma(c: Color32) -> f32 {
     let f = |v: u8| {
         let v = f32::from(v) / 255.0;
-        if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        if v <= 0.03928 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
     };
     0.2126 * f(c.r()) + 0.7152 * f(c.g()) + 0.0722 * f(c.b())
 }
@@ -1662,12 +1750,18 @@ fn clock(secs: u64) -> String {
 /// Fecha de creación de la cuenta, sacada del id (snowflake) de Discord.
 fn member_since(user_id: &str) -> Option<String> {
     use chrono::Datelike;
-    const MONTHS: [&str; 12] =
-        ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
+    const MONTHS: [&str; 12] = [
+        "ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic",
+    ];
     let id: u64 = user_id.parse().ok()?;
     let ms = (id >> 22) as i64 + 1_420_070_400_000;
     let date = chrono::DateTime::from_timestamp_millis(ms)?;
-    Some(format!("{} {} {}", date.day(), MONTHS[date.month0() as usize], date.year()))
+    Some(format!(
+        "{} {} {}",
+        date.day(),
+        MONTHS[date.month0() as usize],
+        date.year()
+    ))
 }
 
 fn connection_label(kind: &str) -> String {

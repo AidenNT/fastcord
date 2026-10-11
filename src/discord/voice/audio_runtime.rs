@@ -29,10 +29,7 @@ impl VoiceAudioRuntime {
                 let runtime = match Builder::new_current_thread().enable_all().build() {
                     Ok(runtime) => runtime,
                     Err(error) => {
-                        logging::error(
-                            "voice",
-                            format!("voice audio runtime build failed: {error}"),
-                        );
+                        logging::error("voice", format!("voice audio runtime build failed: {error}"));
                         return;
                     }
                 };
@@ -67,10 +64,7 @@ impl Drop for VoiceAudioRuntime {
         if let Some(worker) = self.worker.take()
             && let Err(error) = worker.join()
         {
-            logging::debug(
-                "voice",
-                format!("voice audio runtime thread panicked: {error:?}"),
-            );
+            logging::debug("voice", format!("voice audio runtime thread panicked: {error:?}"));
         }
     }
 }

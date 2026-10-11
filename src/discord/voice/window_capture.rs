@@ -21,26 +21,22 @@
 
 use std::ffi::c_void;
 
-use ffmpeg_the_third as ffmpeg;
 use ffmpeg::format::Pixel;
 use ffmpeg::frame::Video;
-use windows::Graphics::Capture::{
-    Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
-};
+use ffmpeg_the_third as ffmpeg;
+use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession};
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
 use windows::Win32::Foundation::{HMODULE, HWND};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
-    D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
+    ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice};
-use windows::Win32::System::WinRT::Direct3D11::{
-    CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
-};
+use windows::Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess};
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
 use windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindow};
@@ -90,9 +86,7 @@ impl WindowCapture {
         // SAFETY: `hwnd` se validó arriba.
         let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(hwnd) }
             .map_err(|error| wgc_error("no se pudo capturar esa ventana", error))?;
-        let size = item
-            .Size()
-            .map_err(|error| wgc_error("tamaño de la ventana", error))?;
+        let size = item.Size().map_err(|error| wgc_error("tamaño de la ventana", error))?;
 
         let mut device = None;
         let mut context = None;
@@ -114,9 +108,7 @@ impl WindowCapture {
         let (Some(device), Some(context)) = (device, context) else {
             return Err("D3D11 no devolvió dispositivo".to_owned());
         };
-        let dxgi: IDXGIDevice = device
-            .cast()
-            .map_err(|error| wgc_error("dispositivo DXGI", error))?;
+        let dxgi: IDXGIDevice = device.cast().map_err(|error| wgc_error("dispositivo DXGI", error))?;
         // SAFETY: `dxgi` es un dispositivo DXGI válido.
         let winrt_device: IDirect3DDevice = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi) }
             .and_then(|inspectable| inspectable.cast())
@@ -124,13 +116,8 @@ impl WindowCapture {
 
         // `CreateFreeThreaded`: no hace falta un DispatcherQueue; los cuadros
         // se leen por sondeo con `TryGetNextFrame`.
-        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
-            &winrt_device,
-            PIXEL_FORMAT,
-            POOL_BUFFERS,
-            size,
-        )
-        .map_err(|error| wgc_error("cola de cuadros", error))?;
+        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(&winrt_device, PIXEL_FORMAT, POOL_BUFFERS, size)
+            .map_err(|error| wgc_error("cola de cuadros", error))?;
         let session = pool
             .CreateCaptureSession(&item)
             .map_err(|error| wgc_error("sesión de captura", error))?;
@@ -192,8 +179,8 @@ impl WindowCapture {
             .cast()
             .map_err(|error| wgc_error("acceso DXGI a la superficie", error))?;
         // SAFETY: la superficie de WGC es una `ID3D11Texture2D`.
-        let texture: ID3D11Texture2D = unsafe { access.GetInterface() }
-            .map_err(|error| wgc_error("textura del cuadro", error))?;
+        let texture: ID3D11Texture2D =
+            unsafe { access.GetInterface() }.map_err(|error| wgc_error("textura del cuadro", error))?;
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         // SAFETY: `desc` es un destino válido.
         unsafe { texture.GetDesc(&mut desc) };

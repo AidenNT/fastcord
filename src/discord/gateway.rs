@@ -46,16 +46,14 @@ use serde_json::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 use url::Url;
 
-
-
+use crate::discord::AppEvent;
 use crate::discord::fingerprint::{self, ClientFingerprint};
 use crate::discord::models::{
-    Channel, Role, ThreadChannel, GatewayMessage, GatewayPayload, GuildCreatePayload, GuildMemberUpdate, GuildMembersChunk,
-    MemberListMember, MemberListUpdate, MessageUpdate, PresenceEvent, ReactionEvent,
-    ReadyPayload, VoiceState,
+    Channel, GatewayMessage, GatewayPayload, GuildCreatePayload, GuildMemberUpdate, GuildMembersChunk,
+    MemberListMember, MemberListUpdate, MessageUpdate, PresenceEvent, ReactionEvent, ReadyPayload, Role, ThreadChannel,
+    VoiceState,
 };
 use crate::discord::websocket::{self, Message};
-use crate::discord::AppEvent;
 
 const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json&compress=zlib-stream";
 
@@ -76,9 +74,8 @@ const ENV_MOCK_URL: &str = "ECORD_MOCK_URL";
 /// `ECORD_USE_MOCK_URL` en cada conexión, así que se puede cambiar entre
 /// reintentos. Apagado por defecto.
 pub fn use_mock_url() -> bool {
-    std::env::var(ENV_USE_MOCK_URL).is_ok_and(|value| {
-        matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-    })
+    std::env::var(ENV_USE_MOCK_URL)
+        .is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
 
 /// URL del mock: `ECORD_MOCK_URL` si está puesta y no vacía; si no, el
@@ -94,13 +91,11 @@ pub fn mock_url() -> String {
 /// Reescribe `real_url` para que pase por el mock: la URL del mock con la
 /// real en `?url=`.
 fn through_mock(mock: &str, real_url: &str) -> anyhow::Result<String> {
-    let mut url = Url::parse(mock)
-        .map_err(|e| anyhow::anyhow!("URL del mock inválida ({ENV_MOCK_URL}={mock:?}): {e}"))?;
+    let mut url =
+        Url::parse(mock).map_err(|e| anyhow::anyhow!("URL del mock inválida ({ENV_MOCK_URL}={mock:?}): {e}"))?;
     url.query_pairs_mut().append_pair("url", real_url);
     Ok(url.to_string())
 }
-
-
 
 /// Bitmask que Discord chequea antes de mandar payloads exclusivos de
 /// cuenta de usuario, como la presencia en vivo de los amigos
@@ -131,7 +126,10 @@ struct GatewayZlibDecoder {
 
 impl Default for GatewayZlibDecoder {
     fn default() -> Self {
-        Self { inflater: Decompress::new(true), pending: Vec::new() }
+        Self {
+            inflater: Decompress::new(true),
+            pending: Vec::new(),
+        }
     }
 }
 
@@ -159,9 +157,9 @@ impl GatewayZlibDecoder {
         loop {
             let input_before = self.inflater.total_in();
             let output_before = self.inflater.total_out();
-            let status =
-                self.inflater
-                    .decompress(&compressed[input_offset..], &mut buffer, FlushDecompress::Sync)?;
+            let status = self
+                .inflater
+                .decompress(&compressed[input_offset..], &mut buffer, FlushDecompress::Sync)?;
             let consumed = (self.inflater.total_in() - input_before) as usize;
             let produced = (self.inflater.total_out() - output_before) as usize;
             input_offset += consumed;
@@ -230,7 +228,10 @@ pub enum GatewayCommand {
     /// canal de voz donde estamos. `guild_id` es `None` en una llamada de DM.
     /// Discord responde con `STREAM_CREATE` + `STREAM_SERVER_UPDATE` de
     /// nuestro propio stream (`guild:<guild>:<canal>:<yo>` o `call:<canal>:<yo>`).
-    StreamCreate { guild_id: Option<String>, channel_id: String },
+    StreamCreate {
+        guild_id: Option<String>,
+        channel_id: String,
+    },
 }
 
 /// La suscripción a la lista de miembros vigente. Se guarda para volver a
@@ -339,8 +340,7 @@ fn stream_delete_payload(stream_key: &str) -> String {
 
 /// Opcode 22: pausar o reanudar un stream.
 fn stream_set_paused_payload(stream_key: &str, paused: bool) -> String {
-    serde_json::json!({ "op": 22, "d": { "stream_key": stream_key, "paused": paused } })
-        .to_string()
+    serde_json::json!({ "op": 22, "d": { "stream_key": stream_key, "paused": paused } }).to_string()
 }
 
 #[derive(Serialize)]
@@ -409,8 +409,7 @@ fn build_identify_payload(token: &str, fp: &ClientFingerprint) -> String {
 }
 
 fn build_resume_payload(token: &str, session_id: &str, sequence: u64) -> String {
-    serde_json::json!({ "op": 6, "d": { "token": token, "session_id": session_id, "seq": sequence } })
-        .to_string()
+    serde_json::json!({ "op": 6, "d": { "token": token, "session_id": session_id, "seq": sequence } }).to_string()
 }
 
 /// Qué hacer después de que una conexión termina (se cortó el socket, o
@@ -552,9 +551,7 @@ pub async fn run(
         if !established {
             consecutive_reconnect_failures += 1;
             if consecutive_reconnect_failures >= MAX_CONSECUTIVE_RECONNECT_FAILURES {
-                anyhow::bail!(
-                    "no se pudo reconectar con Discord después de {consecutive_reconnect_failures} intentos"
-                );
+                anyhow::bail!("no se pudo reconectar con Discord después de {consecutive_reconnect_failures} intentos");
             }
         }
 
@@ -580,7 +577,11 @@ async fn connect_and_run(
     };
     // Un resume_gateway_url de Discord no trae los query params de
     // versión/encoding/compresión — hay que volver a pegárselos.
-    let mut url = if url.contains('?') { url } else { format!("{url}/?v=10&encoding=json&compress=zlib-stream") };
+    let mut url = if url.contains('?') {
+        url
+    } else {
+        format!("{url}/?v=10&encoding=json&compress=zlib-stream")
+    };
     if use_mock_url() {
         let mock = mock_url();
         log::warn!("Gateway: modo mock activo ({ENV_USE_MOCK_URL}); conectando a {mock} en vez de Discord");
@@ -726,10 +727,18 @@ async fn connect_and_run(
 
                 crate::discord::step(
                     tx,
-                    if session.can_resume() { "Reanudando la sesión…" } else { "Autenticando con Discord…" },
+                    if session.can_resume() {
+                        "Reanudando la sesión…"
+                    } else {
+                        "Autenticando con Discord…"
+                    },
                 );
                 let hello_payload = if session.can_resume() {
-                    build_resume_payload(token, session.session_id.as_deref().unwrap_or_default(), session.sequence.unwrap_or_default())
+                    build_resume_payload(
+                        token,
+                        session.session_id.as_deref().unwrap_or_default(),
+                        session.sequence.unwrap_or_default(),
+                    )
                 } else {
                     build_identify_payload(token, fingerprint)
                 };
@@ -751,7 +760,9 @@ async fn connect_and_run(
             // payload (mensajes de sistema, usuarios parciales, servers
             // caídos) y nuestros structs solo cubren lo que usamos.
             0 => {
-                let Some(event_name) = payload.t.as_deref() else { continue };
+                let Some(event_name) = payload.t.as_deref() else {
+                    continue;
+                };
                 if event_name == "RESUMED" {
                     // A un RESUME exitoso Discord no le manda un READY de
                     // vuelta (por algo es más rápido que un IDENTIFY) —
@@ -780,8 +791,10 @@ async fn connect_and_run(
                     // los dos campos que hacen falta para poder mandar un
                     // RESUME la próxima vez que se corte la conexión.
                     session.session_id = data.get("session_id").and_then(Value::as_str).map(str::to_owned);
-                    session.resume_url =
-                        data.get("resume_gateway_url").and_then(Value::as_str).map(str::to_owned);
+                    session.resume_url = data
+                        .get("resume_gateway_url")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
                 }
                 // Diagnóstico ANTES de mover `payload.d` a `handle_dispatch`
                 // (que lo consume): si falla el parseo, mostrar qué claves
@@ -828,7 +841,11 @@ async fn connect_and_run(
             // reintentar con RESUME o si hay que arrancar de cero.
             9 => {
                 let resumable = payload.data().as_bool().unwrap_or(false);
-                return Ok(if resumable { Outcome::Resume } else { Outcome::Reidentify });
+                return Ok(if resumable {
+                    Outcome::Resume
+                } else {
+                    Outcome::Reidentify
+                });
             }
             _ => {}
         }
@@ -1047,10 +1064,7 @@ fn own_member<'a>(
 /// propio) sirven para saber los roles propios de un server que NO vino en el
 /// `READY` (recién unido / "unavailable"); sin ellos ese server queda sin
 /// filtrar y muestra canales que no corresponden.
-fn handle_guild_create(
-    raw: &str,
-    tx: &std::sync::mpsc::Sender<AppEvent>,
-) -> anyhow::Result<()> {
+fn handle_guild_create(raw: &str, tx: &std::sync::mpsc::Sender<AppEvent>) -> anyhow::Result<()> {
     let guild: GuildCreatePayload = serde_json::from_str(raw)?;
     // Los roles se toman de acá también (no solo del `READY`) por si el guild
     // llegó "unavailable" en el `READY`, sin roles.
@@ -1113,7 +1127,10 @@ fn handle_dispatch(
             if let (true, Some(proto)) = (is_preloaded, proto) {
                 if let Ok(settings) = crate::discord::user_settings::decode_base64(proto) {
                     let partial = data.get("partial").and_then(|v| v.as_bool()).unwrap_or(false);
-                    let _ = tx.send(AppEvent::UserSettingsUpdate { settings: Box::new(settings), partial });
+                    let _ = tx.send(AppEvent::UserSettingsUpdate {
+                        settings: Box::new(settings),
+                        partial,
+                    });
                 }
             }
             // Tipo 2 = `FrecencyUserSettings` (favoritos y frecency).
@@ -1121,8 +1138,61 @@ fn handle_dispatch(
             if let (true, Some(proto)) = (is_frecency, proto) {
                 if let Ok(settings) = crate::discord::frecency::decode_base64(proto) {
                     let partial = data.get("partial").and_then(|v| v.as_bool()).unwrap_or(false);
-                    let _ = tx.send(AppEvent::FrecencyUpdate { settings: Box::new(settings), partial });
+                    let _ = tx.send(AppEvent::FrecencyUpdate {
+                        settings: Box::new(settings),
+                        partial,
+                    });
                 }
+            }
+        }
+        // Solicitudes de ingreso a servers con formulario: la propia cuenta
+        // manda, un moderador aprueba/rechaza, o se cancela. El payload puede
+        // traer la solicitud suelta o dentro de `request`.
+        "GUILD_JOIN_REQUEST_CREATE" | "GUILD_JOIN_REQUEST_UPDATE" => {
+            let body = data.get("request").unwrap_or(&data);
+            let mut request = super::join_form::JoinRequest::from_value(body);
+            if let Some(r) = request.as_mut() {
+                // El estado a veces viaja afuera de la solicitud.
+                if r.status == super::join_form::JoinRequestStatus::Other {
+                    if let Some(status) = data.get("status").and_then(|v| v.as_str()) {
+                        let mut patched = body.clone();
+                        patched["application_status"] = serde_json::Value::String(status.to_owned());
+                        if let Some(p) = super::join_form::JoinRequest::from_value(&patched) {
+                            *r = p;
+                        }
+                    }
+                }
+            }
+            if let Some(request) = request {
+                let _ = tx.send(AppEvent::GuildJoinRequestUpsert(request));
+            }
+        }
+        // Alguien tocó un sonido del soundboard (o un efecto con emoji) en un
+        // canal de voz. Solo interesan los sonidos: `sound_id` viene con el
+        // soundboard y no con los efectos de emoji.
+        "VOICE_CHANNEL_EFFECT_SEND" => {
+            let text = |key: &str| match data.get(key) {
+                Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
+                Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+                _ => None,
+            };
+            if let (Some(channel_id), Some(user_id), Some(sound_id)) =
+                (text("channel_id"), text("user_id"), text("sound_id"))
+            {
+                let volume = data.get("sound_volume").and_then(|v| v.as_f64()).map(|v| v as f32);
+                let _ = tx.send(AppEvent::SoundboardEffect {
+                    channel_id,
+                    user_id,
+                    sound_id,
+                    volume,
+                });
+            }
+        }
+        "GUILD_JOIN_REQUEST_DELETE" => {
+            if let Some(guild_id) = data.get("guild_id").and_then(|v| v.as_str()) {
+                let _ = tx.send(AppEvent::GuildJoinRequestDelete {
+                    guild_id: guild_id.to_owned(),
+                });
             }
         }
         "MESSAGE_CREATE" => {
@@ -1182,13 +1252,20 @@ fn handle_dispatch(
             // vacía, significa "nadie en voz" y sí se aplica.
             if let Some(guilds) = data.get("guilds").and_then(Value::as_array) {
                 for guild in guilds {
-                    let Some(guild_id) = guild.get("id").and_then(Value::as_str) else { continue };
-                    let Some(list) = guild.get("voice_states").and_then(Value::as_array) else { continue };
+                    let Some(guild_id) = guild.get("id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let Some(list) = guild.get("voice_states").and_then(Value::as_array) else {
+                        continue;
+                    };
                     let states: Vec<VoiceState> = list
                         .iter()
                         .filter_map(|state| serde_json::from_value(state.clone()).ok())
                         .collect();
-                    let _ = tx.send(AppEvent::GuildVoiceStates { guild_id: guild_id.to_string(), states });
+                    let _ = tx.send(AppEvent::GuildVoiceStates {
+                        guild_id: guild_id.to_string(),
+                        states,
+                    });
                 }
             }
         }
@@ -1203,7 +1280,10 @@ fn handle_dispatch(
         // los usuarios pedidos.
         "GUILD_MEMBERS_CHUNK" => {
             let chunk: GuildMembersChunk = serde_json::from_value(data)?;
-            let _ = tx.send(AppEvent::GuildMembers { guild_id: chunk.guild_id, members: chunk.members });
+            let _ = tx.send(AppEvent::GuildMembers {
+                guild_id: chunk.guild_id,
+                members: chunk.members,
+            });
         }
         // Cambió alguna de nuestras sesiones: es como llega lo que jugás o
         // escuchás en otro cliente tuyo (app oficial, celular).
@@ -1222,7 +1302,9 @@ fn handle_dispatch(
         // eliminada, desbloqueo): solo trae el id de la persona.
         "RELATIONSHIP_REMOVE" => {
             if let Some(user_id) = data.get("id").and_then(Value::as_str) {
-                let _ = tx.send(AppEvent::RelationshipRemove { user_id: user_id.to_owned() });
+                let _ = tx.send(AppEvent::RelationshipRemove {
+                    user_id: user_id.to_owned(),
+                });
             }
         }
         // Un canal se marcó como leído (desde otro dispositivo, o el eco de
@@ -1231,8 +1313,7 @@ fn handle_dispatch(
             let channel_id = data.get("channel_id").and_then(Value::as_str);
             let message_id = data.get("message_id").and_then(Value::as_str);
             if let (Some(channel_id), Some(message_id)) = (channel_id, message_id) {
-                let mention_count =
-                    data.get("mention_count").and_then(Value::as_u64).unwrap_or(0) as u32;
+                let mention_count = data.get("mention_count").and_then(Value::as_u64).unwrap_or(0) as u32;
                 let _ = tx.send(AppEvent::MessageAck {
                     channel_id: channel_id.to_owned(),
                     message_id: message_id.to_owned(),
@@ -1250,7 +1331,10 @@ fn handle_dispatch(
                 roles: update.roles,
                 presence: None,
             };
-            let _ = tx.send(AppEvent::GuildMembers { guild_id: update.guild_id, members: vec![member] });
+            let _ = tx.send(AppEvent::GuildMembers {
+                guild_id: update.guild_id,
+                members: vec![member],
+            });
         }
         // Alguien se conectó/desconectó/cambió de canal de voz. A
         // diferencia del array embebido en `GUILD_CREATE`, acá sí viene
@@ -1311,29 +1395,59 @@ fn handle_dispatch(
         // permisos). Los DMs también pasan por acá pero no traen
         // `guild_id`: se ignoran.
         "CHANNEL_CREATE" | "CHANNEL_UPDATE" => {
-            let Some(guild_id) = data.get("guild_id").and_then(Value::as_str).map(str::to_owned)
-            else {
+            let Some(guild_id) = data.get("guild_id").and_then(Value::as_str).map(str::to_owned) else {
+                // Sin `guild_id` es un DM: 1 = con una persona, 3 = grupal.
+                if matches!(data.get("type").and_then(Value::as_u64), Some(1 | 3)) {
+                    let dm: crate::discord::models::PrivateChannel = serde_json::from_value(data)?;
+                    let _ = tx.send(AppEvent::DmChannelUpsert(Box::new(dm)));
+                }
                 return Ok(());
             };
             let channel: Channel = serde_json::from_value(data)?;
             let _ = tx.send(AppEvent::ChannelUpsert { guild_id, channel });
         }
         "CHANNEL_DELETE" => {
-            let (Some(guild_id), Some(channel_id)) = (
-                data.get("guild_id").and_then(Value::as_str).map(str::to_owned),
-                data.get("id").and_then(Value::as_str).map(str::to_owned),
+            let Some(channel_id) = data.get("id").and_then(Value::as_str).map(str::to_owned) else {
+                return Ok(());
+            };
+            match data.get("guild_id").and_then(Value::as_str).map(str::to_owned) {
+                Some(guild_id) => {
+                    let _ = tx.send(AppEvent::ChannelDelete { guild_id, channel_id });
+                }
+                None => {
+                    let _ = tx.send(AppEvent::DmChannelDelete { channel_id });
+                }
+            }
+        }
+        // Alguien entró a un DM grupal: `{ channel_id, user }`.
+        "CHANNEL_RECIPIENT_ADD" => {
+            let (Some(channel_id), Some(user)) = (
+                data.get("channel_id").and_then(Value::as_str).map(str::to_owned),
+                data.get("user").cloned(),
             ) else {
                 return Ok(());
             };
-            let _ = tx.send(AppEvent::ChannelDelete { guild_id, channel_id });
+            let user: crate::discord::models::User = serde_json::from_value(user)?;
+            let _ = tx.send(AppEvent::DmRecipientAdd { channel_id, user });
+        }
+        // Alguien salió (o lo sacaron) de un DM grupal.
+        "CHANNEL_RECIPIENT_REMOVE" => {
+            let (Some(channel_id), Some(user_id)) = (
+                data.get("channel_id").and_then(Value::as_str).map(str::to_owned),
+                data.pointer("/user/id").and_then(Value::as_str).map(str::to_owned),
+            ) else {
+                return Ok(());
+            };
+            let _ = tx.send(AppEvent::DmRecipientRemove { channel_id, user_id });
         }
         // Rol nuevo o editado: `{ guild_id, role: { ... } }`.
         "GUILD_ROLE_CREATE" | "GUILD_ROLE_UPDATE" => {
-            let Some(guild_id) = data.get("guild_id").and_then(Value::as_str).map(str::to_owned)
-            else {
+            let Some(guild_id) = data.get("guild_id").and_then(Value::as_str).map(str::to_owned) else {
                 return Ok(());
             };
-            let Some(role) = data.get("role").cloned() else { return Ok(()) };
+            let Some(role) = data.get("role").cloned() else {
+                return Ok(());
+            };
             let role: Role = serde_json::from_value(role)?;
             let _ = tx.send(AppEvent::GuildRoleUpsert { guild_id, role });
         }
@@ -1379,9 +1493,15 @@ fn handle_dispatch(
                 message: "La aplicación no respondió a esa interacción.".to_string(),
             });
         }
-        // Muchísimos otros eventos existen (TYPING_START, ...). Se agregan
-        // acá con el mismo patrón: deserializar y mandar un nuevo
-        // `AppEvent`.
+        // Alguien empezó a escribir en un canal o DM (`TYPING_START`). En
+        // servers trae `member` (apodo + usuario) y `guild_id`; en DMs no.
+        // Dura ~10 s: el estado lo expira solo.
+        "TYPING_START" => {
+            let ev: super::models::TypingStart = serde_json::from_value(data)?;
+            let _ = tx.send(AppEvent::TypingStart(ev));
+        }
+        // Muchísimos otros eventos existen. Se agregan acá con el mismo
+        // patrón: deserializar y mandar un nuevo `AppEvent`.
         _ => {}
     }
     Ok(())
@@ -1458,7 +1578,6 @@ mod merged_members_tests {
     }
 }
 
-
 #[cfg(test)]
 mod mock_url_tests {
     use super::*;
@@ -1468,7 +1587,10 @@ mod mock_url_tests {
         let out = through_mock("ws://localhost:5380", "wss://gateway.discord.gg/?v=10&encoding=json").unwrap();
         assert!(out.starts_with("ws://localhost:5380/?url="));
         let parsed = Url::parse(&out).unwrap();
-        let real = parsed.query_pairs().find(|(k, _)| k == "url").map(|(_, v)| v.into_owned());
+        let real = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "url")
+            .map(|(_, v)| v.into_owned());
         assert_eq!(real.as_deref(), Some("wss://gateway.discord.gg/?v=10&encoding=json"));
     }
 

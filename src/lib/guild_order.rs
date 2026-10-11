@@ -55,10 +55,7 @@ pub struct SidebarFolder {
 /// `servers` (el de `READY`) — cualquier server que no haya aparecido en
 /// ningún lado (cuenta sin blob de settings todavía, o un server al que
 /// te uniste después de la última sincronización de `guild_folders`).
-pub fn build_sidebar_order(
-    servers: &[Server],
-    guild_folders: Option<&GuildFolders>,
-) -> Vec<SidebarEntry> {
+pub fn build_sidebar_order(servers: &[Server], guild_folders: Option<&GuildFolders>) -> Vec<SidebarEntry> {
     let by_id: std::collections::HashMap<u64, usize> = servers
         .iter()
         .enumerate()

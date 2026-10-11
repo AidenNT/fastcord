@@ -173,8 +173,7 @@ impl H264Depacketizer {
         }
 
         // Fin del frame.
-        let complete =
-            !self.frame_broken && self.fragment.is_none() && !self.frame.is_empty();
+        let complete = !self.frame_broken && self.fragment.is_none() && !self.frame.is_empty();
         let has_keyframe = self.frame_has_keyframe_nal;
         let frame = std::mem::take(&mut self.frame);
         self.reset_frame();
@@ -216,8 +215,7 @@ impl H264Depacketizer {
             NAL_STAP_A => {
                 let mut offset = 1usize;
                 while offset + 2 <= payload.len() {
-                    let size =
-                        usize::from(u16::from_be_bytes([payload[offset], payload[offset + 1]]));
+                    let size = usize::from(u16::from_be_bytes([payload[offset], payload[offset + 1]]));
                     offset += 2;
                     if size == 0 || offset + size > payload.len() {
                         self.frame_broken = true;
@@ -419,7 +417,6 @@ mod tests {
         assert!(delivered > 0, "debería haber saltado el hueco");
     }
 }
-
 
 // ===========================================================================
 // Lado emisor: transmitir nuestra pantalla (Go Live propio)
@@ -650,10 +647,7 @@ pub(crate) fn encoded_frame_from_access_unit(data: &[u8]) -> Option<EncodedFrame
         out.extend_from_slice(&START_CODE);
         out.extend_from_slice(nal);
     }
-    has_slice.then_some(EncodedFrame {
-        data: out,
-        keyframe,
-    })
+    has_slice.then_some(EncodedFrame { data: out, keyframe })
 }
 
 #[cfg(test)]
@@ -759,10 +753,7 @@ mod sender_tests {
         assert_eq!(frames.len(), 2);
         assert!(frames[0].keyframe);
         assert!(!frames[1].keyframe);
-        assert_eq!(
-            frames[0].data,
-            annexb(&[&[0x09, 0x10], &sps, &pps, &idr_a, &idr_b])
-        );
+        assert_eq!(frames[0].data, annexb(&[&[0x09, 0x10], &sps, &pps, &idr_a, &idr_b]));
         assert_eq!(frames[1].data, annexb(&[&[0x09, 0x30], &p_frame]));
     }
 

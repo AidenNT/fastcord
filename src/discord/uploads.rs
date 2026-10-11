@@ -10,7 +10,7 @@
 //! 3. `POST /channels/{id}/messages` con `attachments: [{ id, filename,
 //!    uploaded_filename }]`, el texto y la respuesta (si hay).
 //!
-//! La UI (`ui::attachments`) arma la lista de [`UploadFile`], guarda un
+//! La UI (`ui::chat::attachments`) arma la lista de [`UploadFile`], guarda un
 //! [`UploadJob`] para mostrar el avance y el error, y llama a
 //! [`spawn_send_with_files`]. El mensaje definitivo llega por el Gateway
 //! (`MESSAGE_CREATE`), así que acá no hay "eco local".
@@ -70,7 +70,9 @@ pub struct UploadJob {
 
 impl UploadJob {
     pub fn new(total: usize) -> Arc<Self> {
-        Arc::new(Self { state: Mutex::new(JobState::Uploading { done: 0, total }) })
+        Arc::new(Self {
+            state: Mutex::new(JobState::Uploading { done: 0, total }),
+        })
     }
 
     pub fn snapshot(&self) -> JobState {

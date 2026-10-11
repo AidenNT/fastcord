@@ -29,8 +29,8 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::discord::user_settings::proto::frecency_user_settings as pb;
 use crate::discord::user_settings::proto::FrecencyUserSettings;
+use crate::discord::user_settings::proto::frecency_user_settings as pb;
 
 // ---------------------------------------------------------------------
 // Campos de primer nivel (para saber cuáles hay que mandar)
@@ -90,13 +90,19 @@ pub fn compute_score(total_uses: u32, recent_uses: &[u64], now_ms: u64) -> i32 {
     if recent_uses.is_empty() {
         return 0;
     }
-    let bonus: f64 = recent_uses.iter().map(|t| bucket_weight(now_ms.saturating_sub(*t))).sum();
+    let bonus: f64 = recent_uses
+        .iter()
+        .map(|t| bucket_weight(now_ms.saturating_sub(*t)))
+        .sum();
     let average = bonus / recent_uses.len() as f64;
     (f64::from(total_uses) * average).round().min(f64::from(i32::MAX)) as i32
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Suma un uso a `key`: total, usos recientes (tope `MAX_RECENT_USES`) y
@@ -253,7 +259,10 @@ pub fn is_loaded() -> bool {
 pub fn reset() {
     with(|s| {
         let generation = s.generation.wrapping_add(1);
-        *s = Store { generation, ..Store::default() };
+        *s = Store {
+            generation,
+            ..Store::default()
+        };
     });
 }
 
@@ -309,8 +318,12 @@ fn take_due_job(s: &mut Store, now: Instant, force: bool) -> Option<FlushJob> {
     {
         return None;
     }
-    let favorites_due = s.favorites_dirty_at.is_some_and(|t| now.duration_since(t) >= FAVORITES_DELAY);
-    let frecency_due = s.frecency_dirty_at.is_some_and(|t| now.duration_since(t) >= FRECENCY_DELAY);
+    let favorites_due = s
+        .favorites_dirty_at
+        .is_some_and(|t| now.duration_since(t) >= FAVORITES_DELAY);
+    let frecency_due = s
+        .frecency_dirty_at
+        .is_some_and(|t| now.duration_since(t) >= FRECENCY_DELAY);
     if !(force || favorites_due || frecency_due) {
         return None;
     }
@@ -321,7 +334,11 @@ fn take_due_job(s: &mut Store, now: Instant, force: bool) -> Option<FlushJob> {
     s.frecency_dirty_at = None;
     s.retry_at = None;
     s.in_flight = true;
-    Some(FlushJob { mask, generation: s.generation, partial })
+    Some(FlushJob {
+        mask,
+        generation: s.generation,
+        partial,
+    })
 }
 
 /// Termina un envío: si falló, los campos vuelven a quedar pendientes.
@@ -433,7 +450,12 @@ pub fn favorite_gifs() -> Vec<FavoriteGif> {
 }
 
 pub fn is_favorite_gif(url: &str) -> bool {
-    with(|s| s.settings.favorite_gifs.as_ref().is_some_and(|f| f.gifs.contains_key(url)))
+    with(|s| {
+        s.settings
+            .favorite_gifs
+            .as_ref()
+            .is_some_and(|f| f.gifs.contains_key(url))
+    })
 }
 
 /// Marca o desmarca un GIF. Devuelve si quedó como favorito (`false` también
@@ -448,10 +470,20 @@ pub fn toggle_favorite_gif(gif: &FavoriteGif) -> bool {
             false
         } else {
             let order = favs.gifs.values().map(|g| g.order).max().unwrap_or(0).saturating_add(1);
-            let format = if gif.video { pb::GifType::Video } else { pb::GifType::Image };
+            let format = if gif.video {
+                pb::GifType::Video
+            } else {
+                pb::GifType::Image
+            };
             favs.gifs.insert(
                 gif.url.clone(),
-                pb::FavoriteGif { format: format as i32, src: gif.src.clone(), width: gif.width, height: gif.height, order },
+                pb::FavoriteGif {
+                    format: format as i32,
+                    src: gif.src.clone(),
+                    width: gif.width,
+                    height: gif.height,
+                    order,
+                },
             );
             true
         };
@@ -491,11 +523,22 @@ pub fn unicode_for_emoji_key(key: &str) -> Option<&'static str> {
 }
 
 pub fn favorite_emojis() -> Vec<String> {
-    with(|s| s.settings.favorite_emojis.as_ref().map(|f| f.emojis.clone()).unwrap_or_default())
+    with(|s| {
+        s.settings
+            .favorite_emojis
+            .as_ref()
+            .map(|f| f.emojis.clone())
+            .unwrap_or_default()
+    })
 }
 
 pub fn is_favorite_emoji(key: &str) -> bool {
-    with(|s| s.settings.favorite_emojis.as_ref().is_some_and(|f| f.emojis.iter().any(|e| e == key)))
+    with(|s| {
+        s.settings
+            .favorite_emojis
+            .as_ref()
+            .is_some_and(|f| f.emojis.iter().any(|e| e == key))
+    })
 }
 
 /// Devuelve si quedó como favorito.
@@ -545,7 +588,11 @@ pub fn record_reaction_use(key: &str) {
         if !s.loaded || key.is_empty() {
             return;
         }
-        let map = &mut s.settings.emoji_reaction_frecency.get_or_insert_with(Default::default).emojis;
+        let map = &mut s
+            .settings
+            .emoji_reaction_frecency
+            .get_or_insert_with(Default::default)
+            .emojis;
         bump(map, key.to_owned(), now_ms());
         s.touch(field::EMOJI_REACTION_FRECENCY);
     });
@@ -566,11 +613,22 @@ pub fn top_reactions(limit: usize) -> Vec<String> {
 // ---------------------------------------------------------------------
 
 pub fn favorite_stickers() -> Vec<u64> {
-    with(|s| s.settings.favorite_stickers.as_ref().map(|f| f.sticker_ids.clone()).unwrap_or_default())
+    with(|s| {
+        s.settings
+            .favorite_stickers
+            .as_ref()
+            .map(|f| f.sticker_ids.clone())
+            .unwrap_or_default()
+    })
 }
 
 pub fn is_favorite_sticker(id: u64) -> bool {
-    with(|s| s.settings.favorite_stickers.as_ref().is_some_and(|f| f.sticker_ids.contains(&id)))
+    with(|s| {
+        s.settings
+            .favorite_stickers
+            .as_ref()
+            .is_some_and(|f| f.sticker_ids.contains(&id))
+    })
 }
 
 /// Devuelve si quedó como favorito.
@@ -597,7 +655,11 @@ pub fn record_sticker_use(id: u64) {
         if !s.loaded || id == 0 {
             return;
         }
-        let map = &mut s.settings.sticker_frecency.get_or_insert_with(Default::default).stickers;
+        let map = &mut s
+            .settings
+            .sticker_frecency
+            .get_or_insert_with(Default::default)
+            .stickers;
         bump(map, id, now_ms());
         s.touch(field::STICKER_FRECENCY);
     });
@@ -628,7 +690,11 @@ pub fn record_command_use(key: &str) {
         if !s.loaded || key.is_empty() {
             return;
         }
-        let map = &mut s.settings.application_command_frecency.get_or_insert_with(Default::default).application_commands;
+        let map = &mut s
+            .settings
+            .application_command_frecency
+            .get_or_insert_with(Default::default)
+            .application_commands;
         bump(map, key.to_owned(), now_ms());
         s.touch(field::APPLICATION_COMMAND_FRECENCY);
     });
@@ -639,7 +705,10 @@ pub fn top_commands(limit: usize) -> Vec<String> {
         let Some(f) = s.settings.application_command_frecency.as_ref() else {
             return Vec::new();
         };
-        ranked(&f.application_commands, now_ms()).into_iter().take(limit).collect()
+        ranked(&f.application_commands, now_ms())
+            .into_iter()
+            .take(limit)
+            .collect()
     })
 }
 
@@ -648,7 +717,11 @@ pub fn record_application_use(application_id: &str) {
         if !s.loaded || application_id.is_empty() {
             return;
         }
-        let map = &mut s.settings.application_frecency.get_or_insert_with(Default::default).applications;
+        let map = &mut s
+            .settings
+            .application_frecency
+            .get_or_insert_with(Default::default)
+            .applications;
         bump(map, application_id.to_owned(), now_ms());
         s.touch(field::APPLICATION_FRECENCY);
     });
@@ -669,7 +742,11 @@ pub fn record_channel_visit(id: u64) {
         if !s.loaded || id == 0 {
             return;
         }
-        let map = &mut s.settings.guild_and_channel_frecency.get_or_insert_with(Default::default).guild_and_channels;
+        let map = &mut s
+            .settings
+            .guild_and_channel_frecency
+            .get_or_insert_with(Default::default)
+            .guild_and_channels;
         bump(map, id, now_ms());
         s.touch(field::GUILD_AND_CHANNEL_FRECENCY);
     });
@@ -680,7 +757,10 @@ pub fn top_channels(limit: usize) -> Vec<u64> {
         let Some(f) = s.settings.guild_and_channel_frecency.as_ref() else {
             return Vec::new();
         };
-        ranked(&f.guild_and_channels, now_ms()).into_iter().take(limit).collect()
+        ranked(&f.guild_and_channels, now_ms())
+            .into_iter()
+            .take(limit)
+            .collect()
     })
 }
 
@@ -691,7 +771,11 @@ pub fn favorite_sounds() -> Vec<u64> {
         };
         // `ordered_sound_ids` es el orden elegido por el usuario; `sound_ids`
         // es la lista plana. Se prefiere la ordenada si la hay.
-        if f.ordered_sound_ids.is_empty() { f.sound_ids.clone() } else { f.ordered_sound_ids.clone() }
+        if f.ordered_sound_ids.is_empty() {
+            f.sound_ids.clone()
+        } else {
+            f.ordered_sound_ids.clone()
+        }
     })
 }
 
@@ -701,7 +785,10 @@ pub fn toggle_favorite_sound(id: u64) -> bool {
         if !s.loaded || id == 0 {
             return false;
         }
-        let favs = s.settings.favorite_soundboard_sounds.get_or_insert_with(Default::default);
+        let favs = s
+            .settings
+            .favorite_soundboard_sounds
+            .get_or_insert_with(Default::default);
         let now_favorite = if favs.sound_ids.contains(&id) || favs.ordered_sound_ids.contains(&id) {
             favs.sound_ids.retain(|x| *x != id);
             favs.ordered_sound_ids.retain(|x| *x != id);
@@ -722,7 +809,11 @@ pub fn record_sound_played(sound_id: &str) {
         if !s.loaded || sound_id.is_empty() {
             return;
         }
-        let map = &mut s.settings.played_sound_frecency.get_or_insert_with(Default::default).played_sounds;
+        let map = &mut s
+            .settings
+            .played_sound_frecency
+            .get_or_insert_with(Default::default)
+            .played_sounds;
         bump(map, sound_id.to_owned(), now_ms());
         s.touch(field::PLAYED_SOUND_FRECENCY);
     });
@@ -734,7 +825,11 @@ pub fn record_sound_heard(sound_id: &str) {
         if !s.loaded || sound_id.is_empty() {
             return;
         }
-        let map = &mut s.settings.heard_sound_frecency.get_or_insert_with(Default::default).heard_sounds;
+        let map = &mut s
+            .settings
+            .heard_sound_frecency
+            .get_or_insert_with(Default::default)
+            .heard_sounds;
         bump(map, sound_id.to_owned(), now_ms());
         s.touch(field::HEARD_SOUND_FRECENCY);
     });
@@ -777,7 +872,10 @@ mod tests {
 
     #[test]
     fn partial_only_carries_dirty_fields_in_full() {
-        let mut store = Store { loaded: true, ..Default::default() };
+        let mut store = Store {
+            loaded: true,
+            ..Default::default()
+        };
         let favs = store.settings.favorite_emojis.get_or_insert_with(Default::default);
         favs.emojis.push("joy".into());
         favs.emojis.push("skull".into());
@@ -790,8 +888,13 @@ mod tests {
 
     #[test]
     fn remote_echo_does_not_undo_unsent_local_change() {
-        let mut store = Store { loaded: true, ..Default::default() };
-        store.settings.favorite_emojis = Some(pb::FavoriteEmojis { emojis: vec!["joy".into()] });
+        let mut store = Store {
+            loaded: true,
+            ..Default::default()
+        };
+        store.settings.favorite_emojis = Some(pb::FavoriteEmojis {
+            emojis: vec!["joy".into()],
+        });
         store.touch(field::FAVORITE_EMOJIS);
         let remote = FrecencyUserSettings {
             favorite_emojis: Some(pb::FavoriteEmojis { emojis: vec![] }),

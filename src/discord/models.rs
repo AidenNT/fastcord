@@ -126,7 +126,7 @@ impl User {
 
     /// URL de la decoración de avatar (el marco/adorno que va alrededor del
     /// avatar). Se pide con `passthrough=true` para que, si es animada, venga
-    /// como APNG (lo anima `ui::anim::source_animated`).
+    /// como APNG (lo anima `ui::chat::anim::source_animated`).
     pub fn avatar_decoration_url(&self) -> Option<String> {
         let asset = self.avatar_decoration_data.as_ref()?.get("asset")?.as_str()?;
         if asset.is_empty() {
@@ -418,8 +418,59 @@ pub struct PrivateChannel {
 
     #[serde(default)]
     pub avatar_url: Option<String>,
+
+    /// Nombre elegido para un DM grupal (tipo 3). `null` o ausente = sin
+    /// nombre: el cliente oficial lo arma con los nombres de los miembros.
+    #[serde(default)]
+    pub name: Option<String>,
+
+    /// Hash del ícono del DM grupal (`/channel-icons/{id}/{hash}`).
+    #[serde(default)]
+    pub icon: Option<String>,
+
+    /// Quién creó el grupo.
+    #[serde(default)]
+    pub owner_id: Option<String>,
 }
 
+impl PrivateChannel {
+    /// `type` de un DM grupal (`1` = DM con una sola persona).
+    pub const GROUP_DM: u8 = 3;
+
+    pub fn is_group(&self) -> bool {
+        self.channel_type == Self::GROUP_DM
+    }
+
+    /// Nombre a mostrar de un DM grupal: el que le pusieron o, si no tiene,
+    /// los nombres de los demás miembros separados por coma (como Discord;
+    /// `recipients` no incluye a uno mismo).
+    pub fn group_display_name(&self) -> String {
+        if let Some(name) = self.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+            return name.to_string();
+        }
+        let names: Vec<&str> = self
+            .recipients
+            .iter()
+            .map(User::display_name)
+            .filter(|n| !n.is_empty())
+            .collect();
+        if names.is_empty() {
+            "Grupo sin nombre".to_string()
+        } else {
+            names.join(", ")
+        }
+    }
+
+    /// Ícono del grupo en el CDN (siempre `.png`: para los animados es el
+    /// primer cuadro, que no cuesta memoria), o `None` si no tiene.
+    pub fn group_icon_url(&self) -> Option<String> {
+        let hash = self.icon.as_deref().filter(|h| !h.is_empty())?;
+        Some(format!(
+            "https://cdn.discordapp.com/channel-icons/{}/{}.png?size=128",
+            self.id, hash
+        ))
+    }
+}
 
 impl Guild {
     /// Nombre a mostrar en el rail. Un server "unavailable" no trae nombre,
@@ -571,6 +622,19 @@ pub struct PartialMember {
     pub roles: Vec<String>,
 }
 
+/// `TYPING_START`: alguien empezó a escribir. Discord lo manda al empezar y
+/// el cliente oficial lo repite cada ~8-10 s mientras sigue escribiendo.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TypingStart {
+    pub channel_id: String,
+    pub user_id: String,
+    #[serde(default)]
+    pub guild_id: Option<String>,
+    /// Solo en canales de server.
+    #[serde(default)]
+    pub member: Option<PartialMember>,
+}
+
 /// Un server en común, tal como viene en `mutual_guilds` de
 /// `GET /users/{id}/profile`. Discord solo manda el id acá — el
 /// nombre/ícono para mostrarlo lo sacamos de `App::servers` cruzando por
@@ -640,7 +704,9 @@ impl UserProfileResponse {
         let from = |meta: &Option<UserProfileMeta>| -> Option<String> {
             let effect = meta.as_ref()?.profile_effect.as_ref()?;
             let id = effect.get("id")?;
-            id.as_str().map(str::to_string).or_else(|| id.as_u64().map(|n| n.to_string()))
+            id.as_str()
+                .map(str::to_string)
+                .or_else(|| id.as_u64().map(|n| n.to_string()))
         };
         // Formato viejo: `profile_effect.id`. Si no viene, el efecto llega como
         // coleccionable `type` 1 con su `sku_id`; `ProfileEffect::from_configs`
@@ -719,7 +785,9 @@ impl UserProfileMeta {
                 return None;
             }
             let sku = item.get("sku_id")?;
-            sku.as_str().map(str::to_string).or_else(|| sku.as_u64().map(|n| n.to_string()))
+            sku.as_str()
+                .map(str::to_string)
+                .or_else(|| sku.as_u64().map(|n| n.to_string()))
         })
     }
 }
@@ -791,7 +859,9 @@ impl ProfileEffect {
         // `effect_id` puede ser el `id` del efecto o el `sku_id` del catálogo.
         let matches = |config: &Value, key: &str| {
             config.get(key).is_some_and(|v| {
-                v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string()))
+                v.as_str()
+                    .map(str::to_string)
+                    .or_else(|| v.as_u64().map(|n| n.to_string()))
                     == Some(effect_id.to_string())
             })
         };
@@ -825,7 +895,13 @@ impl ProfileEffect {
                     .filter(|s| !s.is_empty())
                     .map(str::to_string)
                     .or_else(|| {
-                        layer.get("randomizedSources")?.as_array()?.first()?.get("src")?.as_str().map(str::to_string)
+                        layer
+                            .get("randomizedSources")?
+                            .as_array()?
+                            .first()?
+                            .get("src")?
+                            .as_str()
+                            .map(str::to_string)
                     })?;
                 let position = layer.get("position");
                 Some(EffectLayer {
@@ -920,11 +996,18 @@ impl ProfileFrame {
     pub fn from_item(item: &serde_json::Value) -> Option<Self> {
         use serde_json::Value;
         let snowflake = |v: &Value| {
-            v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string()))
+            v.as_str()
+                .map(str::to_string)
+                .or_else(|| v.as_u64().map(|n| n.to_string()))
         };
         let num = |key: &str| item.get(key).and_then(Value::as_f64).unwrap_or(0.0) as f32;
         let text = |layer: &Value, key: &str| {
-            layer.get(key).and_then(Value::as_str).unwrap_or_default().trim().to_ascii_lowercase()
+            layer
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
         };
         let layers: Vec<FrameLayer> = item
             .get("layers")?
@@ -956,7 +1039,11 @@ impl ProfileFrame {
         }
         Some(Self {
             sku_id: item.get("sku_id").and_then(snowflake).unwrap_or_default(),
-            label: item.get("label").and_then(Value::as_str).unwrap_or_default().to_string(),
+            label: item
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
             inner_width: num("inner_width"),
             overflow_top: num("overflow_top"),
             overflow_bottom: num("overflow_bottom"),
@@ -1111,9 +1198,11 @@ impl Emoji {
     pub fn kind(&self) -> crate::lib::data::ReactionKind {
         use crate::lib::data::ReactionKind;
         match (&self.id, self.name.as_deref()) {
-            (Some(id), Some(name)) if !name.is_empty() => {
-                ReactionKind::Custom { id: id.clone(), name: name.to_string(), animated: self.animated }
-            }
+            (Some(id), Some(name)) if !name.is_empty() => ReactionKind::Custom {
+                id: id.clone(),
+                name: name.to_string(),
+                animated: self.animated,
+            },
             (None, Some(name)) if !name.is_empty() => ReactionKind::Unicode(name.to_string()),
             _ => ReactionKind::Unicode("❓".to_string()),
         }
@@ -1247,6 +1336,29 @@ pub struct GatewayMessage {
     /// Bits de `flags` del mensaje (`1 << 6` = efímero).
     #[serde(default)]
     pub flags: u64,
+    /// Mensaje de llamada (tipo 3): quién participó y cuándo terminó.
+    #[serde(default, deserialize_with = "lenient_call")]
+    pub call: Option<MessageCall>,
+}
+
+/// `call` de un mensaje de tipo 3 (llamada de DM / grupo).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MessageCall {
+    /// Ids de quienes se unieron a la llamada.
+    #[serde(default)]
+    pub participants: Vec<String>,
+    /// `None` = la llamada sigue en curso.
+    #[serde(default)]
+    pub ended_timestamp: Option<String>,
+}
+
+/// Un `call` con forma rara no tira abajo el mensaje entero.
+fn lenient_call<'de, D>(deserializer: D) -> Result<Option<MessageCall>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    Ok(value.and_then(|v| serde_json::from_value(v).ok()))
 }
 
 /// Solo el id del mensaje citado — la parte de `message_reference` que
@@ -1317,7 +1429,12 @@ impl<'de> Deserialize<'de> for SnapshotMessage {
             value
                 .get(key)
                 .and_then(|v| v.as_array())
-                .map(|items| items.iter().filter_map(|item| serde_json::from_value(item.clone()).ok()).collect())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| serde_json::from_value(item.clone()).ok())
+                        .collect()
+                })
                 .unwrap_or_default()
         }
         let value = serde_json::Value::deserialize(deserializer)?;
@@ -1409,7 +1526,7 @@ impl StickerItem {
     ///   los APNG se ven estáticos.
     /// * Lottie (3): el CDN sirve el `.json` (animación vectorial), que
     ///   acá no se puede dibujar. Se pide el `.png` a modo de vista
-    ///   previa; si el CDN no lo tiene, `ui::media` deja un recuadro con
+    ///   previa; si el CDN no lo tiene, `ui::chat::media` deja un recuadro con
     ///   el nombre del sticker.
     ///
     /// Se usa `cdn.discordapp.com` (no `media.discordapp.net`) a propósito:
@@ -1417,10 +1534,7 @@ impl StickerItem {
     /// `discordapp.net`, y eso no aplica a los stickers.
     pub fn url(&self) -> String {
         let ext = if self.format_type == 4 { "gif" } else { "png" };
-        format!(
-            "https://cdn.discordapp.com/stickers/{}.{}?size=320",
-            self.id, ext
-        )
+        format!("https://cdn.discordapp.com/stickers/{}.{}?size=320", self.id, ext)
     }
 
     /// Como [`StickerItem::url`] pero chica (128 px), para las celdas del
@@ -1428,10 +1542,7 @@ impl StickerItem {
     /// dibujar una miniatura.
     pub fn thumb_url(&self) -> String {
         let ext = if self.format_type == 4 { "gif" } else { "png" };
-        format!(
-            "https://cdn.discordapp.com/stickers/{}.{}?size=128",
-            self.id, ext
-        )
+        format!("https://cdn.discordapp.com/stickers/{}.{}?size=128", self.id, ext)
     }
 }
 
@@ -1490,10 +1601,7 @@ impl Attachment {
 
     /// URL preferida para mostrar: el proxy si vino, si no la directa.
     pub fn display_url(&self) -> &str {
-        self.proxy_url
-            .as_deref()
-            .filter(|u| !u.is_empty())
-            .unwrap_or(&self.url)
+        self.proxy_url.as_deref().filter(|u| !u.is_empty()).unwrap_or(&self.url)
     }
 }
 
@@ -1515,10 +1623,7 @@ impl EmbedMedia {
     /// cacheada: cargarla de ahí evita pegarle a un sitio ajeno (y sus
     /// bloqueos de hotlink) desde el cliente.
     pub fn display_url(&self) -> &str {
-        self.proxy_url
-            .as_deref()
-            .filter(|u| !u.is_empty())
-            .unwrap_or(&self.url)
+        self.proxy_url.as_deref().filter(|u| !u.is_empty()).unwrap_or(&self.url)
     }
 
     pub fn has_url(&self) -> bool {
@@ -1874,14 +1979,14 @@ impl ModalRequest {
             .or_else(|| non_empty(text(bot.and_then(|b| b.get("global_name")))))
             .or_else(|| non_empty(text(bot.and_then(|b| b.get("username")))));
         let app_icon_url = non_empty(text(application.and_then(|a| a.get("icon"))))
-            .map(|hash| {
-                format!("https://cdn.discordapp.com/app-icons/{application_id}/{hash}.png?size=128")
-            })
+            .map(|hash| format!("https://cdn.discordapp.com/app-icons/{application_id}/{hash}.png?size=128"))
             .or_else(|| {
                 let bot_id = non_empty(text(bot.and_then(|b| b.get("id"))))?;
                 let hash = non_empty(text(bot.and_then(|b| b.get("avatar"))))?;
                 let ext = if hash.starts_with("a_") { "gif" } else { "png" };
-                Some(format!("https://cdn.discordapp.com/avatars/{bot_id}/{hash}.{ext}?size=128"))
+                Some(format!(
+                    "https://cdn.discordapp.com/avatars/{bot_id}/{hash}.{ext}?size=128"
+                ))
             });
         Some(Self {
             interaction_id,
@@ -1935,6 +2040,11 @@ pub struct ReadyPayload {
     /// Ver [`parse_session_activities`].
     #[serde(default)]
     pub sessions: serde_json::Value,
+    /// Solicitudes de ingreso a servers con formulario (enviadas y aún sin
+    /// aprobar, o ya resueltas). Se guarda crudo; ver
+    /// `join_form::parse_join_requests`.
+    #[serde(default)]
+    pub guild_join_requests: serde_json::Value,
 }
 
 /// Una entrada de `READY.read_state`: qué tan leído está un canal/DM.
@@ -2043,9 +2153,7 @@ pub struct PresenceActivity {
 impl PresenceActivity {
     fn timestamp(&self, key: &str) -> Option<u64> {
         let value = self.timestamps.get(key)?;
-        value
-            .as_u64()
-            .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+        value.as_u64().or_else(|| value.as_str().and_then(|s| s.parse().ok()))
     }
 
     /// Cuándo empezó (milisegundos Unix), si la actividad lo informa.
@@ -2090,7 +2198,9 @@ impl PresenceActivity {
 /// `PRESENCE_UPDATE`. Se descartan los estados personalizados (no son una
 /// actividad) y las repetidas entre sesiones.
 pub fn parse_session_activities(raw: &serde_json::Value) -> Vec<PresenceActivity> {
-    let Some(sessions) = raw.as_array() else { return Vec::new() };
+    let Some(sessions) = raw.as_array() else {
+        return Vec::new();
+    };
     let mut out: Vec<PresenceActivity> = Vec::new();
     for session in sessions {
         let status = session.get("status").and_then(serde_json::Value::as_str).unwrap_or("");
@@ -2155,9 +2265,7 @@ fn activities_subtitle_raw(activities: &[PresenceActivity]) -> Option<String> {
             return Some(state.to_owned());
         }
     }
-    let activity = activities
-        .iter()
-        .find(|a| a.kind != 4 && !a.name.is_empty())?;
+    let activity = activities.iter().find(|a| a.kind != 4 && !a.name.is_empty())?;
     Some(match activity.kind {
         0 => format!("Jugando a {}", activity.name),
         1 => format!("Transmitiendo {}", activity.name),
@@ -2311,7 +2419,6 @@ pub struct GuildMemberUpdate {
     #[serde(default)]
     pub roles: Vec<String>,
 }
-
 
 #[cfg(test)]
 mod read_state_tests {

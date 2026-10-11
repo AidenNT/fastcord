@@ -71,9 +71,7 @@ pub fn encode_base64(settings: &PreloadedUserSettings) -> String {
 /// `THEME_DARKER` y `THEME_MIDNIGHT` son variantes más oscuras del modo
 /// oscuro que `ecord` todavía no distingue como paletas propias, así que
 /// las dos caen en `ThemeMode::Dark` por ahora.
-pub fn theme_mode_from_settings(
-    settings: &PreloadedUserSettings,
-) -> Option<crate::theme::ThemeMode> {
+pub fn theme_mode_from_settings(settings: &PreloadedUserSettings) -> Option<crate::theme::ThemeMode> {
     use crate::theme::ThemeMode;
     use proto::preloaded_user_settings::Theme;
 
@@ -82,43 +80,6 @@ pub fn theme_mode_from_settings(
         Theme::Dark | Theme::Darker | Theme::Midnight => Some(ThemeMode::Dark),
         Theme::Light => Some(ThemeMode::Light),
         Theme::Unset => None,
-    }
-}
-
-/// Locale guardado en la cuenta (`"es-419"`, `"en-US"`, etc.), si el
-/// usuario lo configuró alguna vez desde algún cliente oficial.
-pub fn locale_from_settings(settings: &PreloadedUserSettings) -> Option<&str> {
-    settings
-        .localization
-        .as_ref()?
-        .locale
-        .as_ref()
-        .map(String::as_str)
-}
-
-/// Texto del status personalizado actual (el que se ve al lado del
-/// nombre en la lista de miembros), si hay uno puesto y no expiró.
-pub fn custom_status_text(settings: &PreloadedUserSettings) -> Option<&str> {
-    let status = settings.status.as_ref()?.custom_status.as_ref()?;
-    if status.text.is_empty() {
-        None
-    } else {
-        Some(status.text.as_str())
-    }
-}
-
-/// Arma un `PreloadedUserSettings` "parcial" con solo `appearance.theme`
-/// seteado, pensado para mandar como body de un PATCH sin pisar el resto
-/// de la configuración de la cuenta (ver el comentario de `encode`).
-pub fn partial_with_theme(theme: proto::preloaded_user_settings::Theme) -> PreloadedUserSettings {
-    use proto::preloaded_user_settings::AppearanceSettings;
-
-    PreloadedUserSettings {
-        appearance: Some(AppearanceSettings {
-            theme: theme as i32,
-            ..Default::default()
-        }),
-        ..Default::default()
     }
 }
 

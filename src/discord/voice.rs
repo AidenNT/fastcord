@@ -12,13 +12,13 @@ mod audio_buffer;
 mod audio_runtime;
 mod dave;
 mod devices;
+#[cfg(feature = "voice-playback")]
+mod echo_reference;
 mod gateway;
 mod info;
 mod levels;
 #[cfg(feature = "voice-playback")]
 mod microphone;
-#[cfg(feature = "voice-playback")]
-mod echo_reference;
 #[cfg(feature = "voice-playback")]
 mod noise;
 mod opus;
@@ -35,11 +35,11 @@ mod video_decode;
 // Transmitir la propia pantalla (Go Live): captura + H.264 con ffmpeg-the-third y la
 // sesión de media que lo manda. Ver `stream_publish.rs`.
 mod screen_capture;
-mod stream_publish;
-mod window_list;
 mod source_thumbs;
+mod stream_publish;
 #[cfg(windows)]
 mod window_capture;
+mod window_list;
 
 pub(crate) use devices::{VoiceAudioSourceOptions, VoiceAudioSources, list_voice_audio_sources};
 #[cfg(all(feature = "voice-playback", not(test)))]
@@ -49,8 +49,7 @@ use gateway::*;
 #[cfg(not(test))]
 use gateway::{run_voice_gateway_session, send_voice_binary, send_voice_text};
 pub use info::{
-    MemberInfo, VoiceConnectPhase, VoiceConnectionStatus, VoiceScope, VoiceServerInfo, VoiceSoundKind,
-    VoiceStateInfo,
+    MemberInfo, VoiceConnectPhase, VoiceConnectionStatus, VoiceScope, VoiceServerInfo, VoiceSoundKind, VoiceStateInfo,
 };
 #[cfg(all(feature = "voice-playback", target_os = "linux", not(test)))]
 use microphone::log_captured_alsa_errors;
@@ -61,13 +60,13 @@ use microphone::*;
 #[cfg(test)]
 use runtime::{VoiceRuntimeAction, VoiceRuntimeState};
 pub(crate) use runtime::{forward_app_event, run_voice_runtime};
-pub use state::{CurrentVoiceConnectionState, VoiceAudioSettings, VoiceCache, VoiceParticipantState};
-pub use stream_watch::{StreamFrame, StreamFrameSlot, StreamWatchStatus};
-pub(crate) use stream_watch::{StreamWatchHandle, StreamWatchParams, spawn_stream_watch};
-pub use stream_publish::StreamPublishStatus;
-pub(crate) use stream_publish::{StreamPublishHandle, StreamPublishParams, spawn_stream_publish};
 pub(crate) use screen_capture::{CaptureTarget, ScreenCaptureConfig, StreamQuality};
 pub(crate) use source_thumbs::{ThumbKey, Thumbnail, spawn_source_thumbnails};
+pub use state::{CurrentVoiceConnectionState, VoiceAudioSettings, VoiceCache, VoiceParticipantState};
+pub use stream_publish::StreamPublishStatus;
+pub(crate) use stream_publish::{StreamPublishHandle, StreamPublishParams, spawn_stream_publish};
+pub use stream_watch::{StreamFrame, StreamFrameSlot, StreamWatchStatus};
+pub(crate) use stream_watch::{StreamWatchHandle, StreamWatchParams, spawn_stream_watch};
 pub(crate) use window_list::{
     CaptureMonitor, CaptureWindow, WINDOW_CAPTURE_SUPPORTED, list_capture_monitors, list_capture_windows,
 };
@@ -107,10 +106,10 @@ use playback::{apply_voice_playback_gain_and_limit, write_voice_output_frame};
 #[cfg(any(test, feature = "voice-playback"))]
 use rtp::VoiceOutboundRtpState;
 use rtp::{
-    RtpHeader, VoiceRtpDecryptor, VoiceRtpEncryptor, looks_like_rtcp_packet, parse_rtp_header,
-    rtcp_sender_ssrc,
+    RtpHeader, VoiceRtpDecryptor, VoiceRtpEncryptor, looks_like_rtcp_packet, parse_rtp_header, rtcp_sender_ssrc,
 };
 
+use crate::discord::websocket::{self, Message as WsMessage};
 #[cfg(test)]
 use aes_gcm::{
     Aes256Gcm, Nonce as AesGcmNonce,
@@ -130,7 +129,6 @@ use tokio::{
     task::JoinHandle,
     time::{sleep, timeout},
 };
-use crate::discord::websocket::{self, Message as WsMessage};
 
 use crate::discord::ids::{
     Id,
@@ -138,11 +136,11 @@ use crate::discord::ids::{
 };
 use crate::logging;
 pub use levels::{
-    MicrophoneBufferMs, MicrophoneSensitivityDb, VoiceParticipantPlaybackSettings,
-    VoiceParticipantVolumePercent, VoiceVolumePercent,
+    MicrophoneBufferMs, MicrophoneSensitivityDb, VoiceParticipantPlaybackSettings, VoiceParticipantVolumePercent,
+    VoiceVolumePercent,
 };
 
-use super::{gateway::GatewayCommand, AppEvent};
+use super::{AppEvent, gateway::GatewayCommand};
 
 const VOICE_GATEWAY_VERSION: u8 = 9;
 const VOICE_WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -204,8 +202,7 @@ const VOICE_MIC_QUEUE_BUDGET: Duration = VOICE_MIC_MAX_PROCESSING_DELAY
 #[cfg(feature = "voice-playback")]
 const VOICE_MIC_PCM_FRAME_QUEUE: usize = VOICE_MIC_QUEUE_BUDGET
     .as_millis()
-    .div_ceil(DISCORD_OPUS_FRAME_DURATION.as_millis())
-    as usize
+    .div_ceil(DISCORD_OPUS_FRAME_DURATION.as_millis()) as usize
     + 1;
 #[cfg(all(feature = "voice-playback", target_os = "linux"))]
 const VOICE_MIC_AUTOMATIC_CALLBACKS_PER_SECOND: u32 = 20;
@@ -399,12 +396,7 @@ impl VoiceStatusPublisher {
         Self { events }
     }
 
-    async fn publish(
-        &self,
-        session: &VoiceGatewaySession,
-        status: VoiceConnectionStatus,
-        message: impl Into<String>,
-    ) {
+    async fn publish(&self, session: &VoiceGatewaySession, status: VoiceConnectionStatus, message: impl Into<String>) {
         let _ = self.events.send(AppEvent::VoiceConnectionStatusChanged {
             scope: session.scope.server_id_string(),
             channel_id: Some(session.channel_id.to_string()),
@@ -421,12 +413,7 @@ impl VoiceStatusPublisher {
         });
     }
 
-    async fn publish_speaking(
-        &self,
-        session: &VoiceGatewaySession,
-        user_id: Id<UserMarker>,
-        speaking: bool,
-    ) {
+    async fn publish_speaking(&self, session: &VoiceGatewaySession, user_id: Id<UserMarker>, speaking: bool) {
         let _ = self.events.send(AppEvent::VoiceSpeakingUpdate {
             channel_id: session.channel_id.to_string(),
             user_id: user_id.to_string(),
@@ -510,19 +497,13 @@ impl VoiceSpeakingTracker {
         }
     }
 
-    fn record_remote(
-        &mut self,
-        user_id: Id<UserMarker>,
-        speaking: bool,
-        now: Instant,
-    ) -> Option<bool> {
+    fn record_remote(&mut self, user_id: Id<UserMarker>, speaking: bool, now: Instant) -> Option<bool> {
         if user_id == self.local_user_id {
             return None;
         }
         if speaking {
             let was_active = self.remote_deadlines.contains_key(&user_id);
-            self.remote_deadlines
-                .insert(user_id, now + VOICE_REMOTE_SPEAKING_TTL);
+            self.remote_deadlines.insert(user_id, now + VOICE_REMOTE_SPEAKING_TTL);
             return (!was_active).then_some(true);
         }
         if self.remote_deadlines.remove(&user_id).is_some() {
@@ -757,8 +738,7 @@ struct VoiceGatewayControls {
     capture_gate_rx: mpsc::UnboundedReceiver<VoiceCaptureGate>,
     initial_playback_gate: VoicePlaybackGate,
     playback_gate_rx: mpsc::UnboundedReceiver<VoicePlaybackGate>,
-    participant_playback_rx:
-        watch::Receiver<HashMap<Id<UserMarker>, VoiceParticipantPlaybackSettings>>,
+    participant_playback_rx: watch::Receiver<HashMap<Id<UserMarker>, VoiceParticipantPlaybackSettings>>,
 }
 
 #[cfg(feature = "voice-playback")]
@@ -1042,24 +1022,12 @@ impl VoiceChildTasks {
     }
 
     #[allow(dead_code)]
-    fn set_microphone_capture_enabled(
-        &mut self,
-        enabled: bool,
-        microphone_buffer_ms: Option<MicrophoneBufferMs>,
-    ) {
+    fn set_microphone_capture_enabled(&mut self, enabled: bool, microphone_buffer_ms: Option<MicrophoneBufferMs>) {
         #[cfg(feature = "voice-playback")]
         {
             let buffer_changed = self.microphone_buffer_ms != microphone_buffer_ms;
-            let samples_tx = if enabled {
-                self.microphone_pcm_tx.clone()
-            } else {
-                None
-            };
-            match (
-                samples_tx,
-                self.microphone_capture.is_some(),
-                buffer_changed,
-            ) {
+            let samples_tx = if enabled { self.microphone_pcm_tx.clone() } else { None };
+            match (samples_tx, self.microphone_capture.is_some(), buffer_changed) {
                 (Some(samples_tx), false, _) => {
                     match VoiceMicrophoneCapture::start(
                         samples_tx,
@@ -1070,10 +1038,7 @@ impl VoiceChildTasks {
                             self.microphone_capture = Some(capture);
                             self.microphone_buffer_ms = microphone_buffer_ms;
                         }
-                        Err(error) => logging::error(
-                            "voice",
-                            format!("voice microphone capture unavailable: {error}"),
-                        ),
+                        Err(error) => logging::error("voice", format!("voice microphone capture unavailable: {error}")),
                     }
                 }
                 (Some(samples_tx), true, true) => {
@@ -1089,16 +1054,11 @@ impl VoiceChildTasks {
                         Ok(capture) => {
                             self.microphone_capture = Some(capture);
                             self.microphone_buffer_ms = microphone_buffer_ms;
-                            logging::debug(
-                                "voice",
-                                "replaced voice microphone capture for new buffer setting",
-                            );
+                            logging::debug("voice", "replaced voice microphone capture for new buffer setting");
                         }
                         Err(error) => logging::error(
                             "voice",
-                            format!(
-                                "voice microphone buffer change failed; previous capture remains active: {error}"
-                            ),
+                            format!("voice microphone buffer change failed; previous capture remains active: {error}"),
                         ),
                     }
                 }
@@ -1120,17 +1080,14 @@ impl VoiceChildTasks {
         {
             if let Some(gate) = self.transmit_gate.as_ref() {
                 gate.send_modify(|current| {
-                    let epoch = current.transmit_epoch.wrapping_add(u64::from(
-                        current.transmit_enabled != capture_gate.transmit_enabled,
-                    ));
+                    let epoch = current
+                        .transmit_epoch
+                        .wrapping_add(u64::from(current.transmit_enabled != capture_gate.transmit_enabled));
                     *current = capture_gate;
                     current.transmit_epoch = epoch;
                 });
             }
-            self.set_microphone_capture_enabled(
-                capture_gate.capture_enabled,
-                capture_gate.microphone_buffer_ms,
-            );
+            self.set_microphone_capture_enabled(capture_gate.capture_enabled, capture_gate.microphone_buffer_ms);
         }
         #[cfg(not(feature = "voice-playback"))]
         {
@@ -1166,10 +1123,7 @@ impl VoiceChildTasks {
                 if let Some(samples_tx) = self.microphone_pcm_tx.clone()
                     && (self.microphone_capture.is_some() || capture_gate.capture_enabled)
                 {
-                    logging::debug(
-                        "voice",
-                        "starting replacement voice microphone capture for new source",
-                    );
+                    logging::debug("voice", "starting replacement voice microphone capture for new source");
                     match VoiceMicrophoneCapture::start(
                         samples_tx,
                         sources.input.as_deref(),
@@ -1179,10 +1133,7 @@ impl VoiceChildTasks {
                             self.microphone_capture = Some(capture);
                             self.microphone_source = sources.input;
                             self.microphone_buffer_ms = capture_gate.microphone_buffer_ms;
-                            logging::debug(
-                                "voice",
-                                "replaced voice microphone capture for new source",
-                            );
+                            logging::debug("voice", "replaced voice microphone capture for new source");
                         }
                         Err(error) => errors.push(format!(
                             "Could not switch voice input source. The previous source remains active: {error}"
@@ -1230,8 +1181,7 @@ impl VoiceChildTasks {
             return Ok(());
         };
 
-        let audio_output =
-            VoiceAudioOutput::start(playback_enabled, playback_volume, output_source)?;
+        let audio_output = VoiceAudioOutput::start(playback_enabled, playback_volume, output_source)?;
         decoded_audio_output.replace(Some(&audio_output));
         self.audio_output = Some(audio_output);
         logging::debug("voice", "replaced voice audio output for new source");

@@ -40,9 +40,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use super::captcha::{self, CaptchaCancelled, CaptchaChallenge};
 
 use super::fingerprint::{CLIENT_BUILD_NUMBER, ClientFingerprint};
-use super::models::{
-    Channel, ForumPage, GatewayMessage, ThreadChannel, User, UserProfileResponse,
-};
+use super::models::{Channel, ForumPage, GatewayMessage, ThreadChannel, User, UserProfileResponse};
 
 /// Cuántos mensajes se piden por página (igual que en `rest.rs`).
 pub const MESSAGES_PAGE_SIZE: u8 = 20;
@@ -107,10 +105,10 @@ async fn connected_client(token: &str) -> anyhow::Result<Arc<UwuInner>> {
     let _busy = super::activity::begin();
     let inner = UwuInner::connect(
         token.to_string(),
-        None,                 // custom_api_version: que lo detecte solo
-        Some(build_numbers),  // ← mismo build number que fingerprint/gateway
-        None,                 // client_session: que genere uno propio
-        None,                 // proxy
+        None,                // custom_api_version: que lo detecte solo
+        Some(build_numbers), // ← mismo build number que fingerprint/gateway
+        None,                // client_session: que genere uno propio
+        None,                // proxy
     )
     .await
     .map_err(|e| {
@@ -212,8 +210,7 @@ fn is_stranger_confirmation(error: &BoxError) -> bool {
         }
     }
     let lower = text.to_lowercase();
-    lower.contains("confirmar la solicitud de amistad")
-        || lower.contains("confirm the friend request")
+    lower.contains("confirmar la solicitud de amistad") || lower.contains("confirm the friend request")
 }
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -352,7 +349,9 @@ pub struct UwuRest {
 impl UwuRest {
     pub async fn for_token(token: String) -> anyhow::Result<Self> {
         let inner = connected_client(&token).await?;
-        Ok(Self { client: CaptchaClient { inner } })
+        Ok(Self {
+            client: CaptchaClient { inner },
+        })
     }
 
     fn home() -> RequestProperties {
@@ -361,19 +360,11 @@ impl UwuRest {
 
     pub async fn guild_channels(&self, guild_id: &str) -> anyhow::Result<Vec<Channel>> {
         let path = format!("guilds/{guild_id}/channels");
-        let value: Value = self
-            .client
-            .get(&path, None, Some(Self::home()))
-            .await
-            .map_err(err)?;
+        let value: Value = self.client.get(&path, None, Some(Self::home())).await.map_err(err)?;
         serde_json::from_value(value).map_err(err)
     }
 
-    pub async fn channel_messages(
-        &self,
-        channel_id: &str,
-        limit: u8,
-    ) -> anyhow::Result<Vec<GatewayMessage>> {
+    pub async fn channel_messages(&self, channel_id: &str, limit: u8) -> anyhow::Result<Vec<GatewayMessage>> {
         let mut query = HashMap::new();
         query.insert("limit".to_string(), limit.to_string());
         let path = format!("channels/{channel_id}/messages");
@@ -454,14 +445,13 @@ impl UwuRest {
     /// por fecha de creación; si no, por actividad reciente. Cada hilo y
     /// cada primer mensaje se parsean por separado, así uno raro no tira
     /// abajo toda la página.
-    pub async fn forum_threads(
-        &self,
-        channel_id: &str,
-        offset: u32,
-        by_creation: bool,
-    ) -> anyhow::Result<ForumPage> {
+    pub async fn forum_threads(&self, channel_id: &str, offset: u32, by_creation: bool) -> anyhow::Result<ForumPage> {
         let mut query = HashMap::new();
-        let sort_by = if by_creation { "creation_time" } else { "last_message_time" };
+        let sort_by = if by_creation {
+            "creation_time"
+        } else {
+            "last_message_time"
+        };
         query.insert("sort_by".to_string(), sort_by.to_string());
         query.insert("sort_order".to_string(), "desc".to_string());
         query.insert("limit".to_string(), FORUM_PAGE_SIZE.to_string());
@@ -473,9 +463,7 @@ impl UwuRest {
             .get(&path, Some(query), Some(Self::home()))
             .await
             .map_err(err)?;
-        let list = |key: &str| -> Vec<Value> {
-            value.get(key).and_then(Value::as_array).cloned().unwrap_or_default()
-        };
+        let list = |key: &str| -> Vec<Value> { value.get(key).and_then(Value::as_array).cloned().unwrap_or_default() };
         Ok(ForumPage {
             threads: list("threads")
                 .into_iter()
@@ -628,10 +616,7 @@ impl UwuRest {
         fields: &[(String, String)],
     ) -> anyhow::Result<()> {
         let values: HashMap<String, String> = fields.iter().cloned().collect();
-        let mut rows: Vec<Value> = components
-            .iter()
-            .filter_map(|c| c.to_modal_submit(&values))
-            .collect();
+        let mut rows: Vec<Value> = components.iter().filter_map(|c| c.to_modal_submit(&values)).collect();
         if rows.is_empty() {
             // Sin estructura conocida: formato viejo, un campo por fila.
             rows = fields
@@ -713,11 +698,7 @@ impl UwuRest {
     /// - `Some(valor)`: aceptar; manda `confirm_stranger_request: valor`. Primero
     ///   con `false` y, si Discord no la acepta y la persona lo confirma, con
     ///   `true` (solicitudes de alguien sin amigos ni servers en común).
-    pub async fn add_friend(
-        &self,
-        user_id: &str,
-        confirm_stranger: Option<bool>,
-    ) -> anyhow::Result<()> {
+    pub async fn add_friend(&self, user_id: &str, confirm_stranger: Option<bool>) -> anyhow::Result<()> {
         let path = format!("users/@me/relationships/{user_id}");
         let body = match confirm_stranger {
             Some(confirm) => json!({ "confirm_stranger_request": confirm }),
@@ -857,9 +838,90 @@ impl UwuRest {
             location_channel_type: channel_type,
         }));
         let body = json!({ "session_id": session_id });
+        let value: Value = self.client.post(&path, Some(body), Some(props)).await.map_err(err)?;
+        Ok(value)
+    }
+
+    /// `GET /guilds/{id}/member-verification`: el formulario de ingreso del
+    /// server (reglas y preguntas), con la forma que describe
+    /// `discord::join_form`. `invite_code` es la invitación con la que te
+    /// uniste (el cliente oficial la manda).
+    ///
+    /// Un server sin formulario contesta 404: eso no es un error, es `None`.
+    pub async fn get_join_form(&self, guild_id: &str, invite_code: &str) -> anyhow::Result<Option<Value>> {
+        let mut query = HashMap::new();
+        query.insert("with_guild".to_string(), "false".to_string());
+        if !invite_code.is_empty() {
+            query.insert("invite_code".to_string(), invite_code.to_string());
+        }
+        let path = format!("guilds/{guild_id}/member-verification");
+        let result: Result<Value, _> = self.client.get(&path, Some(query), Some(Self::home())).await;
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(e) => {
+                // El cliente vendorizado deja status y cuerpo en el texto del
+                // error (`... code 404: {"message": "Unknown Guild Member
+                // Verification Form", "code": 180002}`).
+                let text = e.to_string();
+                if text.contains("code 404") || text.contains("180002") {
+                    Ok(None)
+                } else {
+                    Err(err(e))
+                }
+            }
+        }
+    }
+
+    /// `GET /soundboard-default-sounds`: los sonidos que trae Discord.
+    pub async fn soundboard_default_sounds(&self) -> anyhow::Result<Vec<super::soundboard::SoundboardSound>> {
         let value: Value = self
             .client
-            .post(&path, Some(body), Some(props))
+            .get("soundboard-default-sounds", None, Some(Self::home()))
+            .await
+            .map_err(err)?;
+        Ok(super::soundboard::parse_list(&value))
+    }
+
+    /// `GET /guilds/{id}/soundboard-sounds`: los sonidos propios del server.
+    pub async fn guild_soundboard_sounds(
+        &self,
+        guild_id: &str,
+    ) -> anyhow::Result<Vec<super::soundboard::SoundboardSound>> {
+        let path = format!("guilds/{guild_id}/soundboard-sounds");
+        let value: Value = self.client.get(&path, None, Some(Self::home())).await.map_err(err)?;
+        Ok(super::soundboard::parse_list(&value))
+    }
+
+    /// `POST /channels/{id}/send-soundboard-sound`: toca un sonido en el canal
+    /// de voz. `source_guild_id` es el server dueño del sonido (los
+    /// predeterminados no lo llevan).
+    pub async fn send_soundboard_sound(
+        &self,
+        channel_id: &str,
+        sound_id: &str,
+        source_guild_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let path = format!("channels/{channel_id}/send-soundboard-sound");
+        let mut body = json!({ "sound_id": sound_id });
+        if let Some(guild_id) = source_guild_id.filter(|g| !g.is_empty()) {
+            body["source_guild_id"] = json!(guild_id);
+        }
+        let _: Value = self
+            .client
+            .post(&path, Some(body), Some(Self::home()))
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// `PUT /guilds/{id}/requests/@me`: manda el formulario de ingreso
+    /// respondido (`JoinForm::submit_body`). Devuelve la solicitud con su
+    /// `application_status`.
+    pub async fn submit_join_form(&self, guild_id: &str, body: Value) -> anyhow::Result<Value> {
+        let path = format!("guilds/{guild_id}/requests/@me");
+        let value: Value = self
+            .client
+            .put(&path, Some(body), Some(Self::home()))
             .await
             .map_err(err)?;
         Ok(value)
@@ -1033,8 +1095,15 @@ impl UwuRest {
             .map_err(err)?;
 
         let referer: Referer = match guild_id_num {
-            Some(guild_id) => GuildChannelReferer { guild_id, channel_id: channel_id_num }.into(),
-            None => DmChannelReferer { channel_id: channel_id_num }.into(),
+            Some(guild_id) => GuildChannelReferer {
+                guild_id,
+                channel_id: channel_id_num,
+            }
+            .into(),
+            None => DmChannelReferer {
+                channel_id: channel_id_num,
+            }
+            .into(),
         };
         let props = RequestPropertiesBuilder::default()
             .referer::<Referer>(referer)
@@ -1087,8 +1156,8 @@ impl UwuRest {
             let mut last_error = String::new();
             let mut uploaded = false;
             for _attempt in 0..2 {
-                let bytes = std::fs::read(&file.path)
-                    .map_err(|e| anyhow::anyhow!("No se pudo leer {}: {e}", file.filename))?;
+                let bytes =
+                    std::fs::read(&file.path).map_err(|e| anyhow::anyhow!("No se pudo leer {}: {e}", file.filename))?;
                 match self
                     .get_http_client()
                     .put(upload_url)
@@ -1151,7 +1220,7 @@ impl UwuRest {
 
     /// GIFs del selector: `GET /gifs/search?q=...` (Tenor, a través de
     /// Discord) o, con `query` vacío, `GET /gifs/trending`. Devuelve el JSON
-    /// tal cual; `ui::compose_menus` se encarga de leerlo (puede ser una
+    /// tal cual; `ui::chat::compose_menus` se encarga de leerlo (puede ser una
     /// lista de GIFs o un objeto con `gifs`).
     pub async fn gifs(&self, query: &str) -> anyhow::Result<Value> {
         let query = query.trim();
@@ -1178,9 +1247,7 @@ impl UwuRest {
     /// codificada como protobuf y mandada en base64 dentro de un JSON
     /// (`{"settings": "<base64>"}`). Ver `discord::user_settings` para el
     /// mensaje generado y los helpers de encode/decode.
-    pub async fn get_user_settings(
-        &self,
-    ) -> anyhow::Result<crate::discord::user_settings::PreloadedUserSettings> {
+    pub async fn get_user_settings(&self) -> anyhow::Result<crate::discord::user_settings::PreloadedUserSettings> {
         #[derive(serde::Deserialize)]
         struct SettingsProtoResponse {
             settings: String,
@@ -1218,9 +1285,7 @@ impl UwuRest {
     /// (`FrecencyUserSettings`, ver `discord::frecency`). Una cuenta que
     /// nunca guardó nada puede devolver el blob vacío: eso decodifica a un
     /// proto sin campos, no es un error.
-    pub async fn get_frecency_settings(
-        &self,
-    ) -> anyhow::Result<crate::discord::user_settings::FrecencyUserSettings> {
+    pub async fn get_frecency_settings(&self) -> anyhow::Result<crate::discord::user_settings::FrecencyUserSettings> {
         #[derive(serde::Deserialize)]
         struct SettingsProtoResponse {
             #[serde(default)]
@@ -1266,11 +1331,7 @@ impl UwuRest {
     /// transmite (`None` si todavía no hay ninguna).
     pub async fn stream_preview(&self, stream_key: &str) -> anyhow::Result<Option<String>> {
         let path = format!("streams/{stream_key}/preview");
-        let value: Value = self
-            .client
-            .get(&path, None, Some(Self::home()))
-            .await
-            .map_err(err)?;
+        let value: Value = self.client.get(&path, None, Some(Self::home())).await.map_err(err)?;
         Ok(value
             .get("url")
             .and_then(Value::as_str)
@@ -1295,9 +1356,9 @@ impl UwuRest {
             .await
             .map_err(err)?;*/
         /*{
-  "message": "internal network error",
-  "code": 40333
-}*/
+          "message": "internal network error",
+          "code": 40333
+        }*/
         //let value: Value = json!({ "code": 40333, "message": "internal network error" });
         // trigger error response
         let value: Value = json!({ "code": 40333, "message": "internal network error" });
@@ -1332,11 +1393,7 @@ impl UwuRest {
         Ok(value)
     }
 
-    pub async fn user_profile(
-        &self,
-        user_id: &str,
-        guild_id: Option<&str>,
-    ) -> anyhow::Result<UserProfileResponse> {
+    pub async fn user_profile(&self, user_id: &str, guild_id: Option<&str>) -> anyhow::Result<UserProfileResponse> {
         let mut query = HashMap::new();
         query.insert("with_mutual_guilds".to_string(), "true".to_string());
         query.insert("with_mutual_friends".to_string(), "true".to_string());
@@ -1378,6 +1435,18 @@ impl UwuRest {
         Ok(())
     }
 
+    /// `POST /channels/{channel}/typing`: "X está escribiendo…" durante ~10 s.
+    /// Responde 204 sin cuerpo.
+    pub async fn typing(&self, channel_id: &str) -> anyhow::Result<()> {
+        let path = format!("channels/{channel_id}/typing");
+        let _: Value = self
+            .client
+            .post(&path, None::<Value>, Some(Self::home()))
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
+
     /// "Marcar no leído": igual que `ack_message` pero `manual: true`, que es
     /// lo que hace que Discord acepte un ack hacia atrás (deja el canal sin
     /// leer desde ese mensaje).
@@ -1406,12 +1475,7 @@ impl UwuRest {
 
     /// Saca las reacciones de un mensaje: todas (`emoji = None`) o solo las
     /// de un emoji (`reactions/{emoji}`). Hace falta "Administrar mensajes".
-    pub async fn clear_reactions(
-        &self,
-        channel_id: &str,
-        message_id: &str,
-        emoji: Option<&str>,
-    ) -> anyhow::Result<()> {
+    pub async fn clear_reactions(&self, channel_id: &str, message_id: &str, emoji: Option<&str>) -> anyhow::Result<()> {
         let path = match emoji {
             Some(emoji) => format!(
                 "channels/{channel_id}/messages/{message_id}/reactions/{}",
@@ -1440,12 +1504,7 @@ impl UwuRest {
         Ok(())
     }
 
-    pub async fn add_reaction(
-        &self,
-        channel_id: &str,
-        message_id: &str,
-        emoji: &str,
-    ) -> anyhow::Result<()> {
+    pub async fn add_reaction(&self, channel_id: &str, message_id: &str, emoji: &str) -> anyhow::Result<()> {
         let encoded = percent_encode_emoji(emoji);
         let path = format!("channels/{channel_id}/messages/{message_id}/reactions/{encoded}/@me");
         let _: Value = self
@@ -1456,12 +1515,7 @@ impl UwuRest {
         Ok(())
     }
 
-    pub async fn remove_reaction(
-        &self,
-        channel_id: &str,
-        message_id: &str,
-        emoji: &str,
-    ) -> anyhow::Result<()> {
+    pub async fn remove_reaction(&self, channel_id: &str, message_id: &str, emoji: &str) -> anyhow::Result<()> {
         let encoded = percent_encode_emoji(emoji);
         let path = format!("channels/{channel_id}/messages/{message_id}/reactions/{encoded}/@me");
         let _: Value = self

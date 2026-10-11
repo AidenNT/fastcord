@@ -11,9 +11,8 @@ use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 
 use ::opus::{
-    Application as OpusApplication, Bitrate as OpusBitrate, Channels, Decoder as OpusDecoder,
-    Encoder as OpusEncoder, InbandFec as OpusInbandFec, SampleRate as OpusSampleRate,
-    Signal as OpusSignal,
+    Application as OpusApplication, Bitrate as OpusBitrate, Channels, Decoder as OpusDecoder, Encoder as OpusEncoder,
+    InbandFec as OpusInbandFec, SampleRate as OpusSampleRate, Signal as OpusSignal,
 };
 use tokio::{
     sync::mpsc,
@@ -26,14 +25,13 @@ use super::audio_buffer::VoiceAudioOutputStats;
 #[cfg(feature = "voice-playback")]
 use super::playback::VoiceAudioOutput;
 use super::playback::{
-    VoicePlaybackFrame, VoicePlaybackGate, VoicePlaybackPlayoutBuffers, VoicePlaybackPostProcess,
-    VoicePlayoutFrame,
+    VoicePlaybackFrame, VoicePlaybackGate, VoicePlaybackPlayoutBuffers, VoicePlaybackPostProcess, VoicePlayoutFrame,
 };
 use super::{
-    DISCORD_OPUS_20MS_STEREO_SAMPLES, DISCORD_OPUS_FRAME_SAMPLES_PER_CHANNEL,
-    DISCORD_VOICE_CHANNELS, OPUS_MAX_ENCODED_FRAME_BYTES, OPUS_MAX_FRAME_SAMPLES_PER_CHANNEL,
-    VOICE_OUTPUT_STATS_LOG_INTERVAL, VOICE_PLAYBACK_FRAME_QUEUE, VOICE_PLAYBACK_POLL_DURATION,
-    VOICE_PLAYBACK_POLL_SAMPLES_PER_CHANNEL, VoiceParticipantPlaybackSettings,
+    DISCORD_OPUS_20MS_STEREO_SAMPLES, DISCORD_OPUS_FRAME_SAMPLES_PER_CHANNEL, DISCORD_VOICE_CHANNELS,
+    OPUS_MAX_ENCODED_FRAME_BYTES, OPUS_MAX_FRAME_SAMPLES_PER_CHANNEL, VOICE_OUTPUT_STATS_LOG_INTERVAL,
+    VOICE_PLAYBACK_FRAME_QUEUE, VOICE_PLAYBACK_POLL_DURATION, VOICE_PLAYBACK_POLL_SAMPLES_PER_CHANNEL,
+    VoiceParticipantPlaybackSettings,
 };
 use crate::discord::ids::{Id, marker::UserMarker};
 use crate::logging;
@@ -103,10 +101,7 @@ impl VoiceOpusDecode {
             VoiceDecodedAudio::decode_only(),
             participant_playback_rx,
         ));
-        logging::debug(
-            "voice",
-            "voice Opus decode worker started without audio output device",
-        );
+        logging::debug("voice", "voice Opus decode worker started without audio output device");
         Self { frames_tx, task }
     }
 
@@ -129,10 +124,7 @@ impl VoiceOpusDecode {
             output_source,
         ) {
             Ok(audio_output) => {
-                logging::debug(
-                    "voice",
-                    "voice Opus playback worker started with audio output",
-                );
+                logging::debug("voice", "voice Opus playback worker started with audio output");
                 Some(audio_output)
             }
             Err(error) => {
@@ -245,21 +237,15 @@ impl VoiceDecodedAudioOutput {
             return;
         };
         let frames = samples.len() / usize::from(DISCORD_VOICE_CHANNELS);
-        stats
-            .queued_frames
-            .fetch_add(frames as u64, Ordering::Relaxed);
+        stats.queued_frames.fetch_add(frames as u64, Ordering::Relaxed);
         match samples_tx.try_send(samples) {
             Ok(()) => stats.record_pcm_enqueue(frames),
             Err(TrySendError::Full(_)) => {
-                stats
-                    .queued_frames
-                    .fetch_sub(frames as u64, Ordering::Relaxed);
+                stats.queued_frames.fetch_sub(frames as u64, Ordering::Relaxed);
                 stats.queue_full_drops.fetch_add(1, Ordering::Relaxed);
             }
             Err(TrySendError::Disconnected(_)) => {
-                stats
-                    .queued_frames
-                    .fetch_sub(frames as u64, Ordering::Relaxed);
+                stats.queued_frames.fetch_sub(frames as u64, Ordering::Relaxed);
             }
         }
     }
@@ -280,28 +266,19 @@ impl VoiceOpusEncode {
         encoder
             .encoder
             .set_bitrate(OpusBitrate::Value(128_000))
-            .map_err(|error| {
-                format!(
-                    "system audio Opus bitrate setup failed: {}",
-                    error.message()
-                )
-            })?;
+            .map_err(|error| format!("system audio Opus bitrate setup failed: {}", error.message()))?;
         encoder
             .encoder
             .set_signal(OpusSignal::Music)
-            .map_err(|error| {
-                format!("system audio Opus signal setup failed: {}", error.message())
-            })?;
+            .map_err(|error| format!("system audio Opus signal setup failed: {}", error.message()))?;
         encoder
             .encoder
             .set_inband_fec(OpusInbandFec::Mode1)
             .map_err(|error| format!("system audio Opus FEC setup failed: {}", error.message()))?;
-        encoder.encoder.set_packet_loss(10).map_err(|error| {
-            format!(
-                "system audio Opus packet loss setup failed: {}",
-                error.message()
-            )
-        })?;
+        encoder
+            .encoder
+            .set_packet_loss(10)
+            .map_err(|error| format!("system audio Opus packet loss setup failed: {}", error.message()))?;
         Ok(encoder)
     }
 
@@ -339,8 +316,7 @@ async fn run_voice_playback_decode(
     >,
 ) {
     let mut decode_state = VoicePlaybackDecodeState::default();
-    decode_state
-        .replace_participant_playback_settings(participant_playback_rx.borrow_and_update().clone());
+    decode_state.replace_participant_playback_settings(participant_playback_rx.borrow_and_update().clone());
     let mut participant_playback_open = true;
     let mut playout_buffers = VoicePlaybackPlayoutBuffers::default();
     let mut post_process = VoicePlaybackPostProcess::default();
@@ -397,10 +373,7 @@ impl VoicePlaybackDecodeState {
         self.participant_playback_settings = settings;
     }
 
-    pub(super) fn next_mixed_samples(
-        &mut self,
-        frames: Vec<VoicePlayoutFrame>,
-    ) -> Option<Vec<f32>> {
+    pub(super) fn next_mixed_samples(&mut self, frames: Vec<VoicePlayoutFrame>) -> Option<Vec<f32>> {
         for frame in frames {
             let ssrc = frame.ssrc();
             let user_id = frame.user_id();
@@ -430,8 +403,7 @@ impl VoicePlaybackDecodeState {
     }
 
     pub(super) fn next_pending_mix(&mut self) -> Option<Vec<f32>> {
-        let chunk_len =
-            VOICE_PLAYBACK_POLL_SAMPLES_PER_CHANNEL * usize::from(DISCORD_VOICE_CHANNELS);
+        let chunk_len = VOICE_PLAYBACK_POLL_SAMPLES_PER_CHANNEL * usize::from(DISCORD_VOICE_CHANNELS);
         let participant_playback_settings = &self.participant_playback_settings;
         let chunks: Vec<Vec<f32>> = self
             .pending_samples
@@ -455,8 +427,7 @@ impl VoicePlaybackDecodeState {
                 Some(chunk)
             })
             .collect();
-        self.pending_samples
-            .retain(|_, pending| !pending.samples.is_empty());
+        self.pending_samples.retain(|_, pending| !pending.samples.is_empty());
         mix_voice_decoded_samples(&chunks)
     }
 }
@@ -474,8 +445,7 @@ pub(super) fn decode_voice_playout_frame(
     decoders: &mut HashMap<u32, OpusDecoder>,
 ) -> Option<Vec<f32>> {
     let ssrc = frame.ssrc();
-    let packet_loss_stereo_samples =
-        frame.packet_loss_samples_per_channel() * usize::from(DISCORD_VOICE_CHANNELS);
+    let packet_loss_stereo_samples = frame.packet_loss_samples_per_channel() * usize::from(DISCORD_VOICE_CHANNELS);
     if frame.is_packet_loss() && !decoders.contains_key(&ssrc) {
         return Some(vec![0.0f32; packet_loss_stereo_samples]);
     }
@@ -485,10 +455,7 @@ pub(super) fn decode_voice_playout_frame(
                 entry.insert(decoder);
             }
             Err(error) => {
-                logging::error(
-                    "voice",
-                    format!("voice Opus decoder init failed: {}", error.message()),
-                );
+                logging::error("voice", format!("voice Opus decoder init failed: {}", error.message()));
                 return None;
             }
         }
@@ -502,8 +469,7 @@ pub(super) fn decode_voice_playout_frame(
         OPUS_MAX_FRAME_SAMPLES_PER_CHANNEL * usize::from(DISCORD_VOICE_CHANNELS)
     };
     let mut decoded = vec![0.0f32; decode_sample_capacity];
-    let samples_per_channel = match decoder.decode_float_to_slice(frame.opus(), &mut decoded, false)
-    {
+    let samples_per_channel = match decoder.decode_float_to_slice(frame.opus(), &mut decoded, false) {
         Ok(samples) => samples,
         Err(error) => {
             logging::debug(
@@ -582,9 +548,7 @@ mod tests {
 
         decoded_audio.try_send(vec![0.25, -0.25]);
         assert_eq!(
-            first_rx
-                .recv()
-                .expect("first output should receive decoded samples"),
+            first_rx.recv().expect("first output should receive decoded samples"),
             vec![0.25, -0.25]
         );
 

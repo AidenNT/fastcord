@@ -116,26 +116,6 @@ impl Palette {
             window_solid: Color32::from_rgb(0xf4, 0xf5, 0xfa),
         }
     }
-
-    /// A colour derived from album art, softened so it can sit behind text.
-    pub fn tint_from_art(&self, rgb: [u8; 3]) -> Color32 {
-        let [r, g, b] = rgb.map(|c| c as f32 / 255.0);
-        let max = r.max(g).max(b);
-        let min = r.min(g).min(b);
-        let lightness = (max + min) / 2.0;
-        let target = if self.dark { 0.30 } else { 0.72 };
-        let (r, g, b) = if lightness < 0.01 {
-            (target, target, target)
-        } else {
-            let scale = target / lightness;
-            (
-                (r * scale).min(1.0),
-                (g * scale).min(1.0),
-                (b * scale).min(1.0),
-            )
-        };
-        Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
-    }
 }
 
 static MODERN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -185,24 +165,11 @@ pub fn titlebar_color(palette: &Palette) -> Color32 {
     mix(palette.window_solid, Color32::BLACK, 0.28)
 }
 
-/// Marco de una píldora flotante (buscador, pestañas, íconos de arriba).
-pub fn pill_frame(palette: &Palette) -> Frame {
-    Frame::new()
-        .fill(palette.panel)
-        .stroke(Stroke::new(1.0, palette.outline))
-        .corner_radius(CornerRadius::same(PILL_RADIUS))
-}
-
 /// Mezcla `a` hacia `b` en `t` (0..=1).
 pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
     let ch = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
-    Color32::from_rgba_unmultiplied(
-        ch(a.r(), b.r()),
-        ch(a.g(), b.g()),
-        ch(a.b(), b.b()),
-        ch(a.a(), b.a()),
-    )
+    Color32::from_rgba_unmultiplied(ch(a.r(), b.r()), ch(a.g(), b.g()), ch(a.b(), b.b()), ch(a.a(), b.a()))
 }
 
 /// Marco de un panel de la interfaz nueva: una tarjeta redondeada que flota
@@ -215,14 +182,19 @@ pub fn card_frame(palette: &Palette, classic: Frame, inner: i8, left: i8, right:
     }
     // Interfaz nueva: todas las tarjetas se separan GAP entre sí (GAP/2 de
     // cada lado) y el hueco con arriba lo pone la fila de píldoras
-    // (`ui::topbar::show_row`); los argumentos `left`/`right` de la clásica
+    // (`ui::shell::topbar::show_row`); los argumentos `left`/`right` de la clásica
     // se ignoran para que el espaciado sea parejo en todas las pantallas.
     let _ = (left, right);
     Frame::new()
         .fill(palette.panel)
         .stroke(Stroke::new(1.0, palette.outline))
         .corner_radius(CornerRadius::same(CARD_RADIUS))
-        .outer_margin(Margin { left: GAP / 2, right: GAP / 2, top: 0, bottom: GAP })
+        .outer_margin(Margin {
+            left: GAP / 2,
+            right: GAP / 2,
+            top: 0,
+            bottom: GAP,
+        })
         .inner_margin(Margin::same(inner))
 }
 
@@ -271,19 +243,6 @@ pub const PLAYER_BAR_HEIGHT: f32 = 88.0;
 pub const SIDE_PANEL_MIN_WIDTH: f32 = 280.0;
 pub const TOP_BAR_HEIGHT: f32 = 56.0;
 
-/// macOS hides the titlebar and draws the window content all the way to the
-/// top edge, so whatever sits at the top of the window has to leave room for
-/// the traffic lights. Zero everywhere else, and in fullscreen, where the
-/// buttons are gone.
-pub fn titlebar_inset(ctx: &egui::Context) -> f32 {
-    if cfg!(target_os = "macos") && !ctx.input(|input| input.viewport().fullscreen.unwrap_or(false))
-    {
-        28.0
-    } else {
-        0.0
-    }
-}
-
 const INTER_MEDIUM: &str = "inter-medium";
 const INTER_SEMIBOLD: &str = "inter-semibold";
 const INTER_BOLD: &str = "inter-bold";
@@ -315,7 +274,7 @@ pub fn install(ctx: &egui::Context) {
 }
 
 /// Paleta activa tal como la dejó el último `apply` (dark si todavía no corrió).
-/// Sirve para los menús contextuales (`ui::audio_menu`), que no reciben la
+/// Sirve para los menús contextuales (`ui::call::audio_menu`), que no reciben la
 /// paleta por parámetro.
 pub fn current(ctx: &egui::Context) -> Palette {
     ctx.data(|d| d.get_temp::<Palette>(egui::Id::new("ecord_active_palette")))
@@ -396,15 +355,36 @@ pub fn apply(ctx: &egui::Context, palette: &Palette) {
     use egui::{FontId, TextStyle};
     style.text_styles = [
         (TextStyle::Small, FontId::new(11.5, Proportional)),
-        (TextStyle::Body, FontId::new(if modern { 14.5 } else { 14.0 }, Proportional)),
-        (TextStyle::Button, FontId::new(if modern { 14.5 } else { 14.0 }, Proportional)),
-        (TextStyle::Heading, FontId::new(if modern { 24.0 } else { 22.0 }, Proportional)),
+        (
+            TextStyle::Body,
+            FontId::new(if modern { 14.5 } else { 14.0 }, Proportional),
+        ),
+        (
+            TextStyle::Button,
+            FontId::new(if modern { 14.5 } else { 14.0 }, Proportional),
+        ),
+        (
+            TextStyle::Heading,
+            FontId::new(if modern { 24.0 } else { 22.0 }, Proportional),
+        ),
         (TextStyle::Monospace, FontId::new(13.0, Monospace)),
     ]
     .into();
-    style.spacing.item_spacing = if modern { Vec2::new(10.0, 8.0) } else { Vec2::new(8.0, 6.0) };
-    style.spacing.button_padding = if modern { Vec2::new(14.0, 7.0) } else { Vec2::new(12.0, 6.0) };
-    style.spacing.interact_size = if modern { Vec2::new(40.0, 32.0) } else { Vec2::new(40.0, 28.0) };
+    style.spacing.item_spacing = if modern {
+        Vec2::new(10.0, 8.0)
+    } else {
+        Vec2::new(8.0, 6.0)
+    };
+    style.spacing.button_padding = if modern {
+        Vec2::new(14.0, 7.0)
+    } else {
+        Vec2::new(12.0, 6.0)
+    };
+    style.spacing.interact_size = if modern {
+        Vec2::new(40.0, 32.0)
+    } else {
+        Vec2::new(40.0, 28.0)
+    };
     style.spacing.menu_margin = egui::Margin::same(if modern { 8 } else { 6 });
     style.spacing.window_margin = egui::Margin::same(if modern { 20 } else { 16 });
     style.spacing.scroll = egui::style::ScrollStyle {
@@ -442,21 +422,14 @@ fn install_fonts(ctx: &egui::Context) {
         Arc::new(data)
     };
     fonts.font_data.insert("inter".to_owned(), weighted(400.0));
-    fonts
-        .font_data
-        .insert(INTER_MEDIUM.to_owned(), weighted(500.0));
-    fonts
-        .font_data
-        .insert(INTER_SEMIBOLD.to_owned(), weighted(600.0));
-    fonts
-        .font_data
-        .insert(INTER_BOLD.to_owned(), weighted(700.0));
+    fonts.font_data.insert(INTER_MEDIUM.to_owned(), weighted(500.0));
+    fonts.font_data.insert(INTER_SEMIBOLD.to_owned(), weighted(600.0));
+    fonts.font_data.insert(INTER_BOLD.to_owned(), weighted(700.0));
 
     let noto_emoji = include_bytes!("../assets/fonts/NotoEmoji.ttf");
-    fonts.font_data.insert(
-        "noto_emoji".to_owned(),
-        Arc::new(FontData::from_static(noto_emoji)),
-    );
+    fonts
+        .font_data
+        .insert("noto_emoji".to_owned(), Arc::new(FontData::from_static(noto_emoji)));
 
     fonts
         .families
@@ -574,6 +547,7 @@ pub enum Icon {
     Headphones,
     Heart,
     HeartFilled,
+    Hourglass,
     House,
     Info,
     Laptop,
@@ -586,7 +560,7 @@ pub enum Icon {
     Lock,
     LogOut,
     // Ícono de "maximizar ventana" para el titlebar propio (ver
-    // `ui::topbar`); el archivo ya venía en assets/icons pero no estaba
+    // `ui::shell::topbar`); el archivo ya venía en assets/icons pero no estaba
     // registrado como variante.
     Maximize2,
     Mic,
@@ -598,7 +572,7 @@ pub enum Icon {
     Pause,
     PauseFilled,
     PanelLeft,
-    // Íconos de llamada de voz (ver `ui::server`/`ui::dm`/`ui::call_bar`):
+    // Íconos de llamada de voz (ver `ui::server`/`ui::dm`/`ui::call::call_bar`):
     // Lucide no venía con set de "teléfono" en este proyecto (era un
     // cliente de música), así que se agregaron a `assets/icons` junto con
     // los demás — mismo estilo (24x24, stroke 2, cap/join redondeado).
@@ -641,12 +615,12 @@ pub enum Icon {
     VolumeX,
     Watch,
     X,
-    // Barra de llamada nueva (`ui::call_bar::show_bottom`).
+    // Barra de llamada nueva (`ui::call::call_bar::show_bottom`).
     MessageCircle,
     SquareArrowUp,
     Video,
     Zap,
-    // Visor multimedia (`ui::media_viewer`).
+    // Visor multimedia (`ui::chat::media_viewer`).
     ZoomIn,
     ZoomOut,
     Download,
@@ -693,6 +667,7 @@ const ICONS: &[(Icon, &str, &[u8])] = icons! {
     Headphones => "headphones",
     Heart => "heart",
     HeartFilled => "heart-filled",
+    Hourglass => "hourglass",
     House => "house",
     Info => "info",
     Laptop => "laptop",
@@ -805,10 +780,7 @@ pub fn icon(ui: &mut egui::Ui, icon: Icon, size: f32, color: Color32) -> Respons
 
 /// Paints an icon centred in `rect` without allocating space.
 pub fn paint_icon(ui: &egui::Ui, icon: Icon, rect: egui::Rect, size: f32, color: Color32) {
-    let icon_rect = egui::Rect::from_center_size(
-        rect.center() + play_glyph_offset(icon, size),
-        Vec2::splat(size),
-    );
+    let icon_rect = egui::Rect::from_center_size(rect.center() + play_glyph_offset(icon, size), Vec2::splat(size));
     icon.image(color, size).paint_at(ui, icon_rect);
 }
 
@@ -838,9 +810,7 @@ pub fn icon_button(
 ) -> Response {
     let edge = size + 12.0;
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(edge), Sense::click());
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tooltip)
-    });
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tooltip));
     if ui.is_rect_visible(rect) {
         let tint = if response.hovered() || response.has_focus() {
             hover
@@ -881,9 +851,7 @@ pub fn logo(ui: &egui::Ui, center: egui::Pos2, diameter: f32, disc: Color32, gly
         center + play_glyph_offset(Icon::PlayFilled, icon_size),
         Vec2::splat(icon_size),
     );
-    Icon::PlayFilled
-        .image(glyph, icon_size)
-        .paint_at(ui, icon_rect);
+    Icon::PlayFilled.image(glyph, icon_size).paint_at(ui, icon_rect);
 }
 
 pub fn circle_button(
@@ -896,9 +864,7 @@ pub fn circle_button(
     tooltip: &str,
 ) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(diameter), Sense::click());
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tooltip)
-    });
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tooltip));
     if ui.is_rect_visible(rect) {
         let hovered = response.hovered();
         let grow = if hovered { 1.05 } else { 1.0 };
@@ -907,8 +873,7 @@ pub fn circle_button(
         ui.painter().circle_filled(rect.center(), radius, fill);
         let icon_size = diameter * 0.46;
         let offset = play_glyph_offset(icon, icon_size);
-        let icon_rect =
-            egui::Rect::from_center_size(rect.center() + offset, Vec2::splat(icon_size));
+        let icon_rect = egui::Rect::from_center_size(rect.center() + offset, Vec2::splat(icon_size));
         icon.image(icon_color, icon_size).paint_at(ui, icon_rect);
     }
     focus_ring(ui, &response);
@@ -920,71 +885,25 @@ pub fn circle_button(
     }
 }
 
-/// A disc the size of a [`circle_button`] whose icon is replaced by a
-/// spinner: the pressed play button itself shows that Spotify is reacting.
-pub fn circle_spinner(
-    ui: &mut egui::Ui,
-    diameter: f32,
-    fill: Color32,
-    spin: Color32,
-    tooltip: &str,
-) -> Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(diameter), Sense::hover());
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(
-            egui::WidgetType::ProgressIndicator,
-            ui.is_enabled(),
-            tooltip,
-        )
-    });
-    if ui.is_rect_visible(rect) {
-        ui.painter()
-            .circle_filled(rect.center(), diameter / 2.0, fill);
-        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(
-            egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
-        ));
-        spinner(&mut child, diameter * 0.55, spin);
-    }
-    if tooltip.is_empty() {
-        response
-    } else {
-        response.on_hover_text(tooltip)
-    }
-}
-
 /// A pill-shaped text button: filled for the primary action, outlined otherwise.
 pub fn pill_button(ui: &mut egui::Ui, palette: &Palette, label: &str, primary: bool) -> Response {
     let font = semibold(13.0);
-    let color = if primary {
-        palette.on_accent
-    } else {
-        palette.text
-    };
+    let color = if primary { palette.on_accent } else { palette.text };
     let galley = ui.painter().layout_no_wrap(label.to_string(), font, color);
     let padding = Vec2::new(18.0, 8.0);
     let size = galley.size() + padding * 2.0;
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
-    });
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label));
     if ui.is_rect_visible(rect) {
         let hovered = response.hovered();
         let radius = rect.height() / 2.0;
         if primary {
-            let fill = if hovered {
-                palette.accent_hover
-            } else {
-                palette.accent
-            };
+            let fill = if hovered { palette.accent_hover } else { palette.accent };
             ui.painter().rect_filled(rect, radius, fill);
         } else {
             let stroke_color = if hovered { palette.text } else { palette.dim };
-            ui.painter().rect_stroke(
-                rect,
-                radius,
-                Stroke::new(1.0, stroke_color),
-                egui::StrokeKind::Inside,
-            );
+            ui.painter()
+                .rect_stroke(rect, radius, Stroke::new(1.0, stroke_color), egui::StrokeKind::Inside);
         }
         let pos = rect.center() - galley.size() / 2.0;
         ui.painter().galley(pos, galley, color);
@@ -994,27 +913,19 @@ pub fn pill_button(ui: &mut egui::Ui, palette: &Palette, label: &str, primary: b
 }
 
 /// A muted button with an icon and label, for row and header actions.
-pub fn soft_button(
-    ui: &mut egui::Ui,
-    palette: &Palette,
-    icon: Option<Icon>,
-    label: &str,
-    active: bool,
-) -> Response {
+pub fn soft_button(ui: &mut egui::Ui, palette: &Palette, icon: Option<Icon>, label: &str, active: bool) -> Response {
     let font = medium(13.0);
     // `on_accent` y no `window`: `window` puede ser translúcido (ver `Backdrop`).
     let color = if active { palette.on_accent } else { palette.text };
-    let galley =
-        ui.painter()
-            .layout_no_wrap(crate::bidi::display_text(label).into_owned(), font, color);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(crate::bidi::display_text(label).into_owned(), font, color);
     let icon_size = 15.0;
     let icon_width = if icon.is_some() { icon_size + 6.0 } else { 0.0 };
     let padding = Vec2::new(12.0, 7.0);
     let size = Vec2::new(galley.size().x + icon_width, galley.size().y) + padding * 2.0;
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
-    });
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label));
     if ui.is_rect_visible(rect) {
         let hovered = response.hovered();
         let fill = if active {
@@ -1027,10 +938,8 @@ pub fn soft_button(
         ui.painter().rect_filled(rect, rect.height() / 2.0, fill);
         let mut x = rect.left() + padding.x;
         if let Some(icon) = icon {
-            let icon_rect = egui::Rect::from_center_size(
-                egui::pos2(x + icon_size / 2.0, rect.center().y),
-                Vec2::splat(icon_size),
-            );
+            let icon_rect =
+                egui::Rect::from_center_size(egui::pos2(x + icon_size / 2.0, rect.center().y), Vec2::splat(icon_size));
             icon.image(color, icon_size).paint_at(ui, icon_rect);
             x += icon_width;
         }
@@ -1045,8 +954,7 @@ pub fn soft_button(
 pub fn spinner(ui: &mut egui::Ui, size: f32, color: Color32) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     if ui.is_rect_visible(rect) {
-        ui.ctx()
-            .request_repaint_after(std::time::Duration::from_millis(33));
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
         let radius = size / 2.0 - 2.0;
         let start = ui.input(|input| input.time) * std::f64::consts::TAU * 1.2;
         let sweep = 250_f64.to_radians();
@@ -1057,19 +965,13 @@ pub fn spinner(ui: &mut egui::Ui, size: f32, color: Color32) -> Response {
                 rect.center() + radius * egui::vec2(cos as f32, sin as f32)
             })
             .collect();
-        ui.painter()
-            .add(egui::Shape::line(points, Stroke::new(2.0, color)));
+        ui.painter().add(egui::Shape::line(points, Stroke::new(2.0, color)));
     }
     response
 }
 
 /// Truncated single-line text in a given font and colour.
-pub fn text(
-    ui: &mut egui::Ui,
-    text: impl Into<String>,
-    font: egui::FontId,
-    color: Color32,
-) -> Response {
+pub fn text(ui: &mut egui::Ui, text: impl Into<String>, font: egui::FontId, color: Color32) -> Response {
     let text = text.into();
     if crate::bidi::is_rtl(&text) {
         let galley = crate::bidi::layout(
@@ -1084,9 +986,9 @@ pub fn text(
         return ui.add(egui::Label::new(galley).selectable(false));
     }
     // Emojis Unicode: la fuente los dibuja en blanco y negro, así que si el
-    // texto trae alguno se pinta con imágenes a color (ver `ui::emoji`).
-    if crate::ui::emoji::contains_emoji(&text) {
-        return crate::ui::emoji::line(ui, &text, font, color);
+    // texto trae alguno se pinta con imágenes a color (ver `ui::chat::emoji`).
+    if crate::ui::chat::emoji::contains_emoji(&text) {
+        return crate::ui::chat::emoji::line(ui, &text, font, color);
     }
     ui.add(
         egui::Label::new(egui::RichText::new(text).font(font).color(color))
@@ -1096,12 +998,7 @@ pub fn text(
 }
 
 /// Single-line text that acts like a link: underlines on hover, clickable.
-pub fn link(
-    ui: &mut egui::Ui,
-    text: impl Into<String>,
-    font: egui::FontId,
-    color: Color32,
-) -> Response {
+pub fn link(ui: &mut egui::Ui, text: impl Into<String>, font: egui::FontId, color: Color32) -> Response {
     let text = text.into();
     let response = if crate::bidi::is_rtl(&text) {
         let galley = crate::bidi::layout(
@@ -1113,11 +1010,7 @@ pub fn link(
             1,
             Some(crate::bidi::ELLIPSIS),
         );
-        ui.add(
-            egui::Label::new(galley)
-                .selectable(false)
-                .sense(Sense::click()),
-        )
+        ui.add(egui::Label::new(galley).selectable(false).sense(Sense::click()))
     } else {
         ui.add(
             egui::Label::new(egui::RichText::new(text.clone()).font(font).color(color))
@@ -1126,8 +1019,7 @@ pub fn link(
                 .sense(Sense::click()),
         )
     };
-    response
-        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Link, ui.is_enabled(), &text));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Link, ui.is_enabled(), &text));
     focus_ring(ui, &response);
     if response.hovered() {
         let rect = response.rect;
@@ -1481,11 +1373,7 @@ impl ThemeEditor {
     /// Arranca el editor desde un tema guardado, con sus colores originales
     /// (opacos) y su fondo.
     pub fn from_def(def: &ThemeDef) -> Self {
-        let mut editor = Self::from_palette(
-            &Palette::from_def_opaque(def),
-            Some(def.name.clone()),
-            def.name.clone(),
-        );
+        let mut editor = Self::from_palette(&Palette::from_def_opaque(def), Some(def.name.clone()), def.name.clone());
         editor.backdrop = def.backdrop.clone();
         editor
     }
@@ -1589,7 +1477,10 @@ pub struct GradientStop {
 }
 
 fn stop(pos: f32, hex: &str) -> GradientStop {
-    GradientStop { pos, color: from_hex(hex) }
+    GradientStop {
+        pos,
+        color: from_hex(hex),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1675,13 +1566,6 @@ impl Default for Backdrop {
 }
 
 impl Backdrop {
-    /// `true` si algo de esto deja ver lo que hay detrás (fondo o escritorio).
-    pub fn is_see_through(&self) -> bool {
-        self.background_opacity < 0.999
-            || self.panel_opacity < 0.999
-            || self.surface_opacity < 0.999
-    }
-
     /// Fondos de ejemplo para el editor: un clic y queda algo bonito.
     pub fn presets() -> Vec<(&'static str, Backdrop)> {
         let base = Backdrop::default();
@@ -1993,7 +1877,11 @@ impl BackdropRuntime {
         let source = key.0.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let path = if source == "@desktop" { wallpaper::get().ok() } else { Some(source) };
+            let path = if source == "@desktop" {
+                wallpaper::get().ok()
+            } else {
+                Some(source)
+            };
             let image = path.and_then(|p| load_backdrop_image(&p, blur));
             let _ = tx.send(image);
             // Despierta a egui: si no, el resultado esperaría al próximo evento.
@@ -2012,9 +1900,7 @@ impl BackdropRuntime {
             Ok(image) => {
                 // Si no se pudo leer, `texture` queda en `None` pero la clave
                 // se marca como cargada: no reintenta en cada frame.
-                self.texture = image.map(|img| {
-                    ctx.load_texture("backdrop_image", img, egui::TextureOptions::LINEAR)
-                });
+                self.texture = image.map(|img| ctx.load_texture("backdrop_image", img, egui::TextureOptions::LINEAR));
                 self.loaded_key = self.pending_key.take();
                 self.rx = None;
             }

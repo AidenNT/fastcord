@@ -47,17 +47,20 @@
 
 use std::sync::Arc;
 
-use base64::{Engine as _, engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use futures_util::{SinkExt, StreamExt};
 use rsa::pkcs8::EncodePublicKey;
 use rsa::{Oaep, RsaPrivateKey, RsaPublicKey};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::discord::auth_http::{discord_login_headers, DiscordAuthSession};
+use crate::discord::AppEvent;
+use crate::discord::auth_http::{DiscordAuthSession, discord_login_headers};
 use crate::discord::fingerprint::ClientFingerprint;
 use crate::discord::websocket::{self, Message};
-use crate::discord::AppEvent;
 
 const REMOTE_AUTH_URL: &str = "wss://remote-auth-gateway.discord.gg/?v=2";
 const TICKET_EXCHANGE_URL: &str = "https://discord.com/api/v10/users/@me/remote-auth/login";
@@ -144,7 +147,9 @@ async fn run_once(auth_session: &DiscordAuthSession, tx: &std::sync::mpsc::Sende
                 write.send(Message::Text(init.to_string().into())).await?;
             }
             "nonce_proof" => {
-                let Some(encrypted_nonce) = &frame.encrypted_nonce else { continue };
+                let Some(encrypted_nonce) = &frame.encrypted_nonce else {
+                    continue;
+                };
                 let nonce_bytes = STANDARD.decode(encrypted_nonce)?;
                 let decrypted = priv_key.decrypt(Oaep::new::<Sha256>(), &nonce_bytes)?;
                 let hash = Sha256::digest(&decrypted);
@@ -153,7 +158,9 @@ async fn run_once(auth_session: &DiscordAuthSession, tx: &std::sync::mpsc::Sende
                 write.send(Message::Text(reply.to_string().into())).await?;
             }
             "pending_remote_init" => {
-                let Some(server_fingerprint) = &frame.fingerprint else { continue };
+                let Some(server_fingerprint) = &frame.fingerprint else {
+                    continue;
+                };
                 if server_fingerprint != &expected_fingerprint {
                     // No es un error de red: alguien está mandando un
                     // fingerprint que no corresponde a la clave pública
@@ -176,11 +183,7 @@ async fn run_once(auth_session: &DiscordAuthSession, tx: &std::sync::mpsc::Sende
                         if let Ok(payload) = priv_key.decrypt(Oaep::new::<Sha256>(), &bytes) {
                             if let Ok(text) = String::from_utf8(payload) {
                                 // Formato observado: "id:discriminator:avatar:username"
-                                let username = text
-                                    .split(':')
-                                    .last()
-                                    .unwrap_or("tu cuenta de Discord")
-                                    .to_string();
+                                let username = text.split(':').last().unwrap_or("tu cuenta de Discord").to_string();
                                 let _ = tx.send(AppEvent::QrConfirming { username });
                             }
                         }

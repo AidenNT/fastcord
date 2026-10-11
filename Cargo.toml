@@ -263,3 +263,36 @@ prost-build = "0.13"
 # Trae un binario de `protoc` prearmado para la plataforma del que
 # compila, así `build.rs` no depende de tener `protoc` instalado a mano.
 protoc-bin-vendored = "3"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+# --- Paquete .deb (cargo deb) ---
+[package.metadata.deb]
+name = "ecord"
+maintainer = "example@example.com"
+copyright = "2026, eCord contributors"
+license-file = ["LICENSE", "0"]
+extended-description = "Cliente de Discord no oficial escrito en Rust con egui."
+section = "net"
+priority = "optional"
+# $auto = dpkg-shlibdeps mira las .so que usa el binario (FFmpeg, WebKitGTK,
+# ALSA, Pulse...) y arma el Depends con los nombres correctos de la distro.
+depends = "$auto"
+assets = [
+  ["target/release/ecord", "usr/bin/", "755"],
+  ["packaging/linux/ecord.desktop", "usr/share/applications/", "644"],
+  ["assets/packaging/icon-256.png", "usr/share/icons/hicolor/256x256/apps/ecord.png", "644"],
+]
+[package.metadata.packager]
+product-name = "eCord"
+identifier = "dev.ecord.client"
+description = "Cliente de Discord no oficial hecho en Rust con egui"
+authors = ["eCord contributors"]
+license-file = "LICENSE"
+category = "SocialNetworking"
+out-dir = "dist-installers"
+binaries-dir = "target/release"
+binaries = [{ path = "ecord", main = true }]
+icons = ["assets/packaging/icon.ico", "assets/packaging/icon.icns", "assets/packaging/icon.png"]
+resources = [{ src = "packaging/bundle-libs/*", target = "." }]

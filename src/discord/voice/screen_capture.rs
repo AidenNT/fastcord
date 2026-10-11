@@ -41,8 +41,8 @@ use std::time::{Duration, Instant};
 use ffmpeg_the_third as ffmpeg;
 
 use ffmpeg::format::{Pixel, context::Input as InputContext};
-use ffmpeg::software::scaling::{context::Context as ScalerContext, flag::Flags};
 use ffmpeg::picture;
+use ffmpeg::software::scaling::{context::Context as ScalerContext, flag::Flags};
 use ffmpeg::{Dictionary, Error as FfmpegError, Packet, frame::Video};
 
 use super::h264::{EncodedFrame, encoded_frame_from_access_unit};
@@ -183,7 +183,7 @@ impl PreviewRenderer {
     }
 }
 
-/// Qué se captura. Lo elige la persona en `ui::share_picker`.
+/// Qué se captura. Lo elige la persona en `ui::chat::share_picker`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum CaptureTarget {
     /// Todo el escritorio principal.
@@ -360,7 +360,9 @@ fn input_spec(config: &ScreenCaptureConfig) -> Result<InputSpec, String> {
         let url = match &config.target {
             CaptureTarget::Desktop => "desktop".to_owned(),
             CaptureTarget::Window { title, .. } => format!("title={title}"),
-            CaptureTarget::Monitor { x, y, width, height, .. } => {
+            CaptureTarget::Monitor {
+                x, y, width, height, ..
+            } => {
                 options.push(("offset_x", x.to_string()));
                 options.push(("offset_y", y.to_string()));
                 options.push(("video_size", format!("{width}x{height}")));
@@ -381,11 +383,9 @@ fn input_spec(config: &ScreenCaptureConfig) -> Result<InputSpec, String> {
         let display = match std::env::var("DISPLAY") {
             Ok(display) if !display.is_empty() => display,
             _ if std::env::var_os("WAYLAND_DISPLAY").is_some() => {
-                return Err(
-                    "en Wayland puro no se puede capturar la pantalla con x11grab \
+                return Err("en Wayland puro no se puede capturar la pantalla con x11grab \
                      (hace falta XWayland o una captura por PipeWire)"
-                        .to_owned(),
-                );
+                    .to_owned());
             }
             _ => ":0.0".to_owned(),
         };
@@ -551,19 +551,12 @@ pub(crate) fn start_screen_encoder(
             Ok(started) => {
                 logging::debug(
                     "stream",
-                    format!(
-                        "screen encoder started: {} ({})",
-                        encoder.name(),
-                        config.target.label()
-                    ),
+                    format!("screen encoder started: {} ({})", encoder.name(), config.target.label()),
                 );
                 return Ok(started);
             }
             Err(error) => {
-                logging::error(
-                    "stream",
-                    format!("screen encoder {} failed: {error}", encoder.name()),
-                );
+                logging::error("stream", format!("screen encoder {} failed: {error}", encoder.name()));
                 last_error = error;
             }
         }
@@ -698,10 +691,7 @@ fn ffmpeg_error(context: &str, error: FfmpegError) -> String {
 /// entrada (`x11grab`, `gdigrab`...) al abrir, así que se llama directo a
 /// `avformat_open_input`.
 fn open_capture(spec: &InputSpec) -> Result<InputContext, String> {
-    use ffmpeg::ffi::{
-        av_find_input_format, avformat_close_input, avformat_find_stream_info,
-        avformat_open_input,
-    };
+    use ffmpeg::ffi::{av_find_input_format, avformat_close_input, avformat_find_stream_info, avformat_open_input};
 
     let format_name = CString::new(spec.format).map_err(|error| error.to_string())?;
     let url = CString::new(spec.url.as_str()).map_err(|error| error.to_string())?;
@@ -722,8 +712,7 @@ fn open_capture(spec: &InputSpec) -> Result<InputContext, String> {
             ));
         }
         let mut context = ptr::null_mut();
-        let result =
-            avformat_open_input(&mut context, url.as_ptr(), input_format, options.as_mut_ptr());
+        let result = avformat_open_input(&mut context, url.as_ptr(), input_format, options.as_mut_ptr());
         if result < 0 {
             return Err(ffmpeg_error(
                 &format!("no se pudo abrir la captura ({})", spec.format),
@@ -742,18 +731,11 @@ fn open_capture(spec: &InputSpec) -> Result<InputContext, String> {
     }
 }
 
-fn open_encoder(
-    config: &ScreenCaptureConfig,
-    encoder: Encoder,
-) -> Result<ffmpeg::encoder::Video, String> {
+fn open_encoder(config: &ScreenCaptureConfig, encoder: Encoder) -> Result<ffmpeg::encoder::Video, String> {
     let (width, height) = config.even_size();
     let fps = i32::try_from(config.fps.max(1)).unwrap_or(30);
-    let codec = ffmpeg::encoder::find_by_name(encoder.name()).ok_or_else(|| {
-        format!(
-            "estas libs de ffmpeg no incluyen el codificador {}",
-            encoder.name()
-        )
-    })?;
+    let codec = ffmpeg::encoder::find_by_name(encoder.name())
+        .ok_or_else(|| format!("estas libs de ffmpeg no incluyen el codificador {}", encoder.name()))?;
     let mut video = ffmpeg::codec::context::Context::new_with_codec(codec)
         .encoder()
         .video()
@@ -809,15 +791,13 @@ impl Pipeline {
         // El lienzo se reutiliza: el tipo de imagen se fija en cada frame
         // para que una IDR forzada no se arrastre a los siguientes.
         let force = self.keyframe.take()
-            && self.last_forced.is_none_or(|at| at.elapsed() >= MIN_FORCED_KEYFRAME_INTERVAL);
+            && self
+                .last_forced
+                .is_none_or(|at| at.elapsed() >= MIN_FORCED_KEYFRAME_INTERVAL);
         if force {
             self.last_forced = Some(Instant::now());
         }
-        frame.set_kind(if force {
-            picture::Type::I
-        } else {
-            picture::Type::None
-        });
+        frame.set_kind(if force { picture::Type::I } else { picture::Type::None });
         self.encoder
             .send_frame(frame)
             .map_err(|error| ffmpeg_error("codificando", error))?;
@@ -951,10 +931,7 @@ fn window_capture_loop(
 }
 
 /// Saca del codificador todos los paquetes listos. `false` si hay que parar.
-fn drain_packets(
-    encoder: &mut ffmpeg::encoder::Video,
-    sink: &mut FrameSink,
-) -> Result<bool, String> {
+fn drain_packets(encoder: &mut ffmpeg::encoder::Video, sink: &mut FrameSink) -> Result<bool, String> {
     loop {
         let mut packet = Packet::empty();
         match encoder.receive_packet(&mut packet) {
@@ -1009,9 +986,10 @@ impl FrameConverter {
         if source_size.0 == 0 || source_size.1 == 0 {
             return Err("la captura entregó un frame sin tamaño".to_owned());
         }
-        let stale = self.scaler.as_ref().is_none_or(|cached| {
-            cached.source_format != source.format() || cached.source_size != source_size
-        });
+        let stale = self
+            .scaler
+            .as_ref()
+            .is_none_or(|cached| cached.source_format != source.format() || cached.source_size != source_size);
         if stale {
             // Primer frame, o cambió la resolución / el formato (por ejemplo,
             // al cambiar la resolución del monitor).
@@ -1044,10 +1022,7 @@ impl FrameConverter {
         // SAFETY: `canvas` es un AVFrame propio y válido.
         let status = unsafe { ffmpeg::ffi::av_frame_make_writable(self.canvas.as_mut_ptr()) };
         if status < 0 {
-            return Err(ffmpeg_error(
-                "no se pudo preparar el frame",
-                FfmpegError::from(status),
-            ));
+            return Err(ffmpeg_error("no se pudo preparar el frame", FfmpegError::from(status)));
         }
 
         match self.scaled.as_mut() {

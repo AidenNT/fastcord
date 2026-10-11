@@ -1,4 +1,5 @@
-//#![windows_subsystem = "windows"]
+// En release (Windows) no abre consola negra detrás de la ventana.
+#![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
 // El binario no dibuja nada acá: solo arma la ventana y delega
 // - la lógica/estado a `lib::state::App`
 // - el dibujado a los módulos de `ui`
@@ -22,6 +23,19 @@ use lib::state::App;
 #[global_allocator]
 static GLOBAL: support::mem_report::CountingAlloc = support::mem_report::CountingAlloc;
 
+/// Ícono de la ventana (PNG embebido en el binario).
+fn load_icon() -> egui::IconData {
+    let bytes = include_bytes!("../assets/packaging/icon-256.png");
+    match image::load_from_memory(bytes) {
+        Ok(img) => {
+            let img = img.into_rgba8();
+            let (width, height) = img.dimensions();
+            egui::IconData { rgba: img.into_raw(), width, height }
+        }
+        Err(_) => egui::IconData::default(),
+    }
+}
+
 fn main() -> eframe::Result<()> {
     // Este mismo ejecutable también es la ventana del captcha de hCaptcha
     // (ver `discord::captcha`): en ese caso no se arranca eframe.
@@ -38,7 +52,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([900.0, 600.0])
-            // Sin decoraciones nativas: `ui::topbar` dibuja su propia barra
+            // Sin decoraciones nativas: `ui::shell::topbar` dibuja su propia barra
             // (arrastre + minimizar/maximizar/cerrar), al estilo Fastpotify.
             .with_decorations(false)
             // Necesario para que un tema pueda ser transparente (ver
@@ -46,7 +60,9 @@ fn main() -> eframe::Result<()> {
             // con la ventana ya creada, así que se pide siempre; con un tema
             // opaco el fondo se pinta al 100 % y no cambia nada. Si el
             // sistema no tiene compositor, la transparencia se ve negra.
-            .with_transparent(true),
+            .with_transparent(true)
+            // Ícono de la ventana / barra de tareas.
+            .with_icon(load_icon()),
         ..Default::default()
     };
 

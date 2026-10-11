@@ -79,40 +79,28 @@ impl VoiceAudioOutputStats {
                 .fetch_max(now_ms.saturating_sub(previous_ms), Ordering::Relaxed);
         }
         self.pcm_enqueued_chunks.fetch_add(1, Ordering::Relaxed);
-        self.pcm_enqueued_frames
-            .fetch_add(frames as u64, Ordering::Relaxed);
-        self.queued_frames_max.fetch_max(
-            self.queued_frames.load(Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
+        self.pcm_enqueued_frames.fetch_add(frames as u64, Ordering::Relaxed);
+        self.queued_frames_max
+            .fetch_max(self.queued_frames.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 
     pub(super) fn record_callback(&self, frames: usize) {
         let frames = frames as u64;
         self.callback_count.fetch_add(1, Ordering::Relaxed);
-        self.callback_requested_frames
-            .fetch_add(frames, Ordering::Relaxed);
-        self.callback_frames_min
-            .fetch_min(frames, Ordering::Relaxed);
-        self.callback_frames_max
-            .fetch_max(frames, Ordering::Relaxed);
+        self.callback_requested_frames.fetch_add(frames, Ordering::Relaxed);
+        self.callback_frames_min.fetch_min(frames, Ordering::Relaxed);
+        self.callback_frames_max.fetch_max(frames, Ordering::Relaxed);
     }
 
     fn pcm_was_recent(&self) -> bool {
         let last_pcm_enqueue_ms = self.last_pcm_enqueue_ms.load(Ordering::Relaxed);
         last_pcm_enqueue_ms != 0
-            && self
-                .elapsed_ms()
-                .saturating_add(1)
-                .saturating_sub(last_pcm_enqueue_ms)
+            && self.elapsed_ms().saturating_add(1).saturating_sub(last_pcm_enqueue_ms)
                 <= RECENT_PCM_WINDOW.as_millis() as u64
     }
 
     fn elapsed_ms(&self) -> u64 {
-        self.started_at
-            .elapsed()
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64
+        self.started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
     }
 }
 
@@ -168,9 +156,7 @@ impl VoiceAudioBuffer {
                 if self.received_audio && !self.underrunning {
                     self.stats.output_underruns.fetch_add(1, Ordering::Relaxed);
                     if self.stats.pcm_was_recent() {
-                        self.stats
-                            .recent_pcm_underruns
-                            .fetch_add(1, Ordering::Relaxed);
+                        self.stats.recent_pcm_underruns.fetch_add(1, Ordering::Relaxed);
                     }
                     self.underrunning = true;
                 }
@@ -215,8 +201,7 @@ impl VoiceAudioBuffer {
                 voice_stereo_frame_at(&self.current, next_frame),
                 fraction,
             );
-            self.source_position +=
-                f64::from(DISCORD_VOICE_SAMPLE_RATE) / f64::from(self.output_sample_rate.max(1));
+            self.source_position += f64::from(DISCORD_VOICE_SAMPLE_RATE) / f64::from(self.output_sample_rate.max(1));
             return Some(frame);
         }
     }
@@ -236,9 +221,7 @@ impl VoiceAudioBuffer {
 
     fn record_dequeued_samples(&self, samples: &[f32]) {
         let frames = samples.len() / usize::from(DISCORD_VOICE_CHANNELS);
-        self.stats
-            .queued_frames
-            .fetch_sub(frames as u64, Ordering::Relaxed);
+        self.stats.queued_frames.fetch_sub(frames as u64, Ordering::Relaxed);
     }
 
     fn next_fade_stereo_frame(&mut self) -> Option<[f32; 2]> {
@@ -265,10 +248,7 @@ impl VoiceAudioBuffer {
     }
 }
 
-pub(super) fn voice_output_prebuffer_frames(
-    callback_frames: usize,
-    output_sample_rate: u32,
-) -> u64 {
+pub(super) fn voice_output_prebuffer_frames(callback_frames: usize, output_sample_rate: u32) -> u64 {
     let callback_frames = u64::try_from(callback_frames).unwrap_or(u64::MAX);
     let source_frames = callback_frames
         .saturating_mul(u64::from(DISCORD_VOICE_SAMPLE_RATE))

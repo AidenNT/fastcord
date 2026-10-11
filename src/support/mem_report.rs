@@ -1,7 +1,7 @@
 //! Contador de memoria: de dónde sale la RAM y la caché de ecord.
 //!
-//! Junta cuatro fuentes y las expone para `ui::memory_view` (pestaña
-//! Ajustes → Memoria) y para la píldora "RAM" de `ui::topbar`:
+//! Junta cuatro fuentes y las expone para `ui::settings::memory_view` (pestaña
+//! Ajustes → Memoria) y para la píldora "RAM" de `ui::shell::topbar`:
 //!
 //! 1. **RAM real del proceso** que informa el sistema operativo
 //!    ([`process_memory`]): *working set* en Windows, `VmRSS` en Linux.
@@ -22,8 +22,8 @@
 use std::alloc::{GlobalAlloc, Layout};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::time::{Duration, Instant};
 
 use mimalloc::MiMalloc;
@@ -225,7 +225,9 @@ pub fn process_memory() -> Option<ProcessMemory> {
     };
     let cb = counters.cb;
     let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, cb) };
-    (ok != 0).then_some(ProcessMemory { resident: counters.working_set_size })
+    (ok != 0).then_some(ProcessMemory {
+        resident: counters.working_set_size,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -289,7 +291,7 @@ pub struct DiskStats {
     pub json: u64,
     /// Audios de las alertas sonoras.
     pub sounds: u64,
-    /// mp4 de los GIFs ya bajados (`ui::video_player::local_video`).
+    /// mp4 de los GIFs ya bajados (`ui::chat::video_player::local_video`).
     pub video: u64,
     /// `false` mientras el primer escaneo no terminó.
     pub scanned: bool,
@@ -317,13 +319,18 @@ pub fn disk_stats() -> DiskStats {
     };
     if stale && !DISK_SCANNING.swap(true, Ordering::AcqRel) {
         std::thread::spawn(|| {
-            let (images, image_files) = crate::paths::http_cache_dir()
-                .map(|d| dir_size(&d))
-                .unwrap_or((0, 0));
+            let (images, image_files) = crate::paths::http_cache_dir().map(|d| dir_size(&d)).unwrap_or((0, 0));
             let (json, _) = crate::paths::json_cache_dir().map(|d| dir_size(&d)).unwrap_or((0, 0));
             let (sounds, _) = crate::paths::sound_cache_dir().map(|d| dir_size(&d)).unwrap_or((0, 0));
             let (video, _) = crate::paths::video_cache_dir().map(|d| dir_size(&d)).unwrap_or((0, 0));
-            let stats = DiskStats { images, image_files, json, sounds, video, scanned: true };
+            let stats = DiskStats {
+                images,
+                image_files,
+                json,
+                sounds,
+                video,
+                scanned: true,
+            };
             *DISK.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), stats));
             DISK_SCANNING.store(false, Ordering::Release);
         });
@@ -334,7 +341,9 @@ pub fn disk_stats() -> DiskStats {
 /// Tamaño total y cantidad de archivos de una carpeta (las de caché son
 /// planas: un archivo por URL).
 fn dir_size(dir: &Path) -> (u64, usize) {
-    let Ok(read) = std::fs::read_dir(dir) else { return (0, 0) };
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return (0, 0);
+    };
     let mut total = 0u64;
     let mut files = 0usize;
     for entry in read.flatten() {
@@ -458,7 +467,12 @@ pub fn native_breakdown() -> Option<NativeBreakdown> {
     let mut handles = vec![0isize; 1024];
     let mut needed = 0u32;
     let ok = unsafe {
-        K32EnumProcessModules(process, handles.as_mut_ptr(), (handles.len() * size_of::<isize>()) as u32, &mut needed)
+        K32EnumProcessModules(
+            process,
+            handles.as_mut_ptr(),
+            (handles.len() * size_of::<isize>()) as u32,
+            &mut needed,
+        )
     };
     if ok == 0 {
         return None;
@@ -466,7 +480,11 @@ pub fn native_breakdown() -> Option<NativeBreakdown> {
     let count = (needed as usize / size_of::<isize>()).min(handles.len());
     let mut modules: Vec<(usize, usize, String)> = Vec::with_capacity(count);
     for &h in &handles[..count] {
-        let mut mi = ModInfo { base: 0, size: 0, entry: 0 };
+        let mut mi = ModInfo {
+            base: 0,
+            size: 0,
+            entry: 0,
+        };
         if unsafe { K32GetModuleInformation(process, h, &mut mi, size_of::<ModInfo>() as u32) } == 0 {
             continue;
         }
@@ -504,7 +522,9 @@ pub fn native_breakdown() -> Option<NativeBreakdown> {
     for &entry in &buf[1..=entries] {
         let page_addr = (entry >> 12) << 12;
         let idx = regions.partition_point(|r| r.1 <= page_addr);
-        let Some(&(start, _, kind)) = regions.get(idx) else { continue };
+        let Some(&(start, _, kind)) = regions.get(idx) else {
+            continue;
+        };
         if start > page_addr {
             continue;
         }
@@ -533,15 +553,54 @@ pub fn native_breakdown() -> Option<NativeBreakdown> {
         let lower = module.2.to_ascii_lowercase();
         let group = if lower == exe_name {
             0
-        } else if ["avcodec", "avformat", "avutil", "swscale", "swresample", "avfilter", "avdevice", "postproc"]
-            .iter()
-            .any(|p| lower.starts_with(p))
+        } else if [
+            "avcodec",
+            "avformat",
+            "avutil",
+            "swscale",
+            "swresample",
+            "avfilter",
+            "avdevice",
+            "postproc",
+        ]
+        .iter()
+        .any(|p| lower.starts_with(p))
         {
             1
         } else if [
-            "nvoglv", "nvwgf", "nvd3d", "nvldumd", "nvapi", "nvcuda", "nvml", "nvdxgd", "igd", "ig9", "ig75", "igc",
-            "intel", "amdvlk", "atiu", "aticfx", "atig", "amdxx", "amdxc", "amdihk", "amd_ags", "d3d", "dxgi",
-            "dxcore", "dxil", "opengl32", "vulkan", "vk_swiftshader", "libegl", "libglesv2", "dcomp", "d2d1", "dwrite",
+            "nvoglv",
+            "nvwgf",
+            "nvd3d",
+            "nvldumd",
+            "nvapi",
+            "nvcuda",
+            "nvml",
+            "nvdxgd",
+            "igd",
+            "ig9",
+            "ig75",
+            "igc",
+            "intel",
+            "amdvlk",
+            "atiu",
+            "aticfx",
+            "atig",
+            "amdxx",
+            "amdxc",
+            "amdihk",
+            "amd_ags",
+            "d3d",
+            "dxgi",
+            "dxcore",
+            "dxil",
+            "opengl32",
+            "vulkan",
+            "vk_swiftshader",
+            "libegl",
+            "libglesv2",
+            "dcomp",
+            "d2d1",
+            "dwrite",
         ]
         .iter()
         .any(|p| lower.contains(p))
@@ -612,8 +671,23 @@ macro_rules! no_heap {
 }
 
 no_heap!(
-    bool, u8, u16, u32, u64, usize, i8, i16, i32, i64, isize, f32, f64, char,
-    egui::Color32, std::time::Instant, crate::lib::data::Status,
+    bool,
+    u8,
+    u16,
+    u32,
+    u64,
+    usize,
+    i8,
+    i16,
+    i32,
+    i64,
+    isize,
+    f32,
+    f64,
+    char,
+    egui::Color32,
+    std::time::Instant,
+    crate::lib::data::Status,
 );
 
 impl HeapBytes for String {
@@ -673,8 +747,7 @@ impl HeapBytes for serde_json::Value {
             Value::Null | Value::Bool(_) | Value::Number(_) => 0,
             Value::String(s) => s.capacity(),
             Value::Array(items) => {
-                items.capacity() * size_of::<Value>()
-                    + items.iter().map(HeapBytes::heap_bytes).sum::<usize>()
+                items.capacity() * size_of::<Value>() + items.iter().map(HeapBytes::heap_bytes).sum::<usize>()
             }
             // ~48 bytes de nodo por entrada del mapa, más clave y valor.
             Value::Object(map) => map
@@ -708,50 +781,264 @@ impl HeapBytes for crate::lib::data::ReactionKind {
     }
 }
 
-heap_struct!(crate::discord::models::User { id, username, global_name, discriminator, avatar, banner, bio, pronouns, avatar_decoration_data, banner_color, primary_guild, clan, display_name_styles });
-heap_struct!(crate::discord::models::Attachment { id, filename, content_type, url, proxy_url });
+heap_struct!(crate::discord::models::User {
+    id,
+    username,
+    global_name,
+    discriminator,
+    avatar,
+    banner,
+    bio,
+    pronouns,
+    avatar_decoration_data,
+    banner_color,
+    primary_guild,
+    clan,
+    display_name_styles
+});
+heap_struct!(crate::discord::models::Attachment {
+    id,
+    filename,
+    content_type,
+    url,
+    proxy_url
+});
 heap_struct!(crate::discord::models::StickerItem { id, name });
 heap_struct!(crate::discord::models::EmbedMedia { url, proxy_url });
-heap_struct!(crate::discord::models::EmbedFooter { text, icon_url, proxy_icon_url });
-heap_struct!(crate::discord::models::EmbedAuthor { name, url, icon_url, proxy_icon_url });
+heap_struct!(crate::discord::models::EmbedFooter {
+    text,
+    icon_url,
+    proxy_icon_url
+});
+heap_struct!(crate::discord::models::EmbedAuthor {
+    name,
+    url,
+    icon_url,
+    proxy_icon_url
+});
 heap_struct!(crate::discord::models::EmbedProvider { name, url });
 heap_struct!(crate::discord::models::EmbedField { name, value });
-heap_struct!(crate::discord::models::Embed { kind, title, description, url, timestamp, footer, image, thumbnail, video, provider, author, fields });
+heap_struct!(crate::discord::models::Embed {
+    kind,
+    title,
+    description,
+    url,
+    timestamp,
+    footer,
+    image,
+    thumbnail,
+    video,
+    provider,
+    author,
+    fields
+});
 heap_struct!(crate::discord::models::ComponentEmoji { id, name });
 heap_struct!(crate::discord::models::GalleryItem { media, description });
-heap_struct!(crate::discord::models::Component { id, custom_id, label, emoji, url, placeholder, content, components, accessory, component, description, value, items, media, file, name });
+heap_struct!(crate::discord::models::Component {
+    id,
+    custom_id,
+    label,
+    emoji,
+    url,
+    placeholder,
+    content,
+    components,
+    accessory,
+    component,
+    description,
+    value,
+    items,
+    media,
+    file,
+    name
+});
 heap_struct!(crate::discord::models::Role { id, name });
 heap_struct!(crate::discord::models::PermissionOverwrite { id });
 heap_struct!(crate::discord::models::ForumTag { id, name, emoji_name });
 heap_struct!(crate::discord::models::PartialMember { nick, user, roles });
 heap_struct!(crate::discord::models::Presence { status, activities });
-heap_struct!(crate::discord::models::PresenceActivity { name, state, details, application_id, timestamps, assets });
+heap_struct!(crate::discord::models::PresenceActivity {
+    name,
+    state,
+    details,
+    application_id,
+    timestamps,
+    assets
+});
 heap_struct!(crate::discord::models::MemberListGroup { id });
-heap_struct!(crate::discord::models::MemberListMember { user, nick, roles, presence });
+heap_struct!(crate::discord::models::MemberListMember {
+    user,
+    nick,
+    roles,
+    presence
+});
 heap_struct!(crate::discord::models::MemberListItem { group, member });
-heap_struct!(crate::discord::models::Channel { id, name, parent_id, permission_overwrites, available_tags });
-heap_struct!(crate::discord::models::PrivateChannel { safety_warnings, recipients, last_message_id, is_message_request_timestamp, id, username, avatar, avatar_url });
-heap_struct!(crate::discord::models::VoiceState { guild_id, channel_id, user_id, session_id, member });
+heap_struct!(crate::discord::models::Channel {
+    id,
+    name,
+    parent_id,
+    permission_overwrites,
+    available_tags
+});
+heap_struct!(crate::discord::models::PrivateChannel {
+    safety_warnings,
+    recipients,
+    last_message_id,
+    is_message_request_timestamp,
+    id,
+    username,
+    avatar,
+    avatar_url
+});
+heap_struct!(crate::discord::models::VoiceState {
+    guild_id,
+    channel_id,
+    user_id,
+    session_id,
+    member
+});
 heap_struct!(crate::lib::data::Reaction { emoji });
-heap_struct!(crate::lib::data::ReplyTarget { message_id, author, preview });
-heap_struct!(crate::lib::data::RepliedMessage { author, author_id, author_base, preview });
-heap_struct!(crate::lib::data::ForwardedMessage { content, time, mentions, attachments, embeds, stickers });
-heap_struct!(crate::lib::data::Forward { snapshots, source_channel_id, source_guild_id });
-heap_struct!(crate::lib::data::ChatMessage { id, author, author_id, author_base, time, content, avatar_url, mentions, reactions, attachments, embeds, stickers, replied_to, forwarded, components, thread, channel_id, application_id, interaction });
-heap_struct!(crate::lib::data::InteractionLine { user_id, user, avatar_url, command });
-heap_struct!(crate::lib::data::ThreadCard { id, name, last_message_id, owner_id });
-heap_struct!(crate::lib::data::Friend { name, subtitle, avatar_url, user_id, dm_channel_id, handle, member_since, messages });
-heap_struct!(crate::lib::data::VoiceOccupant { user_id, name, avatar_url });
-heap_struct!(crate::lib::data::Channel { name, messages, channel_id, voice_members, overwrites, parent_id, forum });
-heap_struct!(crate::lib::data::ForumState { tags, posts, search, draft_title, draft_body, draft_tags });
-heap_struct!(crate::lib::data::ForumPost { id, title, author, preview, thumbnail, tag_ids, reaction });
+heap_struct!(crate::lib::data::ReplyTarget {
+    message_id,
+    author,
+    preview
+});
+heap_struct!(crate::lib::data::RepliedMessage {
+    author,
+    author_id,
+    author_base,
+    preview
+});
+heap_struct!(crate::lib::data::ForwardedMessage {
+    content,
+    time,
+    mentions,
+    attachments,
+    embeds,
+    stickers
+});
+heap_struct!(crate::lib::data::Forward {
+    snapshots,
+    source_channel_id,
+    source_guild_id
+});
+heap_struct!(crate::lib::data::ChatMessage {
+    id,
+    author,
+    author_id,
+    author_base,
+    time,
+    content,
+    avatar_url,
+    mentions,
+    reactions,
+    attachments,
+    embeds,
+    stickers,
+    replied_to,
+    forwarded,
+    components,
+    thread,
+    channel_id,
+    application_id,
+    interaction
+});
+heap_struct!(crate::lib::data::InteractionLine {
+    user_id,
+    user,
+    avatar_url,
+    command
+});
+heap_struct!(crate::lib::data::ThreadCard {
+    id,
+    name,
+    last_message_id,
+    owner_id
+});
+heap_struct!(crate::lib::data::Friend {
+    name,
+    subtitle,
+    avatar_url,
+    user_id,
+    dm_channel_id,
+    handle,
+    member_since,
+    messages
+});
+heap_struct!(crate::lib::data::VoiceOccupant {
+    user_id,
+    name,
+    avatar_url
+});
+heap_struct!(crate::lib::data::Channel {
+    name,
+    messages,
+    channel_id,
+    voice_members,
+    overwrites,
+    parent_id,
+    forum
+});
+heap_struct!(crate::lib::data::ForumState {
+    tags,
+    posts,
+    search,
+    draft_title,
+    draft_body,
+    draft_tags
+});
+heap_struct!(crate::lib::data::ForumPost {
+    id,
+    title,
+    author,
+    preview,
+    thumbnail,
+    tag_ids,
+    reaction
+});
 heap_struct!(crate::lib::data::ChannelCategory { name, channels });
-heap_struct!(crate::lib::data::Member { name, avatar_url, user_id, subtitle });
+heap_struct!(crate::lib::data::Member {
+    name,
+    avatar_url,
+    user_id,
+    subtitle
+});
 heap_struct!(crate::lib::data::MemberGroup { name, members });
-heap_struct!(crate::lib::data::Server { name, icon_initial, icon_url, banner_url, guild_id, topic, categories, member_groups, roles, member_lists, active_member_list, channel_member_list, pending_list_channel, custom_emojis, custom_stickers, member_info, requested_members, pending_voice_states, known_users, access_ctx, raw_channels });
+heap_struct!(crate::lib::data::Server {
+    name,
+    icon_initial,
+    icon_url,
+    banner_url,
+    guild_id,
+    topic,
+    categories,
+    member_groups,
+    roles,
+    member_lists,
+    active_member_list,
+    channel_member_list,
+    pending_list_channel,
+    custom_emojis,
+    custom_stickers,
+    member_info,
+    requested_members,
+    pending_voice_states,
+    known_users,
+    access_ctx,
+    raw_channels
+});
 heap_struct!(crate::lib::data::MemberInfo { nick, roles });
 heap_struct!(crate::lib::data::KnownUser { name, avatar_url });
 heap_struct!(crate::lib::data::MemberListState { items });
 heap_struct!(crate::lib::data::CustomEmoji { id, name });
-heap_struct!(crate::lib::data::ActivityCard { name, detail, time, connect_label });
-heap_struct!(crate::lib::permissions::AccessContext { owner_id, my_id, my_roles });
+heap_struct!(crate::lib::data::ActivityCard {
+    name,
+    detail,
+    time,
+    connect_label
+});
+heap_struct!(crate::lib::permissions::AccessContext {
+    owner_id,
+    my_id,
+    my_roles
+});

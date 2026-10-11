@@ -1,7 +1,7 @@
 //! Parámetros de la cadena de limpieza de micrófono ("Clean Mic") y su medidor.
 //!
 //! Viven en un almacén global (no en `VoiceCaptureGate`, que es `Copy + Eq` y
-//! viaja por varios canales) para que el popup de `ui::clean_mic_popup` pueda
+//! viaja por varios canales) para que el popup de `ui::call::clean_mic_popup` pueda
 //! cambiarlos en caliente: `voice/noise.rs` mira `version()` en cada frame y,
 //! si cambió, relee `current()` y reconfigura filtros y EQ sin cortar el audio.
 //!
@@ -29,22 +29,55 @@ pub struct EqBand {
 
 impl Default for EqBand {
     fn default() -> Self {
-        Self { freq: 1000.0, gain: 0.0, q: 1.0 }
+        Self {
+            freq: 1000.0,
+            gain: 0.0,
+            q: 1.0,
+        }
     }
 }
 
 /// Frecuencia y Q fijos de cada banda al elegir un estilo de voz.
-const EQ_BASE: [(f32, f32); EQ_BANDS] =
-    [(100.0, 0.7), (300.0, 1.0), (1000.0, 1.0), (3500.0, 0.8), (8000.0, 0.7)];
+const EQ_BASE: [(f32, f32); EQ_BANDS] = [(100.0, 0.7), (300.0, 1.0), (1000.0, 1.0), (3500.0, 0.8), (8000.0, 0.7)];
 
 /// (clave, nombre, descripción, ganancias en dB por banda)
 pub const PRESETS: [(&str, &str, &str, [f32; EQ_BANDS]); 6] = [
-    ("natural", "Natural", "Tu voz, solo que más limpia.", [0.0, -2.0, 0.0, 2.5, 1.5]),
-    ("warm", "Cálida", "Más llena y suave, para charlar.", [3.0, 0.5, -1.0, 1.0, -1.0]),
-    ("crisp", "Nítida", "Brillante y clara, ideal para micrófonos baratos.", [-1.5, -3.0, 0.0, 4.0, 4.0]),
-    ("radio", "Radio", "Sonido grande y pulido de podcast.", [4.0, -3.0, 1.0, 4.0, 2.5]),
-    ("deep", "Grave", "Más peso y graves en la voz.", [6.0, 1.5, -1.0, 1.0, 0.0]),
-    ("flat", "Plana", "Sin cambio de tono, solo limpieza.", [0.0, 0.0, 0.0, 0.0, 0.0]),
+    (
+        "natural",
+        "Natural",
+        "Tu voz, solo que más limpia.",
+        [0.0, -2.0, 0.0, 2.5, 1.5],
+    ),
+    (
+        "warm",
+        "Cálida",
+        "Más llena y suave, para charlar.",
+        [3.0, 0.5, -1.0, 1.0, -1.0],
+    ),
+    (
+        "crisp",
+        "Nítida",
+        "Brillante y clara, ideal para micrófonos baratos.",
+        [-1.5, -3.0, 0.0, 4.0, 4.0],
+    ),
+    (
+        "radio",
+        "Radio",
+        "Sonido grande y pulido de podcast.",
+        [4.0, -3.0, 1.0, 4.0, 2.5],
+    ),
+    (
+        "deep",
+        "Grave",
+        "Más peso y graves en la voz.",
+        [6.0, 1.5, -1.0, 1.0, 0.0],
+    ),
+    (
+        "flat",
+        "Plana",
+        "Sin cambio de tono, solo limpieza.",
+        [0.0, 0.0, 0.0, 0.0, 0.0],
+    ),
 ];
 
 pub fn bands_for(preset: &str) -> [EqBand; EQ_BANDS] {
@@ -52,7 +85,11 @@ pub fn bands_for(preset: &str) -> [EqBand; EQ_BANDS] {
         .iter()
         .find(|(key, ..)| *key == preset)
         .map_or(PRESETS[0].3, |(.., gains)| *gains);
-    std::array::from_fn(|i| EqBand { freq: EQ_BASE[i].0, gain: gains[i], q: EQ_BASE[i].1 })
+    std::array::from_fn(|i| EqBand {
+        freq: EQ_BASE[i].0,
+        gain: gains[i],
+        q: EQ_BASE[i].1,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -127,7 +164,10 @@ struct Store {
 
 fn store() -> &'static Store {
     static STORE: OnceLock<Store> = OnceLock::new();
-    STORE.get_or_init(|| Store { settings: RwLock::new(CleanMicSettings::default()), version: AtomicU64::new(1) })
+    STORE.get_or_init(|| Store {
+        settings: RwLock::new(CleanMicSettings::default()),
+        version: AtomicU64::new(1),
+    })
 }
 
 pub fn current() -> CleanMicSettings {

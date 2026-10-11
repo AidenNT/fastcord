@@ -50,10 +50,7 @@ impl H264Decoder {
             .decoder()
             .video()
             .map_err(|error| format!("could not open the H.264 decoder: {error}"))?;
-        Ok(Self {
-            decoder,
-            scaler: None,
-        })
+        Ok(Self { decoder, scaler: None })
     }
 
     /// Decodifica un access unit y devuelve los frames que salieron (casi

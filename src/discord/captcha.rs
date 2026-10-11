@@ -159,7 +159,11 @@ pub(super) fn parse_challenge(body: &str) -> Option<CaptchaChallenge> {
     let raw: Raw = serde_json::from_str(body).ok()?;
     raw.captcha_key.as_ref()?;
     let sitekey = raw.captcha_sitekey.filter(|key| !key.is_empty())?;
-    if raw.captcha_service.as_deref().is_some_and(|service| service != "hcaptcha") {
+    if raw
+        .captcha_service
+        .as_deref()
+        .is_some_and(|service| service != "hcaptcha")
+    {
         return None;
     }
     Some(CaptchaChallenge {
@@ -331,7 +335,14 @@ fn spawn_window(id: u64, challenge: &CaptchaChallenge) -> Result<CaptchaWindow, 
         }
 
         let solved = token.is_some();
-        resolve(id, token.map(|token| CaptchaSolution { token, rqtoken, session_id }));
+        resolve(
+            id,
+            token.map(|token| CaptchaSolution {
+                token,
+                rqtoken,
+                session_id,
+            }),
+        );
         watcher_outcome.store(if solved { SOLVED } else { CLOSED }, Ordering::Release);
         wake_ui();
     });
@@ -550,8 +561,7 @@ mod tests {
         assert!(parse_challenge(r#"{"code":50035,"message":"Invalid Form Body"}"#).is_none());
         assert!(parse_challenge(r#"{"captcha_key":["captcha-required"]}"#).is_none());
         assert!(
-            parse_challenge(r#"{"captcha_key":["x"],"captcha_sitekey":"s","captcha_service":"recaptcha"}"#)
-                .is_none()
+            parse_challenge(r#"{"captcha_key":["x"],"captcha_sitekey":"s","captcha_service":"recaptcha"}"#).is_none()
         );
         assert!(parse_challenge("not json").is_none());
     }
@@ -566,22 +576,27 @@ mod tests {
         assert!(challenge.rqdata.is_none() && challenge.rqtoken.is_none() && challenge.session_id.is_none());
 
         // `captcha_sitekey` es `?string`: un null no debe romper la deserialización.
-        let nullable: CaptchaRequiredError =
-            serde_json::from_str(r#"{"captcha_key":["x"],"captcha_sitekey":null,"captcha_service":"recaptcha_enterprise"}"#)
-                .expect("null sitekey should deserialize");
+        let nullable: CaptchaRequiredError = serde_json::from_str(
+            r#"{"captcha_key":["x"],"captcha_sitekey":null,"captcha_service":"recaptcha_enterprise"}"#,
+        )
+        .expect("null sitekey should deserialize");
         assert!(nullable.captcha_sitekey.is_empty());
 
-        let recaptcha: CaptchaRequiredError = serde_json::from_str(
-            r#"{"captcha_key":["x"],"captcha_sitekey":"s","captcha_service":"recaptcha"}"#,
-        )
-        .unwrap();
+        let recaptcha: CaptchaRequiredError =
+            serde_json::from_str(r#"{"captcha_key":["x"],"captcha_sitekey":"s","captcha_service":"recaptcha"}"#)
+                .unwrap();
         assert!(CaptchaChallenge::from_vendor(&recaptcha).is_none());
     }
 
     #[test]
     fn broker_round_trip_and_cancel() {
         fn challenge(sitekey: &str) -> CaptchaChallenge {
-            CaptchaChallenge { sitekey: sitekey.to_owned(), rqdata: None, rqtoken: Some("rq".to_owned()), session_id: None }
+            CaptchaChallenge {
+                sitekey: sitekey.to_owned(),
+                rqdata: None,
+                rqtoken: Some("rq".to_owned()),
+                session_id: None,
+            }
         }
         fn run_solve(challenge: CaptchaChallenge) -> std::thread::JoinHandle<Option<CaptchaSolution>> {
             std::thread::spawn(move || {
@@ -604,7 +619,14 @@ mod tests {
         let solver = run_solve(challenge("a"));
         let request = wait_for_request();
         assert_eq!(request.challenge.sitekey, "a");
-        resolve(request.id, Some(CaptchaSolution { token: "tok".into(), rqtoken: Some("rq".into()), session_id: Some("sess".into()) }));
+        resolve(
+            request.id,
+            Some(CaptchaSolution {
+                token: "tok".into(),
+                rqtoken: Some("rq".into()),
+                session_id: Some("sess".into()),
+            }),
+        );
         let solution = solver.join().unwrap().expect("solved");
         assert_eq!(solution.token, "tok");
         assert_eq!(solution.to_vendor().rqtoken, "rq");

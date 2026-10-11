@@ -98,13 +98,8 @@ impl VoiceOutboundSendState {
     }
 
     #[allow(dead_code)]
-    pub(super) fn send_opus_frame(
-        &mut self,
-        opus_payload: &[u8],
-    ) -> Result<VoiceOutboundSendOutcome, String> {
-        self.send_opus_frame_with_dave_payload(VoiceDaveOutboundPayload::Plain(
-            opus_payload.to_vec(),
-        ))
+    pub(super) fn send_opus_frame(&mut self, opus_payload: &[u8]) -> Result<VoiceOutboundSendOutcome, String> {
+        self.send_opus_frame_with_dave_payload(VoiceDaveOutboundPayload::Plain(opus_payload.to_vec()))
     }
 
     pub(super) fn send_opus_frame_with_dave(
@@ -129,9 +124,7 @@ impl VoiceOutboundSendState {
             ));
         }
         let opus_payload = match dave_payload {
-            VoiceDaveOutboundPayload::Plain(opus) | VoiceDaveOutboundPayload::Encrypted(opus) => {
-                opus
-            }
+            VoiceDaveOutboundPayload::Plain(opus) | VoiceDaveOutboundPayload::Encrypted(opus) => opus,
             VoiceDaveOutboundPayload::Blocked(reason) => {
                 return Ok(VoiceOutboundSendOutcome::Blocked(reason));
             }
@@ -146,8 +139,7 @@ impl VoiceOutboundSendState {
             });
             self.speaking = true;
         }
-        self.events
-            .push(VoiceOutboundSendEvent::Packet { bytes: encrypted });
+        self.events.push(VoiceOutboundSendEvent::Packet { bytes: encrypted });
         self.advance_packet_state();
         Ok(VoiceOutboundSendOutcome::Sent)
     }
@@ -189,14 +181,11 @@ impl VoiceOutboundSendState {
         }
 
         let opus_payload = match dave_payload {
-            VoiceDaveOutboundPayload::Plain(opus) | VoiceDaveOutboundPayload::Encrypted(opus) => {
-                opus
-            }
+            VoiceDaveOutboundPayload::Plain(opus) | VoiceDaveOutboundPayload::Encrypted(opus) => opus,
             VoiceDaveOutboundPayload::Blocked(_) => return Ok(self.queue_speaking_off()),
         };
         let encrypted = self.encrypt_current_packet(&opus_payload, false)?;
-        self.events
-            .push(VoiceOutboundSendEvent::Packet { bytes: encrypted });
+        self.events.push(VoiceOutboundSendEvent::Packet { bytes: encrypted });
         self.advance_packet_state();
 
         if finish_talkspurt {
@@ -225,11 +214,7 @@ impl VoiceOutboundSendState {
         self.allow_microphone_transmit && !self.self_mute
     }
 
-    pub(super) fn encrypt_current_packet(
-        &self,
-        opus_payload: &[u8],
-        marker: bool,
-    ) -> Result<Vec<u8>, String> {
+    pub(super) fn encrypt_current_packet(&self, opus_payload: &[u8], marker: bool) -> Result<Vec<u8>, String> {
         let nonce_suffix = self.current_nonce_suffix()?;
         let packet = build_voice_rtp_packet_with_marker(
             self.rtp.sequence,

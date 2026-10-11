@@ -35,15 +35,6 @@ pub fn is_rtl(text: &str) -> bool {
     false
 }
 
-/// The edge the text should hug.
-pub fn halign_for(text: &str) -> Align {
-    if is_rtl(text) {
-        Align::RIGHT
-    } else {
-        Align::LEFT
-    }
-}
-
 /// `text` as the engine should receive it: every right-to-left line with
 /// its words reordered. Text that needs no change comes back borrowed.
 pub fn display_text(text: &str) -> Cow<'_, str> {
@@ -53,12 +44,7 @@ pub fn display_text(text: &str) -> Cow<'_, str> {
     if !text.split('\n').any(is_rtl) {
         return Cow::Borrowed(text);
     }
-    Cow::Owned(
-        text.split('\n')
-            .map(display_line)
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
+    Cow::Owned(text.split('\n').map(display_line).collect::<Vec<_>>().join("\n"))
 }
 
 /// The reordered text, or `None` when `text` can be used as it is. Saves a
@@ -104,10 +90,7 @@ fn display_line(line: &str) -> Cow<'_, str> {
 
 /// A letter of a right-to-left script, or a mark that rides on one.
 fn is_rtl_letter(character: char) -> bool {
-    matches!(
-        bidi_class(character),
-        BidiClass::R | BidiClass::AL | BidiClass::NSM
-    )
+    matches!(bidi_class(character), BidiClass::R | BidiClass::AL | BidiClass::NSM)
 }
 
 /// Lays `text` out within `wrap_width`, on at most `max_rows` rows, with
@@ -135,18 +118,9 @@ pub fn layout(
     // holds its first words. epaint shapes the words itself, so a row's
     // glyphs say nothing reliable about its characters; measuring words is
     // the dependable way to know what fits.
-    let width = |piece: &str| {
-        painter
-            .layout_no_wrap(piece.to_owned(), font.clone(), color)
-            .size()
-            .x
-    };
+    let width = |piece: &str| painter.layout_no_wrap(piece.to_owned(), font.clone(), color).size().x;
     let rows = break_rows(text, wrap_width, max_rows, overflow, width);
-    let display = rows
-        .iter()
-        .map(|row| display_line(row))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let display = rows.iter().map(|row| display_line(row)).collect::<Vec<_>>().join("\n");
     let mut job = LayoutJob::simple(display, font, color, f32::INFINITY);
     job.halign = Align::RIGHT;
     painter.layout_job(job)
@@ -264,23 +238,9 @@ pub fn galley_pos(rect: Rect, galley: &Galley) -> Pos2 {
 
 /// Paints one line of text centred on `y`, starting at `left`, or ending at
 /// `right` when it reads right to left. Returns the painted rect.
-pub fn paint_line(
-    painter: &Painter,
-    left: f32,
-    right: f32,
-    y: f32,
-    text: &str,
-    font: FontId,
-    color: Color32,
-) -> Rect {
+pub fn paint_line(painter: &Painter, left: f32, right: f32, y: f32, text: &str, font: FontId, color: Color32) -> Rect {
     if is_rtl(text) {
-        painter.text(
-            pos2(right, y),
-            Align2::RIGHT_CENTER,
-            display_text(text),
-            font,
-            color,
-        )
+        painter.text(pos2(right, y), Align2::RIGHT_CENTER, display_text(text), font, color)
     } else {
         painter.text(pos2(left, y), Align2::LEFT_CENTER, text, font, color)
     }

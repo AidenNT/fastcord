@@ -128,9 +128,7 @@ impl App {
         mem.account += self
             .in_app_notifications
             .iter()
-            .map(|n| {
-                size_of_val(n) + n.title.capacity() + n.body.capacity() + n.avatar_url.heap_bytes()
-            })
+            .map(|n| size_of_val(n) + n.title.capacity() + n.body.capacity() + n.avatar_url.heap_bytes())
             .sum::<usize>();
         // Estado de voz: unos ~200 bytes por participante.
         mem.account += self.voice.participant_count() * 200;
@@ -145,7 +143,7 @@ impl App {
         let resident = mem_report::process_memory().map(|m| m.resident);
         let total = resident.unwrap_or(heap);
         let discord = self.discord_memory();
-        let images = crate::ui::anim::mem_stats(ctx);
+        let images = crate::ui::chat::anim::mem_stats(ctx);
         let video = egui_video::video_mem_stats();
         let measured = discord.total() + images.decoded + images.downloaded + video.rust_heap();
         MemoryReport {
@@ -159,7 +157,7 @@ impl App {
             animations: images.animations,
             gpu_total: mem_report::gpu_texture_bytes(ctx),
             video,
-            gif_thumbs: crate::ui::gif_thumbs::bytes(),
+            gif_thumbs: crate::ui::chat::gif_thumbs::bytes(),
             native: mem_report::native_breakdown().unwrap_or_default(),
             disk: mem_report::disk_stats(),
         }

@@ -7,23 +7,25 @@
 //! (`App::poll_discord_events`, en `lib/state.rs`) y actualiza su estado.
 
 pub mod activity;
+pub mod affinities;
+mod auth_http;
+pub mod captcha;
 pub mod clean_mic;
+pub mod fingerprint;
+pub mod frecency;
 pub mod gateway;
 pub mod invites;
+pub mod join_form;
 pub mod models;
+pub mod password_auth;
 pub mod remote_auth;
 pub mod rest;
 pub mod slash;
-pub mod fingerprint;
-pub mod password_auth;
-pub mod captcha;
-pub mod affinities;
-pub mod frecency;
-pub mod user_settings;
+pub mod soundboard;
 pub mod uploads;
+pub mod user_settings;
 pub mod uwu_rest;
 pub mod voice;
-mod auth_http;
 mod websocket;
 
 /// Texto con el que Discord (vía el cliente REST vendorizado) rechaza un
@@ -69,15 +71,15 @@ fn connection_failure_event(context: &str, error: &anyhow::Error) -> AppEvent {
 }
 pub(crate) mod ids;
 
-pub use voice::{
-    CurrentVoiceConnectionState, MemberInfo, MicrophoneBufferMs, MicrophoneSensitivityDb,
-    StreamPublishStatus, StreamWatchStatus, VoiceAudioSettings, VoiceCache, VoiceConnectPhase, VoiceConnectionStatus,
-    VoiceParticipantState, VoiceScope, VoiceServerInfo, VoiceSoundKind, VoiceStateInfo,
-    VoiceParticipantPlaybackSettings, VoiceParticipantVolumePercent, VoiceVolumePercent,
-};
 pub use models::{
-    Channel, Emoji, ForumPage, GatewayMessage, ThreadChannel, MemberListMember, MemberListUpdate, MessageUpdate,
-    PresenceEvent, ReadyPayload, Role, User, UserProfileResponse, VoiceState,
+    Channel, Emoji, ForumPage, GatewayMessage, MemberListMember, MemberListUpdate, MessageUpdate, PresenceEvent,
+    ReadyPayload, Role, ThreadChannel, User, UserProfileResponse, VoiceState,
+};
+pub use voice::{
+    CurrentVoiceConnectionState, MemberInfo, MicrophoneBufferMs, MicrophoneSensitivityDb, StreamPublishStatus,
+    StreamWatchStatus, VoiceAudioSettings, VoiceCache, VoiceConnectPhase, VoiceConnectionStatus,
+    VoiceParticipantPlaybackSettings, VoiceParticipantState, VoiceParticipantVolumePercent, VoiceScope,
+    VoiceServerInfo, VoiceSoundKind, VoiceStateInfo, VoiceVolumePercent,
 };
 
 /// `VOICE_SERVER_UPDATE`, tal cual llega del Gateway: sin ids tipados, como
@@ -195,10 +197,7 @@ pub enum AppEvent {
         messages: Vec<GatewayMessage>,
     },
     /// Canales de un server, pedidos por REST al abrirlo por primera vez.
-    GuildChannels {
-        guild_id: String,
-        channels: Vec<Channel>,
-    },
+    GuildChannels { guild_id: String, channels: Vec<Channel> },
     /// Historial de un canal de texto de server, pedido por REST la
     /// primera vez que se abre (`App::open_channel`).
     ChannelMessages {
@@ -232,17 +231,12 @@ pub enum AppEvent {
     },
     /// Falló un pedido `around`/`after`: hay que soltar los "cargando" del
     /// canal para que se pueda reintentar.
-    MessageWindowFailed {
-        channel_id: String,
-    },
+    MessageWindowFailed { channel_id: String },
     /// Foto de "quién está en qué canal de voz" de un guild. Llega por
     /// `READY_SUPPLEMENTAL` (un `{ id, voice_states }` por guild, justo
     /// después del `READY`) y por `GUILD_CREATE`. Es una foto COMPLETA: la
     /// UI reemplaza lo que había, no lo suma.
-    GuildVoiceStates {
-        guild_id: String,
-        states: Vec<VoiceState>,
-    },
+    GuildVoiceStates { guild_id: String, states: Vec<VoiceState> },
     /// Cambio de voz en vivo (`VOICE_STATE_UPDATE`): alguien se conectó, se
     /// desconectó o cambió de canal de voz.
     VoiceStateUpdate(VoiceState),
@@ -266,10 +260,7 @@ pub enum AppEvent {
         message: Option<String>,
     },
     /// Miniatura de un stream ajeno (`spawn_fetch_stream_preview`).
-    StreamPreview {
-        stream_key: String,
-        url: Option<String>,
-    },
+    StreamPreview { stream_key: String, url: Option<String> },
     /// Progreso de NUESTRA transmisión (`voice::spawn_stream_publish`):
     /// conectando, en vivo, falló...
     StreamPublishStatus {
@@ -281,6 +272,8 @@ pub enum AppEvent {
     /// estado de voz llegó sin `member`/`user` embebido (ver
     /// `spawn_fetch_user`).
     UserFetched(User),
+    /// Alguien está escribiendo en un canal/DM (`TYPING_START`).
+    TypingStart(models::TypingStart),
     /// Alguien puso una reacción en vivo (`MESSAGE_REACTION_ADD`), en
     /// cualquier mensaje al que tengamos acceso — no solo el nuestro.
     ReactionAdd {
@@ -330,10 +323,7 @@ pub enum AppEvent {
     },
     /// La nota privada que tenés de `user_id` (`None` = sin nota), pedida al
     /// abrir el editor de notas (`spawn_fetch_note`).
-    UserNote {
-        user_id: String,
-        note: Option<String>,
-    },
+    UserNote { user_id: String, note: Option<String> },
     /// Algo se rompió (login o Gateway); mensaje ya listo para mostrar.
     Error(String),
     /// Se cortó la conexión con Discord (se cerró el socket, dejó de
@@ -375,7 +365,10 @@ pub enum AppEvent {
     /// el chat el nombre del server y el color de su rol. Llega como
     /// respuesta a un `RequestGuildMembers` (`GUILD_MEMBERS_CHUNK`) y
     /// cuando alguien cambia su apodo/roles (`GUILD_MEMBER_UPDATE`).
-    GuildMembers { guild_id: String, members: Vec<MemberListMember> },
+    GuildMembers {
+        guild_id: String,
+        members: Vec<MemberListMember>,
+    },
     /// Cambio de presencia en vivo (`PRESENCE_UPDATE`).
     PresenceUpdate(Box<PresenceEvent>),
     /// Presencias iniciales de los amigos conectados
@@ -458,6 +451,15 @@ pub enum AppEvent {
     ChannelUpsert { guild_id: String, channel: Channel },
     /// `CHANNEL_DELETE` de un server.
     ChannelDelete { guild_id: String, channel_id: String },
+    /// `CHANNEL_CREATE` / `CHANNEL_UPDATE` de un DM (sin `guild_id`): un DM
+    /// grupal nuevo, o uno que cambió de nombre, ícono o dueño.
+    DmChannelUpsert(Box<crate::discord::models::PrivateChannel>),
+    /// `CHANNEL_DELETE` de un DM (te sacaron del grupo, o lo cerraste).
+    DmChannelDelete { channel_id: String },
+    /// `CHANNEL_RECIPIENT_ADD`: alguien entró a un DM grupal.
+    DmRecipientAdd { channel_id: String, user: crate::discord::models::User },
+    /// `CHANNEL_RECIPIENT_REMOVE`: alguien salió de un DM grupal.
+    DmRecipientRemove { channel_id: String, user_id: String },
     /// `GUILD_ROLE_CREATE` / `GUILD_ROLE_UPDATE`: rol nuevo o modificado
     /// (nombre, color, permisos...). Cambiar sus permisos cambia qué
     /// canales se ven.
@@ -493,12 +495,45 @@ pub enum AppEvent {
     /// `INTERACTION_SUCCESS`: la app contestó bien a la interacción (botón o
     /// formulario). Apaga el spinner del botón apretado.
     InteractionSucceeded,
+    /// El formulario de ingreso de un server se mandó bien
+    /// (`spawn_submit_join_form`). `outcome` dice si ya puedes participar o
+    /// si un moderador tiene que revisarlo.
+    JoinFormSubmitted {
+        guild_name: String,
+        outcome: join_form::JoinOutcome,
+    },
+    /// Llegaron los sonidos del soundboard (`spawn_fetch_soundboard`).
+    SoundboardLoaded {
+        guild_id: Option<String>,
+        defaults: Vec<soundboard::SoundboardSound>,
+        guild_sounds: Vec<soundboard::SoundboardSound>,
+    },
+    /// No se pudo cargar o tocar un sonido del soundboard.
+    SoundboardFailed { message: String },
+    /// `VOICE_CHANNEL_EFFECT_SEND` con un sonido: alguien tocó un sonido en un
+    /// canal de voz. Cada cliente lo reproduce por su cuenta.
+    SoundboardEffect {
+        channel_id: String,
+        user_id: String,
+        sound_id: String,
+        volume: Option<f32>,
+    },
+    /// `GUILD_JOIN_REQUEST_CREATE` / `_UPDATE`: una solicitud de ingreso cambió.
+    GuildJoinRequestUpsert(join_form::JoinRequest),
+    /// `GUILD_JOIN_REQUEST_DELETE`: la solicitud del server (`guild_id`) ya no existe.
+    GuildJoinRequestDelete { guild_id: String },
+    /// No se pudo mandar el formulario de ingreso: el formulario sigue
+    /// abierto para reintentar.
+    JoinFormFailed { guild_name: String, message: String },
     /// Se pudo crear un hilo desde un mensaje (`spawn_create_thread`); el
     /// panel lo abre enseguida.
     ThreadOpened { thread: ThreadChannel },
     /// Llegó el catálogo de slash commands de `key` (el id del server, o del
     /// canal en un DM). Ver `spawn_fetch_slash_catalog`.
-    SlashCatalogLoaded { key: String, catalog: std::sync::Arc<slash::SlashCatalog> },
+    SlashCatalogLoaded {
+        key: String,
+        catalog: std::sync::Arc<slash::SlashCatalog>,
+    },
     /// No se pudo pedir el catálogo de `key`.
     SlashCatalogFailed { key: String },
 }
@@ -508,15 +543,10 @@ pub enum AppEvent {
 /// debajo). Devuelve enseguida; los resultados llegan por `tx`.
 pub fn spawn_login_flow(tx: std::sync::mpsc::Sender<AppEvent>) {
     std::thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(rt) => rt,
             Err(e) => {
-                let _ = tx.send(AppEvent::Error(format!(
-                    "No se pudo iniciar el runtime async: {e}"
-                )));
+                let _ = tx.send(AppEvent::Error(format!("No se pudo iniciar el runtime async: {e}")));
                 return;
             }
         };
@@ -538,9 +568,7 @@ pub fn spawn_login_flow(tx: std::sync::mpsc::Sender<AppEvent>) {
                         return;
                     }
 
-                    let _ = tx.send(AppEvent::LoggedIn {
-                        token: token.clone(),
-                    });
+                    let _ = tx.send(AppEvent::LoggedIn { token: token.clone() });
                     let (commands_tx, commands_rx) = tokio::sync::mpsc::unbounded_channel();
                     let _ = tx.send(AppEvent::GatewayCommands(commands_tx));
                     if let Err(e) = gateway::run(token, fingerprint, tx.clone(), commands_rx).await {
@@ -565,17 +593,16 @@ pub fn spawn_login_flow(tx: std::sync::mpsc::Sender<AppEvent>) {
 /// nunca bloquea ni rompe el inicio de sesión.
 async fn init_fingerprint() -> std::sync::Arc<fingerprint::ClientFingerprint> {
     let loading = fingerprint::load_client_fingerprint_and_http();
-    let (fingerprint, _http) =
-        match tokio::time::timeout(std::time::Duration::from_secs(10), loading).await {
-            Ok(pair) => pair,
-            Err(_) => {
-                log::warn!("No se pudo cargar el fingerprint a tiempo; se usa el de respaldo");
-                (
-                    std::sync::Arc::new(fingerprint::ClientFingerprint::new(fingerprint::CLIENT_BUILD_NUMBER)),
-                    reqwest::Client::new(),
-                )
-            }
-        };
+    let (fingerprint, _http) = match tokio::time::timeout(std::time::Duration::from_secs(10), loading).await {
+        Ok(pair) => pair,
+        Err(_) => {
+            log::warn!("No se pudo cargar el fingerprint a tiempo; se usa el de respaldo");
+            (
+                std::sync::Arc::new(fingerprint::ClientFingerprint::new(fingerprint::CLIENT_BUILD_NUMBER)),
+                reqwest::Client::new(),
+            )
+        }
+    };
     rest::set_shared_fingerprint(fingerprint.clone());
     uwu_rest::set_shared_fingerprint(fingerprint.clone());
     fingerprint
@@ -620,11 +647,7 @@ pub fn spawn_fetch_dm(token: String, user_id: String, tx: std::sync::mpsc::Sende
 /// Pide los canales de texto de un server. Se llama al abrirlo por primera
 /// vez (`App::open_server`); el resultado llega como
 /// `AppEvent::GuildChannels`.
-pub fn spawn_fetch_guild_channels(
-    token: String,
-    guild_id: String,
-    tx: std::sync::mpsc::Sender<AppEvent>,
-) {
+pub fn spawn_fetch_guild_channels(token: String, guild_id: String, tx: std::sync::mpsc::Sender<AppEvent>) {
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
@@ -656,11 +679,7 @@ pub fn spawn_fetch_guild_channels(
 /// Pide el historial reciente de un canal de texto de server. Se llama al
 /// abrirlo por primera vez (`App::open_channel`); el resultado llega como
 /// `AppEvent::ChannelMessages`.
-pub fn spawn_fetch_channel_messages(
-    token: String,
-    channel_id: String,
-    tx: std::sync::mpsc::Sender<AppEvent>,
-) {
+pub fn spawn_fetch_channel_messages(token: String, channel_id: String, tx: std::sync::mpsc::Sender<AppEvent>) {
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
@@ -669,9 +688,7 @@ pub fn spawn_fetch_channel_messages(
             let rest = match uwu_rest::UwuRest::for_token(token).await {
                 Ok(rest) => rest,
                 Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!(
-                        "No se pudo traer el historial del canal: {e}"
-                    )));
+                    let _ = tx.send(AppEvent::Error(format!("No se pudo traer el historial del canal: {e}")));
                     return;
                 }
             };
@@ -680,9 +697,7 @@ pub fn spawn_fetch_channel_messages(
                     let _ = tx.send(AppEvent::ChannelMessages { channel_id, messages });
                 }
                 Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!(
-                        "No se pudo traer el historial del canal: {e}"
-                    )));
+                    let _ = tx.send(AppEvent::Error(format!("No se pudo traer el historial del canal: {e}")));
                 }
             }
         });
@@ -710,7 +725,12 @@ pub fn spawn_fetch_forum_posts(
             };
             match result {
                 Ok(page) => {
-                    let _ = tx.send(AppEvent::ForumPosts { channel_id, offset, by_creation, page });
+                    let _ = tx.send(AppEvent::ForumPosts {
+                        channel_id,
+                        offset,
+                        by_creation,
+                        page,
+                    });
                 }
                 Err(e) => {
                     let _ = tx.send(AppEvent::ForumPostsFailed { channel_id });
@@ -819,9 +839,7 @@ pub fn spawn_fetch_messages_around(
                 Ok(rest) => rest,
                 Err(e) => {
                     let _ = tx.send(AppEvent::MessageWindowFailed { channel_id });
-                    let _ = tx.send(AppEvent::Error(format!(
-                        "No se pudo ir al mensaje: {e}"
-                    )));
+                    let _ = tx.send(AppEvent::Error(format!("No se pudo ir al mensaje: {e}")));
                     return;
                 }
             };
@@ -839,9 +857,7 @@ pub fn spawn_fetch_messages_around(
                 }
                 Err(e) => {
                     let _ = tx.send(AppEvent::MessageWindowFailed { channel_id });
-                    let _ = tx.send(AppEvent::Error(format!(
-                        "No se pudo ir al mensaje: {e}"
-                    )));
+                    let _ = tx.send(AppEvent::Error(format!("No se pudo ir al mensaje: {e}")));
                 }
             }
         });
@@ -1084,7 +1100,9 @@ static PROFILE_CACHE: std::sync::Mutex<
 /// de respaldo si el pedido nuevo falla.
 fn profile_cache_get(user_id: &str, guild_id: Option<&str>) -> Option<(UserProfileResponse, bool)> {
     let guard = PROFILE_CACHE.lock().ok()?;
-    let (at, profile) = guard.as_ref()?.get(&(user_id.to_string(), guild_id.map(str::to_string)))?;
+    let (at, profile) = guard
+        .as_ref()?
+        .get(&(user_id.to_string(), guild_id.map(str::to_string)))?;
     Some((profile.clone(), at.elapsed() < PROFILE_TTL))
 }
 
@@ -1107,19 +1125,13 @@ fn profile_cache_put(user_id: &str, guild_id: Option<&str>, profile: &UserProfil
 /// Catálogo de efectos de perfil (`GET /user-profile-effects`), cacheado: es
 /// el mismo para todos los usuarios y bastante pesado, así que se pide una
 /// sola vez por sesión.
-static PROFILE_EFFECT_CONFIGS: std::sync::Mutex<Option<serde_json::Value>> =
-    std::sync::Mutex::new(None);
+static PROFILE_EFFECT_CONFIGS: std::sync::Mutex<Option<serde_json::Value>> = std::sync::Mutex::new(None);
 
 /// Resuelve las capas del efecto `effect_id` (ver `ProfileEffect`).
-async fn fetch_profile_effect(
-    rest: &uwu_rest::UwuRest,
-    effect_id: &str,
-) -> Option<models::ProfileEffect> {
+async fn fetch_profile_effect(rest: &uwu_rest::UwuRest, effect_id: &str) -> Option<models::ProfileEffect> {
     let cached = PROFILE_EFFECT_CONFIGS.lock().ok().and_then(|guard| guard.clone());
     // Memoria → disco (1 día) → red.
-    let cached = cached.or_else(|| {
-        crate::support::http_cache::json_read("profile_effects", CATALOG_TTL)
-    });
+    let cached = cached.or_else(|| crate::support::http_cache::json_read("profile_effects", CATALOG_TTL));
     let configs = match cached {
         Some(configs) => {
             if let Ok(mut guard) = PROFILE_EFFECT_CONFIGS.lock() {
@@ -1155,14 +1167,10 @@ async fn fetch_profile_effect(
 
 /// Productos de coleccionables ya pedidos (`GET /collectibles-products/{sku}`),
 /// por `sku_id`: no cambian, así que se piden una sola vez por sesión.
-static COLLECTIBLE_PRODUCTS: std::sync::Mutex<
-    Option<std::collections::HashMap<String, serde_json::Value>>,
-> = std::sync::Mutex::new(None);
+static COLLECTIBLE_PRODUCTS: std::sync::Mutex<Option<std::collections::HashMap<String, serde_json::Value>>> =
+    std::sync::Mutex::new(None);
 
-async fn fetch_collectible_product(
-    rest: &uwu_rest::UwuRest,
-    sku_id: &str,
-) -> Option<serde_json::Value> {
+async fn fetch_collectible_product(rest: &uwu_rest::UwuRest, sku_id: &str) -> Option<serde_json::Value> {
     let cached = COLLECTIBLE_PRODUCTS
         .lock()
         .ok()
@@ -1174,7 +1182,9 @@ async fn fetch_collectible_product(
     let disk_key = format!("collectible_{sku_id}");
     if let Some(product) = crate::support::http_cache::json_read(&disk_key, CATALOG_TTL) {
         if let Ok(mut guard) = COLLECTIBLE_PRODUCTS.lock() {
-            guard.get_or_insert_with(Default::default).insert(sku_id.to_string(), product.clone());
+            guard
+                .get_or_insert_with(Default::default)
+                .insert(sku_id.to_string(), product.clone());
         }
         return Some(product);
     }
@@ -1182,7 +1192,9 @@ async fn fetch_collectible_product(
         Ok(product) => {
             crate::support::http_cache::json_write(&disk_key, &product);
             if let Ok(mut guard) = COLLECTIBLE_PRODUCTS.lock() {
-                guard.get_or_insert_with(Default::default).insert(sku_id.to_string(), product.clone());
+                guard
+                    .get_or_insert_with(Default::default)
+                    .insert(sku_id.to_string(), product.clone());
             }
             Some(product)
         }
@@ -1194,10 +1206,7 @@ async fn fetch_collectible_product(
 }
 
 /// Efecto de perfil desde su producto (`items[]` con `type` 1).
-async fn fetch_profile_effect_by_sku(
-    rest: &uwu_rest::UwuRest,
-    sku_id: &str,
-) -> Option<models::ProfileEffect> {
+async fn fetch_profile_effect_by_sku(rest: &uwu_rest::UwuRest, sku_id: &str) -> Option<models::ProfileEffect> {
     let product = fetch_collectible_product(rest, sku_id).await?;
     let item = models::collectible_item(&product, models::COLLECTIBLE_PROFILE_EFFECT)?;
     let effect = models::ProfileEffect::from_entry(item);
@@ -1367,7 +1376,7 @@ pub fn spawn_send_sticker(
 /// Pide los GIFs del selector (`query` vacío = los del momento) en un hilo
 /// aparte y le pasa el JSON crudo (o el error ya como texto) a `done`, que
 /// corre en ese mismo hilo. Quien llama guarda el resultado donde la UI lo
-/// pueda leer y pide un repaint (ver `ui::compose_menus`).
+/// pueda leer y pide un repaint (ver `ui::chat::compose_menus`).
 pub fn spawn_fetch_gifs(
     token: String,
     query: String,
@@ -1379,9 +1388,7 @@ pub fn spawn_fetch_gifs(
             return;
         };
         let result: Result<serde_json::Value, String> = rt.block_on(async move {
-            let rest = uwu_rest::UwuRest::for_token(token)
-                .await
-                .map_err(|e| e.to_string())?;
+            let rest = uwu_rest::UwuRest::for_token(token).await.map_err(|e| e.to_string())?;
             rest.gifs(&query).await.map_err(|e| e.to_string())
         });
         done(result);
@@ -1394,13 +1401,7 @@ pub fn spawn_fetch_gifs(
 /// real (con `send_target` y `id` — los mensajes de demo no llaman esto).
 /// Si falla, por ahora se pierde en silencio, como `spawn_send_message`:
 /// el eco local ya se aplicó optimistamente en `ChatMessage::toggle_reaction`.
-pub fn spawn_toggle_reaction(
-    token: String,
-    channel_id: String,
-    message_id: String,
-    emoji: String,
-    adding: bool,
-) {
+pub fn spawn_toggle_reaction(token: String, channel_id: String, message_id: String, emoji: String, adding: bool) {
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
@@ -1450,6 +1451,29 @@ pub fn spawn_ack_message(token: String, channel_id: String, message_id: String) 
     });
 }
 
+/// Avisa que estamos escribiendo en `channel_id` (`POST /channels/{id}/typing`).
+/// Discord lo muestra ~10 s, así que quien llama lo repite mientras se sigue
+/// escribiendo. Si falla solo se registra: no vale un toast.
+pub fn spawn_typing(token: String, channel_id: String) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            return;
+        };
+        rt.block_on(async move {
+            let rest = match uwu_rest::UwuRest::for_token(token).await {
+                Ok(rest) => rest,
+                Err(e) => {
+                    log::warn!("No se pudo loguear el REST para avisar que escribo: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = rest.typing(&channel_id).await {
+                log::warn!("No se pudo avisar que escribo en {channel_id}: {e}");
+            }
+        });
+    });
+}
+
 /// Borra un mensaje (`ui::chat`, menú del mensaje). El mensaje ya se sacó de
 /// la lista local; si falla (falta de permisos, por ejemplo) solo se registra.
 pub fn spawn_delete_message(token: String, channel_id: String, message_id: String) {
@@ -1486,10 +1510,7 @@ pub fn spawn_clear_reactions(token: String, channel_id: String, message_id: Stri
                     return;
                 }
             };
-            if let Err(e) = rest
-                .clear_reactions(&channel_id, &message_id, emoji.as_deref())
-                .await
-            {
+            if let Err(e) = rest.clear_reactions(&channel_id, &message_id, emoji.as_deref()).await {
                 log::warn!("No se pudieron sacar las reacciones de {message_id}: {e}");
             }
         });
@@ -1519,7 +1540,7 @@ pub fn spawn_ack_message_manual(token: String, channel_id: String, message_id: S
 }
 
 /// Acción de red que se puede lanzar desde el menú de clic derecho sobre una
-/// persona (`ui::audio_menu`). Ver `spawn_user_action`.
+/// persona (`ui::call::audio_menu`). Ver `spawn_user_action`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UserAction {
     /// Mandar una solicitud de amistad.
@@ -1527,7 +1548,9 @@ pub enum UserAction {
     /// Aceptar la solicitud que esa persona ya mandó. `confirm` es el valor de
     /// `confirm_stranger_request`: se intenta con `false` y, si hace falta,
     /// tras el popup de confirmación, con `true`.
-    AcceptFriend { confirm: bool },
+    AcceptFriend {
+        confirm: bool,
+    },
     /// Quitar al amigo, cancelar la solicitud o rechazarla.
     RemoveFriend,
     Block,
@@ -1537,18 +1560,15 @@ pub enum UserAction {
     /// Guardar la nota privada (texto vacío = borrarla).
     SetNote(String),
     /// Crear una invitación al server y mandársela por DM.
-    InviteToServer { guild_id: String },
+    InviteToServer {
+        guild_id: String,
+    },
 }
 
 /// Ejecuta una `UserAction` contra Discord sin bloquear el frame y avisa el
 /// resultado con `AppEvent::UserActionDone` (la UI muestra un toast y, si
 /// salió bien, actualiza el estado local).
-pub fn spawn_user_action(
-    token: String,
-    user_id: String,
-    action: UserAction,
-    tx: std::sync::mpsc::Sender<AppEvent>,
-) {
+pub fn spawn_user_action(token: String, user_id: String, action: UserAction, tx: std::sync::mpsc::Sender<AppEvent>) {
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
@@ -1558,12 +1578,8 @@ pub fn spawn_user_action(
                 let rest = uwu_rest::UwuRest::for_token(token).await?;
                 match &action {
                     UserAction::AddFriend => rest.add_friend(&user_id, None).await,
-                    UserAction::AcceptFriend { confirm } => {
-                        rest.add_friend(&user_id, Some(*confirm)).await
-                    }
-                    UserAction::RemoveFriend | UserAction::Unblock => {
-                        rest.remove_relationship(&user_id).await
-                    }
+                    UserAction::AcceptFriend { confirm } => rest.add_friend(&user_id, Some(*confirm)).await,
+                    UserAction::RemoveFriend | UserAction::Unblock => rest.remove_relationship(&user_id).await,
                     UserAction::Block => rest.block_user(&user_id).await,
                     UserAction::Ignore => rest.ignore_user(&user_id).await,
                     UserAction::Unignore => rest.unignore_user(&user_id).await,
@@ -1580,21 +1596,17 @@ pub fn spawn_user_action(
                             .ok_or_else(|| anyhow::anyhow!("el server no tiene canales de texto"))?;
                         let code = rest.create_invite(&channel.id).await?;
                         let dm_channel = rest.open_dm(&user_id).await?;
-                        rest.send_message(
-                            &dm_channel,
-                            None,
-                            &format!("https://discord.gg/{code}"),
-                            None,
-                        )
-                        .await
-                        .map(|_| ())
+                        rest.send_message(&dm_channel, None, &format!("https://discord.gg/{code}"), None)
+                            .await
+                            .map(|_| ())
                     }
                 }
             }
             .await;
-            let needs_stranger_confirm = result.as_ref().err().is_some_and(|e| {
-                e.downcast_ref::<uwu_rest::StrangerConfirmationRequired>().is_some()
-            });
+            let needs_stranger_confirm = result
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.downcast_ref::<uwu_rest::StrangerConfirmationRequired>().is_some());
             let error = result.err().map(|e| e.to_string());
             if let Some(e) = &error {
                 log::warn!("Falló la acción {action:?} sobre {user_id}: {e}");
@@ -1769,7 +1781,8 @@ pub fn spawn_submit_modal(
         rt.block_on(async move {
             let result = async {
                 let rest = uwu_rest::UwuRest::for_token(token).await?;
-                rest.submit_modal(&ctx, &modal_interaction_id, &modal_custom_id, &components, &fields).await
+                rest.submit_modal(&ctx, &modal_interaction_id, &modal_custom_id, &components, &fields)
+                    .await
             }
             .await;
             if let Err(e) = result {
@@ -1777,6 +1790,129 @@ pub fn spawn_submit_modal(
                 let _ = tx.send(AppEvent::InteractionFailed {
                     message: "No se pudo enviar el formulario.".to_string(),
                 });
+            }
+        });
+    });
+}
+
+/// Pide los sonidos del soundboard (los predeterminados y, si `guild_id` es
+/// `Some`, los de ese server) y avisa con `AppEvent::SoundboardLoaded`.
+pub fn spawn_fetch_soundboard(token: String, guild_id: Option<String>, tx: std::sync::mpsc::Sender<AppEvent>) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            return;
+        };
+        rt.block_on(async move {
+            let rest = match uwu_rest::UwuRest::for_token(token).await {
+                Ok(rest) => rest,
+                Err(e) => {
+                    let _ = tx.send(AppEvent::SoundboardFailed {
+                        message: format!("No se pudo cargar el soundboard: {e}"),
+                    });
+                    return;
+                }
+            };
+            let defaults = rest.soundboard_default_sounds().await;
+            let guild_sounds = match &guild_id {
+                Some(id) => rest.guild_soundboard_sounds(id).await,
+                None => Ok(Vec::new()),
+            };
+            if defaults.is_err() && guild_sounds.is_err() {
+                log::warn!(
+                    "soundboard: {:?} / {:?}",
+                    defaults.as_ref().err(),
+                    guild_sounds.as_ref().err()
+                );
+                let _ = tx.send(AppEvent::SoundboardFailed {
+                    message: "No se pudo cargar el soundboard.".to_string(),
+                });
+                return;
+            }
+            let _ = tx.send(AppEvent::SoundboardLoaded {
+                guild_id,
+                defaults: defaults.unwrap_or_default(),
+                guild_sounds: guild_sounds.unwrap_or_default(),
+            });
+        });
+    });
+}
+
+/// Toca un sonido en el canal de voz. Si falla avisa con
+/// `AppEvent::SoundboardFailed`; si sale bien no manda nada (el sonido suena
+/// cuando llega `AppEvent::SoundboardEffect`).
+pub fn spawn_send_soundboard_sound(
+    token: String,
+    channel_id: String,
+    sound_id: String,
+    source_guild_id: Option<String>,
+    tx: std::sync::mpsc::Sender<AppEvent>,
+) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            return;
+        };
+        rt.block_on(async move {
+            let result = async {
+                let rest = uwu_rest::UwuRest::for_token(token).await?;
+                rest.send_soundboard_sound(&channel_id, &sound_id, source_guild_id.as_deref())
+                    .await
+            }
+            .await;
+            if let Err(e) = result {
+                log::warn!("No se pudo tocar el sonido {sound_id}: {e}");
+                let _ = tx.send(AppEvent::SoundboardFailed {
+                    message: "No se pudo tocar el sonido. Revisa que sigas en el canal de voz y tengas permiso."
+                        .to_string(),
+                });
+            }
+        });
+    });
+}
+
+/// Baja el audio de un sonido y lo reproduce (en un hilo propio).
+pub fn spawn_play_soundboard_sound(sound_id: String, volume: f32) {
+    std::thread::spawn(move || match soundboard::fetch_audio(&sound_id) {
+        Ok(bytes) => crate::support::sound_alerts::play_clip(bytes, volume),
+        Err(e) => log::warn!("No se pudo bajar el sonido {sound_id}: {e}"),
+    });
+}
+
+/// Manda el formulario de ingreso de un server ya respondido
+/// (`PUT /guilds/{id}/requests/@me`) y avisa con `AppEvent::JoinFormSubmitted`
+/// o `AppEvent::JoinFormFailed`.
+pub fn spawn_submit_join_form(token: String, form: join_form::JoinForm, tx: std::sync::mpsc::Sender<AppEvent>) {
+    std::thread::spawn(move || {
+        let guild_name = form.guild_name.clone();
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            let _ = tx.send(AppEvent::JoinFormFailed {
+                guild_name,
+                message: "No se pudo enviar el formulario.".to_string(),
+            });
+            return;
+        };
+        rt.block_on(async move {
+            let result = async {
+                let rest = uwu_rest::UwuRest::for_token(token).await?;
+                rest.submit_join_form(&form.guild_id, form.submit_body()).await
+            }
+            .await;
+            match result {
+                Ok(value) => {
+                    let _ = tx.send(AppEvent::JoinFormSubmitted {
+                        guild_name,
+                        outcome: join_form::JoinOutcome::from_response(&value),
+                    });
+                }
+                Err(e) => {
+                    log::warn!("No se pudo mandar el formulario de ingreso de {guild_name}: {e}");
+                    // Cerrar la ventana del captcha no es un fallo del formulario.
+                    let message = if e.to_string() == captcha::CaptchaCancelled.to_string() {
+                        "Se canceló la verificación. Vuelve a intentarlo.".to_string()
+                    } else {
+                        "No se pudo enviar el formulario. Revisa tu conexión e inténtalo otra vez.".to_string()
+                    };
+                    let _ = tx.send(AppEvent::JoinFormFailed { guild_name, message });
+                }
             }
         });
     });

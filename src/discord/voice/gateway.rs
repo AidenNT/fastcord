@@ -75,11 +75,7 @@ pub(super) async fn connect_voice_gateway(
         ),
     );
     status_publisher
-        .publish(
-            session,
-            VoiceConnectionStatus::Connected,
-            "Voice gateway connected",
-        )
+        .publish(session, VoiceConnectionStatus::Connected, "Voice gateway connected")
         .await;
     let (writer, mut reader) = ws.split();
     let writer = Arc::new(Mutex::new(writer));
@@ -107,8 +103,7 @@ pub(super) async fn connect_voice_gateway(
     let (local_speaking_tx, mut local_speaking_rx) = mpsc::unbounded_channel();
     #[cfg_attr(not(feature = "voice-playback"), allow(unused_variables))]
     let (transmit_failure_tx, mut transmit_failure_rx) = mpsc::unbounded_channel::<String>();
-    let (remote_speaking_tx, mut remote_speaking_rx) =
-        mpsc::channel(VOICE_REMOTE_SPEAKING_QUEUE_CAPACITY);
+    let (remote_speaking_tx, mut remote_speaking_rx) = mpsc::channel(VOICE_REMOTE_SPEAKING_QUEUE_CAPACITY);
     #[cfg_attr(
         not(feature = "voice-playback"),
         allow(unused_mut, unused_variables, unused_assignments)
@@ -124,193 +119,148 @@ pub(super) async fn connect_voice_gateway(
     let mut voice_ready: Option<VoiceTransportSession> = None;
     let last_sequence = Arc::new(Mutex::new(None));
     let heartbeat_ack = Arc::new(Mutex::new(VoiceHeartbeatAckState::default()));
-    let (heartbeat_timeout_tx, mut heartbeat_timeout_rx) =
-        mpsc::unbounded_channel::<VoiceHeartbeatTimeout>();
+    let (heartbeat_timeout_tx, mut heartbeat_timeout_rx) = mpsc::unbounded_channel::<VoiceHeartbeatTimeout>();
     let dave_state = Arc::new(Mutex::new(VoiceDaveState::new(session)));
 
     let result: Result<VoiceConnectionEnd, String> = async {
-    send_voice_text(&writer, voice_identify_payload(session)).await?;
-    status_publisher
-        .publish_phase(session, VoiceConnectPhase::Authenticating)
-        .await;
-    logging::debug("voice", "voice identify sent");
-    logging::debug("voice", "voice websocket read loop started");
-    let mut resume_pending = false;
-    let mut resume_deadline: Option<Instant> = None;
-    let mut connection_generation = 0u64;
-    let mut connection_stable_deadline: Option<Instant> = None;
+        send_voice_text(&writer, voice_identify_payload(session)).await?;
+        status_publisher
+            .publish_phase(session, VoiceConnectPhase::Authenticating)
+            .await;
+        logging::debug("voice", "voice identify sent");
+        logging::debug("voice", "voice websocket read loop started");
+        let mut resume_pending = false;
+        let mut resume_deadline: Option<Instant> = None;
+        let mut connection_generation = 0u64;
+        let mut connection_stable_deadline: Option<Instant> = None;
 
-    loop {
-        let frame = tokio::select! {
-            audio_sources = audio_sources_rx.changed() => {
-                match audio_sources {
-                    Ok(()) => {
-                        let selection = audio_sources_rx.borrow_and_update().clone();
-                        let requested_audio_sources = selection.sources;
-                        let outcome = child_tasks.set_voice_audio_sources(
-                            requested_audio_sources.clone(),
-                            current_capture_gate,
-                        );
-                        current_audio_sources = outcome.active_sources;
-                        if let Some(message) = outcome.error {
-                            let _ = events_tx.send(VoiceRuntimeEvent::AudioSourcesApplyFailed {
-                                connection_id: session.connection_id,
-                                generation: selection.generation,
-                                requested_sources: requested_audio_sources,
-                                active_sources: current_audio_sources.clone(),
-                                message,
+        loop {
+            let frame = tokio::select! {
+                audio_sources = audio_sources_rx.changed() => {
+                    match audio_sources {
+                        Ok(()) => {
+                            let selection = audio_sources_rx.borrow_and_update().clone();
+                            let requested_audio_sources = selection.sources;
+                            let outcome = child_tasks.set_voice_audio_sources(
+                                requested_audio_sources.clone(),
+                                current_capture_gate,
+                            );
+                            current_audio_sources = outcome.active_sources;
+                            if let Some(message) = outcome.error {
+                                let _ = events_tx.send(VoiceRuntimeEvent::AudioSourcesApplyFailed {
+                                    connection_id: session.connection_id,
+                                    generation: selection.generation,
+                                    requested_sources: requested_audio_sources,
+                                    active_sources: current_audio_sources.clone(),
+                                    message,
+                                });
+                            }
+                            continue;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                capture_gate = capture_gate_rx.recv() => {
+                    match capture_gate {
+                        Some(capture_gate) => {
+                            #[cfg(feature = "voice-playback")]
+                            {
+                                current_capture_gate = capture_gate;
+                            }
+                            child_tasks.set_voice_transmit_gate(capture_gate);
+                            continue;
+                        }
+                        None => {
+                            child_tasks.set_voice_transmit_gate(VoiceCaptureGate {
+                                transmit_epoch: 0,
+                                capture_enabled: false,
+                                transmit_enabled: false,
+                                use_voice_activity: true,
+                                noise_suppression: false,
+                                microphone_buffer_ms: None,
+                                microphone_sensitivity: MicrophoneSensitivityDb::default(),
+                                microphone_volume: VoiceVolumePercent::default(),
                             });
+                            break;
                         }
-                        continue;
                     }
-                    Err(_) => break,
                 }
-            }
-            capture_gate = capture_gate_rx.recv() => {
-                match capture_gate {
-                    Some(capture_gate) => {
-                        #[cfg(feature = "voice-playback")]
-                        {
-                            current_capture_gate = capture_gate;
+                playback_gate = playback_gate_rx.recv() => {
+                    match playback_gate {
+                        Some(playback_gate) => {
+                            current_playback_gate = playback_gate;
+                            child_tasks.set_voice_playback_gate(playback_gate);
+                            continue;
                         }
-                        child_tasks.set_voice_transmit_gate(capture_gate);
-                        continue;
+                        None => {
+                            child_tasks.set_voice_playback_gate(VoicePlaybackGate {
+                                enabled: false,
+                                volume: VoiceVolumePercent::default(),
+                            });
+                            break;
+                        }
                     }
-                    None => {
-                        child_tasks.set_voice_transmit_gate(VoiceCaptureGate {
-                            transmit_epoch: 0,
-                            capture_enabled: false,
-                            transmit_enabled: false,
-                            use_voice_activity: true,
-                            noise_suppression: false,
-                            microphone_buffer_ms: None,
-                            microphone_sensitivity: MicrophoneSensitivityDb::default(),
-                            microphone_volume: VoiceVolumePercent::default(),
-                        });
+                }
+                local_speaking = local_speaking_rx.recv() => {
+                    let Some(local_speaking) = local_speaking else {
                         break;
+                    };
+                    if let Some(speaking) = speaking_tracker.record_local(local_speaking) {
+                        status_publisher
+                            .publish_speaking(session, session.user_id, speaking)
+                            .await;
                     }
+                    continue;
                 }
-            }
-            playback_gate = playback_gate_rx.recv() => {
-                match playback_gate {
-                    Some(playback_gate) => {
-                        current_playback_gate = playback_gate;
-                        child_tasks.set_voice_playback_gate(playback_gate);
-                        continue;
-                    }
-                    None => {
-                        child_tasks.set_voice_playback_gate(VoicePlaybackGate {
-                            enabled: false,
-                            volume: VoiceVolumePercent::default(),
-                        });
+                remote_speaking = remote_speaking_rx.recv() => {
+                    let Some(user_id) = remote_speaking else {
                         break;
+                    };
+                    if let Some(speaking) = speaking_tracker.record_remote(user_id, true, Instant::now()) {
+                        status_publisher.publish_speaking(session, user_id, speaking).await;
                     }
+                    continue;
                 }
-            }
-            local_speaking = local_speaking_rx.recv() => {
-                let Some(local_speaking) = local_speaking else {
-                    break;
-                };
-                if let Some(speaking) = speaking_tracker.record_local(local_speaking) {
-                    status_publisher
-                        .publish_speaking(session, session.user_id, speaking)
-                        .await;
-                }
-                continue;
-            }
-            remote_speaking = remote_speaking_rx.recv() => {
-                let Some(user_id) = remote_speaking else {
-                    break;
-                };
-                if let Some(speaking) = speaking_tracker.record_remote(user_id, true, Instant::now()) {
-                    status_publisher.publish_speaking(session, user_id, speaking).await;
-                }
-                continue;
-            }
-            transmit_failure = transmit_failure_rx.recv() => {
-                let Some(error) = transmit_failure else {
-                    break;
-                };
-                logging::error(
-                    "voice",
-                    format!("voice UDP transmit failed, reconnecting: {error}"),
-                );
-                return Ok(VoiceConnectionEnd::Reconnect);
-            }
-            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
-                connection_stable_deadline.unwrap_or_else(Instant::now)
-            )), if connection_stable_deadline.is_some() => {
-                connection_stable_deadline = None;
-                let _ = events_tx.send(session.connection_established_event());
-                continue;
-            }
-            _ = speaking_sweep.tick() => {
-                for user_id in speaking_tracker.expire_remote(Instant::now()) {
-                    status_publisher.publish_speaking(session, user_id, false).await;
-                }
-                continue;
-            }
-            heartbeat_timeout = heartbeat_timeout_rx.recv() => {
-                match heartbeat_timeout {
-                    Some(timeout) if timeout.generation == connection_generation => None,
-                    Some(_) => continue,
-                    None => break,
-                }
-            }
-            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
-                resume_deadline.unwrap_or_else(Instant::now)
-            )), if resume_deadline.is_some() => {
-                logging::debug("voice", "voice resume handshake timed out");
-                return Ok(VoiceConnectionEnd::Reconnect);
-            }
-            frame = reader.next() => Some(frame),
-        };
-        let Some(frame) = frame else {
-            if resume_pending {
-                return Ok(VoiceConnectionEnd::Reconnect);
-            }
-            connection_generation = connection_generation.wrapping_add(1);
-            reader = resume_voice_gateway(
-                &url,
-                &writer,
-                session,
-                &last_sequence,
-                &heartbeat_ack,
-                &mut child_tasks,
-                "heartbeat ACK timed out",
-            )
-            .await?;
-            resume_pending = true;
-            resume_deadline = Some(Instant::now() + VOICE_RESUME_HANDSHAKE_TIMEOUT);
-            continue;
-        };
-        let Some(frame) = frame else {
-            if resume_pending {
-                return Ok(VoiceConnectionEnd::Reconnect);
-            }
-            connection_generation = connection_generation.wrapping_add(1);
-            reader = resume_voice_gateway(
-                &url,
-                &writer,
-                session,
-                &last_sequence,
-                &heartbeat_ack,
-                &mut child_tasks,
-                "websocket stream ended",
-            )
-            .await?;
-            resume_pending = true;
-            resume_deadline = Some(Instant::now() + VOICE_RESUME_HANDSHAKE_TIMEOUT);
-            continue;
-        };
-        let frame = match frame {
-            Ok(frame) => frame,
-            Err(error) => {
-                if resume_pending {
-                    logging::debug(
+                transmit_failure = transmit_failure_rx.recv() => {
+                    let Some(error) = transmit_failure else {
+                        break;
+                    };
+                    logging::error(
                         "voice",
-                        format!("voice resume websocket failed before completion: {error}"),
+                        format!("voice UDP transmit failed, reconnecting: {error}"),
                     );
+                    return Ok(VoiceConnectionEnd::Reconnect);
+                }
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                    connection_stable_deadline.unwrap_or_else(Instant::now)
+                )), if connection_stable_deadline.is_some() => {
+                    connection_stable_deadline = None;
+                    let _ = events_tx.send(session.connection_established_event());
+                    continue;
+                }
+                _ = speaking_sweep.tick() => {
+                    for user_id in speaking_tracker.expire_remote(Instant::now()) {
+                        status_publisher.publish_speaking(session, user_id, false).await;
+                    }
+                    continue;
+                }
+                heartbeat_timeout = heartbeat_timeout_rx.recv() => {
+                    match heartbeat_timeout {
+                        Some(timeout) if timeout.generation == connection_generation => None,
+                        Some(_) => continue,
+                        None => break,
+                    }
+                }
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                    resume_deadline.unwrap_or_else(Instant::now)
+                )), if resume_deadline.is_some() => {
+                    logging::debug("voice", "voice resume handshake timed out");
+                    return Ok(VoiceConnectionEnd::Reconnect);
+                }
+                frame = reader.next() => Some(frame),
+            };
+            let Some(frame) = frame else {
+                if resume_pending {
                     return Ok(VoiceConnectionEnd::Reconnect);
                 }
                 connection_generation = connection_generation.wrapping_add(1);
@@ -321,230 +271,16 @@ pub(super) async fn connect_voice_gateway(
                     &last_sequence,
                     &heartbeat_ack,
                     &mut child_tasks,
-                    &format!("websocket read failed: {error}"),
+                    "heartbeat ACK timed out",
                 )
                 .await?;
                 resume_pending = true;
                 resume_deadline = Some(Instant::now() + VOICE_RESUME_HANDSHAKE_TIMEOUT);
                 continue;
-            }
-        };
-        match frame {
-            WsMessage::Text(text) => {
-                let value: Value = serde_json::from_str(&text)
-                    .map_err(|error| format!("voice websocket JSON parse failed: {error}"))?;
-                if let Some(sequence) = value.get("seq").and_then(Value::as_i64) {
-                    *last_sequence.lock().await = Some(sequence);
-                }
-                let Some(opcode) = voice_gateway_opcode(&value) else {
-                    logging::debug("voice", "ignored voice gateway payload with invalid opcode");
-                    continue;
-                };
-                match opcode {
-                    VOICE_OP_HEARTBEAT => {
-                        send_requested_voice_heartbeat(&writer, &last_sequence).await?;
-                    }
-                    VOICE_OP_READY => {
-                        status_publisher
-                            .publish_phase(session, VoiceConnectPhase::Transport)
-                            .await;
-                        let (socket, ready) =
-                            establish_voice_transport(&value, &writer, &audio_handle).await?;
-                        udp_socket = Some(socket);
-                        #[cfg(feature = "voice-playback")]
-                        {
-                            voice_ready = Some(ready);
-                        }
-                        #[cfg(not(feature = "voice-playback"))]
-                        let _ = ready;
-                    }
-                    VOICE_OP_SESSION_DESCRIPTION => {
-                        let description = parse_voice_session_description(&value)?;
-                        logging::debug(
-                            "voice",
-                            format!("voice session description received: {description:?}"),
-                        );
-                        if let Some(current) = current_session_description.as_ref() {
-                            if current.secret_key == description.secret_key
-                                && current.mode != description.mode
-                            {
-                                return Err(
-                                    "voice transport mode changed without a new secret key"
-                                        .to_owned(),
-                                );
-                            }
-                            if current.uses_same_transport(&description) {
-                                if current.dave_protocol_version
-                                    != description.dave_protocol_version
-                                    && let Some(dave_protocol_version) =
-                                        description.dave_protocol_version
-                                {
-                                    let dave_protocol_version =
-                                        u16::try_from(dave_protocol_version).map_err(|_| {
-                                            "DAVE protocol version does not fit u16".to_owned()
-                                        })?;
-                                    dave_state.lock().await.reinit(dave_protocol_version)?;
-                                }
-                                current_session_description = Some(description);
-                                logging::debug(
-                                    "voice",
-                                    "keeping current voice transport for duplicate session description",
-                                );
-                                continue;
-                            }
-                        }
-                        status_publisher
-                            .publish_phase(session, VoiceConnectPhase::Encrypting)
-                            .await;
-                        if let Some(dave_protocol_version) = description.dave_protocol_version {
-                            let dave_protocol_version = u16::try_from(dave_protocol_version)
-                                .map_err(|_| "DAVE protocol version does not fit u16".to_owned())?;
-                            dave_state.lock().await.reinit(dave_protocol_version)?;
-                        }
-                        let Some(socket) = udp_socket.as_ref() else {
-                            return Err(
-                                "voice session description received before transport ready"
-                                    .to_owned(),
-                            );
-                        };
-                        #[cfg(feature = "voice-playback")]
-                        if child_tasks
-                            .stop_udp_transmit_gracefully(
-                                "stopping previous voice UDP transmit task",
-                            )
-                            .await
-                        {
-                            while local_speaking_rx.try_recv().is_ok() {}
-                            while transmit_failure_rx.try_recv().is_ok() {}
-                            if let Some(speaking) = speaking_tracker.record_local(false) {
-                                status_publisher
-                                    .publish_speaking(session, session.user_id, speaking)
-                                    .await;
-                            }
-                        }
-                        start_voice_session_audio(
-                            description.clone(),
-                            &mut child_tasks,
-                            VoiceSessionAudio {
-                                socket,
-                                #[cfg(feature = "voice-playback")]
-                                writer: &writer,
-                                audio_handle: &audio_handle,
-                                dave_state: &dave_state,
-                                remote_speaking_tx: &remote_speaking_tx,
-                                current_playback_gate,
-                                participant_playback_rx: participant_playback_rx.clone(),
-                                output_source: current_audio_sources.output.as_deref(),
-                                #[cfg(feature = "voice-playback")]
-                                voice_ready: voice_ready.as_ref(),
-                                #[cfg(feature = "voice-playback")]
-                                current_capture_gate,
-                                #[cfg(feature = "voice-playback")]
-                                local_speaking_tx: &local_speaking_tx,
-                                #[cfg(feature = "voice-playback")]
-                                transmit_failure_tx: &transmit_failure_tx,
-                            },
-                        );
-                        current_session_description = Some(description);
-                        status_publisher
-                            .publish_phase(session, VoiceConnectPhase::Ready)
-                            .await;
-                        if connection_stable_deadline.is_none() {
-                            connection_stable_deadline =
-                                Some(Instant::now() + VOICE_CONNECTION_STABLE_INTERVAL);
-                        }
-                    }
-                    VOICE_OP_SESSION_UPDATE => {
-                        let Some(description) = current_session_description.as_mut() else {
-                            return Err(
-                                "voice session update received before session description"
-                                    .to_owned(),
-                            );
-                        };
-                        apply_voice_session_update(&value, description)?;
-                        logging::debug(
-                            "voice",
-                            format!("voice session updated: {description:?}"),
-                        );
-                    }
-                    VOICE_OP_HEARTBEAT_ACK => {
-                        heartbeat_ack.lock().await.mark_acknowledged();
-                    }
-                    VOICE_OP_RESUMED => {
-                        resume_pending = false;
-                        resume_deadline = None;
-                        logging::debug("voice", "voice gateway session resumed");
-                    }
-                    VOICE_OP_HELLO => {
-                        handle_voice_hello(
-                            &value,
-                            &writer,
-                            &last_sequence,
-                            &heartbeat_ack,
-                            &heartbeat_timeout_tx,
-                            connection_generation,
-                            &mut child_tasks,
-                        )
-                        .await?;
-                    }
-                    VOICE_OP_CLIENTS_CONNECT
-                    | VOICE_OP_CLIENT_DISCONNECT
-                    | VOICE_OP_MEDIA_SINK_WANTS
-                    | VOICE_OP_CLIENT_FLAGS
-                    | VOICE_OP_CLIENT_PLATFORM
-                    | VOICE_OP_DAVE_PREPARE_TRANSITION
-                    | VOICE_OP_DAVE_EXECUTE_TRANSITION
-                    | VOICE_OP_DAVE_PREPARE_EPOCH => {
-                        dave_state
-                            .lock()
-                            .await
-                            .handle_json_op(&writer, opcode, &value)
-                            .await?;
-                    }
-                    VOICE_OP_SPEAKING => {
-                        handle_voice_speaking(
-                            &value,
-                            session,
-                            &dave_state,
-                            &mut speaking_tracker,
-                            status_publisher,
-                        )
-                        .await;
-                    }
-                    other => logging::debug("voice", format!("unhandled voice gateway op={other}")),
-                }
-            }
-            WsMessage::Ping(payload) => {
-                let mut writer = writer.lock().await;
-                writer
-                    .send(WsMessage::Pong(payload))
-                    .await
-                    .map_err(|error| format!("voice websocket pong failed: {error}"))?;
-            }
-            WsMessage::Close(frame) => {
-                let close_action = frame
-                    .as_ref()
-                    .map(|frame| voice_close_action(u16::from(frame.code.clone())))
-                    .unwrap_or(VoiceCloseAction::Resume);
-                if let Some(frame) = frame {
-                    let reason = frame.reason.to_string();
-                    logging::debug(
-                        "voice",
-                        format!(
-                            "voice websocket closed: code={} reason={reason}",
-                            u16::from(frame.code)
-                        ),
-                    );
-                } else {
-                    logging::debug("voice", "voice websocket closed without close frame");
-                }
-                match close_action {
-                    VoiceCloseAction::Stop => return Ok(VoiceConnectionEnd::Stop),
-                    VoiceCloseAction::Reconnect => return Ok(VoiceConnectionEnd::Reconnect),
-                    VoiceCloseAction::Resume if resume_pending => {
-                        return Ok(VoiceConnectionEnd::Reconnect);
-                    }
-                    VoiceCloseAction::Resume => {}
+            };
+            let Some(frame) = frame else {
+                if resume_pending {
+                    return Ok(VoiceConnectionEnd::Reconnect);
                 }
                 connection_generation = connection_generation.wrapping_add(1);
                 reader = resume_voice_gateway(
@@ -554,34 +290,252 @@ pub(super) async fn connect_voice_gateway(
                     &last_sequence,
                     &heartbeat_ack,
                     &mut child_tasks,
-                    "websocket closed",
+                    "websocket stream ended",
                 )
                 .await?;
                 resume_pending = true;
                 resume_deadline = Some(Instant::now() + VOICE_RESUME_HANDSHAKE_TIMEOUT);
-            }
-            WsMessage::Binary(payload) => {
-                let frame = parse_voice_binary_frame(&payload)?;
-                *last_sequence.lock().await = Some(frame.sequence);
-                dave_state
-                    .lock()
-                    .await
-                    .handle_binary_frame(&writer, frame)
+                continue;
+            };
+            let frame = match frame {
+                Ok(frame) => frame,
+                Err(error) => {
+                    if resume_pending {
+                        logging::debug(
+                            "voice",
+                            format!("voice resume websocket failed before completion: {error}"),
+                        );
+                        return Ok(VoiceConnectionEnd::Reconnect);
+                    }
+                    connection_generation = connection_generation.wrapping_add(1);
+                    reader = resume_voice_gateway(
+                        &url,
+                        &writer,
+                        session,
+                        &last_sequence,
+                        &heartbeat_ack,
+                        &mut child_tasks,
+                        &format!("websocket read failed: {error}"),
+                    )
                     .await?;
+                    resume_pending = true;
+                    resume_deadline = Some(Instant::now() + VOICE_RESUME_HANDSHAKE_TIMEOUT);
+                    continue;
+                }
+            };
+            match frame {
+                WsMessage::Text(text) => {
+                    let value: Value = serde_json::from_str(&text)
+                        .map_err(|error| format!("voice websocket JSON parse failed: {error}"))?;
+                    if let Some(sequence) = value.get("seq").and_then(Value::as_i64) {
+                        *last_sequence.lock().await = Some(sequence);
+                    }
+                    let Some(opcode) = voice_gateway_opcode(&value) else {
+                        logging::debug("voice", "ignored voice gateway payload with invalid opcode");
+                        continue;
+                    };
+                    match opcode {
+                        VOICE_OP_HEARTBEAT => {
+                            send_requested_voice_heartbeat(&writer, &last_sequence).await?;
+                        }
+                        VOICE_OP_READY => {
+                            status_publisher
+                                .publish_phase(session, VoiceConnectPhase::Transport)
+                                .await;
+                            let (socket, ready) = establish_voice_transport(&value, &writer, &audio_handle).await?;
+                            udp_socket = Some(socket);
+                            #[cfg(feature = "voice-playback")]
+                            {
+                                voice_ready = Some(ready);
+                            }
+                            #[cfg(not(feature = "voice-playback"))]
+                            let _ = ready;
+                        }
+                        VOICE_OP_SESSION_DESCRIPTION => {
+                            let description = parse_voice_session_description(&value)?;
+                            logging::debug("voice", format!("voice session description received: {description:?}"));
+                            if let Some(current) = current_session_description.as_ref() {
+                                if current.secret_key == description.secret_key && current.mode != description.mode {
+                                    return Err("voice transport mode changed without a new secret key".to_owned());
+                                }
+                                if current.uses_same_transport(&description) {
+                                    if current.dave_protocol_version != description.dave_protocol_version
+                                        && let Some(dave_protocol_version) = description.dave_protocol_version
+                                    {
+                                        let dave_protocol_version = u16::try_from(dave_protocol_version)
+                                            .map_err(|_| "DAVE protocol version does not fit u16".to_owned())?;
+                                        dave_state.lock().await.reinit(dave_protocol_version)?;
+                                    }
+                                    current_session_description = Some(description);
+                                    logging::debug(
+                                        "voice",
+                                        "keeping current voice transport for duplicate session description",
+                                    );
+                                    continue;
+                                }
+                            }
+                            status_publisher
+                                .publish_phase(session, VoiceConnectPhase::Encrypting)
+                                .await;
+                            if let Some(dave_protocol_version) = description.dave_protocol_version {
+                                let dave_protocol_version = u16::try_from(dave_protocol_version)
+                                    .map_err(|_| "DAVE protocol version does not fit u16".to_owned())?;
+                                dave_state.lock().await.reinit(dave_protocol_version)?;
+                            }
+                            let Some(socket) = udp_socket.as_ref() else {
+                                return Err("voice session description received before transport ready".to_owned());
+                            };
+                            #[cfg(feature = "voice-playback")]
+                            if child_tasks
+                                .stop_udp_transmit_gracefully("stopping previous voice UDP transmit task")
+                                .await
+                            {
+                                while local_speaking_rx.try_recv().is_ok() {}
+                                while transmit_failure_rx.try_recv().is_ok() {}
+                                if let Some(speaking) = speaking_tracker.record_local(false) {
+                                    status_publisher
+                                        .publish_speaking(session, session.user_id, speaking)
+                                        .await;
+                                }
+                            }
+                            start_voice_session_audio(
+                                description.clone(),
+                                &mut child_tasks,
+                                VoiceSessionAudio {
+                                    socket,
+                                    #[cfg(feature = "voice-playback")]
+                                    writer: &writer,
+                                    audio_handle: &audio_handle,
+                                    dave_state: &dave_state,
+                                    remote_speaking_tx: &remote_speaking_tx,
+                                    current_playback_gate,
+                                    participant_playback_rx: participant_playback_rx.clone(),
+                                    output_source: current_audio_sources.output.as_deref(),
+                                    #[cfg(feature = "voice-playback")]
+                                    voice_ready: voice_ready.as_ref(),
+                                    #[cfg(feature = "voice-playback")]
+                                    current_capture_gate,
+                                    #[cfg(feature = "voice-playback")]
+                                    local_speaking_tx: &local_speaking_tx,
+                                    #[cfg(feature = "voice-playback")]
+                                    transmit_failure_tx: &transmit_failure_tx,
+                                },
+                            );
+                            current_session_description = Some(description);
+                            status_publisher.publish_phase(session, VoiceConnectPhase::Ready).await;
+                            if connection_stable_deadline.is_none() {
+                                connection_stable_deadline = Some(Instant::now() + VOICE_CONNECTION_STABLE_INTERVAL);
+                            }
+                        }
+                        VOICE_OP_SESSION_UPDATE => {
+                            let Some(description) = current_session_description.as_mut() else {
+                                return Err("voice session update received before session description".to_owned());
+                            };
+                            apply_voice_session_update(&value, description)?;
+                            logging::debug("voice", format!("voice session updated: {description:?}"));
+                        }
+                        VOICE_OP_HEARTBEAT_ACK => {
+                            heartbeat_ack.lock().await.mark_acknowledged();
+                        }
+                        VOICE_OP_RESUMED => {
+                            resume_pending = false;
+                            resume_deadline = None;
+                            logging::debug("voice", "voice gateway session resumed");
+                        }
+                        VOICE_OP_HELLO => {
+                            handle_voice_hello(
+                                &value,
+                                &writer,
+                                &last_sequence,
+                                &heartbeat_ack,
+                                &heartbeat_timeout_tx,
+                                connection_generation,
+                                &mut child_tasks,
+                            )
+                            .await?;
+                        }
+                        VOICE_OP_CLIENTS_CONNECT
+                        | VOICE_OP_CLIENT_DISCONNECT
+                        | VOICE_OP_MEDIA_SINK_WANTS
+                        | VOICE_OP_CLIENT_FLAGS
+                        | VOICE_OP_CLIENT_PLATFORM
+                        | VOICE_OP_DAVE_PREPARE_TRANSITION
+                        | VOICE_OP_DAVE_EXECUTE_TRANSITION
+                        | VOICE_OP_DAVE_PREPARE_EPOCH => {
+                            dave_state.lock().await.handle_json_op(&writer, opcode, &value).await?;
+                        }
+                        VOICE_OP_SPEAKING => {
+                            handle_voice_speaking(
+                                &value,
+                                session,
+                                &dave_state,
+                                &mut speaking_tracker,
+                                status_publisher,
+                            )
+                            .await;
+                        }
+                        other => logging::debug("voice", format!("unhandled voice gateway op={other}")),
+                    }
+                }
+                WsMessage::Ping(payload) => {
+                    let mut writer = writer.lock().await;
+                    writer
+                        .send(WsMessage::Pong(payload))
+                        .await
+                        .map_err(|error| format!("voice websocket pong failed: {error}"))?;
+                }
+                WsMessage::Close(frame) => {
+                    let close_action = frame
+                        .as_ref()
+                        .map(|frame| voice_close_action(u16::from(frame.code.clone())))
+                        .unwrap_or(VoiceCloseAction::Resume);
+                    if let Some(frame) = frame {
+                        let reason = frame.reason.to_string();
+                        logging::debug(
+                            "voice",
+                            format!("voice websocket closed: code={} reason={reason}", u16::from(frame.code)),
+                        );
+                    } else {
+                        logging::debug("voice", "voice websocket closed without close frame");
+                    }
+                    match close_action {
+                        VoiceCloseAction::Stop => return Ok(VoiceConnectionEnd::Stop),
+                        VoiceCloseAction::Reconnect => return Ok(VoiceConnectionEnd::Reconnect),
+                        VoiceCloseAction::Resume if resume_pending => {
+                            return Ok(VoiceConnectionEnd::Reconnect);
+                        }
+                        VoiceCloseAction::Resume => {}
+                    }
+                    connection_generation = connection_generation.wrapping_add(1);
+                    reader = resume_voice_gateway(
+                        &url,
+                        &writer,
+                        session,
+                        &last_sequence,
+                        &heartbeat_ack,
+                        &mut child_tasks,
+                        "websocket closed",
+                    )
+                    .await?;
+                    resume_pending = true;
+                    resume_deadline = Some(Instant::now() + VOICE_RESUME_HANDSHAKE_TIMEOUT);
+                }
+                WsMessage::Binary(payload) => {
+                    let frame = parse_voice_binary_frame(&payload)?;
+                    *last_sequence.lock().await = Some(frame.sequence);
+                    dave_state.lock().await.handle_binary_frame(&writer, frame).await?;
+                }
+                _ => {}
             }
-            _ => {}
         }
-    }
 
-    Ok(VoiceConnectionEnd::Stop)
+        Ok(VoiceConnectionEnd::Stop)
     }
     .await;
 
     child_tasks.shutdown_all().await;
     for user_id in speaking_tracker.clear_all() {
-        status_publisher
-            .publish_speaking(session, user_id, false)
-            .await;
+        status_publisher.publish_speaking(session, user_id, false).await;
     }
     result
 }
@@ -611,10 +565,7 @@ async fn resume_voice_gateway(
     child_tasks: &mut VoiceChildTasks,
     reason: &str,
 ) -> Result<VoiceReader, String> {
-    logging::debug(
-        "voice",
-        format!("resuming voice websocket after {reason}: {url}"),
-    );
+    logging::debug("voice", format!("resuming voice websocket after {reason}: {url}"));
     child_tasks.heartbeat.abort();
     heartbeat_ack.lock().await.reset();
 
@@ -677,8 +628,7 @@ struct VoiceSessionAudio<'a> {
     dave_state: &'a Arc<Mutex<VoiceDaveState>>,
     remote_speaking_tx: &'a mpsc::Sender<Id<UserMarker>>,
     current_playback_gate: VoicePlaybackGate,
-    participant_playback_rx:
-        watch::Receiver<HashMap<Id<UserMarker>, VoiceParticipantPlaybackSettings>>,
+    participant_playback_rx: watch::Receiver<HashMap<Id<UserMarker>, VoiceParticipantPlaybackSettings>>,
     output_source: Option<&'a str>,
     #[cfg(feature = "voice-playback")]
     voice_ready: Option<&'a VoiceTransportSession>,
@@ -714,11 +664,7 @@ fn start_voice_session_audio(
         playback_tx,
         audio.remote_speaking_tx.clone(),
     )));
-    child_tasks.replace_udp_ping(
-        audio
-            .audio_handle
-            .spawn(run_voice_udp_ping(Arc::clone(audio.socket))),
-    );
+    child_tasks.replace_udp_ping(audio.audio_handle.spawn(run_voice_udp_ping(Arc::clone(audio.socket))));
     #[cfg(feature = "voice-playback")]
     if let Some(ready) = audio.voice_ready {
         let (pcm_tx, pcm_rx) = mpsc::channel(VOICE_MIC_PCM_FRAME_QUEUE);
@@ -789,10 +735,7 @@ async fn handle_voice_hello(
         .ok_or_else(|| "voice hello missing heartbeat interval".to_owned())?;
     logging::debug(
         "voice",
-        format!(
-            "voice hello received: heartbeat_interval_ms={}",
-            interval.as_millis()
-        ),
+        format!("voice hello received: heartbeat_interval_ms={}", interval.as_millis()),
     );
     let writer = Arc::clone(writer);
     let last_sequence = Arc::clone(last_sequence);
@@ -822,14 +765,10 @@ async fn handle_voice_speaking(
     if let (Some(user_id), Some(speaking)) = (
         speaking.user_id.and_then(Id::<UserMarker>::new_checked),
         speaking.speaking,
-    ) && let Some(speaking) = speaking_tracker.record_remote(
-        user_id,
-        voice_speaking_microphone_active(speaking),
-        Instant::now(),
-    ) {
-        status_publisher
-            .publish_speaking(session, user_id, speaking)
-            .await;
+    ) && let Some(speaking) =
+        speaking_tracker.record_remote(user_id, voice_speaking_microphone_active(speaking), Instant::now())
+    {
+        status_publisher.publish_speaking(session, user_id, speaking).await;
     }
 }
 
@@ -839,17 +778,11 @@ pub(super) async fn discover_voice_udp_address(
     logging::debug("voice", "binding voice UDP socket");
     let socket = bind_voice_udp_socket()?;
     if let Ok(local_addr) = socket.local_addr() {
-        logging::debug(
-            "voice",
-            format!("voice UDP socket bound: local={local_addr}"),
-        );
+        logging::debug("voice", format!("voice UDP socket bound: local={local_addr}"));
     }
     logging::debug(
         "voice",
-        format!(
-            "connecting voice UDP socket: remote={}:{}",
-            ready.ip, ready.port
-        ),
+        format!("connecting voice UDP socket: remote={}:{}", ready.ip, ready.port),
     );
     socket
         .connect((ready.ip.as_str(), ready.port))
@@ -911,8 +844,7 @@ fn bind_voice_udp_socket() -> Result<UdpSocket, String> {
     socket
         .bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into())
         .map_err(|error| format!("voice UDP bind failed: {error}"))?;
-    UdpSocket::from_std(socket.into())
-        .map_err(|error| format!("register voice UDP socket failed: {error}"))
+    UdpSocket::from_std(socket.into()).map_err(|error| format!("register voice UDP socket failed: {error}"))
 }
 
 pub(super) async fn run_voice_udp_receive(
@@ -930,10 +862,7 @@ pub(super) async fn run_voice_udp_receive(
             return;
         }
     };
-    logging::debug(
-        "voice",
-        format!("voice UDP receive decrypt active: mode={mode}"),
-    );
+    logging::debug("voice", format!("voice UDP receive decrypt active: mode={mode}"));
     let mut packet = vec![0u8; 2048];
     let mut rtp_packets = 0u64;
     let mut decrypted_packets = 0u64;
@@ -952,9 +881,7 @@ pub(super) async fn run_voice_udp_receive(
                     if udp_ping_responses == 1 || udp_ping_responses.is_multiple_of(12) {
                         logging::debug(
                             "voice",
-                            format!(
-                                "voice UDP ping acknowledged: count={udp_ping_responses} sequence={sequence}"
-                            ),
+                            format!("voice UDP ping acknowledged: count={udp_ping_responses} sequence={sequence}"),
                         );
                     }
                     continue;
@@ -1001,10 +928,8 @@ pub(super) async fn run_voice_udp_receive(
                                 let (remote_user_id, media) = {
                                     let mut dave_state = dave_state.lock().await;
                                     let remote_user_id = dave_state.user_id_for_ssrc(header.ssrc);
-                                    let media = dave_state.unwrap_media_payload_for_ssrc(
-                                        header.ssrc,
-                                        &payload.media_payload,
-                                    );
+                                    let media =
+                                        dave_state.unwrap_media_payload_for_ssrc(header.ssrc, &payload.media_payload);
                                     (remote_user_id, media)
                                 };
                                 let media_payload_len = match &media {
@@ -1012,11 +937,8 @@ pub(super) async fn run_voice_udp_receive(
                                     VoiceMediaPayload::DaveUnexpectedPlain { payload_len }
                                     | VoiceMediaPayload::DaveMissingUser { payload_len }
                                     | VoiceMediaPayload::DaveNotReady { payload_len, .. } => {
-                                        dave_pending_packets =
-                                            dave_pending_packets.saturating_add(1);
-                                        if dave_pending_packets == 1
-                                            || dave_pending_packets.is_multiple_of(100)
-                                        {
+                                        dave_pending_packets = dave_pending_packets.saturating_add(1);
+                                        if dave_pending_packets == 1 || dave_pending_packets.is_multiple_of(100) {
                                             logging::debug(
                                                 "voice",
                                                 format!(
@@ -1032,30 +954,23 @@ pub(super) async fn run_voice_udp_receive(
                                     }
                                     VoiceMediaPayload::DaveDecryptFailed { message, .. } => {
                                         decrypt_failures = decrypt_failures.saturating_add(1);
-                                        if decrypt_failures == 1
-                                            || decrypt_failures.is_multiple_of(100)
-                                        {
+                                        if decrypt_failures == 1 || decrypt_failures.is_multiple_of(100) {
                                             logging::debug(
                                                 "voice",
                                                 format!(
                                                     "DAVE media decrypt failed: count={} ssrc={} seq={} error={}",
-                                                    decrypt_failures,
-                                                    header.ssrc,
-                                                    header.sequence,
-                                                    message
+                                                    decrypt_failures, header.ssrc, header.sequence, message
                                                 ),
                                             );
                                         }
                                         payload.media_payload.len()
                                     }
                                     VoiceMediaPayload::DaveDecrypted { opus, .. } => {
-                                        dave_decrypted_packets =
-                                            dave_decrypted_packets.saturating_add(1);
+                                        dave_decrypted_packets = dave_decrypted_packets.saturating_add(1);
                                         opus.len()
                                     }
                                 };
-                                if (dave_decrypted_packets == 1
-                                    || dave_decrypted_packets.is_multiple_of(500))
+                                if (dave_decrypted_packets == 1 || dave_decrypted_packets.is_multiple_of(500))
                                     && let VoiceMediaPayload::DaveDecrypted { user_id, .. } = &media
                                 {
                                     logging::debug(
@@ -1070,8 +985,7 @@ pub(super) async fn run_voice_udp_receive(
                                         ),
                                     );
                                 }
-                                if let Some(frame) =
-                                    voice_playback_frame(&media, &header, remote_user_id)
+                                if let Some(frame) = voice_playback_frame(&media, &header, remote_user_id)
                                     && let Some(tx) = playback_tx.as_ref()
                                 {
                                     let _ = tx.try_send(frame);
@@ -1104,11 +1018,7 @@ pub(super) async fn run_voice_udp_receive(
                                         "voice",
                                         format!(
                                             "RTP decrypt failed: count={} ssrc={} seq={} timestamp={} error={}",
-                                            decrypt_failures,
-                                            header.ssrc,
-                                            header.sequence,
-                                            header.timestamp,
-                                            error
+                                            decrypt_failures, header.ssrc, header.sequence, header.timestamp, error
                                         ),
                                     );
                                 }
@@ -1120,9 +1030,7 @@ pub(super) async fn run_voice_udp_receive(
                         if malformed_packets == 1 || malformed_packets.is_multiple_of(100) {
                             logging::debug(
                                 "voice",
-                                format!(
-                                    "ignoring non-RTP UDP packet: count={malformed_packets} error={error}"
-                                ),
+                                format!("ignoring non-RTP UDP packet: count={malformed_packets} error={error}"),
                             );
                         }
                     }
@@ -1183,11 +1091,7 @@ pub(super) async fn send_voice_text(writer: &VoiceWriter, payload: String) -> Re
         .map_err(|error| format!("voice websocket send failed: {error}"))
 }
 
-pub(super) async fn send_voice_binary(
-    writer: &VoiceWriter,
-    opcode: u8,
-    mut payload: Vec<u8>,
-) -> Result<(), String> {
+pub(super) async fn send_voice_binary(writer: &VoiceWriter, opcode: u8, mut payload: Vec<u8>) -> Result<(), String> {
     let mut frame = Vec::with_capacity(payload.len() + 1);
     frame.push(opcode);
     frame.append(&mut payload);
@@ -1266,9 +1170,7 @@ pub(super) fn voice_speaking_payload(ssrc: u32, speaking: bool) -> String {
 }
 
 pub(super) fn parse_voice_ready_payload(value: &Value) -> Result<VoiceTransportSession, String> {
-    let data = value
-        .get("d")
-        .ok_or_else(|| "voice ready missing data".to_owned())?;
+    let data = value.get("d").ok_or_else(|| "voice ready missing data".to_owned())?;
     let ssrc = data
         .get("ssrc")
         .and_then(Value::as_u64)
@@ -1294,12 +1196,7 @@ pub(super) fn parse_voice_ready_payload(value: &Value) -> Result<VoiceTransportS
         .map(str::to_owned)
         .collect();
 
-    Ok(VoiceTransportSession {
-        ssrc,
-        ip,
-        port,
-        modes,
-    })
+    Ok(VoiceTransportSession { ssrc, ip, port, modes })
 }
 
 pub(super) fn choose_encryption_mode(modes: &[String]) -> Result<String, String> {
@@ -1333,8 +1230,7 @@ pub(super) fn parse_udp_ping_response(packet: &[u8]) -> Option<u32> {
 
     let packet: &[u8; UDP_PING_PACKET_LEN] = packet.try_into().ok()?;
     let magic = u32::from_be_bytes(packet[..4].try_into().expect("4-byte UDP ping magic"));
-    (magic == RESPONSE_MAGIC)
-        .then(|| u32::from_be_bytes(packet[4..].try_into().expect("4-byte UDP ping sequence")))
+    (magic == RESPONSE_MAGIC).then(|| u32::from_be_bytes(packet[4..].try_into().expect("4-byte UDP ping sequence")))
 }
 
 pub(super) fn parse_udp_discovery_response(
@@ -1371,10 +1267,7 @@ pub(super) fn parse_udp_discovery_response(
     Ok(DiscoveredVoiceAddress { address, port })
 }
 
-pub(super) fn voice_select_protocol_payload(
-    discovered: &DiscoveredVoiceAddress,
-    mode: &str,
-) -> String {
+pub(super) fn voice_select_protocol_payload(discovered: &DiscoveredVoiceAddress, mode: &str) -> String {
     json!({
         "op": 1,
         "d": {
@@ -1389,9 +1282,7 @@ pub(super) fn voice_select_protocol_payload(
     .to_string()
 }
 
-pub(super) fn parse_voice_session_description(
-    value: &Value,
-) -> Result<VoiceSessionDescription, String> {
+pub(super) fn parse_voice_session_description(value: &Value) -> Result<VoiceSessionDescription, String> {
     let data = value
         .get("d")
         .ok_or_else(|| "voice session description missing data".to_owned())?;
@@ -1537,9 +1428,7 @@ pub(super) fn voice_playback_frame(
 ) -> Option<VoicePlaybackFrame> {
     let (user_id, opus) = match media {
         VoiceMediaPayload::Plain(opus) => (remote_user_id, opus.clone()),
-        VoiceMediaPayload::DaveDecrypted { user_id, opus } => {
-            (Id::new_checked(*user_id), opus.clone())
-        }
+        VoiceMediaPayload::DaveDecrypted { user_id, opus } => (Id::new_checked(*user_id), opus.clone()),
         VoiceMediaPayload::DaveUnexpectedPlain { .. }
         | VoiceMediaPayload::DaveMissingUser { .. }
         | VoiceMediaPayload::DaveNotReady { .. }
@@ -1564,4 +1453,3 @@ pub(super) fn voice_media_payload_counts_as_remote_activity(media: &VoiceMediaPa
     };
     opus.as_slice() != DISCORD_OPUS_SILENCE_FRAME
 }
-

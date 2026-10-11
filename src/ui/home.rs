@@ -1,18 +1,21 @@
 #![allow(dead_code)]
 
-use egui::{Align, Color32, CornerRadius, Frame, Layout, Margin, Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind, UiBuilder, Vec2};
+use egui::{
+    Align, Color32, CornerRadius, Frame, Layout, Margin, Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind,
+    UiBuilder, Vec2,
+};
 
 use crate::lib::data::Status;
 use crate::lib::state::App;
-use crate::ui::extra;
-use crate::ui::nav;
+use crate::ui::shell::extra;
+use crate::ui::shell::nav;
 use crate::ui::theme::{self, Icon, Palette};
 
 const TABS: [&str; 4] = ["En línea", "Todos", "Pendiente", "Sugerencias"];
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
     // Rail de servidores + panel de amigos/DMs + barra de usuario
-    // combinada; ver `ui::nav`.
+    // combinada; ver `ui::shell::nav`.
     nav::show(app, ui);
     // "Usar nueva interfaz": Inicio en tarjetas flotantes (ver `modern`).
     if theme::is_modern() {
@@ -47,11 +50,9 @@ fn active_now_panel(app: &App, ui: &mut egui::Ui) {
                 ui.add_space(4.0);
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(
-                            "Cuando un amigo juegue o escuche algo, o vos lo hagas, aparece acá.",
-                        )
-                        .font(theme::regular(12.0))
-                        .color(palette.dim),
+                        egui::RichText::new("Cuando un amigo juegue o escuche algo, o vos lo hagas, aparece acá.")
+                            .font(theme::regular(12.0))
+                            .color(palette.dim),
                     )
                     .wrap(),
                 );
@@ -77,7 +78,11 @@ fn now_ms() -> u64 {
 /// `3:07` / `1:02:03`.
 fn clock(total_secs: u64) -> String {
     let (h, m, s) = (total_secs / 3600, (total_secs / 60) % 60, total_secs % 60);
-    if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
 }
 
 /// Tiempo transcurrido en texto corto: "hace un momento", "2 min", "1 h 5 min".
@@ -88,7 +93,11 @@ fn elapsed_label(start_ms: u64) -> String {
         60..=3599 => format!("{} min", secs / 60),
         _ => {
             let (h, m) = (secs / 3600, (secs / 60) % 60);
-            if m == 0 { format!("{h} h") } else { format!("{h} h {m} min") }
+            if m == 0 {
+                format!("{h} h")
+            } else {
+                format!("{h} h {m} min")
+            }
         }
     }
 }
@@ -104,7 +113,11 @@ fn activity_heading(activity: &crate::discord::models::PresenceActivity, is_me: 
         _ => "",
     };
     let _ = is_me;
-    if verb.is_empty() { activity.name.clone() } else { format!("{verb} {}", activity.name) }
+    if verb.is_empty() {
+        activity.name.clone()
+    } else {
+        format!("{verb} {}", activity.name)
+    }
 }
 
 /// Dibuja una línea de texto recortada a `rect` (sin `…`, solo clip), en una
@@ -134,11 +147,29 @@ fn activity_card(ui: &mut egui::Ui, palette: &Palette, card: &crate::lib::data::
                     .find(|c| c.is_alphanumeric())
                     .map(|c| c.to_uppercase().to_string())
                     .unwrap_or_else(|| "?".to_string());
-                extra::avatar(ui, rect.center(), 14.0, card.avatar_url.as_deref(), card.avatar_color, &initial, palette);
-                extra::status_dot(ui, rect.center(), 14.0, extra::status_color(card.status, palette), palette.surface);
+                extra::avatar(
+                    ui,
+                    rect.center(),
+                    14.0,
+                    card.avatar_url.as_deref(),
+                    card.avatar_color,
+                    &initial,
+                    palette,
+                );
+                extra::status_dot(
+                    ui,
+                    rect.center(),
+                    14.0,
+                    extra::status_color(card.status, palette),
+                    palette.surface,
+                );
                 let text_w = (ui.available_width() - 4.0).max(0.0);
                 let (text_rect, _) = ui.allocate_exact_size(Vec2::new(text_w, 30.0), egui::Sense::hover());
-                let name = if card.is_me { format!("{} (vos)", card.name) } else { card.name.clone() };
+                let name = if card.is_me {
+                    format!("{} (vos)", card.name)
+                } else {
+                    card.name.clone()
+                };
                 clipped_line(
                     ui,
                     egui::Rect::from_min_size(text_rect.min, Vec2::new(text_w, 15.0)),
@@ -162,7 +193,7 @@ fn activity_card(ui: &mut egui::Ui, palette: &Palette, card: &crate::lib::data::
                 let (art_rect, _) = ui.allocate_exact_size(Vec2::splat(art), egui::Sense::hover());
                 let mut drew_image = false;
                 if let Some(url) = activity.image_url() {
-                    let image = egui::Image::new(crate::ui::anim::plain(&url))
+                    let image = egui::Image::new(crate::ui::chat::anim::plain(&url))
                         .corner_radius(CornerRadius::same(6))
                         .fit_to_exact_size(Vec2::splat(art))
                         .show_loading_spinner(false);
@@ -198,14 +229,22 @@ fn activity_card(ui: &mut egui::Ui, palette: &Palette, card: &crate::lib::data::
                 let line = |y: f32| egui::Rect::from_min_size(col.min + Vec2::new(0.0, y), Vec2::new(text_w, 15.0));
 
                 // Título: `details` (canción / lo que hace); si no hay, el nombre.
-                let title = activity.details.as_deref().filter(|d| !d.trim().is_empty()).unwrap_or(&activity.name);
+                let title = activity
+                    .details
+                    .as_deref()
+                    .filter(|d| !d.trim().is_empty())
+                    .unwrap_or(&activity.name);
                 clipped_line(ui, line(2.0), title, theme::semibold(12.5), palette.text);
 
                 // Subtítulo: `state` (artistas / detalle). En Spotify los
                 // artistas vienen separados por `;`.
                 let mut y = 19.0;
                 if let Some(state) = activity.state.as_deref().filter(|s| !s.trim().is_empty()) {
-                    let state = if activity.is_spotify() { state.replace(';', ",") } else { state.to_string() };
+                    let state = if activity.is_spotify() {
+                        state.replace(';', ",")
+                    } else {
+                        state.to_string()
+                    };
                     clipped_line(ui, line(y), &state, theme::regular(12.0), palette.secondary);
                     y += 17.0;
                 }
@@ -262,11 +301,9 @@ fn central_panel(app: &mut App, ui: &mut egui::Ui) {
                 ui.add_space(16.0);
                 for (i, tab) in TABS.iter().enumerate() {
                     let selected = app.friends_tab == i;
-                    let galley = ui.painter().layout_no_wrap(
-                        tab.to_string(),
-                        theme::medium(13.5),
-                        palette.text,
-                    );
+                    let galley = ui
+                        .painter()
+                        .layout_no_wrap(tab.to_string(), theme::medium(13.5), palette.text);
                     let size = Vec2::new(galley.size().x + 24.0, 30.0);
                     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
                     let bg = if selected {
@@ -276,7 +313,8 @@ fn central_panel(app: &mut App, ui: &mut egui::Ui) {
                     } else {
                         palette.panel
                     };
-                    ui.painter().rect_filled(rect, CornerRadius::same(theme::radius_small() + 2), bg);
+                    ui.painter()
+                        .rect_filled(rect, CornerRadius::same(theme::radius_small() + 2), bg);
                     let color = if selected { palette.text } else { palette.secondary };
                     ui.painter().text(
                         rect.center(),
@@ -333,9 +371,7 @@ fn central_panel(app: &mut App, ui: &mut egui::Ui) {
                         return false;
                     }
                     let matches_search = app.friends_search.is_empty()
-                        || f.name
-                            .to_lowercase()
-                            .contains(&app.friends_search.to_lowercase());
+                        || f.name.to_lowercase().contains(&app.friends_search.to_lowercase());
                     let matches_tab = match app.friends_tab {
                         0 => f.status != Status::Offline,
                         _ => true,
@@ -368,7 +404,12 @@ fn central_panel(app: &mut App, ui: &mut egui::Ui) {
             if app.friends_tab >= 3 {
                 ui.add_space(40.0);
                 ui.vertical_centered(|ui| {
-                    theme::text(ui, "No hay elementos en esta vista (demo)", theme::regular(13.0), palette.dim);
+                    theme::text(
+                        ui,
+                        "No hay elementos en esta vista (demo)",
+                        theme::regular(13.0),
+                        palette.dim,
+                    );
                 });
                 return;
             }
@@ -409,7 +450,7 @@ fn central_panel(app: &mut App, ui: &mut egui::Ui) {
 //   └────────────────────┘ └─────────────────────────────┘
 //
 // Las notificaciones ya no son una sección del Inicio: viven en la campana
-// de la barra superior (`ui::inbox`).
+// de la barra superior (`ui::dm::inbox`).
 //
 // Las secciones se dibujan sobre rectángulos calculados a mano (en vez de
 // paneles anidados) para que el reparto de alto sea estable y cada lista
@@ -458,7 +499,7 @@ const TILE_GAP: f32 = 16.0;
 
 /// Contenido de la píldora larga de la fila de arriba cuando se está en
 /// Inicio: ícono + "Amigos", las pestañas y el botón verde de añadir amigo.
-/// Lo llama `ui::topbar::show_row` dentro de un layout izquierda→derecha.
+/// Lo llama `ui::shell::topbar::show_row` dentro de un layout izquierda→derecha.
 pub(crate) fn row_tabs(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
     theme::icon(ui, Icon::Users, 18.0, palette.secondary);
@@ -472,7 +513,11 @@ pub(crate) fn row_tabs(app: &mut App, ui: &mut egui::Ui) {
             .painter()
             .layout_no_wrap(tab.to_string(), theme::medium(14.0), palette.text);
         // "Pendiente" lleva un globito rojo con las solicitudes recibidas.
-        let badge = if i == PENDING_TAB { app.pending_incoming_count() } else { 0 };
+        let badge = if i == PENDING_TAB {
+            app.pending_incoming_count()
+        } else {
+            0
+        };
         let badge_w = if badge > 0 { 24.0 } else { 0.0 };
         let size = Vec2::new(galley.size().x + 22.0 + badge_w, 30.0);
         let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
@@ -526,8 +571,7 @@ pub(crate) fn row_tabs(app: &mut App, ui: &mut egui::Ui) {
         let galley = ui
             .painter()
             .layout_no_wrap(label.to_string(), theme::semibold(13.0), Color32::WHITE);
-        let (rect, resp) =
-            ui.allocate_exact_size(Vec2::new(galley.size().x + 26.0, 30.0), Sense::click());
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(galley.size().x + 26.0, 30.0), Sense::click());
         let green = extra::status_color(Status::Online, &palette);
         let selected = app.friends_tab == ADD_FRIEND_TAB;
         let fill = if selected {
@@ -590,7 +634,11 @@ fn modern_central(app: &mut App, ui: &mut egui::Ui) {
             // la ventana es lo bastante ancha).
             let show_active = full.width() > 820.0;
             let right_w = if show_active { 340.0 } else { 0.0 };
-            let center_w = if show_active { full.width() - right_w - gap } else { full.width() };
+            let center_w = if show_active {
+                full.width() - right_w - gap
+            } else {
+                full.width()
+            };
             let center = Rect::from_min_size(full.min, Vec2::new(center_w, full.height()));
 
             // --- Tarjeta central -----------------------------------------
@@ -644,7 +692,11 @@ fn modern_central(app: &mut App, ui: &mut egui::Ui) {
                 let title_w = title_galley.size().x;
                 ui.painter().galley(inner.min, title_galley, palette.text);
                 if tab == ONLINE_TAB || tab == ALL_TAB || tab == PENDING_TAB {
-                    let count = if tab == PENDING_TAB { app.pending_requests.len() } else { order.len() };
+                    let count = if tab == PENDING_TAB {
+                        app.pending_requests.len()
+                    } else {
+                        order.len()
+                    };
                     ui.painter().text(
                         inner.min + Vec2::new(title_w + 10.0, 3.0),
                         egui::Align2::LEFT_TOP,
@@ -655,10 +707,7 @@ fn modern_central(app: &mut App, ui: &mut egui::Ui) {
                 }
 
                 // Buscador hundido.
-                let search_rect = Rect::from_min_size(
-                    inner.min + Vec2::new(0.0, 46.0),
-                    Vec2::new(inner.width(), 38.0),
-                );
+                let search_rect = Rect::from_min_size(inner.min + Vec2::new(0.0, 46.0), Vec2::new(inner.width(), 38.0));
                 ui.painter()
                     .rect_filled(search_rect, CornerRadius::same(10), theme::inset(&palette));
                 ui.scope_builder(
@@ -679,10 +728,7 @@ fn modern_central(app: &mut App, ui: &mut egui::Ui) {
                 );
 
                 // Cuadrícula de tarjetas.
-                let body = Rect::from_min_max(
-                    egui::pos2(inner.min.x, search_rect.max.y + 18.0),
-                    inner.max,
-                );
+                let body = Rect::from_min_max(egui::pos2(inner.min.x, search_rect.max.y + 18.0), inner.max);
                 let app_ref: &App = app;
                 if tab == PENDING_TAB {
                     pending_click = in_rect(ui, body, |ui| pending_list(ui, &palette, app_ref, &needle));
@@ -714,14 +760,11 @@ fn modern_central(app: &mut App, ui: &mut egui::Ui) {
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 let avail = (ui.available_width() - 8.0).max(TILE_MIN_W);
-                                let cols = (((avail + TILE_GAP) / (TILE_MIN_W + TILE_GAP)).floor() as usize)
-                                    .clamp(1, 4);
+                                let cols =
+                                    (((avail + TILE_GAP) / (TILE_MIN_W + TILE_GAP)).floor() as usize).clamp(1, 4);
                                 let tile_w = (avail - TILE_GAP * (cols as f32 - 1.0)) / cols as f32;
                                 for chunk in order.chunks(cols) {
-                                    let (row, _) = ui.allocate_exact_size(
-                                        Vec2::new(avail, TILE_H),
-                                        Sense::hover(),
-                                    );
+                                    let (row, _) = ui.allocate_exact_size(Vec2::new(avail, TILE_H), Sense::hover());
                                     for (k, &idx) in chunk.iter().enumerate() {
                                         let rect = Rect::from_min_size(
                                             row.min + Vec2::new(k as f32 * (tile_w + TILE_GAP), 0.0),
@@ -751,11 +794,9 @@ fn modern_central(app: &mut App, ui: &mut egui::Ui) {
                         ui.add_space(4.0);
                         ui.add(
                             egui::Label::new(
-                                RichText::new(
-                                    "Cuando un amigo juegue o escuche algo, o vos lo hagas, aparece acá.",
-                                )
-                                .font(theme::regular(12.0))
-                                .color(palette.dim),
+                                RichText::new("Cuando un amigo juegue o escuche algo, o vos lo hagas, aparece acá.")
+                                    .font(theme::regular(12.0))
+                                    .color(palette.dim),
                             )
                             .wrap(),
                         );
@@ -895,10 +936,12 @@ fn add_friend_form(ui: &mut egui::Ui, palette: &Palette, app: &mut App) -> Optio
     if app.add_friend_busy {
         theme::text(ui, "Enviando solicitud…", theme::regular(13.0), palette.dim);
     } else if let Some((ok, message)) = &app.add_friend_status {
-        let color = if *ok { extra::status_color(Status::Online, palette) } else { palette.danger };
-        ui.add(
-            egui::Label::new(RichText::new(message.as_str()).font(theme::regular(13.0)).color(color)).wrap(),
-        );
+        let color = if *ok {
+            extra::status_color(Status::Online, palette)
+        } else {
+            palette.danger
+        };
+        ui.add(egui::Label::new(RichText::new(message.as_str()).font(theme::regular(13.0)).color(color)).wrap());
     }
     send
 }
@@ -947,14 +990,18 @@ fn apply_pending_click(app: &mut App, click: PendingClick) {
 fn pending_list(ui: &mut egui::Ui, palette: &Palette, app: &App, needle: &str) -> Option<PendingClick> {
     let needle = needle.trim().to_lowercase();
     let matches = |p: &crate::lib::data::PendingRequest| {
-        needle.is_empty()
-            || p.name.to_lowercase().contains(&needle)
-            || p.username.to_lowercase().contains(&needle)
+        needle.is_empty() || p.name.to_lowercase().contains(&needle) || p.username.to_lowercase().contains(&needle)
     };
-    let incoming: Vec<&crate::lib::data::PendingRequest> =
-        app.pending_requests.iter().filter(|p| p.incoming && matches(p)).collect();
-    let outgoing: Vec<&crate::lib::data::PendingRequest> =
-        app.pending_requests.iter().filter(|p| !p.incoming && matches(p)).collect();
+    let incoming: Vec<&crate::lib::data::PendingRequest> = app
+        .pending_requests
+        .iter()
+        .filter(|p| p.incoming && matches(p))
+        .collect();
+    let outgoing: Vec<&crate::lib::data::PendingRequest> = app
+        .pending_requests
+        .iter()
+        .filter(|p| !p.incoming && matches(p))
+        .collect();
 
     if incoming.is_empty() && outgoing.is_empty() {
         if app.pending_requests.is_empty() {
@@ -965,7 +1012,12 @@ fn pending_list(ui: &mut egui::Ui, palette: &Palette, app: &App, needle: &str) -
                 "Cuando alguien te mande una solicitud de amistad, o mandes una tú, aparece aquí.",
             );
         } else {
-            empty_card(ui, palette, "Sin resultados", "Ninguna solicitud coincide con la búsqueda.");
+            empty_card(
+                ui,
+                palette,
+                "Sin resultados",
+                "Ninguna solicitud coincide con la búsqueda.",
+            );
         }
         return None;
     }
@@ -975,11 +1027,19 @@ fn pending_list(ui: &mut egui::Ui, palette: &Palette, app: &App, needle: &str) -
         .id_salt("home_pending_list")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            for (title, list) in [("Solicitudes entrantes", &incoming), ("Solicitudes enviadas", &outgoing)] {
+            for (title, list) in [
+                ("Solicitudes entrantes", &incoming),
+                ("Solicitudes enviadas", &outgoing),
+            ] {
                 if list.is_empty() {
                     continue;
                 }
-                theme::text(ui, format!("{title} — {}", list.len()), theme::semibold(12.5), palette.dim);
+                theme::text(
+                    ui,
+                    format!("{title} — {}", list.len()),
+                    theme::semibold(12.5),
+                    palette.dim,
+                );
                 ui.add_space(6.0);
                 for request in list.iter() {
                     if let Some(c) = pending_row(ui, palette, request) {
@@ -1028,12 +1088,16 @@ fn pending_row(
     let accept_rect = request
         .incoming
         .then(|| Rect::from_center_size(egui::pos2(right - btn / 2.0, rect.center().y), Vec2::splat(btn)));
-    let buttons_w = if request.incoming { 2.0 * btn + 8.0 + 12.0 } else { btn + 12.0 };
+    let buttons_w = if request.incoming {
+        2.0 * btn + 8.0 + 12.0
+    } else {
+        btn + 12.0
+    };
 
     // Texto.
     let text_x = 64.0;
     let max_w = (rect.width() - text_x - buttons_w - 12.0).max(40.0);
-    crate::ui::emoji::paint_line_top(
+    crate::ui::chat::emoji::paint_line_top(
         ui,
         rect.left_top() + Vec2::new(text_x, 13.0),
         &request.name,
@@ -1060,16 +1124,42 @@ fn pending_row(
         palette.dim,
     );
 
-    let base = if hovered { palette.surface_hover } else { palette.surface };
+    let base = if hovered {
+        palette.surface_hover
+    } else {
+        palette.surface
+    };
     let id = ui.id().with(("pending_row", &request.user.id));
     if let Some(accept_rect) = accept_rect {
         let green = extra::status_color(Status::Online, palette);
-        if round_icon_button(ui, palette, base, accept_rect, id.with("accept"), Icon::Check, green, "Aceptar") {
+        if round_icon_button(
+            ui,
+            palette,
+            base,
+            accept_rect,
+            id.with("accept"),
+            Icon::Check,
+            green,
+            "Aceptar",
+        ) {
             click = Some(PendingClick::Accept(request.user.id.clone()));
         }
     }
-    let tip = if request.incoming { "Rechazar" } else { "Cancelar solicitud" };
-    if round_icon_button(ui, palette, base, remove_rect, id.with("remove"), Icon::X, palette.danger, tip) {
+    let tip = if request.incoming {
+        "Rechazar"
+    } else {
+        "Cancelar solicitud"
+    };
+    if round_icon_button(
+        ui,
+        palette,
+        base,
+        remove_rect,
+        id.with("remove"),
+        Icon::X,
+        palette.danger,
+        tip,
+    ) {
         click = Some(PendingClick::Remove(request.user.id.clone()));
     }
 
@@ -1095,8 +1185,16 @@ fn round_icon_button(
     let hovered = resp.hovered();
     let bg = if hovered { palette.surface_active } else { base };
     ui.painter().circle_filled(rect.center(), rect.width() / 2.0, bg);
-    theme::paint_icon(ui, icon, rect, 18.0, if hovered { hover_color } else { palette.secondary });
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip).clicked()
+    theme::paint_icon(
+        ui,
+        icon,
+        rect,
+        18.0,
+        if hovered { hover_color } else { palette.secondary },
+    );
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(tip)
+        .clicked()
 }
 
 /// Tarjeta de amigo: banner de color arriba, avatar grande que lo pisa con su
@@ -1119,7 +1217,12 @@ fn friend_tile(
     let banner = Rect::from_min_size(rect.min, Vec2::new(rect.width(), BANNER_H));
     painter.rect_filled(
         banner,
-        CornerRadius { nw: 14, ne: 14, sw: 0, se: 0 },
+        CornerRadius {
+            nw: 14,
+            ne: 14,
+            sw: 0,
+            se: 0,
+        },
         palette.accent,
     );
     painter.rect_stroke(rect, radius, Stroke::new(1.0, palette.outline), StrokeKind::Inside);
@@ -1142,7 +1245,7 @@ fn friend_tile(
     // Nombre y estado.
     let text_x = rect.min.x + 18.0;
     let text_w = (rect.width() - 36.0).max(0.0);
-    crate::ui::emoji::paint_line_top(
+    crate::ui::chat::emoji::paint_line_top(
         ui,
         egui::pos2(text_x, banner.max.y + av_r + 12.0),
         &friend.name,
@@ -1150,7 +1253,10 @@ fn friend_tile(
         palette.text,
         text_w,
     );
-    let subtitle = friend.subtitle.clone().unwrap_or_else(|| friend.status.label().to_string());
+    let subtitle = friend
+        .subtitle
+        .clone()
+        .unwrap_or_else(|| friend.status.label().to_string());
     let max_chars = ((text_w / 6.4).max(8.0)) as usize;
     painter.text(
         egui::pos2(text_x, banner.max.y + av_r + 36.0),
@@ -1189,10 +1295,7 @@ fn heading_row(ui: &mut egui::Ui, palette: &Palette, title: &str, tag: Tag) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
         ui.set_height(HEADING_H - 8.0);
-        ui.add(
-            egui::Label::new(RichText::new(title).font(theme::bold(24.0)).color(palette.text))
-                .selectable(false),
-        );
+        ui.add(egui::Label::new(RichText::new(title).font(theme::bold(24.0)).color(palette.text)).selectable(false));
         match tag {
             Tag::None => {}
             Tag::Count(0) => {}
@@ -1211,14 +1314,13 @@ fn heading_row(ui: &mut egui::Ui, palette: &Palette, title: &str, tag: Tag) {
             }
             Tag::Online(n) => {
                 let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
-                ui.painter().circle_filled(
-                    rect.center(),
-                    5.0,
-                    extra::status_color(Status::Online, palette),
-                );
+                ui.painter()
+                    .circle_filled(rect.center(), 5.0, extra::status_color(Status::Online, palette));
                 ui.add(
                     egui::Label::new(
-                        RichText::new(n.to_string()).font(theme::regular(16.0)).color(palette.secondary),
+                        RichText::new(n.to_string())
+                            .font(theme::regular(16.0))
+                            .color(palette.secondary),
                     )
                     .selectable(false),
                 );
@@ -1238,10 +1340,7 @@ fn empty_card(ui: &mut egui::Ui, palette: &Palette, title: &str, hint: &str) {
             ui.set_width(ui.available_width());
             theme::text(ui, title, theme::semibold(14.0), palette.text);
             ui.add_space(4.0);
-            ui.add(
-                egui::Label::new(RichText::new(hint).font(theme::regular(12.5)).color(palette.dim))
-                    .wrap(),
-            );
+            ui.add(egui::Label::new(RichText::new(hint).font(theme::regular(12.5)).color(palette.dim)).wrap());
         });
 }
 
@@ -1280,12 +1379,20 @@ fn friends_section(app: &App, ui: &mut egui::Ui, rect: Rect, action: &mut Option
         .map(|(i, _)| i)
         .collect();
     order.sort_by_key(|&i| app.friends[i].status == Status::Offline);
-    let online = order.iter().filter(|&&i| app.friends[i].status != Status::Offline).count();
+    let online = order
+        .iter()
+        .filter(|&&i| app.friends[i].status != Status::Offline)
+        .count();
 
     in_rect(ui, rect, |ui| {
         heading_row(ui, &palette, "Amigos", Tag::Online(online));
         if order.is_empty() {
-            empty_card(ui, &palette, "Todavía no hay amigos", "Cuando agregues a alguien, aparece acá.");
+            empty_card(
+                ui,
+                &palette,
+                "Todavía no hay amigos",
+                "Cuando agregues a alguien, aparece acá.",
+            );
             return;
         }
         ScrollArea::vertical()
@@ -1305,15 +1412,27 @@ fn friends_section(app: &App, ui: &mut egui::Ui, rect: Rect, action: &mut Option
 
 fn friend_card(ui: &mut egui::Ui, palette: &Palette, friend: &crate::lib::data::Friend, width: f32) -> bool {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 58.0), Sense::click());
-    let fill = if resp.hovered() { palette.surface_hover } else { palette.surface };
+    let fill = if resp.hovered() {
+        palette.surface_hover
+    } else {
+        palette.surface
+    };
     ui.painter().rect_filled(rect, CornerRadius::same(ROW_RADIUS), fill);
 
     let center = rect.left_center() + Vec2::new(32.0, 0.0);
-    extra::avatar(ui, center, 19.0, friend.avatar_url.as_deref(), friend.avatar_color, &friend.initial(), palette);
+    extra::avatar(
+        ui,
+        center,
+        19.0,
+        friend.avatar_url.as_deref(),
+        friend.avatar_color,
+        &friend.initial(),
+        palette,
+    );
     extra::status_dot(ui, center, 19.0, extra::status_color(friend.status, palette), fill);
 
     let text_x = 64.0;
-    crate::ui::emoji::paint_line_top(
+    crate::ui::chat::emoji::paint_line_top(
         ui,
         rect.left_top() + Vec2::new(text_x, 11.0),
         &friend.name,
@@ -1321,7 +1440,10 @@ fn friend_card(ui: &mut egui::Ui, palette: &Palette, friend: &crate::lib::data::
         palette.text,
         (width - text_x - 12.0).max(0.0),
     );
-    let subtitle = friend.subtitle.clone().unwrap_or_else(|| friend.status.label().to_string());
+    let subtitle = friend
+        .subtitle
+        .clone()
+        .unwrap_or_else(|| friend.status.label().to_string());
     let max_chars = (((width - text_x - 16.0) / 6.2).max(8.0)) as usize;
     ui.painter().text(
         rect.left_top() + Vec2::new(text_x, 33.0),
@@ -1358,11 +1480,9 @@ fn active_section(app: &App, ui: &mut egui::Ui, rect: Rect) {
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = 12.0;
                     for card in &cards {
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(300.0, 150.0),
-                            Layout::top_down(Align::Min),
-                            |ui| activity_card(ui, &palette, card),
-                        );
+                        ui.allocate_ui_with_layout(Vec2::new(300.0, 150.0), Layout::top_down(Align::Min), |ui| {
+                            activity_card(ui, &palette, card)
+                        });
                     }
                 });
             });
@@ -1544,7 +1664,8 @@ fn preview_list(
                     continue;
                 }
                 if resp.hovered() {
-                    ui.painter().rect_filled(row, CornerRadius::same(10), palette.surface_hover);
+                    ui.painter()
+                        .rect_filled(row, CornerRadius::same(10), palette.surface_hover);
                 }
                 if preview.first_unread == Some(i) {
                     // Línea roja donde empiezan los mensajes sin leer.
@@ -1615,7 +1736,11 @@ fn preview_list(
                 ui.painter().text(
                     end.center(),
                     egui::Align2::CENTER_CENTER,
-                    if preview.loading_newer { "Cargando más mensajes…" } else { "Seguí bajando para ver más" },
+                    if preview.loading_newer {
+                        "Cargando más mensajes…"
+                    } else {
+                        "Seguí bajando para ver más"
+                    },
                     theme::regular(11.5),
                     palette.dim,
                 );
@@ -1641,7 +1766,8 @@ fn channels_section(app: &App, ui: &mut egui::Ui, rect: Rect, action: &mut Optio
             return;
         }
         ui.allocate_rect(card, Sense::hover());
-        ui.painter().rect_filled(card, CornerRadius::same(theme::CARD_RADIUS), palette.panel);
+        ui.painter()
+            .rect_filled(card, CornerRadius::same(theme::CARD_RADIUS), palette.panel);
         ui.painter().rect_stroke(
             card,
             CornerRadius::same(theme::CARD_RADIUS),
@@ -1720,7 +1846,9 @@ fn channels_section(app: &App, ui: &mut egui::Ui, rect: Rect, action: &mut Optio
         }
 
         // ---- Vista previa del canal elegido ----
-        let Some(current) = recent.iter().find(|r| r.key() == selected) else { return };
+        let Some(current) = recent.iter().find(|r| r.key() == selected) else {
+            return;
+        };
         let preview = preview_messages(app, current);
         // Todavía sin mensajes: se piden alrededor del último leído.
         if preview.needs_load && action.is_none() {
@@ -1743,7 +1871,11 @@ fn channels_section(app: &App, ui: &mut egui::Ui, rect: Rect, action: &mut Optio
         ui.painter().rect_filled(
             button,
             CornerRadius::same(14),
-            if button_resp.hovered() { palette.surface_hover } else { palette.surface },
+            if button_resp.hovered() {
+                palette.surface_hover
+            } else {
+                palette.surface
+            },
         );
         ui.painter().text(
             button.center(),
@@ -1774,15 +1906,16 @@ fn channels_section(app: &App, ui: &mut egui::Ui, rect: Rect, action: &mut Optio
         );
 
         // Compositor (decorativo: al hacer click abre el canal).
-        let composer = Rect::from_min_max(
-            egui::pos2(pane_rect.left(), pane_rect.bottom() - 44.0),
-            pane_rect.max,
-        );
+        let composer = Rect::from_min_max(egui::pos2(pane_rect.left(), pane_rect.bottom() - 44.0), pane_rect.max);
         let composer_resp = ui.interact(composer, egui::Id::new("home_recent_composer"), Sense::click());
         ui.painter().rect_filled(
             composer,
             CornerRadius::same(14),
-            if composer_resp.hovered() { palette.surface_hover } else { palette.surface },
+            if composer_resp.hovered() {
+                palette.surface_hover
+            } else {
+                palette.surface
+            },
         );
         ui.painter().text(
             composer.left_center() + Vec2::new(16.0, 0.0),
@@ -1804,7 +1937,11 @@ fn channels_section(app: &App, ui: &mut egui::Ui, rect: Rect, action: &mut Optio
             ui.painter().with_clip_rect(msgs_rect).text(
                 msgs_rect.center(),
                 egui::Align2::CENTER_CENTER,
-                if preview.loading || preview.needs_load { "Cargando mensajes…" } else { "Todavía no hay mensajes cargados." },
+                if preview.loading || preview.needs_load {
+                    "Cargando mensajes…"
+                } else {
+                    "Todavía no hay mensajes cargados."
+                },
                 theme::regular(13.0),
                 palette.dim,
             );
@@ -1813,7 +1950,12 @@ fn channels_section(app: &App, ui: &mut egui::Ui, rect: Rect, action: &mut Optio
         }
 
         if open {
-            *action = Some(HomeAction::OpenChannelAt(current.server, current.cat, current.chan, unread_id));
+            *action = Some(HomeAction::OpenChannelAt(
+                current.server,
+                current.cat,
+                current.chan,
+                unread_id,
+            ));
         }
     });
 }
@@ -1847,7 +1989,7 @@ fn recent_row(ui: &mut egui::Ui, palette: &Palette, r: &RecentChannel, selected:
         theme::medium(13.5),
         if selected { palette.text } else { palette.secondary },
     );
-    crate::ui::notifications::paint_badge(
+    crate::ui::shell::notifications::paint_badge(
         ui.painter(),
         rect.right_center() - Vec2::new(20.0, 0.0),
         r.mentions,
@@ -1893,11 +2035,25 @@ fn friend_row_full(ui: &mut egui::Ui, palette: &Palette, friend: &crate::lib::da
                 .rect_filled(rect, CornerRadius::same(theme::radius() + 2), palette.surface);
         }
         let avatar_center = rect.left_center() + Vec2::new(20.0, 0.0);
-        extra::avatar(ui, avatar_center, 20.0, friend.avatar_url.as_deref(), friend.avatar_color, &friend.initial(), palette);
-        extra::status_dot(ui, avatar_center, 20.0, extra::status_color(friend.status, palette), palette.panel);
+        extra::avatar(
+            ui,
+            avatar_center,
+            20.0,
+            friend.avatar_url.as_deref(),
+            friend.avatar_color,
+            &friend.initial(),
+            palette,
+        );
+        extra::status_dot(
+            ui,
+            avatar_center,
+            20.0,
+            extra::status_color(friend.status, palette),
+            palette.panel,
+        );
 
         let text_x = 52.0;
-        crate::ui::emoji::paint_line_top(
+        crate::ui::chat::emoji::paint_line_top(
             ui,
             rect.left_top() + Vec2::new(text_x, 14.0),
             &friend.name,
@@ -1942,10 +2098,7 @@ fn friend_row_full(ui: &mut egui::Ui, palette: &Palette, friend: &crate::lib::da
     ui.add_space(2.0);
     ui.horizontal(|ui| {
         ui.add_space(16.0 + 52.0);
-        let (rect, _) = ui.allocate_exact_size(
-            Vec2::new(ui.available_width() - 32.0, 1.0),
-            egui::Sense::hover(),
-        );
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width() - 32.0, 1.0), egui::Sense::hover());
         ui.painter().rect_filled(rect, 0.0, palette.outline);
     });
     clicked
@@ -2011,7 +2164,7 @@ fn centered_line(ui: &egui::Ui, center_x: f32, top: f32, text: &str, font: egui:
         .size()
         .x
         .min(max_w);
-    crate::ui::emoji::paint_line_top(ui, egui::pos2(center_x - w / 2.0, top), text, font, color, max_w);
+    crate::ui::chat::emoji::paint_line_top(ui, egui::pos2(center_x - w / 2.0, top), text, font, color, max_w);
 }
 
 /// Rectángulo con las esquinas de arriba redondeadas y un degradado vertical
@@ -2099,7 +2252,7 @@ fn dash_header(
     let hello_w = hello.size().x;
     ui.painter().galley(egui::pos2(text_x, top), hello, palette.text);
     let max_name_w = (rect.max.x - text_x - hello_w - 20.0).max(40.0);
-    crate::ui::emoji::paint_line_top(
+    crate::ui::chat::emoji::paint_line_top(
         ui,
         egui::pos2(text_x + hello_w, top),
         name,
@@ -2122,10 +2275,18 @@ fn dash_header(
 fn dash_arrow(ui: &mut egui::Ui, palette: &Palette, rect: Rect, icon: Icon, enabled: bool, id: egui::Id) -> bool {
     let resp = ui.interact(rect, id, if enabled { Sense::click() } else { Sense::hover() });
     if enabled && resp.hovered() {
-        ui.painter().rect_filled(rect, CornerRadius::same(8), palette.surface_hover);
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(8), palette.surface_hover);
     }
-    let color = if enabled { palette.secondary } else { extra::blend(palette.dim, palette.panel, 0.55) };
-    ui.put(Rect::from_center_size(rect.center(), Vec2::splat(18.0)), icon.image(color, 18.0));
+    let color = if enabled {
+        palette.secondary
+    } else {
+        extra::blend(palette.dim, palette.panel, 0.55)
+    };
+    ui.put(
+        Rect::from_center_size(rect.center(), Vec2::splat(18.0)),
+        icon.image(color, 18.0),
+    );
     enabled && resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
@@ -2166,7 +2327,11 @@ fn dash_controls(
             Vec2::new(w, 20.0),
         );
         let resp = ui.interact(r, ui.id().with((salt, "see_all")), Sense::click());
-        let color = if resp.hovered() { extra::blend(palette.accent, Color32::WHITE, 0.2) } else { palette.accent };
+        let color = if resp.hovered() {
+            extra::blend(palette.accent, Color32::WHITE, 0.2)
+        } else {
+            palette.accent
+        };
         ui.painter().text(
             r.left_center(),
             egui::Align2::LEFT_CENTER,
@@ -2210,7 +2375,10 @@ fn dash_carousel(
             }
         })
     });
-    (out.state.offset.x, (out.content_size.x - out.inner_rect.width()).max(0.0))
+    (
+        out.state.offset.x,
+        (out.content_size.x - out.inner_rect.width()).max(0.0),
+    )
 }
 
 /// Título de un carrusel (`Amigos · 283 · 3 en línea`).
@@ -2246,30 +2414,49 @@ fn friend_ring(palette: &Palette, f: &crate::lib::data::HomeFriend) -> Color32 {
 }
 
 /// Un amigo del carrusel: avatar con aro, nombre y qué está haciendo.
-fn dash_friend_item(
-    ui: &mut egui::Ui,
-    palette: &Palette,
-    f: &crate::lib::data::HomeFriend,
-    item: Rect,
-) -> bool {
+fn dash_friend_item(ui: &mut egui::Ui, palette: &Palette, f: &crate::lib::data::HomeFriend, item: Rect) -> bool {
     let resp = ui.interact(item, ui.id().with(("home_friend", f.index)), Sense::click());
     if resp.hovered() {
         ui.painter().rect_filled(item, CornerRadius::same(14), palette.surface);
     }
     let center = egui::pos2(item.center().x, item.min.y + 8.0 + FRIEND_AV_R);
     let ring = friend_ring(palette, f);
-    extra::avatar(ui, center, FRIEND_AV_R - 3.0, f.avatar_url.as_deref(), f.avatar_color, &f.initial, palette);
+    extra::avatar(
+        ui,
+        center,
+        FRIEND_AV_R - 3.0,
+        f.avatar_url.as_deref(),
+        f.avatar_color,
+        &f.initial,
+        palette,
+    );
     ui.painter()
         .circle_stroke(center, FRIEND_AV_R - 1.0, Stroke::new(3.0, ring));
 
     let max_w = item.width() - 12.0;
-    centered_line(ui, item.center().x, center.y + FRIEND_AV_R + 10.0, &f.name, theme::semibold(14.0), palette.text, max_w);
+    centered_line(
+        ui,
+        item.center().x,
+        center.y + FRIEND_AV_R + 10.0,
+        &f.name,
+        theme::semibold(14.0),
+        palette.text,
+        max_w,
+    );
     let (sub, sub_color) = match (&f.activity, f.status) {
         (Some(activity), _) => (activity.clone(), ring),
         (None, Status::Offline) => (Status::Offline.label().to_string(), palette.dim),
         (None, status) => (status.label().to_string(), ring),
     };
-    centered_line(ui, item.center().x, center.y + FRIEND_AV_R + 31.0, &sub, theme::medium(12.5), sub_color, max_w);
+    centered_line(
+        ui,
+        item.center().x,
+        center.y + FRIEND_AV_R + 31.0,
+        &sub,
+        theme::medium(12.5),
+        sub_color,
+        max_w,
+    );
 
     let clicked = resp.clicked();
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -2293,9 +2480,21 @@ fn friend_hover_card(ui: &mut egui::Ui, palette: &Palette, f: &crate::lib::data:
             .inner_margin(Margin::same(10))
             .show(ui, |ui| {
                 ui.set_width(W - 20.0);
-                theme::text(ui, title.clone(), theme::semibold(14.0), extra::status_color(Status::Online, palette));
+                theme::text(
+                    ui,
+                    title.clone(),
+                    theme::semibold(14.0),
+                    extra::status_color(Status::Online, palette),
+                );
                 if let Some(detail) = &f.activity_detail {
-                    ui.add(egui::Label::new(RichText::new(detail).font(theme::regular(12.5)).color(palette.secondary)).wrap());
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(detail)
+                                .font(theme::regular(12.5))
+                                .color(palette.secondary),
+                        )
+                        .wrap(),
+                    );
                 }
             });
         ui.add_space(8.0);
@@ -2304,7 +2503,15 @@ fn friend_hover_card(ui: &mut egui::Ui, palette: &Palette, f: &crate::lib::data:
     // Identidad.
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(52.0), Sense::hover());
-        extra::avatar(ui, rect.center(), 24.0, f.avatar_url.as_deref(), f.avatar_color, &f.initial, palette);
+        extra::avatar(
+            ui,
+            rect.center(),
+            24.0,
+            f.avatar_url.as_deref(),
+            f.avatar_color,
+            &f.initial,
+            palette,
+        );
         ui.painter().circle_stroke(rect.center(), 25.5, Stroke::new(2.5, ring));
         ui.vertical(|ui| {
             theme::text(ui, f.name.clone(), theme::bold(16.0), palette.text);
@@ -2321,7 +2528,8 @@ fn friend_hover_card(ui: &mut egui::Ui, palette: &Palette, f: &crate::lib::data:
             theme::text(ui, format!("{pct:.0}%"), theme::bold(22.0), palette.accent);
             // Barra de progreso.
             let (bar, _) = ui.allocate_exact_size(Vec2::new(W, 6.0), Sense::hover());
-            ui.painter().rect_filled(bar, CornerRadius::same(3), theme::inset(palette));
+            ui.painter()
+                .rect_filled(bar, CornerRadius::same(3), theme::inset(palette));
             let fill = Rect::from_min_size(bar.min, Vec2::new(bar.width() * (pct / 100.0).clamp(0.0, 1.0), 6.0));
             ui.painter().rect_filled(fill, CornerRadius::same(3), palette.accent);
             ui.add_space(6.0);
@@ -2335,7 +2543,12 @@ fn friend_hover_card(ui: &mut egui::Ui, palette: &Palette, f: &crate::lib::data:
             }
         }
         None => {
-            theme::text(ui, "Sin datos de afinidad para este amigo", theme::regular(12.5), palette.dim);
+            theme::text(
+                ui,
+                "Sin datos de afinidad para este amigo",
+                theme::regular(12.5),
+                palette.dim,
+            );
         }
     }
     ui.add_space(4.0);
@@ -2343,24 +2556,44 @@ fn friend_hover_card(ui: &mut egui::Ui, palette: &Palette, f: &crate::lib::data:
 }
 
 /// Un server del carrusel: ícono, nombre y cuántos hay en línea.
-fn dash_server_item(
-    ui: &mut egui::Ui,
-    palette: &Palette,
-    s: &crate::lib::data::HomeServer,
-    item: Rect,
-) -> bool {
+fn dash_server_item(ui: &mut egui::Ui, palette: &Palette, s: &crate::lib::data::HomeServer, item: Rect) -> bool {
     let resp = ui.interact(item, ui.id().with(("home_server", s.index)), Sense::click());
     if resp.hovered() {
         ui.painter().rect_filled(item, CornerRadius::same(14), palette.surface);
     }
     let center = egui::pos2(item.center().x, item.min.y + 8.0 + SERVER_ICON_R);
-    extra::avatar_rounded(ui, center, SERVER_ICON_R, 20.0, s.icon_url.as_deref(), s.icon_color, &s.initial, palette);
+    extra::avatar_rounded(
+        ui,
+        center,
+        SERVER_ICON_R,
+        20.0,
+        s.icon_url.as_deref(),
+        s.icon_color,
+        &s.initial,
+        palette,
+    );
 
     let max_w = item.width() - 12.0;
-    centered_line(ui, item.center().x, center.y + SERVER_ICON_R + 10.0, &s.name, theme::semibold(14.0), palette.text, max_w);
+    centered_line(
+        ui,
+        item.center().x,
+        center.y + SERVER_ICON_R + 10.0,
+        &s.name,
+        theme::semibold(14.0),
+        palette.text,
+        max_w,
+    );
     if s.online_count > 0 {
         let sub = format!("{} en línea", s.online_count);
-        centered_line(ui, item.center().x, center.y + SERVER_ICON_R + 31.0, &sub, theme::medium(12.5), palette.secondary, max_w);
+        centered_line(
+            ui,
+            item.center().x,
+            center.y + SERVER_ICON_R + 31.0,
+            &sub,
+            theme::medium(12.5),
+            palette.secondary,
+            max_w,
+        );
     }
 
     let clicked = resp.clicked();
@@ -2388,10 +2621,14 @@ fn dashboard(app: &mut App, ui: &mut egui::Ui, full: Rect, action: &mut Option<H
     let friends = app.home_friends_sorted();
     let servers = app.home_servers_sorted();
     let online = friends.iter().filter(|f| f.status != Status::Offline).count();
-    let me = app
-        .me
-        .as_ref()
-        .map(|m| (m.display_name().to_string(), m.username.clone(), m.avatar_url(), m.accent_color));
+    let me = app.me.as_ref().map(|m| {
+        (
+            m.display_name().to_string(),
+            m.username.clone(),
+            m.avatar_url(),
+            m.accent_color,
+        )
+    });
     let servers_ranked = !app.affinity_guilds.is_empty();
 
     let friends_h = DASH_PAD * 2.0 + DASH_HEAD_H + FRIEND_ROW_H + DASH_SCROLLBAR_ROOM;
@@ -2411,10 +2648,7 @@ fn dashboard(app: &mut App, ui: &mut egui::Ui, full: Rect, action: &mut Option<H
                 dash_header(ui, &palette, header, me.as_ref());
 
                 // --- 2. Amigos ---------------------------------------------
-                let card = Rect::from_min_size(
-                    egui::pos2(content.min.x, header.max.y + gap),
-                    Vec2::new(w, friends_h),
-                );
+                let card = Rect::from_min_size(egui::pos2(content.min.x, header.max.y + gap), Vec2::new(w, friends_h));
                 card_bg(ui, &palette, card);
                 let inner = card.shrink(DASH_PAD);
                 dash_title(
@@ -2428,17 +2662,30 @@ fn dashboard(app: &mut App, ui: &mut egui::Ui, full: Rect, action: &mut Option<H
                 let row = Rect::from_min_max(egui::pos2(inner.min.x, inner.min.y + DASH_HEAD_H), inner.max);
                 if friends.is_empty() {
                     in_rect(ui, row, |ui| {
-                        empty_card(ui, &palette, "Todavía no hay amigos por acá", "Cuando agregues amigos, aparecen en esta fila.");
+                        empty_card(
+                            ui,
+                            &palette,
+                            "Todavía no hay amigos por acá",
+                            "Cuando agregues amigos, aparecen en esta fila.",
+                        );
                     });
                 } else {
                     let req = app.home_scroll_req[0].take();
-                    let (offset, max_offset) = dash_carousel(ui, "home_friends_row", row, friends.len(), req, |ui, i, item| {
-                        if dash_friend_item(ui, &palette, &friends[i], item) {
-                            *action = Some(HomeAction::OpenFriend(friends[i].index));
-                        }
-                    });
-                    let (see_all, dir) =
-                        dash_controls(ui, &palette, head, "friends", true, offset > 1.0, offset < max_offset - 1.0);
+                    let (offset, max_offset) =
+                        dash_carousel(ui, "home_friends_row", row, friends.len(), req, |ui, i, item| {
+                            if dash_friend_item(ui, &palette, &friends[i], item) {
+                                *action = Some(HomeAction::OpenFriend(friends[i].index));
+                            }
+                        });
+                    let (see_all, dir) = dash_controls(
+                        ui,
+                        &palette,
+                        head,
+                        "friends",
+                        true,
+                        offset > 1.0,
+                        offset < max_offset - 1.0,
+                    );
                     if see_all {
                         app.friends_tab = ALL_TAB;
                     }
@@ -2449,34 +2696,48 @@ fn dashboard(app: &mut App, ui: &mut egui::Ui, full: Rect, action: &mut Option<H
                 }
 
                 // --- 3. Servidores frecuentes --------------------------------
-                let card = Rect::from_min_size(
-                    egui::pos2(content.min.x, card.max.y + gap),
-                    Vec2::new(w, servers_h),
-                );
+                let card = Rect::from_min_size(egui::pos2(content.min.x, card.max.y + gap), Vec2::new(w, servers_h));
                 card_bg(ui, &palette, card);
                 let inner = card.shrink(DASH_PAD);
                 dash_title(
                     ui,
                     &palette,
                     inner.min,
-                    if servers_ranked { "Servidores frecuentes" } else { "Tus servidores" },
+                    if servers_ranked {
+                        "Servidores frecuentes"
+                    } else {
+                        "Tus servidores"
+                    },
                     "",
                 );
                 let head = Rect::from_min_size(inner.min, Vec2::new(inner.width(), 30.0));
                 let row = Rect::from_min_max(egui::pos2(inner.min.x, inner.min.y + DASH_HEAD_H), inner.max);
                 if servers.is_empty() {
                     in_rect(ui, row, |ui| {
-                        empty_card(ui, &palette, "Todavía no estás en ningún servidor", "Cuando te unas a uno, aparece en esta fila.");
+                        empty_card(
+                            ui,
+                            &palette,
+                            "Todavía no estás en ningún servidor",
+                            "Cuando te unas a uno, aparece en esta fila.",
+                        );
                     });
                 } else {
                     let req = app.home_scroll_req[1].take();
-                    let (offset, max_offset) = dash_carousel(ui, "home_servers_row", row, servers.len(), req, |ui, i, item| {
-                        if dash_server_item(ui, &palette, &servers[i], item) {
-                            *action = Some(HomeAction::OpenServer(servers[i].index));
-                        }
-                    });
-                    let (_, dir) =
-                        dash_controls(ui, &palette, head, "servers", false, offset > 1.0, offset < max_offset - 1.0);
+                    let (offset, max_offset) =
+                        dash_carousel(ui, "home_servers_row", row, servers.len(), req, |ui, i, item| {
+                            if dash_server_item(ui, &palette, &servers[i], item) {
+                                *action = Some(HomeAction::OpenServer(servers[i].index));
+                            }
+                        });
+                    let (_, dir) = dash_controls(
+                        ui,
+                        &palette,
+                        head,
+                        "servers",
+                        false,
+                        offset > 1.0,
+                        offset < max_offset - 1.0,
+                    );
                     if dir != 0 {
                         app.home_scroll_req[1] = Some(dash_step(offset, max_offset, dir));
                         ui.ctx().request_repaint();

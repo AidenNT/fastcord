@@ -8,8 +8,8 @@
 use sonora::config::EchoCanceller;
 use sonora::{AudioProcessing, Config, StreamConfig};
 
-use super::chain::FRAME;
 use super::super::echo_reference;
+use super::chain::FRAME;
 
 const SAMPLE_RATE: u32 = 48_000;
 

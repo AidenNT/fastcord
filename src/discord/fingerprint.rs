@@ -14,13 +14,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::{
     Url,
     cookie::CookieStore,
-    header::{
-        ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE, HeaderMap, HeaderValue, REFERER, USER_AGENT,
-    },
+    header::{ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE, HeaderMap, HeaderValue, REFERER, USER_AGENT},
 };
-use reqwest_cookie_store::{
-    CookieStore as PersistentCookieStore, CookieStoreMutex as PersistentCookieStoreMutex,
-};
+use reqwest_cookie_store::{CookieStore as PersistentCookieStore, CookieStoreMutex as PersistentCookieStoreMutex};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -39,8 +35,7 @@ pub(super) const DISCORD_ORIGIN: &str = "https://discord.com";
 
 const DISCORD_CHANNELS_REFERER: &str = "https://discord.com/channels/@me";
 const DISCORD_ROOT_REFERER: &str = "https://discord.com/";
-const DISCORD_EXPERIMENTS_URL: &str =
-    "https://discord.com/api/v9/experiments?with_guild_experiments=true";
+const DISCORD_EXPERIMENTS_URL: &str = "https://discord.com/api/v9/experiments?with_guild_experiments=true";
 const DISCORD_APEX_EXPERIMENTS_URL: &str = "https://discord.com/api/v9/apex/experiments?surface=2";
 const COOKIE_PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
 pub(super) const DISCORD_LOCALE: &str = "en-US";
@@ -96,27 +91,6 @@ impl ClientFingerprint {
             .read()
             .expect("installation id lock is not poisoned")
             .clone()
-    }
-
-    pub(super) fn update_installation_id(&self, installation_id: &str) -> Result<bool, String> {
-        let Some(installation_id) = valid_session_identifier(Some(installation_id.to_owned()))
-        else {
-            return Ok(false);
-        };
-        let mut current = self
-            .installation_id
-            .write()
-            .map_err(|_| "installation id lock is poisoned".to_owned())?;
-        if current.as_deref() == Some(installation_id.as_str()) {
-            return Ok(false);
-        }
-        *current = Some(installation_id.clone());
-        drop(current);
-        save_session_identifiers(&SessionIdentifiers {
-            fingerprint: self.anonymous_fingerprint.clone(),
-            installation: Some(installation_id),
-        })?;
-        Ok(true)
     }
 
     #[cfg(test)]
@@ -195,8 +169,7 @@ struct SessionIdentifierFetchFailure {
 /// Creates the login-session fingerprint after reading Discord's current web
 /// build. The returned HTTP client retains the cookies from that bootstrap
 /// request and is reused for authentication and REST.
-pub(crate) async fn load_client_fingerprint_and_http() -> (Arc<ClientFingerprint>, reqwest::Client)
-{
+pub(crate) async fn load_client_fingerprint_and_http() -> (Arc<ClientFingerprint>, reqwest::Client) {
     let bootstrap = Arc::new(ClientFingerprint::new(CLIENT_BUILD_NUMBER));
     let client = discord_http_client(&bootstrap);
     let client_build_number = match fetch_client_build_number(&client).await {
@@ -252,16 +225,9 @@ fn session_identifier_fetch_summary(
     }
 }
 
-pub(super) fn discord_channel_referer(
-    guild_id: Option<Id<GuildMarker>>,
-    channel_id: Id<ChannelMarker>,
-) -> String {
+pub(super) fn discord_channel_referer(guild_id: Option<Id<GuildMarker>>, channel_id: Id<ChannelMarker>) -> String {
     match guild_id {
-        Some(guild_id) => format!(
-            "{DISCORD_ORIGIN}/channels/{}/{}",
-            guild_id.get(),
-            channel_id.get()
-        ),
+        Some(guild_id) => format!("{DISCORD_ORIGIN}/channels/{}/{}", guild_id.get(), channel_id.get()),
         None => format!("{DISCORD_CHANNELS_REFERER}/{}", channel_id.get()),
     }
 }
@@ -284,9 +250,7 @@ fn load_session_identifiers() -> Option<SessionIdentifiers> {
     }
 }
 
-fn load_session_identifiers_from_path(
-    path: &Path,
-) -> std::result::Result<Option<SessionIdentifiers>, String> {
+fn load_session_identifiers_from_path(path: &Path) -> std::result::Result<Option<SessionIdentifiers>, String> {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -304,10 +268,7 @@ fn save_session_identifiers(identifiers: &SessionIdentifiers) -> std::result::Re
     save_session_identifiers_to_path(&path, identifiers)
 }
 
-fn save_session_identifiers_to_path(
-    path: &Path,
-    identifiers: &SessionIdentifiers,
-) -> std::result::Result<(), String> {
+fn save_session_identifiers_to_path(path: &Path, identifiers: &SessionIdentifiers) -> std::result::Result<(), String> {
     if identifiers.is_empty() {
         return Ok(());
     }
@@ -346,10 +307,7 @@ impl LoggingCookieJar {
             .and_then(|path| match load_cookie_store_from_path(path) {
                 Ok(store) => store,
                 Err(error) => {
-                    crate::logging::debug(
-                        "http",
-                        format!("could not load persisted Discord cookies: {error}"),
-                    );
+                    crate::logging::debug("http", format!("could not load persisted Discord cookies: {error}"));
                     None
                 }
             })
@@ -400,20 +358,13 @@ impl CookiePersistence {
 impl Drop for CookiePersistence {
     fn drop(&mut self) {
         self.persist_tx.take();
-        if self
-            .worker
-            .take()
-            .is_some_and(|worker| worker.join().is_err())
-        {
+        if self.worker.take().is_some_and(|worker| worker.join().is_err()) {
             crate::logging::debug("http", "Discord cookie persistence worker panicked");
         }
     }
 }
 
-fn spawn_cookie_persistence(
-    inner: Arc<PersistentCookieStoreMutex>,
-    path: PathBuf,
-) -> Option<CookiePersistence> {
+fn spawn_cookie_persistence(inner: Arc<PersistentCookieStoreMutex>, path: PathBuf) -> Option<CookiePersistence> {
     let (persist_tx, persist_rx) = sync_channel(1);
     let worker = match thread::Builder::new()
         .name("concord-cookie-persist".to_owned())
@@ -421,10 +372,7 @@ fn spawn_cookie_persistence(
     {
         Ok(worker) => worker,
         Err(error) => {
-            crate::logging::debug(
-                "http",
-                format!("could not start Discord cookie persistence: {error}"),
-            );
+            crate::logging::debug("http", format!("could not start Discord cookie persistence: {error}"));
             return None;
         }
     };
@@ -434,11 +382,7 @@ fn spawn_cookie_persistence(
     })
 }
 
-fn persist_cookies_after_changes(
-    inner: Arc<PersistentCookieStoreMutex>,
-    path: PathBuf,
-    persist_rx: Receiver<()>,
-) {
+fn persist_cookies_after_changes(inner: Arc<PersistentCookieStoreMutex>, path: PathBuf, persist_rx: Receiver<()>) {
     while persist_rx.recv().is_ok() {
         let disconnected = loop {
             match persist_rx.recv_timeout(COOKIE_PERSIST_DEBOUNCE) {
@@ -448,10 +392,7 @@ fn persist_cookies_after_changes(
             }
         };
         if let Err(error) = persist_cookie_store(&inner, &path) {
-            crate::logging::debug(
-                "http",
-                format!("could not persist Discord cookies: {error}"),
-            );
+            crate::logging::debug("http", format!("could not persist Discord cookies: {error}"));
         }
         if disconnected {
             break;
@@ -459,10 +400,7 @@ fn persist_cookies_after_changes(
     }
 }
 
-fn persist_cookie_store(
-    inner: &PersistentCookieStoreMutex,
-    path: &Path,
-) -> std::result::Result<(), String> {
+fn persist_cookie_store(inner: &PersistentCookieStoreMutex, path: &Path) -> std::result::Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         private_file::set_private_dir_permissions(parent).map_err(|error| error.to_string())?;
@@ -494,9 +432,7 @@ fn cookie_names_for_log(cookies: Option<&HeaderValue>) -> String {
         .unwrap_or_else(|| "<none>".to_owned())
 }
 
-fn load_cookie_store_from_path(
-    path: &Path,
-) -> std::result::Result<Option<PersistentCookieStore>, String> {
+fn load_cookie_store_from_path(path: &Path) -> std::result::Result<Option<PersistentCookieStore>, String> {
     let content = match fs::read(path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -552,16 +488,10 @@ pub(super) fn discord_rest_headers(fingerprint: &ClientFingerprint) -> HeaderMap
 /// Endpoint builders call this directly instead of inheriting from another
 /// endpoint profile. The caller must choose its own referer and add any
 /// authentication, cache, or bootstrap-only headers explicitly.
-pub(super) fn discord_api_request_headers(
-    fingerprint: &ClientFingerprint,
-    referer: &'static str,
-) -> HeaderMap {
+pub(super) fn discord_api_request_headers(fingerprint: &ClientFingerprint, referer: &'static str) -> HeaderMap {
     let mut headers = discord_browser_headers(fingerprint);
     headers.insert(ACCEPT, HeaderValue::from_static("*/*"));
-    headers.insert(
-        ACCEPT_ENCODING,
-        HeaderValue::from_static("gzip, deflate, br, zstd"),
-    );
+    headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("gzip, deflate, br, zstd"));
     headers.insert(REFERER, HeaderValue::from_static(referer));
     headers.insert("Priority", HeaderValue::from_static("u=1, i"));
     headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("empty"));
@@ -578,28 +508,18 @@ pub(super) fn discord_api_request_headers(
             .expect("base64 super properties are a valid header value"),
     );
     let installation_id = fingerprint.installation_id();
-    insert_session_header(
-        &mut headers,
-        "X-Installation-ID",
-        installation_id.as_deref(),
-    );
+    insert_session_header(&mut headers, "X-Installation-ID", installation_id.as_deref());
     headers
 }
 
 pub(super) fn insert_fingerprint_header(headers: &mut HeaderMap, fingerprint: &ClientFingerprint) {
-    insert_session_header(
-        headers,
-        "X-Fingerprint",
-        fingerprint.anonymous_fingerprint.as_deref(),
-    );
+    insert_session_header(headers, "X-Fingerprint", fingerprint.anonymous_fingerprint.as_deref());
 }
 
 fn insert_chrome_client_hints(headers: &mut HeaderMap, os: &str) {
     headers.insert(
         "Sec-CH-UA",
-        HeaderValue::from_static(
-            "\"Not;A=Brand\";v=\"8\", \"Chromium\";v=\"150\", \"Google Chrome\";v=\"150\"",
-        ),
+        HeaderValue::from_static("\"Not;A=Brand\";v=\"8\", \"Chromium\";v=\"150\", \"Google Chrome\";v=\"150\""),
     );
     headers.insert("Sec-CH-UA-Mobile", HeaderValue::from_static("?0"));
     headers.insert(
@@ -791,15 +711,9 @@ fn normalize_system_locale(raw: &str) -> Option<String> {
     let mut subtags = locale.split('-');
     let language = subtags.next()?;
     if !(2..=8).contains(&language.len())
-        || !language
-            .chars()
-            .all(|character| character.is_ascii_alphabetic())
+        || !language.chars().all(|character| character.is_ascii_alphabetic())
         || subtags.any(|subtag| {
-            subtag.is_empty()
-                || subtag.len() > 8
-                || !subtag
-                    .chars()
-                    .all(|character| character.is_ascii_alphanumeric())
+            subtag.is_empty() || subtag.len() > 8 || !subtag.chars().all(|character| character.is_ascii_alphanumeric())
         })
         || HeaderValue::from_str(&locale).is_err()
     {
@@ -873,8 +787,16 @@ fn operating_system_version() -> String {
 }
 
 fn command_output(program: &str, args: &[&str]) -> Option<String> {
-    Command::new(program)
-        .args(args)
+    let mut command = Command::new(program);
+    command.args(args);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW: la app no tiene consola (windows_subsystem), así que
+        // sin esto `cmd /C ver` abre y cierra una ventana de consola al arrancar.
+        command.creation_flags(0x0800_0000);
+    }
+    command
         .output()
         .ok()
         .filter(|output| output.status.success())

@@ -6,9 +6,9 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 
 use super::{
     AEAD_AES256_GCM_RTPSIZE, AEAD_XCHACHA20_POLY1305_RTPSIZE, DISCORD_OPUS_TIMESTAMP_INCREMENT,
-    DISCORD_VOICE_PAYLOAD_TYPE, RTCP_MIN_PACKET_BYTES, RTCP_SENDER_SSRC_BYTES,
-    RTCP_SENDER_SSRC_OFFSET, RTP_AEAD_NONCE_SUFFIX_BYTES, RTP_AEAD_TAG_BYTES,
-    RTP_EXTENSION_WORD_BYTES, RTP_HEADER_EXTENSION_BYTES, RTP_HEADER_MIN_LEN, RTP_VERSION,
+    DISCORD_VOICE_PAYLOAD_TYPE, RTCP_MIN_PACKET_BYTES, RTCP_SENDER_SSRC_BYTES, RTCP_SENDER_SSRC_OFFSET,
+    RTP_AEAD_NONCE_SUFFIX_BYTES, RTP_AEAD_TAG_BYTES, RTP_EXTENSION_WORD_BYTES, RTP_HEADER_EXTENSION_BYTES,
+    RTP_HEADER_MIN_LEN, RTP_VERSION,
 };
 
 const RTCP_FEEDBACK_AUTHENTICATED_HEADER_BYTES: usize = 8;
@@ -61,8 +61,7 @@ impl<'a> Iterator for RtcpPackets<'a> {
             return Some(Err(RtcpPacketError::InvalidVersion));
         }
 
-        let packet_len =
-            (usize::from(u16::from_be_bytes([self.remaining[2], self.remaining[3]])) + 1) * 4;
+        let packet_len = (usize::from(u16::from_be_bytes([self.remaining[2], self.remaining[3]])) + 1) * 4;
         if packet_len > self.remaining.len() {
             self.remaining = &[];
             return Some(Err(RtcpPacketError::LengthExceedsData));
@@ -138,11 +137,7 @@ impl VoiceRtpDecryptor {
         }
     }
 
-    pub(super) fn decrypt_packet(
-        &self,
-        packet: &[u8],
-        header: &RtpHeader,
-    ) -> Result<DecryptedRtpPayload, String> {
+    pub(super) fn decrypt_packet(&self, packet: &[u8], header: &RtpHeader) -> Result<DecryptedRtpPayload, String> {
         if header.payload_type != DISCORD_VOICE_PAYLOAD_TYPE {
             return Err(format!(
                 "RTP packet has unsupported payload type: {}",
@@ -152,11 +147,7 @@ impl VoiceRtpDecryptor {
         self.decrypt_packet_any(packet, header)
     }
 
-    pub(super) fn decrypt_packet_any(
-        &self,
-        packet: &[u8],
-        header: &RtpHeader,
-    ) -> Result<DecryptedRtpPayload, String> {
+    pub(super) fn decrypt_packet_any(&self, packet: &[u8], header: &RtpHeader) -> Result<DecryptedRtpPayload, String> {
         let sealed_end = packet
             .len()
             .checked_sub(RTP_AEAD_NONCE_SUFFIX_BYTES)
@@ -178,10 +169,7 @@ impl VoiceRtpDecryptor {
                 .authenticated_header_len
                 .checked_sub(RTP_HEADER_EXTENSION_BYTES)
                 .ok_or_else(|| "RTP extension header offset underflowed".to_owned())?;
-            Some(u16::from_be_bytes([
-                packet[profile_offset],
-                packet[profile_offset + 1],
-            ]))
+            Some(u16::from_be_bytes([packet[profile_offset], packet[profile_offset + 1]]))
         };
         let extension_body = decrypted[..header.encrypted_extension_body_len].to_vec();
         let media_payload = &decrypted[header.encrypted_extension_body_len..];
@@ -355,13 +343,7 @@ impl VoiceRtpEncryptor {
                 nonce[..RTP_AEAD_NONCE_SUFFIX_BYTES].copy_from_slice(&nonce_suffix);
                 let nonce = AesGcmNonce::from(nonce);
                 cipher
-                    .encrypt(
-                        &nonce,
-                        Payload {
-                            msg: plaintext,
-                            aad,
-                        },
-                    )
+                    .encrypt(&nonce, Payload { msg: plaintext, aad })
                     .map_err(|_| "RTP AES-GCM encrypt failed".to_owned())?
             }
             Self::XChaCha20Poly1305(cipher) => {
@@ -369,19 +351,12 @@ impl VoiceRtpEncryptor {
                 nonce[..RTP_AEAD_NONCE_SUFFIX_BYTES].copy_from_slice(&nonce_suffix);
                 let nonce = XNonce::from(nonce);
                 cipher
-                    .encrypt(
-                        &nonce,
-                        Payload {
-                            msg: plaintext,
-                            aad,
-                        },
-                    )
+                    .encrypt(&nonce, Payload { msg: plaintext, aad })
                     .map_err(|_| "RTP XChaCha20-Poly1305 encrypt failed".to_owned())?
             }
         };
 
-        let mut encrypted =
-            Vec::with_capacity(aad.len() + sealed_payload.len() + RTP_AEAD_NONCE_SUFFIX_BYTES);
+        let mut encrypted = Vec::with_capacity(aad.len() + sealed_payload.len() + RTP_AEAD_NONCE_SUFFIX_BYTES);
         encrypted.extend_from_slice(aad);
         encrypted.extend_from_slice(&sealed_payload);
         encrypted.extend_from_slice(&nonce_suffix);
@@ -392,12 +367,9 @@ impl VoiceRtpEncryptor {
 #[allow(dead_code)]
 impl VoiceOutboundRtpState {
     pub(super) fn packetize(&mut self, opus_payload: &[u8]) -> Result<Vec<u8>, String> {
-        let packet =
-            build_voice_rtp_packet(self.sequence, self.timestamp, self.ssrc, opus_payload)?;
+        let packet = build_voice_rtp_packet(self.sequence, self.timestamp, self.ssrc, opus_payload)?;
         self.sequence = self.sequence.wrapping_add(1);
-        self.timestamp = self
-            .timestamp
-            .wrapping_add(DISCORD_OPUS_TIMESTAMP_INCREMENT);
+        self.timestamp = self.timestamp.wrapping_add(DISCORD_OPUS_TIMESTAMP_INCREMENT);
         Ok(packet)
     }
 }
@@ -482,9 +454,7 @@ pub(super) fn parse_rtp_header(packet: &[u8]) -> Result<RtpHeader, String> {
 }
 
 pub(super) fn looks_like_rtcp_packet(packet: &[u8]) -> bool {
-    packet.len() >= RTCP_MIN_PACKET_BYTES
-        && packet[0] >> 6 == RTP_VERSION
-        && (192..=223).contains(&packet[1])
+    packet.len() >= RTCP_MIN_PACKET_BYTES && packet[0] >> 6 == RTP_VERSION && (192..=223).contains(&packet[1])
 }
 
 fn validate_rtcp_compound_packet(packet: &[u8]) -> Result<(), String> {
@@ -496,9 +466,7 @@ fn validate_rtcp_compound_packet(packet: &[u8]) -> Result<(), String> {
         let packet = packet.map_err(|error| match error {
             RtcpPacketError::TruncatedHeader => "RTCP packet is shorter than its header".to_owned(),
             RtcpPacketError::InvalidVersion => "RTCP packet has unsupported version".to_owned(),
-            RtcpPacketError::LengthExceedsData => {
-                "RTCP packet length exceeds received data".to_owned()
-            }
+            RtcpPacketError::LengthExceedsData => "RTCP packet length exceeds received data".to_owned(),
         })?;
         if !(192..=223).contains(&packet.packet_type()) {
             return Err("RTCP packet has invalid packet type".to_owned());
@@ -519,4 +487,3 @@ pub(super) fn rtcp_sender_ssrc(packet: &[u8]) -> Option<u32> {
         ])
     })
 }
-
