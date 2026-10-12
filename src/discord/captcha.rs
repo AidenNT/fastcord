@@ -75,6 +75,7 @@ pub const WINDOW_FLAG: &str = "--captcha-window";
 pub const MAX_SOLVES_PER_REQUEST: usize = 3;
 
 const TOKEN_PREFIX: &str = "ECORD_CAPTCHA_TOKEN:";
+const ERROR_PREFIX: &str = "ECORD_CAPTCHA_ERROR:";
 const ENV_SITEKEY: &str = "ECORD_CAPTCHA_SITEKEY";
 const ENV_RQDATA: &str = "ECORD_CAPTCHA_RQDATA";
 const ENV_USER_AGENT: &str = "ECORD_CAPTCHA_UA";
@@ -192,6 +193,10 @@ struct Broker {
     /// Para despertar a la UI cuando llega algo (egui no repinta solo).
     repaint: Option<egui::Context>,
 }
+
+/// Último motivo por el que la ventana del captcha se cerró sin token (lo
+/// reporta el proceso hijo por stdout). `CaptchaController::poll` lo muestra.
+static LAST_WINDOW_ERROR: Mutex<Option<String>> = Mutex::new(None);
 
 static BROKER: LazyLock<Mutex<Broker>> = LazyLock::new(|| Mutex::new(Broker::default()));
 
@@ -315,11 +320,26 @@ fn spawn_window(id: u64, challenge: &CaptchaChallenge) -> Result<CaptchaWindow, 
     let rqtoken = challenge.rqtoken.clone();
     let session_id = challenge.session_id.clone();
     std::thread::spawn(move || {
-        let token = BufReader::new(stdout)
-            .lines()
-            .map_while(Result::ok)
-            .find_map(|line| line.strip_prefix(TOKEN_PREFIX).map(str::to_owned))
-            .filter(|token| !token.is_empty());
+        let mut token = None;
+        let mut window_error = None;
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(found) = line.strip_prefix(TOKEN_PREFIX) {
+                if !found.is_empty() {
+                    token = Some(found.to_owned());
+                    break;
+                }
+            } else if let Some(message) = line.strip_prefix(ERROR_PREFIX) {
+                window_error = Some(message.to_owned());
+            }
+        }
+        if token.is_none() {
+            if let Some(message) = window_error {
+                log::warn!("la ventana del captcha terminó con error: {message}");
+                if let Ok(mut slot) = LAST_WINDOW_ERROR.lock() {
+                    *slot = Some(message);
+                }
+            }
+        }
 
         // Esperar a que el proceso termine sin retener el candado (si no,
         // `CaptchaWindow::close` se quedaría esperando).
@@ -369,6 +389,11 @@ pub struct CaptchaController {
 impl CaptchaController {
     pub fn poll(&mut self) -> Vec<CaptchaNotice> {
         let mut notices = Vec::new();
+        if let Some(message) = LAST_WINDOW_ERROR.lock().ok().and_then(|mut slot| slot.take()) {
+            notices.push(CaptchaNotice::OpenFailed(format!(
+                "La ventana del captcha se cerró por un error: {message}"
+            )));
+        }
         self.queue.extend(take_requests());
 
         if self.active.as_ref().is_some_and(|(_, window)| window.is_finished()) {
@@ -420,6 +445,22 @@ pub fn run_window() -> ! {
     use tao::window::WindowBuilder;
     use wry::WebViewBuilder;
 
+    // Cualquier fallo de arranque (WebView2 ausente, carpeta de datos sin
+    // permisos, panic) se le avisa al proceso padre por stdout: en release
+    // este proceso no tiene consola y antes la ventana se cerraba sin dejar
+    // ningún rastro.
+    std::panic::set_hook(Box::new(|info| {
+        report_fatal(&format!("panic: {info}"));
+    }));
+    #[cfg(windows)]
+    if std::env::var_os("WEBVIEW2_USER_DATA_FOLDER").is_none() {
+        if let Some(dir) = crate::paths::webview_data_dir() {
+            let _ = std::fs::create_dir_all(&dir);
+            // SAFETY: todavía es el único hilo del proceso hijo.
+            unsafe { std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", dir) };
+        }
+    }
+
     let sitekey = std::env::var(ENV_SITEKEY).unwrap_or_default();
     let rqdata = std::env::var(ENV_RQDATA).ok();
     let user_agent = std::env::var(ENV_USER_AGENT).ok();
@@ -430,7 +471,7 @@ pub fn run_window() -> ! {
         .with_title("eCord — Verificación")
         .with_inner_size(LogicalSize::new(500.0, 680.0))
         .build(&event_loop)
-        .expect("no se pudo crear la ventana del captcha");
+        .unwrap_or_else(|error| report_fatal(&format!("no se pudo crear la ventana: {error}")));
 
     let script = init_script(&sitekey, rqdata.as_deref());
     let mut builder = WebViewBuilder::new()
@@ -444,7 +485,11 @@ pub fn run_window() -> ! {
     }
     let webview = builder
         .build(&window)
-        .expect("no se pudo crear el WebView del captcha (¿falta WebView2/webkit2gtk?)");
+        .unwrap_or_else(|error| {
+            report_fatal(&format!(
+                "no se pudo crear el WebView ({error}); ¿falta WebView2 (Windows) o webkit2gtk (Linux)?"
+            ))
+        });
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -463,6 +508,16 @@ pub fn run_window() -> ! {
             _ => {}
         }
     })
+}
+
+/// Avisa del error al proceso padre (stdout) y a stderr, y termina.
+fn report_fatal(message: &str) -> ! {
+    use std::io::Write;
+    let one_line = message.replace(['\r', '\n'], " ");
+    println!("{ERROR_PREFIX}{one_line}");
+    let _ = std::io::stdout().flush();
+    eprintln!("[captcha-window] {one_line}");
+    std::process::exit(1)
 }
 
 /// Script que corre al crear cada documento: en la página de discord.com

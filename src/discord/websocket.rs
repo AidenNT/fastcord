@@ -96,3 +96,20 @@ pub(crate) async fn connect(url: &str) -> Result<WebSocket, wreq::Error> {
     }
     result
 }
+
+/// Como [`connect`], pero mandando `Origin` en el handshake.
+///
+/// Solo lo usa el login por QR: `remote-auth-gateway.discord.gg` (a
+/// diferencia de `gateway.discord.gg`, ver la nota del módulo) rechaza el
+/// upgrade con `403` si no viene `Origin: https://discord.com`, igual que
+/// hace el cliente web. No usarlo para el Gateway principal ni para voz.
+pub(crate) async fn connect_with_origin(url: &str, origin: &str) -> Result<WebSocket, wreq::Error> {
+    let result = match client()?.websocket(url).header("Origin", origin).send().await {
+        Ok(response) => response.into_websocket().await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = &result {
+        log::warn!("handshake WebSocket (con Origin {origin}) a {url} falló: {error:?}");
+    }
+    result
+}

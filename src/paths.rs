@@ -19,6 +19,14 @@ fn state_dir() -> Option<PathBuf> {
     Some(dirs.state_dir().unwrap_or_else(|| dirs.data_local_dir()).to_path_buf())
 }
 
+/// Carpeta de datos de WebView2 para la ventana del captcha. Por defecto
+/// WebView2 la crea junto al .exe, y si eCord está instalado en
+/// `Program Files` no se puede escribir ahí: el WebView falla al crearse y
+/// la ventana se cierra al instante.
+pub fn webview_data_dir() -> Option<PathBuf> {
+    state_dir().map(|dir| dir.join("webview"))
+}
+
 /// Carpeta de caché (borrable sin perder nada): imágenes y JSON bajados.
 fn cache_dir() -> Option<PathBuf> {
     ProjectDirs::from("", "", APP_NAME).map(|dirs| dirs.cache_dir().to_path_buf())

@@ -58,7 +58,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::discord::AppEvent;
-use crate::discord::auth_http::{DiscordAuthSession, discord_login_headers};
+use crate::discord::auth_http::DiscordAuthSession;
 use crate::discord::fingerprint::ClientFingerprint;
 use crate::discord::websocket::{self, Message};
 
@@ -109,7 +109,7 @@ async fn run_once(auth_session: &DiscordAuthSession, tx: &std::sync::mpsc::Sende
     // `init` — ver el comentario de más arriba.
     let expected_fingerprint = URL_SAFE_NO_PAD.encode(Sha256::digest(pub_key_der.as_bytes()));
 
-    let ws_stream = websocket::connect(REMOTE_AUTH_URL).await?;
+    let ws_stream = websocket::connect_with_origin(REMOTE_AUTH_URL, crate::discord::fingerprint::DISCORD_ORIGIN).await?;
     let (mut write, mut read) = ws_stream.split();
 
     // El QR tarda un rato en escanearse, así que hay que mandar heartbeats
@@ -205,23 +205,30 @@ async fn run_once(auth_session: &DiscordAuthSession, tx: &std::sync::mpsc::Sende
     let ticket = ticket_for_login
         .ok_or_else(|| anyhow::anyhow!("El Gateway cerró la conexión antes de mandar el ticket de login"))?;
 
-    // Canjear el ticket por el token real vía REST — con el mismo
-    // cliente (y por lo tanto los mismos headers/cookies) que el resto
-    // del flujo de auth, no un `reqwest::Client` nuevo y anónimo.
+    // Canjear el ticket por el token real vía REST — con el mismo cliente
+    // (y por lo tanto los mismos headers/cookies) que el resto del flujo de
+    // auth. Pasa por `post_json`, que además resuelve un captcha si Discord
+    // lo pide en este paso, y devuelve el cuerpo para poder mostrar el
+    // motivo real si falla (antes `error_for_status` lo tiraba y solo se
+    // veía "403").
     #[derive(Deserialize)]
     struct LoginResponse {
         encrypted_token: String,
     }
-    let resp: LoginResponse = auth_session
-        .http()
-        .post(TICKET_EXCHANGE_URL)
-        .headers(discord_login_headers(auth_session.fingerprint()))
-        .json(&serde_json::json!({ "ticket": ticket }))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let (status, body) = crate::discord::password_auth::post_json(
+        auth_session,
+        TICKET_EXCHANGE_URL,
+        serde_json::json!({ "ticket": ticket }),
+        "No se pudo canjear el ticket del QR",
+    )
+    .await
+    .map_err(|message| anyhow::anyhow!(message))?;
+    if !status.is_success() {
+        let snippet: String = body.chars().take(300).collect();
+        log::warn!("remote-auth/login respondió {status}: {snippet}");
+        anyhow::bail!("Discord rechazó el canje del ticket del QR ({status}): {snippet}");
+    }
+    let resp: LoginResponse = serde_json::from_str(&body)?;
 
     let token_bytes = STANDARD.decode(resp.encrypted_token)?;
     let token = priv_key.decrypt(Oaep::new::<Sha256>(), &token_bytes)?;

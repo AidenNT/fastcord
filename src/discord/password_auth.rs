@@ -155,7 +155,7 @@ enum LoginOutcome {
 /// el cuerpo está deprecado). Devuelve el estado y el cuerpo de la
 /// respuesta final; `send_error` es el prefijo del error si no se puede ni
 /// mandar el pedido.
-async fn post_json(
+pub(super) async fn post_json(
     auth_session: &DiscordAuthSession,
     url: &str,
     body: Value,
