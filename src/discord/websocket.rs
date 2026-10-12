@@ -97,19 +97,32 @@ pub(crate) async fn connect(url: &str) -> Result<WebSocket, wreq::Error> {
     result
 }
 
-/// Como [`connect`], pero mandando `Origin` en el handshake.
+/// Socket del login por QR (tokio-tungstenite, no wreq).
+pub(crate) type QrSocket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Abre el WebSocket del login por QR con `tokio-tungstenite` + rustls y
+/// exactamente `headers` en el handshake.
 ///
-/// Solo lo usa el login por QR: `remote-auth-gateway.discord.gg` (a
-/// diferencia de `gateway.discord.gg`, ver la nota del módulo) rechaza el
-/// upgrade con `403` si no viene `Origin: https://discord.com`, igual que
-/// hace el cliente web. No usarlo para el Gateway principal ni para voz.
-pub(crate) async fn connect_with_origin(url: &str, origin: &str) -> Result<WebSocket, wreq::Error> {
-    let result = match client()?.websocket(url).header("Origin", origin).send().await {
-        Ok(response) => response.into_websocket().await,
-        Err(error) => Err(error),
-    };
-    if let Err(error) = &result {
-        log::warn!("handshake WebSocket (con Origin {origin}) a {url} falló: {error:?}");
+/// `remote-auth-gateway.discord.gg` devolvió `403` con todas las variantes de
+/// `wreq` (con y sin emulación de Chrome, con y sin `Origin`), mientras que
+/// con esta pila (la que se usaba antes de pasar todo a wreq) el QR andaba.
+/// Solo para el QR: el Gateway principal y la voz siguen usando [`connect`].
+pub(crate) async fn connect_qr(url: &str, headers: &[(&'static str, String)]) -> anyhow::Result<QrSocket> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+
+    let mut request = url.into_client_request()?;
+    for (name, value) in headers {
+        request.headers_mut().insert(
+            HeaderName::from_bytes(name.as_bytes())?,
+            HeaderValue::from_str(value)?,
+        );
     }
-    result
+    match tokio_tungstenite::connect_async(request).await {
+        Ok((socket, _response)) => Ok(socket),
+        Err(error) => {
+            log::warn!("handshake WebSocket del QR (tungstenite) a {url} falló: {error:?}");
+            Err(anyhow::anyhow!("handshake del QR rechazado (tungstenite): {error}"))
+        }
+    }
 }

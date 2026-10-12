@@ -722,6 +722,19 @@ fn normalize_system_locale(raw: &str) -> Option<String> {
     Some(locale)
 }
 
+/// Headers del handshake del WebSocket de login por QR: los mismos que
+/// mandaba la versión con `tokio-tungstenite`, con la que el login por QR
+/// funcionaba (User-Agent y Accept-Language del fingerprint + Origin).
+pub(super) fn discord_gateway_headers(fingerprint: &ClientFingerprint) -> Vec<(&'static str, String)> {
+    vec![
+        ("User-Agent", fingerprint.user_agent.clone()),
+        ("Accept-Language", accept_language(&fingerprint.system_locale)),
+        ("Origin", DISCORD_ORIGIN.to_owned()),
+        ("Cache-Control", "no-cache".to_owned()),
+        ("Pragma", "no-cache".to_owned()),
+    ]
+}
+
 pub(super) fn accept_language(locale: &str) -> String {
     let language = locale.split('-').next().unwrap_or(locale);
     if language.eq_ignore_ascii_case("en") {

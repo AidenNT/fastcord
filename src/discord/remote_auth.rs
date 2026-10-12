@@ -60,7 +60,8 @@ use sha2::{Digest, Sha256};
 use crate::discord::AppEvent;
 use crate::discord::auth_http::DiscordAuthSession;
 use crate::discord::fingerprint::ClientFingerprint;
-use crate::discord::websocket::{self, Message};
+use crate::discord::websocket;
+use tokio_tungstenite::tungstenite::Message;
 
 const REMOTE_AUTH_URL: &str = "wss://remote-auth-gateway.discord.gg/?v=2";
 const TICKET_EXCHANGE_URL: &str = "https://discord.com/api/v10/users/@me/remote-auth/login";
@@ -109,7 +110,11 @@ async fn run_once(auth_session: &DiscordAuthSession, tx: &std::sync::mpsc::Sende
     // `init` — ver el comentario de más arriba.
     let expected_fingerprint = URL_SAFE_NO_PAD.encode(Sha256::digest(pub_key_der.as_bytes()));
 
-    let ws_stream = websocket::connect_with_origin(REMOTE_AUTH_URL, crate::discord::fingerprint::DISCORD_ORIGIN).await?;
+    let ws_stream = websocket::connect_qr(
+        REMOTE_AUTH_URL,
+        &crate::discord::fingerprint::discord_gateway_headers(auth_session.fingerprint()),
+    )
+    .await?;
     let (mut write, mut read) = ws_stream.split();
 
     // El QR tarda un rato en escanearse, así que hay que mandar heartbeats

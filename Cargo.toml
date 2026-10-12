@@ -168,6 +168,13 @@ discord_client_structs = { path = "vendor/discord_client_structs" }
 # src/discord/websocket.rs) salen por wreq, con la misma huella TLS de Chrome que
 # el REST. Reemplaza a tokio-tungstenite, que ya no es dependencia directa.
 wreq = { version = "6.0.0-rc.29", features = ["gzip", "deflate", "zstd", "brotli", "json", "cookies", "socks", "ws"] }
+# Solo para el WebSocket del login por QR (src/discord/websocket.rs,
+# `connect_qr`): `remote-auth-gateway.discord.gg` devolvía 403 con todas las
+# variantes de wreq (con/sin emulación, con/sin Origin) y con tokio-tungstenite
+# + rustls funcionaba. La versión coincide con la que ya trae wreq (0.29); el
+# proveedor criptográfico de rustls en este proyecto es `ring` (única opción
+# en Cargo.lock), así que `ClientConfig::builder()` no necesita configuración.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 # Misma versión que usa vendor/discord_client_rest: websocket.rs arma la misma emulación
 # (Chrome149 / Windows) para que REST y WebSockets se vean como un solo navegador.
 wreq-util = "3.0.0-rc.14"
