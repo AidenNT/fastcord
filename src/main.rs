@@ -13,6 +13,7 @@ mod support;
 mod system_fonts;
 mod theme;
 mod ui;
+mod updater;
 
 use lib::state::App;
 
@@ -37,6 +38,13 @@ fn load_icon() -> egui::IconData {
 }
 
 fn main() -> eframe::Result<()> {
+    // Lo PRIMERO, antes del captcha, del logger y de la instancia única:
+    // si este proceso es el ayudante de una actualización (`--apply-update`)
+    // instala y sale sin abrir ventana; si no, quita las banderas del updater.
+    updater::intercept();
+    // `ecord --version`: el ayudante de la versión anterior lo ejecuta para
+    // comprobar el binario descargado antes de instalarlo.
+    updater::answer_version_probe();
     // Este mismo ejecutable también es la ventana del captcha de hCaptcha
     // (ver `discord::captcha`): en ese caso no se arranca eframe.
     if std::env::args().any(|arg| arg == discord::captcha::WINDOW_FLAG) {

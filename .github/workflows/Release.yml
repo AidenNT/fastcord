@@ -1,15 +1,25 @@
-# Compila eCord para Windows, Linux y macOS y publica todo en UN release de GitHub.
+# Compila eCord para Windows, Linux y macOS y publica todo en UN release de GitHub,
+# con los archivos que necesita el actualizador automático (src/updater.rs).
 #
 #   * Tag `v*` (git tag v0.1.0 && git push origin v0.1.0) -> compila todo y crea el release.
 #   * A mano (Actions > Release > Run workflow):
 #       - con "tag" -> compila y crea/actualiza ese release;
 #       - sin "tag" -> solo compila y deja los archivos como artefactos.
 #
-# Salidas:
-#   Windows : .msi (WiX) + .exe (NSIS) + .zip portable
-#   Linux   : UN .deb con FFmpeg 8.1 incluido en /usr/lib/ecord (sirve en cualquier distro
-#             reciente); un job aparte lo instala en varias distros y comprueba las .so
-#   macOS   : .dmg (experimental: no bloquea el release si falla)
+# Requisitos para publicar (ver packaging/ACTUALIZACIONES.md):
+#   1. REPOSITORY en src/updater.rs = este repo (dueño/nombre).
+#   2. assets/update-public-key.hex = clave pública Ed25519 (64 hex).
+#   3. Secreto del repo ECORD_UPDATE_KEY = clave privada PEM correspondiente.
+#   El job "Versión" lo comprueba todo ANTES de gastar una hora compilando.
+#
+# Archivos del release (los nombres los fija el actualizador, no los cambies):
+#   Windows : ecord-vX-x86_64-pc-windows-msvc.zip        (portable, se actualiza solo)
+#             ecord-vX-x86_64-pc-windows-msvc-setup.exe  (instalador por usuario, se actualiza solo)
+#             ecord-vX-windows-x64.msi                   (instalación manual/empresas, por equipo)
+#   Linux   : ecord-vX-x86_64-unknown-linux-gnu.tar.gz   (portable con FFmpeg, se actualiza solo)
+#             ecord-vX-linux-amd64.deb                   (FFmpeg incluido; lo actualiza apt/dpkg, no la app)
+#   macOS   : ecord-vX-macos-universal.dmg               (arm64 + x86_64, experimental)
+#   Todos   : checksums.txt + checksums.txt.sig          (SHA-256 firmado con Ed25519)
 #
 # Por qué un runner por sistema y no cross-compile: el proyecto enlaza FFmpeg,
 # WebKitGTK/WebView2, ALSA/Pulse y BoringSSL (nasm/cmake). Todo eso se compila
@@ -40,7 +50,7 @@ env:
 jobs:
   # ---------------------------------------------------------------- versión
   meta:
-    name: Versión
+    name: Versión y configuración del actualizador
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.v.outputs.version }}
@@ -58,7 +68,7 @@ jobs:
           else v="dev-${GITHUB_SHA::7}"; rel=false; fi
           echo "version=$v"  >> "$GITHUB_OUTPUT"
           echo "release=$rel" >> "$GITHUB_OUTPUT"
-          # MSI/deb toman la versión de Cargo.toml: tiene que coincidir con el tag.
+          # MSI/deb y el actualizador toman la versión de Cargo.toml: tiene que coincidir con el tag.
           if [ "$rel" = true ]; then
             cargo_v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
             if [ "v$cargo_v" != "$v" ]; then
@@ -66,6 +76,40 @@ jobs:
               exit 1
             fi
           fi
+
+      # Falla rápido si el actualizador quedaría roto en el release.
+      - name: Comprobar configuración del actualizador
+        if: steps.v.outputs.release == 'true'
+        env:
+          ECORD_UPDATE_KEY: ${{ secrets.ECORD_UPDATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          repo=$(grep -m1 'pub const REPOSITORY' src/updater.rs | cut -d'"' -f2)
+          if [ "${repo,,}" != "${GITHUB_REPOSITORY,,}" ]; then
+            echo "::error file=src/updater.rs::REPOSITORY = \"$repo\", pero el release se publica en \"$GITHUB_REPOSITORY\". Las copias instaladas buscarían actualizaciones en otro repo."
+            exit 1
+          fi
+
+          pub=$(tr -d ' \r\n' < assets/update-public-key.hex)
+          if ! [[ "$pub" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "::error file=assets/update-public-key.hex::La clave pública no son 64 caracteres hexadecimales (¿sigue el texto de ejemplo?)."
+            exit 1
+          fi
+
+          if [ -z "$ECORD_UPDATE_KEY" ]; then
+            echo "::error::Falta el secreto ECORD_UPDATE_KEY (clave privada Ed25519 en PEM). Sin él el release no se puede firmar y las copias instaladas lo rechazarían."
+            exit 1
+          fi
+          key="$RUNNER_TEMP/k.pem"
+          (umask 077; printf '%s\n' "$ECORD_UPDATE_KEY" > "$key")
+          trap 'rm -f "$key"' EXIT
+          derived=$(openssl pkey -in "$key" -pubout -outform DER | tail -c 32 | od -An -v -tx1 | tr -d ' \n')
+          if [ "${derived,,}" != "${pub,,}" ]; then
+            echo "::error::ECORD_UPDATE_KEY no corresponde a assets/update-public-key.hex. Firmarías releases que las copias instaladas rechazan."
+            exit 1
+          fi
+          echo "Actualizador OK: repo=$repo, la clave privada coincide con la pública."
 
   # ---------------------------------------------------------------- Windows
   windows:
@@ -75,6 +119,8 @@ jobs:
     timeout-minutes: 120
     env:
       VERSION: ${{ needs.meta.outputs.version }}
+      # Triple que usa el actualizador en los nombres de archivo.
+      TARGET: x86_64-pc-windows-msvc
       # FFmpeg de BtbN (build "shared" LGPL con include/ lib/ bin/).
       FFMPEG_ASSET: ffmpeg-n8.1-latest-win64-lgpl-shared-8.1
       FFMPEG_DIR: C:\ffmpeg
@@ -163,7 +209,7 @@ jobs:
       - name: Instalar cargo-packager
         run: cargo install cargo-packager --locked
 
-      - name: DLLs de FFmpeg y avisos de licencias para el instalador
+      - name: DLLs de FFmpeg, avisos de licencias y marcador del instalador
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force packaging\bundle-libs | Out-Null
@@ -176,6 +222,10 @@ jobs:
           Copy-Item assets\icons\LICENSE.txt packaging\notices\Lucide-LICENSE.txt
           if (Test-Path "$env:FFMPEG_DIR\LICENSE.txt") { Copy-Item "$env:FFMPEG_DIR\LICENSE.txt" packaging\notices\FFmpeg-LICENSE.txt }
           Copy-Item packaging\notices\* packaging\bundle-libs\
+          # Marcador que le dice al actualizador "esto es una copia instalada por el
+          # instalador": sin él, esa copia no se actualiza sola. Solo va en el instalador;
+          # el zip portable lleva ecord-portable.txt (más abajo).
+          Copy-Item packaging\ecord-installer.txt packaging\bundle-libs\
 
       - name: Generar .msi y .exe (setup)
         shell: pwsh
@@ -191,25 +241,25 @@ jobs:
       - name: Reunir archivos
         shell: pwsh
         run: |
-          $n = "ecord-$env:VERSION-windows-x64"
+          $n = "ecord-$env:VERSION-$env:TARGET"
           New-Item -ItemType Directory -Force dist | Out-Null
           $msi = Get-ChildItem dist-installers -Recurse -Filter *.msi | Select-Object -First 1
           $exe = Get-ChildItem dist-installers -Recurse -Filter *-setup.exe | Select-Object -First 1
           if (-not $msi) { throw "No se generó ningún .msi en dist-installers (mirá el paso anterior)" }
           if (-not $exe) { throw "No se generó el instalador -setup.exe en dist-installers (mirá el paso anterior)" }
-          Copy-Item $msi.FullName "dist\$n.msi"
+          # El .exe (NSIS) instala por usuario, sin elevación: es el que usa el actualizador.
           Copy-Item $exe.FullName "dist\$n-setup.exe"
-          # ZIP portable (exe + DLLs)
+          # El .msi (WiX) instala por equipo y pide elevación, que el actualizador no puede
+          # dar. Va con otro nombre (sin el triple) para que no lo elija por error.
+          Copy-Item $msi.FullName "dist\ecord-$env:VERSION-windows-x64.msi"
+          # ZIP portable: carpeta ecord-vX-<target>\ con ecord.exe, DLLs y ecord-portable.txt.
           $stage = "stage\$n"
           New-Item -ItemType Directory -Force $stage | Out-Null
           Copy-Item target\release\ecord.exe $stage
           Copy-Item "$env:FFMPEG_DIR\bin\*.dll" $stage
           Copy-Item packaging\notices\* $stage
-          Compress-Archive -Path "$stage\*" -DestinationPath "dist\$n-portable.zip" -Force
-          Get-ChildItem dist | ForEach-Object {
-            $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
-            "$h  $($_.Name)" | Out-File "$($_.FullName).sha256" -Encoding ascii
-          }
+          Copy-Item packaging\ecord-portable.txt $stage
+          Compress-Archive -Path $stage -DestinationPath "dist\$n.zip" -Force
           Get-ChildItem dist | Format-Table Name, Length
 
       - uses: actions/upload-artifact@v4
@@ -219,17 +269,20 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------- Linux
-  # Un solo .deb para todas las distros: FFmpeg (compilación de BtbN) viaja dentro
-  # del paquete, en /usr/lib/ecord, y el binario lo encuentra por rpath. Se compila
-  # en Ubuntu 22.04 (glibc 2.35) para que el binario corra también en distros nuevas.
+  # FFmpeg (compilación de BtbN) viaja dentro de los dos paquetes:
+  #   * .deb          -> /usr/lib/ecord, el binario lo encuentra por rpath. Lo actualiza apt.
+  #   * .tar.gz       -> carpeta lib/ junto al ejecutable (rpath $ORIGIN/lib). Es el que se
+  #                      actualiza solo desde la app (lleva ecord-portable.txt).
+  # Se compila en Ubuntu 22.04 (glibc 2.35) para que corra también en distros nuevas.
   linux:
-    name: Linux x64 (.deb con FFmpeg incluido)
+    name: Linux x64 (.deb y .tar.gz con FFmpeg incluido)
     needs: meta
     runs-on: ubuntu-latest
     container: ubuntu:22.04
     timeout-minutes: 120
     env:
       VERSION: ${{ needs.meta.outputs.version }}
+      TARGET: x86_64-unknown-linux-gnu
       DEBIAN_FRONTEND: noninteractive
       # GPL = trae libx264 (hace falta para transmitir pantalla). Para una build
       # LGPL, sin x264, cambiá "gpl" por "lgpl".
@@ -304,9 +357,34 @@ jobs:
           cargo deb --no-build --variant bundled
           mkdir -p dist
           cp target/debian/*.deb "dist/ecord-${VERSION}-linux-amd64.deb"
-          (cd dist && sha256sum *.deb > "ecord-${VERSION}-linux-amd64.deb.sha256")
           dpkg-deb --info dist/*.deb
           dpkg-deb --contents dist/*.deb | grep -E "usr/bin|usr/lib/ecord"
+
+      # Portable: el que el actualizador sabe reemplazar. Carpeta ecord-vX-<target>/ con el
+      # ejecutable `ecord`, ecord-portable.txt a su lado y las .so de FFmpeg en lib/.
+      # El .deb NO lleva el marcador: lo gestiona apt.
+      - name: Generar .tar.gz portable
+        run: |
+          N="ecord-${VERSION}-${TARGET}"
+          mkdir -p "stage/$N/lib" dist
+          # Copia del binario con otro rpath; el de target/release (para el .deb) no se toca.
+          cp target/release/ecord "stage/$N/ecord"
+          patchelf --set-rpath '$ORIGIN/lib' "stage/$N/ecord"
+          cp packaging/linux/ffmpeg-libs/* "stage/$N/lib/"
+          cp packaging/ecord-portable.txt "stage/$N/"
+          cp THIRD_PARTY_NOTICES.md "stage/$N/"
+          cp LICENSE "stage/$N/LICENSE.txt"
+          cp assets/fonts/Inter-LICENSE.txt assets/fonts/NotoEmoji-LICENSE.txt "stage/$N/"
+          cp assets/icons/LICENSE.txt "stage/$N/Lucide-LICENSE.txt"
+          cp packaging/linux/ffmpeg-LICENSE.txt "stage/$N/FFmpeg-LICENSE.txt"
+          # Que el ejecutable portable encuentre FFmpeg en lib/ (y no en /usr/lib/ecord).
+          ldd "stage/$N/ecord" | tee /tmp/ldd-portable.txt
+          if grep -q "not found" /tmp/ldd-portable.txt; then
+            echo "::error::El portable tiene bibliotecas sin resolver"; grep -B1 "not found" /tmp/ldd-portable.txt; exit 1
+          fi
+          tar -C stage -czf "dist/$N.tar.gz" "$N"
+          tar -tzf "dist/$N.tar.gz" | head -30
+          ls -l dist
 
       - uses: actions/upload-artifact@v4
         with:
@@ -314,10 +392,10 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # Instala el .deb en distros limpias y mira si queda alguna biblioteca sin resolver.
-  # Informa, pero no bloquea el release.
+  # Instala el .deb en distros limpias y mira si queda alguna biblioteca sin resolver
+  # (en el .deb y en el .tar.gz portable). Informa, pero no bloquea el release.
   linux-verify:
-    name: Verificar .deb en ${{ matrix.image }}
+    name: Verificar paquetes en ${{ matrix.image }}
     needs: [meta, linux]
     runs-on: ubuntu-latest
     container: ${{ matrix.image }}
@@ -343,23 +421,42 @@ jobs:
         run: |
           apt-get update
           apt-get install -y ./dist/*.deb
-      - name: Comprobar bibliotecas
+      - name: Comprobar bibliotecas del .deb
         run: |
           ldd /usr/bin/ecord | tee /tmp/ldd.txt
           for f in /usr/lib/ecord/*.so.*; do echo "== $f"; ldd "$f"; done | tee -a /tmp/ldd.txt
           if grep -q "not found" /tmp/ldd.txt; then
             echo "::error::Faltan bibliotecas en ${{ matrix.image }}"; grep -B1 "not found" /tmp/ldd.txt; exit 1
           fi
+      # Las dependencias del sistema ya las trajo el .deb; el portable usa las mismas.
+      - name: Comprobar el .tar.gz portable
+        run: |
+          mkdir -p /tmp/portable
+          tar -xzf dist/*.tar.gz -C /tmp/portable
+          exe=$(echo /tmp/portable/*/ecord)
+          test -f "$(dirname "$exe")/ecord-portable.txt"
+          ldd "$exe" | tee /tmp/ldd-portable.txt
+          if grep -q "not found" /tmp/ldd-portable.txt; then
+            echo "::error::El portable tiene bibliotecas sin resolver en ${{ matrix.image }}"; grep -B1 "not found" /tmp/ldd-portable.txt; exit 1
+          fi
 
   # ---------------------------------------------------------------- macOS
-  macos:
-    name: macOS arm64 (.dmg, experimental)
+  # El actualizador espera UN .dmg universal (ecord-vX-macos-universal.dmg). Se compila
+  # una vez por arquitectura (cada una con su Homebrew y su FFmpeg) y un job aparte las
+  # une con lipo. Experimental: si falla, no bloquea Windows/Linux (pero ese release
+  # saldrá sin .dmg).
+  macos-build:
+    name: macOS ${{ matrix.arch }} (compilación)
     needs: meta
-    runs-on: macos-14
-    continue-on-error: true   # que un fallo acá no frene Windows/Linux
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: true
     timeout-minutes: 120
-    env:
-      VERSION: ${{ needs.meta.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: arm64,  runner: macos-14 }
+          - { arch: x86_64, runner: macos-15-intel }
     steps:
       - uses: actions/checkout@v4
 
@@ -370,17 +467,76 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-${{ matrix.arch }}
 
       - name: cargo build --release
         run: cargo build --release --locked
 
-      # Mete las dylibs de FFmpeg dentro de la app para no exigirle Homebrew al usuario.
+      # Mete las dylibs de FFmpeg junto al binario para no exigirle Homebrew al usuario.
       - name: Embeber dylibs
         run: |
-          mkdir -p packaging/bundle-libs
+          mkdir -p packaging/bundle-libs out
           dylibbundler -od -b -x target/release/ecord \
             -d packaging/bundle-libs -p @executable_path/../Resources/
+          cp target/release/ecord out/ecord
+          cp -R packaging/bundle-libs out/libs
+          file out/ecord
+
+      # Nombre `build-*` (no `ecord-*`) a propósito: el job de publicación sube todo lo
+      # que empieza con `ecord-`, y esto son piezas intermedias.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-macos-${{ matrix.arch }}
+          path: out
+          if-no-files-found: error
+
+  macos:
+    name: macOS universal (.dmg, experimental)
+    needs: [meta, macos-build]
+    runs-on: macos-14
+    continue-on-error: true   # que un fallo acá no frene Windows/Linux
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-macos-arm64
+          path: parts/arm64
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-macos-x86_64
+          path: parts/x86_64
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Unir arm64 + x86_64 (lipo)
+        run: |
+          mkdir -p target/release packaging/bundle-libs
+          lipo -create parts/arm64/ecord parts/x86_64/ecord -output target/release/ecord
+          lipo -archs target/release/ecord
+
+          # Cada dylib se une con su par. Si una solo existe en una arquitectura, se copia
+          # tal cual: solo la carga el binario de esa arquitectura.
+          for f in parts/arm64/libs/*.dylib parts/x86_64/libs/*.dylib; do
+            b=$(basename "$f")
+            [ -f "packaging/bundle-libs/$b" ] && continue
+            if [ -f "parts/arm64/libs/$b" ] && [ -f "parts/x86_64/libs/$b" ]; then
+              lipo -create "parts/arm64/libs/$b" "parts/x86_64/libs/$b" -output "packaging/bundle-libs/$b"
+            else
+              echo "::warning::$b existe en una sola arquitectura"
+              cp "$f" "packaging/bundle-libs/$b"
+            fi
+          done
+          ls -l packaging/bundle-libs
+
+          # lipo invalida las firmas: firma de nuevo (ad-hoc), dylibs primero.
+          for f in packaging/bundle-libs/*.dylib; do codesign --force --sign - "$f"; done
           codesign --force --sign - target/release/ecord
+
           # Avisos de licencias dentro de la app (mismo glob que las dylibs).
           cp THIRD_PARTY_NOTICES.md packaging/bundle-libs/
           cp LICENSE packaging/bundle-libs/LICENSE.txt
@@ -392,12 +548,12 @@ jobs:
           cargo install cargo-packager --locked
           cargo packager --release --formats dmg
           mkdir -p dist
-          cp dist-installers/*.dmg "dist/ecord-${VERSION}-macos-arm64.dmg"
-          (cd dist && shasum -a 256 *.dmg > "ecord-${VERSION}-macos-arm64.dmg.sha256")
+          cp dist-installers/*.dmg "dist/ecord-${VERSION}-macos-universal.dmg"
+          ls -l dist
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ecord-${{ env.VERSION }}-macos-arm64
+          name: ecord-${{ env.VERSION }}-macos-universal
           path: dist/*
           if-no-files-found: error
 
@@ -413,6 +569,34 @@ jobs:
           pattern: ecord-*
           merge-multiple: true
           path: dist
+
+      # checksums.txt lista TODOS los archivos del release; la firma (Ed25519, cruda, 64
+      # bytes) es lo que valida el actualizador antes de descargar nada.
+      - name: Firmar checksums.txt
+        env:
+          ECORD_UPDATE_KEY: ${{ secrets.ECORD_UPDATE_KEY }}
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -l
+          sha256sum ecord-v* > checksums.txt
+          cat checksums.txt
+
+          key="$RUNNER_TEMP/ecord-update-key.pem"
+          (umask 077; printf '%s\n' "$ECORD_UPDATE_KEY" > "$key")
+          trap 'rm -f "$key" "$RUNNER_TEMP/ecord-update-pub.pem"' EXIT
+
+          openssl pkeyutl -sign -rawin -inkey "$key" -in checksums.txt -out checksums.txt.sig
+          test "$(stat -c %s checksums.txt.sig)" = 64
+
+          # Comprobación con la clave pública que está EN EL REPO (la que lleva la app).
+          pub=$(tr -d ' \r\n' < ../assets/update-public-key.hex)
+          python3 -c 'import sys; sys.stdout.buffer.write(bytes.fromhex("302a300506032b6570032100" + sys.argv[1]))' "$pub" > "$RUNNER_TEMP/pub.der"
+          openssl pkey -pubin -inform DER -in "$RUNNER_TEMP/pub.der" -out "$RUNNER_TEMP/ecord-update-pub.pem"
+          openssl pkeyutl -verify -rawin -pubin -inkey "$RUNNER_TEMP/ecord-update-pub.pem" \
+            -in checksums.txt -sigfile checksums.txt.sig
+          echo "Firma verificada con assets/update-public-key.hex"
+
       - run: ls -l dist
       - uses: softprops/action-gh-release@v2
         with:

@@ -60,8 +60,7 @@ use sha2::{Digest, Sha256};
 use crate::discord::AppEvent;
 use crate::discord::auth_http::DiscordAuthSession;
 use crate::discord::fingerprint::ClientFingerprint;
-use crate::discord::websocket;
-use tokio_tungstenite::tungstenite::Message;
+use crate::discord::websocket::{self, Message};
 
 const REMOTE_AUTH_URL: &str = "wss://remote-auth-gateway.discord.gg/?v=2";
 const TICKET_EXCHANGE_URL: &str = "https://discord.com/api/v10/users/@me/remote-auth/login";

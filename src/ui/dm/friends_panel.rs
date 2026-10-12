@@ -252,8 +252,8 @@ fn dm_row_compact(
 
 pub(crate) fn user_bar(ui: &mut egui::Ui, app: &mut App) {
     let palette = app.palette;
-    let self_mute = app.voice_target.as_ref().is_some_and(|t| t.self_mute);
-    let self_deaf = app.voice_target.as_ref().is_some_and(|t| t.self_deaf);
+    let self_mute = app.voice_target.as_ref().map_or(app.self_mute, |t| t.self_mute);
+    let self_deaf = app.voice_target.as_ref().map_or(app.self_deaf, |t| t.self_deaf);
 
     let mut settings_clicked = false;
     let mut deafen_clicked = false;

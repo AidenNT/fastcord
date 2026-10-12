@@ -1,7 +1,6 @@
 //! Cliente WebSocket común a todo `ecord` (Gateway, login por QR y voz).
 //!
-//! Antes cada uno abría su socket con `tokio-tungstenite` (TLS de rustls,
-//! huella propia). Ahora todos pasan por el mismo `wreq::Client` con la
+//! Todos los sockets pasan por el mismo `wreq::Client` con la
 //! emulación de Chrome que usa el REST vendorizado, así que el tráfico de la
 //! cuenta se ve como un solo navegador y hay una única pila TLS para sockets.
 //!
@@ -41,6 +40,7 @@ use std::sync::OnceLock;
 use wreq_util::{Emulation, Platform, Profile};
 
 pub(crate) use wreq::ws::WebSocket;
+use wreq::header::OrigHeaderMap;
 pub(crate) use wreq::ws::message::Message;
 
 /// Cliente `wreq` compartido (se arma una sola vez y se reusa entre
@@ -82,10 +82,41 @@ fn client() -> Result<&'static wreq::Client, wreq::Error> {
     Ok(CLIENT.get_or_init(|| client))
 }
 
+/// Grafía y orden de los headers del handshake WebSocket tal como los manda
+/// Chrome por HTTP/1.1 (el upgrade a WebSocket NO va por HTTP/2, así que acá
+/// sí se ve la grafía: `Title-Case`, con `Sec-WebSocket-*` en mayúsculas
+/// internas). Sin esto wreq los manda todos en minúscula, que es lo que un
+/// navegador real nunca hace en HTTP/1.1 y lo que delata al cliente.
+///
+/// `OrigHeaderMap` solo fija CÓMO se escribe cada nombre y en qué orden; los
+/// valores siguen siendo los de la emulación o los que se agreguen aparte.
+/// El orden es el de Chrome en el cable (las capturas de HTTP Toolkit lo
+/// muestran ordenado alfabéticamente, no es el real).
+pub(crate) fn browser_ws_header_case() -> OrigHeaderMap {
+    let mut map = OrigHeaderMap::new();
+    for name in [
+        "Host",
+        "Connection",
+        "Pragma",
+        "Cache-Control",
+        "User-Agent",
+        "Upgrade",
+        "Origin",
+        "Sec-WebSocket-Version",
+        "Accept-Encoding",
+        "Accept-Language",
+        "Sec-WebSocket-Key",
+        "Sec-WebSocket-Extensions",
+    ] {
+        map.insert(name);
+    }
+    map
+}
+
 /// Abre un WebSocket (`ws://` o `wss://`). Los headers del handshake son los
 /// de la emulación (ver la nota del módulo).
 pub(crate) async fn connect(url: &str) -> Result<WebSocket, wreq::Error> {
-    let result = match client()?.websocket(url).send().await {
+    let result = match client()?.websocket(url).orig_headers(browser_ws_header_case()).send().await {
         Ok(response) => response.into_websocket().await,
         Err(error) => Err(error),
     };
@@ -97,32 +128,25 @@ pub(crate) async fn connect(url: &str) -> Result<WebSocket, wreq::Error> {
     result
 }
 
-/// Socket del login por QR (tokio-tungstenite, no wreq).
-pub(crate) type QrSocket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
-/// Abre el WebSocket del login por QR con `tokio-tungstenite` + rustls y
-/// exactamente `headers` en el handshake.
+/// Abre el WebSocket del login por QR con `wreq` (misma emulación de Chrome
+/// que el resto) y `headers` propios en el handshake, escritos con la grafía
+/// y el orden de un navegador real (`browser_ws_header_case`).
 ///
-/// `remote-auth-gateway.discord.gg` devolvió `403` con todas las variantes de
-/// `wreq` (con y sin emulación de Chrome, con y sin `Origin`), mientras que
-/// con esta pila (la que se usaba antes de pasar todo a wreq) el QR andaba.
-/// Solo para el QR: el Gateway principal y la voz siguen usando [`connect`].
-pub(crate) async fn connect_qr(url: &str, headers: &[(&'static str, String)]) -> anyhow::Result<QrSocket> {
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
-
-    let mut request = url.into_client_request()?;
+/// Antes esto salía por `tokio-tungstenite` porque con `wreq` el servidor
+/// devolvía `403`: los headers propios se mandaban todos en minúscula, algo
+/// que Chrome no hace en HTTP/1.1. Con la grafía corregida el handshake pasa
+/// y ya no hace falta una segunda pila de WebSocket.
+pub(crate) async fn connect_qr(url: &str, headers: &[(&'static str, String)]) -> anyhow::Result<WebSocket> {
+    let mut request = client()?.websocket(url).orig_headers(browser_ws_header_case());
     for (name, value) in headers {
-        request.headers_mut().insert(
-            HeaderName::from_bytes(name.as_bytes())?,
-            HeaderValue::from_str(value)?,
-        );
+        request = request.header(*name, value.as_str());
     }
-    match tokio_tungstenite::connect_async(request).await {
-        Ok((socket, _response)) => Ok(socket),
-        Err(error) => {
-            log::warn!("handshake WebSocket del QR (tungstenite) a {url} falló: {error:?}");
-            Err(anyhow::anyhow!("handshake del QR rechazado (tungstenite): {error}"))
-        }
-    }
+    let result = match request.send().await {
+        Ok(response) => response.into_websocket().await,
+        Err(error) => Err(error),
+    };
+    result.map_err(|error| {
+        log::warn!("handshake WebSocket del QR a {url} falló: {error:?}");
+        anyhow::anyhow!("handshake del QR rechazado: {error}")
+    })
 }

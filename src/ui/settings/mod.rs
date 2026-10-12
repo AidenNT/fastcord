@@ -15,6 +15,7 @@
 pub mod account_settings;
 pub mod changelog;
 pub mod memory_view;
+pub mod updates;
 
 use egui::{Area, Color32, CornerRadius, Frame, Margin, Order, ScrollArea, Sense, Stroke, UiBuilder, Vec2};
 
@@ -50,6 +51,8 @@ pub enum SettingsTab {
 enum Action {
     Close,
     OpenChangelog,
+    /// Buscar / instalar actualizaciones (Ajustes → Cuenta → Acerca de).
+    Update(updates::UiAction),
     SetMode(ThemeMode),
     SetImageMode(crate::ui::chat::anim::ImageMode),
     SetNotificationSide(NotificationSide),
@@ -64,7 +67,6 @@ enum Action {
     SetTab(SettingsTab),
     SetVoiceInputSource(Option<String>),
     SetVoiceOutputSource(Option<String>),
-    SetAllowMicrophoneTransmit(bool),
     SetNoiseSuppression(bool),
     SetMicrophoneSensitivity(i8),
     SetMicrophoneVolume(u8),
@@ -271,6 +273,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                                     {
                                         action = Some(Action::OpenChangelog);
                                     }
+                                    ui.add_space(14.0);
+                                    if let Some(taken) = updates::section(ui, &palette) {
+                                        action = Some(Action::Update(taken));
+                                    }
                                 }
                                 SettingsTab::Voice => {
                                     if let Some(taken) = voice_settings_view(
@@ -307,6 +313,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         match action {
             Action::Close => app.settings_open = false,
             Action::OpenChangelog => app.open_changelog(),
+            Action::Update(taken) => updates::apply(app, ui.ctx(), taken),
             Action::SetMode(mode) => app.set_theme_mode(mode),
             Action::SetImageMode(mode) => app.set_image_mode(mode),
             Action::SetNotificationSide(side) => app.set_notification_side(side),
@@ -345,7 +352,6 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             }
             Action::SetVoiceInputSource(id) => app.set_voice_input_source(id),
             Action::SetVoiceOutputSource(id) => app.set_voice_output_source(id),
-            Action::SetAllowMicrophoneTransmit(allow) => app.set_voice_allow_microphone_transmit(allow),
             Action::SetNoiseSuppression(enabled) => app.set_voice_noise_suppression(enabled),
             Action::SetMicrophoneSensitivity(db) => app.set_voice_microphone_sensitivity(db),
             Action::SetMicrophoneVolume(percent) => app.set_voice_microphone_volume(percent),
@@ -1094,32 +1100,12 @@ fn voice_settings_view(
     theme::section_title(ui, palette, "Micrófono");
     ui.add_space(8.0);
 
-    if theme::soft_button(
-        ui,
-        palette,
-        None,
-        "Permitir que el micrófono transmita",
-        audio.allow_microphone_transmit,
-    )
-    .clicked()
-    {
-        action = Some(Action::SetAllowMicrophoneTransmit(!audio.allow_microphone_transmit));
-    }
-    theme::text(
-        ui,
-        "Apagado por default: hasta que lo prendas acá, unirte a un canal de voz no manda \
-         audio tuyo, aunque no estés silenciado.",
-        theme::regular(11.5),
-        palette.dim,
-    );
-    ui.add_space(12.0);
-
     if theme::soft_button(ui, palette, None, "Configurar micrófono y Clean Mic…", false).clicked() {
         action = Some(Action::OpenCleanMic);
     }
     ui.add_space(12.0);
 
-    ui.add_enabled_ui(audio.allow_microphone_transmit, |ui| {
+    ui.scope(|ui| {
         if theme::soft_button(ui, palette, None, "Supresión de ruido", audio.noise_suppression).clicked() {
             action = Some(Action::SetNoiseSuppression(!audio.noise_suppression));
         }

@@ -433,8 +433,8 @@ pub fn content_modern(app: &mut App, ui: &mut egui::Ui) {
 
     // --- Píldora de abajo: silenciar, ensordecer, ajustes ----------------
     {
-        let self_mute = app.voice_target.as_ref().is_some_and(|t| t.self_mute);
-        let self_deaf = app.voice_target.as_ref().is_some_and(|t| t.self_deaf);
+        let self_mute = app.voice_target.as_ref().map_or(app.self_mute, |t| t.self_mute);
+        let self_deaf = app.voice_target.as_ref().map_or(app.self_deaf, |t| t.self_deaf);
         let cx = bottom_rect.center().x;
         let y0 = bottom_rect.min.y + M_PAD + M_ICON / 2.0;
         let y1 = y0 + M_ICON + M_STEP;

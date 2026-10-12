@@ -7,6 +7,7 @@ pub(crate) use crate::theme;
 pub mod auth;
 pub mod call;
 pub mod chat;
+pub mod devtools;
 pub mod dm;
 pub mod home;
 pub mod profile_popup;

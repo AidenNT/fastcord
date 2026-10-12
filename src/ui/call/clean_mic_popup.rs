@@ -26,7 +26,6 @@ const CARD_SIZE: Vec2 = Vec2::new(640.0, 700.0);
 enum Action {
     Close,
     SetInput(Option<String>),
-    SetAllowTransmit(bool),
     SetNoiseSuppression(bool),
     SetSensitivity(i8),
     SetVolume(u8),
@@ -124,19 +123,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                                 });
                         });
                         ui.add_space(8.0);
-                        if theme::soft_button(
-                            ui,
-                            &palette,
-                            None,
-                            "Permitir que el micrófono transmita",
-                            audio.allow_microphone_transmit,
-                        )
-                        .clicked()
-                        {
-                            action = Some(Action::SetAllowTransmit(!audio.allow_microphone_transmit));
-                        }
-                        ui.add_space(6.0);
-                        ui.add_enabled_ui(audio.allow_microphone_transmit, |ui| {
+                        ui.scope(|ui| {
                             if theme::soft_button(
                                 ui,
                                 &palette,
@@ -320,7 +307,6 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         match action {
             Action::Close => app.clean_mic_open = false,
             Action::SetInput(id) => app.set_voice_input_source(id),
-            Action::SetAllowTransmit(allow) => app.set_voice_allow_microphone_transmit(allow),
             Action::SetNoiseSuppression(enabled) => app.set_voice_noise_suppression(enabled),
             Action::SetSensitivity(db) => app.set_voice_microphone_sensitivity(db),
             Action::SetVolume(percent) => app.set_voice_microphone_volume(percent),

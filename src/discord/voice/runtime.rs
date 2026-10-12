@@ -323,7 +323,7 @@ impl VoiceRuntimeState {
         if active.scope != requested.scope || active.channel_id != requested.channel_id {
             return None;
         }
-        let capture_enabled = requested.allow_microphone_transmit && !requested.self_mute;
+        let capture_enabled = !requested.self_mute;
         Some(VoiceCaptureGate {
             transmit_epoch: 0,
             capture_enabled,

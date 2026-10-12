@@ -43,8 +43,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, width: f32) {
     let status = app.voice_connection_status;
     let phase = app.voice_connect_phase;
     let connected = app.voice_fully_connected();
-    let self_mute = app.voice_target.as_ref().is_some_and(|t| t.self_mute);
-    let self_deaf = app.voice_target.as_ref().is_some_and(|t| t.self_deaf);
+    let self_mute = app.voice_target.as_ref().map_or(app.self_mute, |t| t.self_mute);
+    let self_deaf = app.voice_target.as_ref().map_or(app.self_deaf, |t| t.self_deaf);
     let label = app
         .current_voice_channel_label()
         .unwrap_or_else(|| "Llamada de voz".to_string());

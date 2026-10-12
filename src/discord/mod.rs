@@ -26,7 +26,7 @@ pub mod uploads;
 pub mod user_settings;
 pub mod uwu_rest;
 pub mod voice;
-mod websocket;
+pub(crate) mod websocket;
 
 /// Texto con el que Discord (vía el cliente REST vendorizado) rechaza un
 /// token: lo devuelve tal cual ante un 401 que no es de MFA.

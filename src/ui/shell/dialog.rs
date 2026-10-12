@@ -680,7 +680,7 @@ pub fn render(ctx: &egui::Context, palette: &Palette, d: &mut Dialog) -> Option<
         dismiss = true;
     }
 
-    Area::new(Id::new(("dialog_card", dialog_id.as_str())))
+    let card_area = Area::new(Id::new(("dialog_card", dialog_id.as_str())))
         .order(Order::Foreground)
         .anchor(Align2::CENTER_CENTER, [0.0, (1.0 - eased) * 18.0])
         .show(ctx, |ui| {
@@ -756,6 +756,13 @@ pub fn render(ctx: &egui::Context, palette: &Palette, d: &mut Dialog) -> Option<
                 accent,
             );
         });
+
+    // egui sube al frente cualquier Area sobre la que se presiona el puntero.
+    // Como el fondo oscuro es un Area aparte (misma capa `Foreground`), un clic
+    // fuera de la tarjeta lo subía POR ENCIMA de ella: la tarjeta quedaba
+    // tapada por el tinte (se veía oscura/opaca) y sin recibir ningún clic. Se
+    // vuelve a poner la tarjeta arriba en cada frame.
+    ctx.move_to_top(card_area.response.layer_id);
 
     // Resolver qué pasó.
     let mut closed_with: Option<Option<String>> = None;

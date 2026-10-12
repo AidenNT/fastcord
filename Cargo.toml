@@ -167,7 +167,7 @@ discord_client_structs = { path = "vendor/discord_client_structs" }
 # `ws`: todos los WebSockets (Gateway, login por QR y voz, ver
 # src/discord/websocket.rs) salen por wreq, con la misma huella TLS de Chrome que
 # el REST. Reemplaza a tokio-tungstenite, que ya no es dependencia directa.
-wreq = { version = "6.0.0-rc.29", features = ["gzip", "deflate", "zstd", "brotli", "json", "cookies", "socks", "ws"] }
+wreq = { version = "0.16", features = ["gzip", "deflate", "zstd", "brotli", "json", "cookies", "socks", "ws"] }
 # Solo para el WebSocket del login por QR (src/discord/websocket.rs,
 # `connect_qr`): `remote-auth-gateway.discord.gg` devolvía 403 con todas las
 # variantes de wreq (con/sin emulación, con/sin Origin) y con tokio-tungstenite
@@ -177,7 +177,7 @@ wreq = { version = "6.0.0-rc.29", features = ["gzip", "deflate", "zstd", "brotli
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 # Misma versión que usa vendor/discord_client_rest: websocket.rs arma la misma emulación
 # (Chrome149 / Windows) para que REST y WebSockets se vean como un solo navegador.
-wreq-util = "3.0.0-rc.14"
+wreq-util = "0.2"
 
 # --- Llamadas de voz (src/discord/voice/, portado de concord) ---
 # Cifrado RTP de extremo a extremo del canal de voz.
@@ -201,6 +201,14 @@ sonora = { version = "0.2.0", optional = true }
 rfd = "0.15"
 # Pegar una captura / imagen del portapapeles como adjunto (Ctrl+V).
 arboard = "3"
+
+# --- Actualizaciones automáticas (src/updater.rs) ---
+# De fastframe (github.com/crmne/fastframe, MIT), fijado a un commit. Busca versiones
+# en los releases de GitHub, verifica la firma Ed25519 y el SHA-256, y
+# reemplaza el ejecutable con un ayudante que restaura la anterior si la
+# nueva no arranca. `reqwest` = el transporte sobre reqwest 0.12 blocking
+# (el cliente de arriba ya lo compila con rustls y proxy del sistema).
+fastframe-update = { git = "https://github.com/crmne/fastframe", rev = "491f7194d555578bf75e2ce9706b2b2b4d42cf31", features = ["reqwest"] }
 
 # --- Notificaciones de escritorio (src/lib/notifications.rs) ---
 # Notificación nativa del SO (D-Bus en Linux, centro de notificaciones en
@@ -234,6 +242,11 @@ strip = "symbols"
 # opt-level 0 para que compilar y depurar sea rápido.
 [profile.dev.package."*"]
 opt-level = 3
+
+[profile.release-fast]
+inherits = "release"
+lto = "off"
+codegen-units = 16
 
 [features]
 default = ["voice-playback"]
@@ -336,3 +349,20 @@ binaries = [{ path = "ecord", main = true }]
 icons = ["assets/packaging/icon.ico", "assets/packaging/icon.icns", "assets/packaging/icon.png"]
 # DLLs (Windows) o dylibs (macOS) que el CI copia aquí antes de empaquetar.
 resources = [{ src = "packaging/bundle-libs/*", target = "." }]
+
+# --- wreq / wreq-util desde la rama principal de GitHub ---
+# `[patch.crates-io]` reemplaza esos crates en TODO el grafo (este crate y
+# vendor/discord_client_*), así que hay una sola copia de wreq y los tipos
+# (Client, Emulation, WebSocket) coinciden. Los `Cargo.toml` de cada crate
+# siguen pidiendo `wreq = "0.16"` / `wreq-util = "0.2"`: el patch tiene que
+# cumplir esos requisitos. Para volver a las versiones publicadas, borrá
+# esta sección. wreq y wreq-util están fijados a un commit exacto (`rev`);
+# para actualizarlos, cambiá el hash. btls/btls-sys siguen en `main` (Cargo.lock
+# fija el commit que resolvió cargo).
+# btls/btls-sys: wreq (main) los parchea igual desde git; hay que repetirlo
+# acá porque los `[patch]` de un dependiente no se aplican.
+[patch.crates-io]
+wreq = { git = "https://github.com/0x676e67/wreq", rev = "1e0e270d7f4570e1d3d69f60341d7255bc6fac18" }
+wreq-util = { git = "https://github.com/0x676e67/wreq-util", rev = "5715529002738f46eea86a7271f918f9374d3582" }
+btls = { git = "https://github.com/0x676e67/btls", branch = "main" }
+btls-sys = { git = "https://github.com/0x676e67/btls", branch = "main" }

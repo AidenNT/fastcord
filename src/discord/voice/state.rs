@@ -31,7 +31,6 @@ pub struct VoiceParticipantState {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct VoiceAudioSettings {
-    pub allow_microphone_transmit: bool,
     pub noise_suppression: bool,
     pub microphone_buffer_ms: Option<MicrophoneBufferMs>,
     pub microphone_sensitivity: MicrophoneSensitivityDb,
@@ -45,7 +44,6 @@ pub struct CurrentVoiceConnectionState {
     pub channel_id: Id<ChannelMarker>,
     pub self_mute: bool,
     pub self_deaf: bool,
-    pub allow_microphone_transmit: bool,
     pub noise_suppression: bool,
     pub microphone_buffer_ms: Option<MicrophoneBufferMs>,
     pub microphone_sensitivity: MicrophoneSensitivityDb,
@@ -156,7 +154,6 @@ impl App {
                 channel_id: state.channel_id,
                 self_mute: state.self_mute,
                 self_deaf: state.self_deaf,
-                allow_microphone_transmit: settings.allow_microphone_transmit,
                 noise_suppression: settings.noise_suppression,
                 microphone_buffer_ms: settings.microphone_buffer_ms,
                 microphone_sensitivity: settings.microphone_sensitivity,

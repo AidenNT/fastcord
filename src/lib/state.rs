@@ -593,6 +593,9 @@ pub struct App {
     pub component_modal: Option<ComponentModal>,
     /// Formulario de ingreso de un server (ver [`JoinFormModal`]).
     pub join_form: Option<JoinFormModal>,
+    /// Ventana flotante de herramientas de desarrollo (`ui::devtools`); solo
+    /// existe si se activó `use_developer_features`.
+    pub devtools: crate::ui::devtools::DevTools,
     /// Soundboard de la llamada: el popup está abierto.
     pub soundboard_open: bool,
     /// Botón de la barra de llamada que lo abrió (el popup se ubica encima y
@@ -895,6 +898,18 @@ impl Default for App {
         };
         // Parámetros de la cadena de Clean Mic (ver `discord::clean_mic`).
         crate::discord::clean_mic::load_from_storage();
+        // Mute/deafen persistentes (también valen fuera de una llamada).
+        // Deafen implica mute, así que si el blob guardado es incoherente
+        // se corrige acá.
+        let (saved_self_mute, saved_self_deaf) = match web_local_storage_api::get_item("self_mute_deaf") {
+            Ok(Some(raw)) => {
+                let mut parts = raw.split(',');
+                let deaf = parts.next() == Some("1");
+                let mute = parts.next() == Some("1");
+                (mute || deaf, deaf)
+            }
+            _ => (false, false),
+        };
         let voice_audio_sources = match web_local_storage_api::get_item("voice_audio_sources") {
             Ok(Some(json)) => serde_json::from_str::<VoiceAudioSources>(&json).unwrap_or_default(),
             _ => VoiceAudioSources::default(),
@@ -966,6 +981,7 @@ impl Default for App {
             last_history_trim: 0.0,
             component_modal: None,
             join_form: None,
+            devtools: crate::ui::devtools::DevTools::default(),
             soundboard_open: false,
             soundboard_button: None,
             soundboard_loading: false,
@@ -1039,8 +1055,8 @@ impl Default for App {
             voice_connection_status: None,
             voice_connection_message: None,
             voice_connect_phase: None,
-            self_mute: false,
-            self_deaf: false,
+            self_mute: saved_self_mute,
+            self_deaf: saved_self_deaf,
             stream_sessions: std::collections::HashMap::new(),
             watching_stream: None,
             broadcasting_stream: None,
@@ -1087,6 +1103,13 @@ impl App {
     /// derecho a la conexión del Gateway.
     pub fn start_sign_in(&mut self) {
         self.login_error = None;
+        self.start_qr_keep_error();
+    }
+
+    /// Igual que `start_sign_in` pero sin borrar `login_error`: la pantalla de
+    /// login muestra usuario/contraseña y QR juntos, y el QR se genera solo, así
+    /// que no debe tapar el error de un intento anterior de contraseña.
+    pub fn start_qr_keep_error(&mut self) {
         self.auth = AuthStatus::Starting;
         let (tx, rx) = std::sync::mpsc::channel();
         self.event_tx = Some(tx.clone());
@@ -1449,14 +1472,7 @@ impl App {
         self.auth = AuthStatus::Failed(message);
     }
 
-    /// Pasa de la pantalla de QR a la de usuario/contraseña (link "Usar
-    /// usuario y contraseña" en `ui::auth::login`).
-    pub fn switch_to_password_form(&mut self) {
-        self.login_error = None;
-        self.auth = AuthStatus::PasswordForm;
-    }
-
-    /// Vuelve de la pantalla de contraseña (o de 2FA) a la de QR, y
+    /// Vuelve de la pantalla de 2FA al login (QR + contraseña), y
     /// limpia lo tipeado — igual que `cancel_sign_in`, no cancela
     /// activamente un pedido en vuelo, solo deja de escuchar la
     /// respuesta.
@@ -1468,7 +1484,9 @@ impl App {
         self.login_sms_sent = false;
         self.login_error = None;
         self.pending_mfa = None;
-        self.auth = AuthStatus::SignedOut;
+        // La pantalla de login muestra QR y contraseña juntos: se genera un QR
+        // nuevo en vez de dejar la pantalla vacía.
+        self.start_sign_in();
     }
 
     /// Manda el formulario de usuario/contraseña. No valida nada de
@@ -6395,7 +6413,6 @@ impl App {
             channel_id,
             self_mute: self.self_mute,
             self_deaf: self.self_deaf,
-            allow_microphone_transmit: settings.allow_microphone_transmit,
             noise_suppression: settings.noise_suppression,
             microphone_buffer_ms: settings.microphone_buffer_ms,
             microphone_sensitivity: settings.microphone_sensitivity,
@@ -6813,6 +6830,7 @@ impl App {
             target.self_deaf = self.self_deaf;
             self.sync_voice_target();
         }
+        self.persist_self_mute_deaf();
     }
 
     /// Prende/apaga "ensordecerse" (no escuchar a nadie). Al ensordecerse
@@ -6829,6 +6847,7 @@ impl App {
             target.self_deaf = self.self_deaf;
             self.sync_voice_target();
         }
+        self.persist_self_mute_deaf();
     }
 
     /// Nombre para mostrar en la barra de llamada (`ui::call::call_bar`): el
@@ -6917,19 +6936,6 @@ impl App {
         }
     }
 
-    /// Prende/apaga si el micrófono puede transmitir. Arranca en `false`
-    /// (ver `VoiceAudioSettings::default`) a propósito, como opt-in
-    /// explícito: hasta que no lo tocás acá una vez, unirte a un canal de
-    /// voz no manda audio, aunque no estés silenciado.
-    pub fn set_voice_allow_microphone_transmit(&mut self, allow: bool) {
-        if self.voice.audio.allow_microphone_transmit == allow {
-            return;
-        }
-        self.voice.audio.allow_microphone_transmit = allow;
-        self.persist_voice_audio_settings();
-        self.sync_voice_audio_settings_to_target();
-    }
-
     pub fn set_voice_noise_suppression(&mut self, enabled: bool) {
         if self.voice.audio.noise_suppression == enabled {
             return;
@@ -6973,6 +6979,12 @@ impl App {
         self.sync_voice_audio_settings_to_target();
     }
 
+    /// Guarda mute/deafen ("deaf,mute") para que sobrevivan al reinicio.
+    fn persist_self_mute_deaf(&self) {
+        let value = format!("{},{}", u8::from(self.self_deaf), u8::from(self.self_mute));
+        let _ = web_local_storage_api::set_item("self_mute_deaf", &value);
+    }
+
     fn persist_voice_audio_settings(&self) {
         if let Ok(json) = serde_json::to_string(&self.voice.audio) {
             let _ = web_local_storage_api::set_item("voice_audio_settings", &json);
@@ -6989,7 +7001,6 @@ impl App {
     fn sync_voice_audio_settings_to_target(&mut self) {
         let Some(target) = &mut self.voice_target else { return };
         let settings = self.voice.audio.clone();
-        target.allow_microphone_transmit = settings.allow_microphone_transmit;
         target.noise_suppression = settings.noise_suppression;
         target.microphone_buffer_ms = settings.microphone_buffer_ms;
         target.microphone_sensitivity = settings.microphone_sensitivity;
@@ -7597,6 +7608,8 @@ impl eframe::App for App {
         self.track_unread_marker();
         self.ack_viewed_channel();
         self.sync_window_title(ui.ctx());
+        // Herramientas de desarrollo (no hace nada sin `use_developer_features`).
+        self.devtools.show(ui.ctx());
         // El hilo de Discord no despierta la UI al llegar un evento, y sin
         // input/animaciones eframe no repinta: con la ventana en segundo
         // plano los mensajes se quedarían sin procesar (y sin notificar)
@@ -7783,6 +7796,8 @@ impl eframe::App for App {
         // va al final para quedar por encima de todo, incluida la pantalla de
         // login (donde se escribe el token).
         crate::ui::shell::dialog::show(self, ui);
+        // Actualizaciones automáticas: arranque del updater y avisos (ver `ui::settings::updates`).
+        crate::ui::settings::updates::poll(self, ui.ctx());
         // Visor multimedia (imágenes/GIFs a pantalla completa).
         crate::ui::chat::media_viewer::show(self, ui);
         crate::ui::chat::video_player::show_fullscreen(ui.ctx());
