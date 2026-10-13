@@ -3,6 +3,7 @@
 pub mod components;
 pub mod dialog;
 pub mod extra;
+pub mod incoming_call;
 pub mod nav;
 pub mod notifications;
 pub mod overlay;

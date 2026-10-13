@@ -539,6 +539,35 @@ impl UwuRest {
         message_flags: u64,
         custom_id: &str,
     ) -> anyhow::Result<()> {
+        let data = json!({ "component_type": 2, "custom_id": custom_id });
+        self.send_component_interaction(ctx, message_id, message_flags, data).await
+    }
+
+    /// Elige en un menú desplegable de un mensaje (`POST /interactions`, tipo
+    /// 3). `component_type` es 3 (texto), 5 (usuarios), 6 (roles), 7
+    /// (menciones) u 8 (canales); `values` son los `value` de las opciones
+    /// elegidas, o los ids de los usuarios/roles/canales.
+    pub async fn select_option(
+        &self,
+        ctx: &super::InteractionContext,
+        message_id: &str,
+        message_flags: u64,
+        custom_id: &str,
+        component_type: u8,
+        values: &[String],
+    ) -> anyhow::Result<()> {
+        let data = json!({ "component_type": component_type, "custom_id": custom_id, "values": values });
+        self.send_component_interaction(ctx, message_id, message_flags, data).await
+    }
+
+    /// Cuerpo común de las interacciones de componentes (botones y menús).
+    async fn send_component_interaction(
+        &self,
+        ctx: &super::InteractionContext,
+        message_id: &str,
+        message_flags: u64,
+        data: Value,
+    ) -> anyhow::Result<()> {
         let mut body = json!({
             "type": 3,
             "nonce": Self::interaction_nonce(),
@@ -547,7 +576,7 @@ impl UwuRest {
             "message_flags": message_flags,
             "application_id": ctx.application_id,
             "session_id": ctx.session_id,
-            "data": { "component_type": 2, "custom_id": custom_id },
+            "data": data,
         });
         if let Some(guild_id) = &ctx.guild_id {
             body["guild_id"] = json!(guild_id);
@@ -1442,6 +1471,20 @@ impl UwuRest {
         let _: Value = self
             .client
             .post(&path, None::<Value>, Some(Self::home()))
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// `POST /channels/{channel}/call/stop-ringing`: deja de sonar la llamada
+    /// de un DM/grupo para `recipients` (rechazar la llamada entrante pasa
+    /// nuestro propio id). Responde 204 sin cuerpo.
+    pub async fn stop_ringing(&self, channel_id: &str, recipients: &[String]) -> anyhow::Result<()> {
+        let path = format!("channels/{channel_id}/call/stop-ringing");
+        let body = json!({ "recipients": recipients });
+        let _: Value = self
+            .client
+            .post(&path, Some(body), Some(Self::home()))
             .await
             .map_err(err)?;
         Ok(())

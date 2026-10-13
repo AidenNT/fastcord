@@ -235,6 +235,14 @@ const REVEAL_ZONE: f32 = 10.0;
 /// Ahí los mismos controles viven dentro de la propia vista
 /// (`ui::call::call_view::controls_bar`), así que la barra se esconde.
 pub fn viewing_call(app: &App) -> bool {
+    // Llamada de DM/grupo: la vista de la llamada va arriba del chat del DM.
+    if let Screen::Dm(index) = app.screen {
+        return app
+            .friends
+            .get(index)
+            .and_then(|friend| friend.dm_channel_id.as_deref())
+            .is_some_and(|id| app.is_connected_to_voice_dm_str(id));
+    }
     let Screen::Server(index) = app.screen else {
         return false;
     };
@@ -346,6 +354,10 @@ pub fn show_bottom(app: &mut App, ui: &mut egui::Ui) {
         .map(|c| c.to_uppercase().collect::<String>())
         .unwrap_or_default();
 
+    let private_call = matches!(
+        app.voice_target.as_ref().map(|target| target.scope),
+        Some(crate::discord::VoiceScope::Private(_))
+    );
     let mut leave_clicked = false;
     let mut settings_clicked = false;
     let mut goto_clicked = false;
@@ -415,7 +427,7 @@ pub fn show_bottom(app: &mut App, ui: &mut egui::Ui) {
                     }
                     ui.add_space(10.0);
 
-                    status_pill(ui, &palette, status, phase, &channel);
+                    status_pill(ui, &palette, status, phase, &channel, private_call);
 
                     if theme::icon_button(
                         ui,
@@ -484,6 +496,7 @@ fn status_pill(
     status: Option<VoiceConnectionStatus>,
     phase: Option<VoiceConnectPhase>,
     channel: &str,
+    private_call: bool,
 ) {
     let color = match status {
         Some(VoiceConnectionStatus::Disconnected) | Some(VoiceConnectionStatus::Failed) => palette.danger,
@@ -503,7 +516,8 @@ fn status_pill(
                 ui.add_space(2.0);
                 vertical_separator(ui, palette);
                 ui.add_space(2.0);
-                theme::icon(ui, Icon::Volume2, 15.0, palette.secondary);
+                let icon = if private_call { Icon::Phone } else { Icon::Volume2 };
+                theme::icon(ui, icon, 15.0, palette.secondary);
                 theme::text(ui, channel, theme::semibold(12.5), palette.text);
             });
         });

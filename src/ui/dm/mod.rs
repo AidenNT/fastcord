@@ -322,6 +322,26 @@ fn central_panel(app: &mut App, ui: &mut egui::Ui, index: usize) {
                 }
             }
 
+            // Llamada en curso en este DM/grupo (o recién pedida): la vista de la
+            // llamada va arriba del chat, con los tiles de quienes están dentro y
+            // los controles; los mensajes siguen debajo.
+            if let Some(call_channel_id) = app.friends[index].dm_channel_id.clone()
+                && app.dm_call_visible(&call_channel_id)
+            {
+                let call_name = app.friends[index].name.clone();
+                let call_height = (ui.available_height() * 0.5).clamp(220.0, 340.0);
+                let (call_rect, _) = ui.allocate_exact_size(
+                    egui::Vec2::new(ui.available_width(), call_height),
+                    egui::Sense::hover(),
+                );
+                let mut call_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(call_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                crate::ui::call::call_view::show_dm(app, &mut call_ui, &palette, &call_channel_id, &call_name);
+            }
+
             let friend_name = app.friends[index].name.clone();
             // Un DM 1:1 dice "@usuario"; un grupo, el nombre a secas.
             let placeholder = if app.friends[index].is_group {

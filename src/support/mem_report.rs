@@ -850,7 +850,16 @@ heap_struct!(crate::discord::models::Component {
     items,
     media,
     file,
-    name
+    name,
+    options,
+    default_values
+});
+heap_struct!(crate::discord::models::DefaultValue { id, kind });
+heap_struct!(crate::discord::models::SelectOption {
+    label,
+    value,
+    description,
+    emoji
 });
 heap_struct!(crate::discord::models::Role { id, name });
 heap_struct!(crate::discord::models::PermissionOverwrite { id });

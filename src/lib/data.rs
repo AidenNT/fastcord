@@ -432,6 +432,14 @@ pub struct ChatMessage {
     pub interaction: Option<InteractionLine>,
 }
 
+/// Prefijo del id de los avisos locales "Ejecutando comando..." (ver
+/// [`ChatMessage::is_slash_placeholder`]).
+pub const SLASH_PLACEHOLDER_PREFIX: &str = "local-slash:";
+
+/// Prefijo del id del aviso local de un slash command que falló. A propósito
+/// NO empieza con [`SLASH_PLACEHOLDER_PREFIX`]: así no se borra solo.
+pub const SLASH_ERROR_PREFIX: &str = "local-slash-error:";
+
 /// Encabezado "X ha utilizado /comando" de la respuesta de un bot.
 #[derive(Debug, Clone, Default)]
 pub struct InteractionLine {
@@ -451,6 +459,11 @@ pub struct ComponentClick {
     pub application_id: Option<String>,
     pub flags: u64,
     pub custom_id: String,
+    /// `None` = se apretó un botón. `Some((tipo, valores))` = se eligió en un
+    /// menú desplegable: el tipo del componente (3 texto, 5 usuarios, 6 roles,
+    /// 7 menciones, 8 canales) y los valores elegidos (los `value` de las
+    /// opciones, o los ids de usuarios/roles/canales).
+    pub values: Option<(u8, Vec<String>)>,
 }
 
 /// Un botón de bot al que se le mandó la interacción y que todavía no
@@ -487,6 +500,123 @@ pub fn loading_buttons(ctx: &egui::Context, message_id: &str) -> Vec<String> {
                 .map(|(_, custom_id)| custom_id.clone())
                 .collect()
         })
+        .unwrap_or_default()
+}
+
+/// Un usuario, rol o canal del server abierto, para los menús desplegables de
+/// los bots (tipos 5, 6, 7 y 8). Ver [`publish_pick_directory`].
+#[derive(Clone)]
+pub struct PickUser {
+    pub id: String,
+    pub name: String,
+    pub avatar_url: Option<String>,
+    pub color: Color32,
+}
+
+#[derive(Clone)]
+pub struct PickRole {
+    pub id: String,
+    pub name: String,
+    pub color: Option<Color32>,
+}
+
+#[derive(Clone)]
+pub struct PickChannel {
+    pub id: String,
+    pub name: String,
+    pub voice: bool,
+    pub forum: bool,
+}
+
+/// Lo que se puede elegir en esos menús: los miembros que ya cargó la lista
+/// lateral (Discord solo manda los de la parte visible), los roles y los
+/// canales del server abierto.
+#[derive(Clone, Default)]
+pub struct PickDirectory {
+    pub users: Vec<PickUser>,
+    pub roles: Vec<PickRole>,
+    pub channels: Vec<PickChannel>,
+}
+
+fn pick_directory_id() -> egui::Id {
+    egui::Id::new("ecord_pick_directory")
+}
+
+type PickStamp = (Option<(String, usize, usize, usize)>, std::time::Instant);
+
+/// Deja en la memoria de egui el directorio del server abierto (`None` = no
+/// hay ninguno: Inicio o un DM), para que `ui::shell::components` arme las
+/// listas de los menús de usuarios/roles/canales sin recibir los servers por
+/// parámetro. Se reconstruye si cambia el server o la cantidad de miembros,
+/// roles o canales, o cada 5 s.
+pub fn publish_pick_directory(ctx: &egui::Context, server: Option<&Server>) {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let stamp_id = egui::Id::new("ecord_pick_directory_stamp");
+    let key = server.map(|s| {
+        (
+            s.guild_id.clone(),
+            s.member_groups.iter().map(|g| g.members.len()).sum::<usize>(),
+            s.roles.len(),
+            s.categories.iter().map(|c| c.channels.len()).sum::<usize>(),
+        )
+    });
+    let fresh = ctx
+        .data(|d| d.get_temp::<PickStamp>(stamp_id))
+        .is_some_and(|(k, at)| k == key && at.elapsed() < Duration::from_secs(5));
+    if fresh {
+        return;
+    }
+
+    let mut dir = PickDirectory::default();
+    if let Some(server) = server.filter(|s| !s.guild_id.is_empty()) {
+        let mut seen = std::collections::HashSet::new();
+        for member in server.member_groups.iter().flat_map(|g| g.members.iter()) {
+            if !member.user_id.is_empty() && seen.insert(member.user_id.as_str()) {
+                dir.users.push(PickUser {
+                    id: member.user_id.clone(),
+                    name: member.name.clone(),
+                    avatar_url: member.avatar_url.clone(),
+                    color: member.avatar_color,
+                });
+            }
+        }
+        let mut roles: Vec<&crate::discord::models::Role> = server.roles.iter().collect();
+        roles.sort_by_key(|r| std::cmp::Reverse(r.position));
+        dir.roles = roles
+            .into_iter()
+            .map(|r| PickRole {
+                id: r.id.clone(),
+                name: r.name.clone(),
+                color: (r.color != 0).then(|| {
+                    Color32::from_rgb(((r.color >> 16) & 0xff) as u8, ((r.color >> 8) & 0xff) as u8, (r.color & 0xff) as u8)
+                }),
+            })
+            .collect();
+        for channel in server.categories.iter().flat_map(|c| c.channels.iter()) {
+            if channel.is_thread {
+                continue;
+            }
+            if let Some(id) = channel.channel_id.as_ref() {
+                dir.channels.push(PickChannel {
+                    id: id.clone(),
+                    name: channel.name.clone(),
+                    voice: channel.is_voice,
+                    forum: channel.is_forum,
+                });
+            }
+        }
+    }
+    ctx.data_mut(|d| {
+        d.insert_temp(pick_directory_id(), Arc::new(dir));
+        d.insert_temp::<PickStamp>(stamp_id, (key, Instant::now()));
+    });
+}
+
+/// El directorio publicado por [`publish_pick_directory`] (vacío si no hay).
+pub fn pick_directory(ctx: &egui::Context) -> std::sync::Arc<PickDirectory> {
+    ctx.data(|d| d.get_temp::<std::sync::Arc<PickDirectory>>(pick_directory_id()))
         .unwrap_or_default()
 }
 
@@ -733,6 +863,19 @@ impl ChatMessage {
             avatar_color: color_from_id(&user.id),
             command,
         })
+    }
+
+    /// ¿Es el aviso local "Ejecutando comando..." que se muestra mientras la
+    /// app contesta a un slash command? Nunca existió en Discord: se borra
+    /// solo cuando llega la respuesta (ver `App::clear_slash_placeholders`).
+    pub fn is_slash_placeholder(&self) -> bool {
+        self.id.starts_with(SLASH_PLACEHOLDER_PREFIX)
+    }
+
+    /// ¿Es el aviso local de que un slash command falló (el placeholder
+    /// convertido por `App::fail_slash_placeholders`, con el motivo)?
+    pub fn is_slash_error(&self) -> bool {
+        self.id.starts_with(SLASH_ERROR_PREFIX)
     }
 
     /// ¿Es el mismo autor que `other`, a efectos de agrupar mensajes

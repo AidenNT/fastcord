@@ -1843,6 +1843,48 @@ pub struct Component {
     pub divider: Option<bool>,
     #[serde(default)]
     pub spacing: Option<u8>,
+    /// Menú de texto (3): sus opciones y cuántas se pueden elegir. Sin
+    /// `min_values`/`max_values` Discord entiende "exactamente una".
+    #[serde(default)]
+    pub options: Vec<SelectOption>,
+    #[serde(default)]
+    pub min_values: Option<u32>,
+    #[serde(default)]
+    pub max_values: Option<u32>,
+    /// Menús de usuarios/roles/menciones/canales (5-8): lo que viene elegido
+    /// de antemano.
+    #[serde(default)]
+    pub default_values: Vec<DefaultValue>,
+    /// Menú de canales (8): qué tipos de canal se pueden elegir (vacío = todos).
+    #[serde(default)]
+    pub channel_types: Vec<u8>,
+}
+
+/// Un valor ya elegido de un menú de usuarios, roles, menciones o canales.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DefaultValue {
+    #[serde(default)]
+    pub id: String,
+    /// `user`, `role` o `channel`.
+    #[serde(rename = "type", default)]
+    pub kind: String,
+}
+
+/// Una opción de un menú de texto (componente tipo 3).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SelectOption {
+    #[serde(default)]
+    pub label: String,
+    /// Lo que recibe el bot cuando se elige esta opción.
+    #[serde(default)]
+    pub value: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub emoji: Option<ComponentEmoji>,
+    /// Viene marcada de antemano (`default` en el JSON).
+    #[serde(rename = "default", default)]
+    pub is_default: bool,
 }
 
 /// Un elemento de una galería de medios (componente V2 tipo 12).
@@ -1858,6 +1900,13 @@ pub struct GalleryItem {
 
 impl Component {
     pub const BUTTON: u8 = 2;
+    /// Menú desplegable de texto (el único menú que ecord sabe usar).
+    pub const STRING_SELECT: u8 = 3;
+    /// Menús de usuarios (5), roles (6), usuarios o roles (7) y canales (8).
+    pub const USER_SELECT: u8 = 5;
+    pub const ROLE_SELECT: u8 = 6;
+    pub const MENTIONABLE_SELECT: u8 = 7;
+    pub const CHANNEL_SELECT: u8 = 8;
     pub const TEXT_INPUT: u8 = 4;
     pub const STYLE_LINK: u8 = 5;
 

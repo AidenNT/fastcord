@@ -496,6 +496,10 @@ struct RowActions {
     component: Option<ComponentClick>,
     /// Click en la cita de una respuesta: id del mensaje original al que ir.
     jump_to: Option<String>,
+    /// "Eliminar mensaje" de un mensaje efímero: id del mensaje a sacar de la
+    /// lista. Es solo local: Discord no guarda los efímeros, así que no hay
+    /// nada que borrar del lado del servidor.
+    dismiss: Option<String>,
 }
 
 /// Resultado de un frame de `show`: casi siempre `None`, salvo cuando el
@@ -1497,6 +1501,12 @@ pub fn show(
         }
     }
 
+    // "Eliminar mensaje" de un efímero: se saca de la lista (solo local).
+    if let Some(id) = actions.dismiss.take() {
+        messages.retain(|m| m.id != id);
+        ui.ctx().request_repaint();
+    }
+
     let composer_top = ui.cursor().top();
     nitro_required |= composer(
         ui,
@@ -2438,10 +2448,11 @@ fn interaction_row(ui: &mut egui::Ui, palette: &Palette, line: &crate::lib::data
             palette,
         );
         let name = theme::text(ui, &line.user, theme::semibold(11.5), palette.dim);
-        if response.clicked()
+        if (response.clicked()
             || ui
                 .interact(name.rect, name.id.with("profile"), Sense::click())
-                .clicked()
+                .clicked())
+            && !line.user_id.is_empty()
         {
             crate::ui::profile_popup::request_open(
                 ui.ctx(),
@@ -2566,7 +2577,14 @@ fn message_body(
 ) {
     // Un mensaje que es solo el link de una imagen/GIF se ve como la
     // imagen sola, sin la URL repetida arriba (ver `media::hides_content`).
-    if !media::hides_content(&msg.content, &msg.embeds) {
+    if msg.is_slash_error() {
+        // Slash command que falló: signo de exclamación + el motivo.
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            theme::icon(ui, Icon::CircleAlert, 15.0, palette.danger);
+            theme::text(ui, &msg.content, theme::medium(13.5), palette.danger);
+        });
+    } else if !media::hides_content(&msg.content, &msg.embeds) {
         let ctx = MentionCtx {
             mentions: &msg.mentions,
             channels,
@@ -2588,12 +2606,19 @@ fn message_body(
     }
     if msg.flags & crate::ui::shell::components::FLAG_EPHEMERAL != 0 {
         ui.add_space(2.0);
-        theme::text(
-            ui,
-            "Solo vos podés ver este mensaje.",
-            theme::regular(11.5),
-            palette.dim,
-        );
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            theme::icon(ui, Icon::Eye, 13.0, palette.dim);
+            theme::text(ui, "Solo tú puedes ver esto", theme::regular(11.5), palette.dim);
+            theme::text(ui, "·", theme::regular(11.5), palette.dim);
+            let link = theme::text(ui, "Eliminar mensaje", theme::medium(11.5), palette.accent);
+            let response = ui
+                .interact(link.rect, link.id.with("dismiss_ephemeral"), Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if response.clicked() {
+                actions.dismiss = Some(msg.id.clone());
+            }
+        });
     }
     reactions_row(ui, palette, msg, index, toggled_reaction);
     if let Some(card) = msg.thread.as_ref() {
@@ -4078,6 +4103,32 @@ fn composer(
             }
             slash_ui::FormOutcome::Submit(options) => {
                 if let Some((_, channel_id, guild_id)) = send_target.clone() {
+                    // Aviso local mientras la app contesta: "Ejecutando
+                    // comando..." con el nombre/ícono de la app. Se borra solo
+                    // al llegar la respuesta (`App::clear_slash_placeholders`).
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or_default();
+                    let mut placeholder_msg = ChatMessage::them(
+                        &active.entry.app_name,
+                        "ahora",
+                        "Ejecutando comando...",
+                        palette.accent,
+                    );
+                    placeholder_msg.id = format!("{}{now_ms}", crate::lib::data::SLASH_PLACEHOLDER_PREFIX);
+                    placeholder_msg.is_bot = true;
+                    placeholder_msg.avatar_url = active.entry.app_icon_url.clone();
+                    placeholder_msg.application_id = Some(active.entry.app_id.clone());
+                    placeholder_msg.channel_id = channel_id.clone();
+                    placeholder_msg.interaction = Some(crate::lib::data::InteractionLine {
+                        user_id: String::new(),
+                        user: own_author.to_string(),
+                        avatar_url: None,
+                        avatar_color: own_color,
+                        command: active.entry.display.clone(),
+                    });
+                    messages.push(placeholder_msg);
                     slash_ui::request_run(
                         &ctx,
                         slash_ui::SlashInvocation {

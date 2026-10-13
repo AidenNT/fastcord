@@ -107,6 +107,7 @@ pub fn content(app: &mut App, ui: &mut egui::Ui) {
                     mentions,
                     status,
                     activity.as_deref(),
+                    app.dm_call_active(&dm.id),
                 ) {
                     clicked_dm = Some(i);
                 }
@@ -168,6 +169,7 @@ fn dm_row_compact(
     mentions: u32,
     status: Status,
     activity: Option<&str>,
+    in_call: bool,
 ) -> bool {
     let modern = theme::is_modern();
     let desired = Vec2::new(ui.available_width() - 12.0, if modern { 52.0 } else { 46.0 });
@@ -229,13 +231,32 @@ fn dm_row_compact(
         };
         let subtitle = crate::discord::models::one_line(subtitle);
         let subtitle = subtitle.as_str();
-        ui.painter().text(
-            rect.left_top() + Vec2::new(text_x, sub_y),
-            egui::Align2::LEFT_TOP,
-            truncate(subtitle, 26),
-            theme::regular(11.0),
-            palette.dim,
-        );
+        if in_call {
+            // Con una llamada en curso en ese DM/grupo: teléfono + "En llamada"
+            // en lugar del estado, así se ve desde afuera del chat.
+            let green = Color32::from_rgb(0x3b, 0xa5, 0x5d);
+            let icon_size = 12.0;
+            let icon_rect = egui::Rect::from_min_size(
+                rect.left_top() + Vec2::new(text_x, sub_y + 1.0),
+                Vec2::splat(icon_size),
+            );
+            theme::paint_icon(ui, Icon::Phone, icon_rect, icon_size, green);
+            ui.painter().text(
+                rect.left_top() + Vec2::new(text_x + icon_size + 4.0, sub_y),
+                egui::Align2::LEFT_TOP,
+                "En llamada",
+                theme::medium(11.0),
+                green,
+            );
+        } else {
+            ui.painter().text(
+                rect.left_top() + Vec2::new(text_x, sub_y),
+                egui::Align2::LEFT_TOP,
+                truncate(subtitle, 26),
+                theme::regular(11.0),
+                palette.dim,
+            );
+        }
         // Contador de menciones sin leer (todo mensaje de un DM cuenta).
         let ring = theme::row_fill(palette, selected, resp.hovered());
         crate::ui::shell::notifications::paint_badge(

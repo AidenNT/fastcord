@@ -309,6 +309,14 @@ impl StreamMode {
 // Entrada
 // ---------------------------------------------------------------------
 
+/// De dónde sale la llamada que se dibuja: un canal de voz de un server o la
+/// llamada de un DM/grupo.
+enum CallTarget<'a> {
+    Server { server_index: usize, cat: usize, chan: usize },
+    Dm { channel_id: &'a str },
+}
+
+/// Vista de la llamada de un canal de voz de un server.
 pub fn show(
     app: &mut App,
     ui: &mut egui::Ui,
@@ -318,19 +326,46 @@ pub fn show(
     chan: usize,
     channel_name: &str,
 ) {
-    let server = &app.servers[server_index];
-    let guild_id = server.guild_id.clone();
-    let channel = server.channel(cat, chan);
-    let members: Vec<VoiceOccupant> = channel.map(|c| c.voice_members.clone()).unwrap_or_default();
-    let channel_id = channel.and_then(|c| c.channel_id.clone());
-    let connected_here = channel_id
-        .as_deref()
-        .is_some_and(|id| app.is_connected_to_voice_channel_str(&guild_id, id));
+    show_target(app, ui, palette, CallTarget::Server { server_index, cat, chan }, channel_name);
+}
+
+/// Vista de la llamada de un DM/grupo (`channel_id` es el id del propio DM).
+/// Es la misma pantalla que la de un canal de voz —tiles, controles, fundido
+/// por inactividad— pero sin transmisiones (Go Live todavía no existe en DMs).
+pub fn show_dm(app: &mut App, ui: &mut egui::Ui, palette: &Palette, channel_id: &str, channel_name: &str) {
+    show_target(app, ui, palette, CallTarget::Dm { channel_id }, channel_name);
+}
+
+fn show_target(app: &mut App, ui: &mut egui::Ui, palette: &Palette, target: CallTarget<'_>, channel_name: &str) {
+    let (guild_id, members, speaking, channel_id, connected_here): (
+        String,
+        Vec<VoiceOccupant>,
+        Vec<bool>,
+        Option<String>,
+        bool,
+    ) = match target {
+        CallTarget::Server { server_index, cat, chan } => {
+            let server = &app.servers[server_index];
+            let guild_id = server.guild_id.clone();
+            let channel = server.channel(cat, chan);
+            let members: Vec<VoiceOccupant> = channel.map(|c| c.voice_members.clone()).unwrap_or_default();
+            let channel_id = channel.and_then(|c| c.channel_id.clone());
+            let connected_here = channel_id
+                .as_deref()
+                .is_some_and(|id| app.is_connected_to_voice_channel_str(&guild_id, id));
+            let speaking: Vec<bool> = members
+                .iter()
+                .map(|m| app.user_voice_speaking_in_guild_str(&guild_id, &m.user_id))
+                .collect();
+            (guild_id, members, speaking, channel_id, connected_here)
+        }
+        CallTarget::Dm { channel_id } => {
+            let (members, speaking) = app.dm_call_members(channel_id);
+            let connected_here = app.is_connected_to_voice_dm_str(channel_id);
+            (String::new(), members, speaking, Some(channel_id.to_owned()), connected_here)
+        }
+    };
     let my_id: Option<String> = app.me.as_ref().map(|me| me.id.clone());
-    let speaking: Vec<bool> = members
-        .iter()
-        .map(|m| app.user_voice_speaking_in_guild_str(&guild_id, &m.user_id))
-        .collect();
     let playback: std::collections::HashMap<String, crate::discord::VoiceParticipantPlaybackSettings> = members
         .iter()
         .map(|m| (m.user_id.clone(), app.voice_participant_playback(&m.user_id)))
@@ -661,7 +696,12 @@ pub fn show(
     }
     if ev.join {
         if let Some(channel_id) = channel_id {
-            app.join_voice_channel(&guild_id, &channel_id);
+            if guild_id.is_empty() {
+                // Llamada de DM/grupo: no hay server al que unirse.
+                app.start_dm_call(&channel_id);
+            } else {
+                app.join_voice_channel(&guild_id, &channel_id);
+            }
         }
     }
 }

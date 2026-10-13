@@ -1092,6 +1092,14 @@ fn handle_guild_create(raw: &str, tx: &std::sync::mpsc::Sender<AppEvent>) -> any
 /// `user`).
 static OWN_USER_ID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+/// Ids de quienes están sonando en un `CALL_CREATE`/`CALL_UPDATE`.
+fn call_ringing_ids(data: &serde_json::Value) -> Vec<String> {
+    data.get("ringing")
+        .and_then(|v| v.as_array())
+        .map(|ids| ids.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+        .unwrap_or_default()
+}
+
 fn handle_dispatch(
     event_name: &str,
     data: serde_json::Value,
@@ -1342,6 +1350,40 @@ fn handle_dispatch(
         "VOICE_STATE_UPDATE" => {
             let state: VoiceState = serde_json::from_value(data)?;
             let _ = tx.send(AppEvent::VoiceStateUpdate(state));
+        }
+        // Llamadas de DM/grupo. `CALL_CREATE` trae quién está dentro
+        // (`voice_states`, sin `guild_id`) y a quién se está llamando
+        // (`ringing`); los estados de voz se reenvían como si fueran
+        // `VOICE_STATE_UPDATE` para que sigan el mismo camino que ya usa el
+        // resto (cache de participantes y runtime de voz).
+        "CALL_CREATE" => {
+            let Some(channel_id) = data.get("channel_id").and_then(|v| v.as_str()).map(str::to_owned) else {
+                return Ok(());
+            };
+            if let Some(states) = data.get("voice_states").and_then(|v| v.as_array()) {
+                for raw in states {
+                    if let Ok(mut state) = serde_json::from_value::<VoiceState>(raw.clone()) {
+                        if state.channel_id.is_none() {
+                            state.channel_id = Some(channel_id.clone());
+                        }
+                        let _ = tx.send(AppEvent::VoiceStateUpdate(state));
+                    }
+                }
+            }
+            let ringing = call_ringing_ids(&data);
+            let _ = tx.send(AppEvent::CallCreate { channel_id, ringing });
+        }
+        "CALL_UPDATE" => {
+            let Some(channel_id) = data.get("channel_id").and_then(|v| v.as_str()).map(str::to_owned) else {
+                return Ok(());
+            };
+            let ringing = call_ringing_ids(&data);
+            let _ = tx.send(AppEvent::CallUpdate { channel_id, ringing });
+        }
+        "CALL_DELETE" => {
+            if let Some(channel_id) = data.get("channel_id").and_then(|v| v.as_str()).map(str::to_owned) {
+                let _ = tx.send(AppEvent::CallDelete { channel_id });
+            }
         }
         // El endpoint/token de voz para la conexión que acabamos de pedir
         // con `GatewayCommand::UpdateVoiceState` (opcode 4). Llega después

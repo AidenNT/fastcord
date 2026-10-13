@@ -204,6 +204,45 @@ impl App {
             .is_some_and(|conn| conn.scope == VoiceScope::Private(channel_id) && conn.channel_id == channel_id)
     }
 
+    /// ¿Hay alguien conectado a la llamada de ese DM/grupo?
+    pub fn private_call_has_participants(&self, channel_id: Id<ChannelMarker>) -> bool {
+        self.voice
+            .states
+            .keys()
+            .any(|(scope, _)| *scope == VoiceScope::Private(channel_id))
+    }
+
+    /// Olvida a los participantes de la llamada de ese DM/grupo, menos
+    /// `keep` (la cuenta propia: su estado lo maneja Discord al desconectarnos).
+    pub fn clear_private_call_except(&mut self, channel_id: Id<ChannelMarker>, keep: Option<Id<UserMarker>>) {
+        self.voice
+            .states
+            .retain(|(scope, user_id), _| *scope != VoiceScope::Private(channel_id) || Some(*user_id) == keep);
+    }
+
+    /// Quién está dentro de la llamada de un DM/grupo (`VoiceScope::Private`),
+    /// ordenado por id para que los tiles no salten de lugar entre frames.
+    /// Incluye a la cuenta propia si está conectada.
+    pub fn private_call_participants(&self, channel_id: Id<ChannelMarker>) -> Vec<VoiceParticipantState> {
+        let mut participants: Vec<VoiceParticipantState> = self
+            .voice
+            .states
+            .iter()
+            .filter(|((scope, _), state)| *scope == VoiceScope::Private(channel_id) && state.channel_id == channel_id)
+            .map(|((_, user_id), state)| VoiceParticipantState {
+                user_id: *user_id,
+                display_name: state.display_name.clone().unwrap_or_default(),
+                deaf: state.deaf,
+                mute: state.mute,
+                self_deaf: state.self_deaf,
+                self_mute: state.self_mute,
+                speaking: state.speaking,
+            })
+            .collect();
+        participants.sort_by_key(|participant| participant.user_id.get());
+        participants
+    }
+
     pub fn user_voice_speaking_in_guild(&self, guild_id: Id<GuildMarker>, user_id: Id<UserMarker>) -> bool {
         self.voice
             .states

@@ -72,6 +72,7 @@ use web_local_storage_api;
 
 // Informe de memoria (Ajustes → Memoria): hijo de este módulo para poder leer
 // los campos privados de `App`. Ver `lib/state/memory.rs`.
+pub mod dm_calls;
 pub mod memory;
 
 /// Pantalla completa que se está mostrando.
@@ -466,6 +467,17 @@ pub struct App {
     /// adelante otros campos (status, notificaciones, privacidad...) sin
     /// tener que pedirlo de nuevo.
     pub discord_settings: Option<crate::discord::user_settings::PreloadedUserSettings>,
+    /// Llamadas de DM/grupo en curso, por id de canal (`CALL_CREATE` /
+    /// `CALL_UPDATE` / `CALL_DELETE`). Ver `lib::state::dm_calls`.
+    pub dm_calls: std::collections::HashMap<String, dm_calls::DmCallInfo>,
+    /// Llamadas cuyo ring ya se rechazó o atendió (no vuelven a sonar hasta que
+    /// Discord deje de nombrarnos en ese ring).
+    declined_rings: std::collections::HashSet<String>,
+    /// La llamada entrante que está sonando ahora (tarjeta con Aceptar /
+    /// Rechazar en `ui::shell::incoming_call`).
+    pub incoming_ring: Option<dm_calls::IncomingRing>,
+    /// Mientras exista, suena el tono; soltarlo lo corta.
+    ring_sound: Option<crate::support::ringtone::RingHandle>,
     /// Volumen y silencio local de cada persona de las llamadas (clic derecho
     /// sobre su tile). Es el espejo de `audio_context_settings.user` de la
     /// cuenta: se llena con lo que trae `AppEvent::UserSettings`/`UserSettingsUpdate`
@@ -610,6 +622,12 @@ pub struct App {
     /// Botones de bots que ya mandaron su interacción y esperan respuesta:
     /// se dibujan con un spinner adentro (ver `ui::shell::components`).
     pub pending_buttons: Vec<crate::lib::data::PendingButton>,
+    /// Desde cuándo hay un "Ejecutando comando..." local esperando a que la
+    /// app conteste a un slash command (ver `clear_slash_placeholders`).
+    slash_waiting_since: Option<Instant>,
+    /// La app ya confirmó la interacción (`INTERACTION_SUCCESS`): si después
+    /// no llega ningún mensaje, el aviso se quita sin marcarlo como error.
+    slash_succeeded: bool,
     /// El Gateway se cortó y `gateway::run` está reintentando: la barra
     /// superior muestra el spinner amarillo con un "!" hasta que vuelve
     /// (`GatewayDisconnected` lo prende; `GatewayReconnected` o perder la
@@ -992,6 +1010,8 @@ impl Default for App {
             soundboard_defaults: Vec::new(),
             soundboard_guild_sounds: std::collections::HashMap::new(),
             pending_buttons: Vec::new(),
+            slash_waiting_since: None,
+            slash_succeeded: false,
             gateway_disconnected: false,
             gateway_session_id: String::new(),
             slash_catalogs: std::collections::HashMap::new(),
@@ -1015,6 +1035,10 @@ impl Default for App {
             affinity_users: Default::default(),
             affinity_guilds: Default::default(),
             home_scroll_req: [None; 2],
+            dm_calls: std::collections::HashMap::new(),
+            declined_rings: std::collections::HashSet::new(),
+            incoming_ring: None,
+            ring_sound: None,
             in_app_notifications: Vec::new(),
             notification_side,
             mute_rules: crate::lib::notifications::MuteRules::default(),
@@ -2274,11 +2298,13 @@ impl App {
     /// (`ui::chat::slash::take_invocation`).
     fn run_slash_invocation(&mut self, invocation: crate::ui::chat::slash::SlashInvocation) {
         let Some((token, tx)) = self.discord_token.clone().zip(self.event_tx.clone()) else {
+            self.fail_slash_placeholders("Todavía no hay conexión con Discord.");
             return;
         };
         let application_id = invocation.command.application_id.clone();
         let Some(ctx) = self.interaction_context(&invocation.channel_id, &application_id, invocation.guild_id.clone())
         else {
+            self.fail_slash_placeholders("Todavía no hay conexión con Discord.");
             self.push_toast(
                 ToastKind::Warning,
                 "No se pudo ejecutar el comando",
@@ -2297,6 +2323,10 @@ impl App {
         };
         crate::discord::frecency::record_command_use(&key);
         crate::discord::frecency::record_application_use(&application_id);
+        // El "Ejecutando comando..." (puesto por el compositor) vive hasta que
+        // conteste la app, falle la interacción o venza el respaldo.
+        self.slash_waiting_since = Some(Instant::now());
+        self.slash_succeeded = false;
         crate::discord::spawn_run_slash_command(token, ctx, invocation.command, invocation.options, tx);
     }
 
@@ -2324,8 +2354,8 @@ impl App {
         })
     }
 
-    /// Se apretó un botón de un mensaje: se le manda la interacción a la
-    /// app dueña. Lo que conteste (mensaje, edición, formulario) llega por
+    /// Se apretó un botón (o se eligió en un menú desplegable) de un mensaje:
+    /// se le manda la interacción a la app dueña. Lo que conteste (mensaje, edición, formulario) llega por
     /// el Gateway.
     pub fn press_component(&mut self, click: crate::lib::data::ComponentClick) {
         let Some((token, tx)) = self.discord_token.clone().zip(self.event_tx.clone()) else {
@@ -2356,7 +2386,70 @@ impl App {
             custom_id: click.custom_id.clone(),
             since: Instant::now(),
         });
-        crate::discord::spawn_press_button(token, ctx, click.message_id, click.flags, click.custom_id, tx);
+        crate::discord::spawn_press_button(
+            token,
+            ctx,
+            click.message_id,
+            click.flags,
+            click.custom_id,
+            click.values,
+            tx,
+        );
+    }
+
+    /// Saca de todos los chats el aviso local "Ejecutando comando...".
+    fn clear_slash_placeholders(&mut self) {
+        self.slash_waiting_since = None;
+        self.slash_succeeded = false;
+        self.for_each_message_list(|messages| messages.retain(|m| !m.is_slash_placeholder()));
+    }
+
+    /// Convierte el aviso "Ejecutando comando..." en un mensaje de error
+    /// (signo de exclamación + `reason`) que queda hasta que se elimine.
+    fn fail_slash_placeholders(&mut self, reason: &str) {
+        use crate::lib::data::{SLASH_ERROR_PREFIX, SLASH_PLACEHOLDER_PREFIX};
+        self.slash_waiting_since = None;
+        self.slash_succeeded = false;
+        self.for_each_message_list(|messages| {
+            for m in messages.iter_mut().filter(|m| m.is_slash_placeholder()) {
+                m.id = m.id.replacen(SLASH_PLACEHOLDER_PREFIX, SLASH_ERROR_PREFIX, 1);
+                m.content = reason.to_string();
+                // Solo lo ve quien ejecutó el comando (ojo + "Eliminar mensaje").
+                m.flags |= crate::ui::shell::components::FLAG_EPHEMERAL;
+            }
+        });
+    }
+
+    /// Aplica `f` a la lista de mensajes de cada DM y de cada canal.
+    fn for_each_message_list(&mut self, mut f: impl FnMut(&mut Vec<ChatMessage>)) {
+        for friend in &mut self.friends {
+            f(&mut friend.messages);
+        }
+        for server in &mut self.servers {
+            for category in &mut server.categories {
+                for channel in &mut category.channels {
+                    f(&mut channel.messages);
+                }
+            }
+        }
+    }
+
+    /// Respaldo del "Ejecutando comando...": si la app nunca contesta (o su
+    /// respuesta no es un mensaje) se saca solo. Una vez por frame.
+    fn tick_slash_placeholders(&mut self, ctx: &egui::Context) {
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+        let Some(since) = self.slash_waiting_since else {
+            return;
+        };
+        if since.elapsed() >= TIMEOUT {
+            if self.slash_succeeded {
+                self.clear_slash_placeholders();
+            } else {
+                self.fail_slash_placeholders("La aplicación no respondió a tiempo.");
+            }
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
     }
 
     /// Vence los botones que esperan respuesta hace demasiado y deja la
@@ -3505,6 +3598,11 @@ impl App {
             }
         }
         crate::lib::data::publish_guild_directory(ctx, &self.servers);
+        let open_server = match self.screen {
+            Screen::Server(index) => self.servers.get(index),
+            _ => None,
+        };
+        crate::lib::data::publish_pick_directory(ctx, open_server);
         self.flush_member_subscription(ctx);
         // Favoritos/frecency: manda lo pendiente cuando toca (o ya, si la
         // ventana perdió el foco: cerrar la app no avisa). Si queda algo sin
@@ -3520,6 +3618,9 @@ impl App {
         if self.flush_participant_audio(!self.window_focused) {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
+        // Llamada entrante: arranca/corta el tono y la tarjeta según el estado de
+        // cada frame (ring vigente, "No molestar", ya estar en la llamada...).
+        self.update_incoming_ring();
         let Some(rx) = &self.event_rx else { return };
         let pending: Vec<AppEvent> = rx.try_iter().collect();
         for event in pending {
@@ -4493,15 +4594,28 @@ impl App {
                 }
             }
             AppEvent::ModalCreate(request) => {
+                self.clear_slash_placeholders();
                 self.pending_buttons.clear();
                 self.component_modal = Some(ComponentModal::new(*request));
             }
             AppEvent::InteractionFailed { message } => {
                 self.pending_buttons.clear();
-                self.push_toast(ToastKind::Warning, "No se pudo completar la acción", message);
+                if self.slash_waiting_since.is_some() {
+                    // Era un slash command: el motivo se muestra en el chat.
+                    self.fail_slash_placeholders(&message);
+                } else {
+                    self.push_toast(ToastKind::Warning, "No se pudo completar la acción", message);
+                }
             }
             AppEvent::InteractionSucceeded => {
                 self.pending_buttons.clear();
+                // La respuesta (un mensaje) suele llegar pegada a este aviso:
+                // se da un par de segundos de gracia para que no parpadee el
+                // hueco; si no llega ninguna, el respaldo lo saca.
+                if self.slash_waiting_since.is_some() {
+                    self.slash_succeeded = true;
+                    self.slash_waiting_since = Instant::now().checked_sub(std::time::Duration::from_secs(13));
+                }
             }
             AppEvent::JoinFormSubmitted { guild_name, outcome } => {
                 use crate::discord::join_form::JoinOutcome;
@@ -4737,6 +4851,12 @@ impl App {
             // `App` — el endpoint/token de voz no se muestran en ningún
             // lado de la UI.
             AppEvent::VoiceServerUpdate(_) => {}
+            // Llamadas de DM/grupo: quién las está sonando y cuándo terminan
+            // (los participantes ya entraron al cache de voz arriba del `match`).
+            AppEvent::CallCreate { channel_id, ringing } | AppEvent::CallUpdate { channel_id, ringing } => {
+                self.apply_call_event(channel_id, ringing);
+            }
+            AppEvent::CallDelete { channel_id } => self.apply_call_deleted(&channel_id),
             // Go Live: los tres datos para conectarse al servidor de media
             // del stream llegan en dos eventos, en cualquier orden.
             AppEvent::StreamCreate(create) => {
@@ -5838,6 +5958,10 @@ impl App {
     fn handle_incoming_message(&mut self, msg: crate::discord::models::GatewayMessage) {
         // Antes que nada (el resto puede salir temprano con `return`): sube
         // el DM al tope de la lista y avisa si corresponde.
+        // La app contestó al slash command: ya no hace falta el aviso local.
+        if self.slash_waiting_since.is_some() && (msg.interaction.is_some() || msg.interaction_metadata.is_some()) {
+            self.clear_slash_placeholders();
+        }
         self.bump_dm_order(&msg);
         self.notify_incoming(&msg);
         // Si mandó el mensaje, ya no está "escribiendo".
@@ -6904,11 +7028,9 @@ impl App {
                         .map(|c| c.name.clone())
                 })
             }
-            crate::discord::VoiceScope::Private(_) => self
-                .friends
-                .iter()
-                .find(|f| f.dm_channel_id.as_deref() == Some(channel_id.as_str()))
-                .map(|f| f.name.clone()),
+            // Un DM 1:1 o un grupo: sale de la lista de DMs (los grupos no
+            // tienen entrada en `friends`) y, si no, de los amigos.
+            crate::discord::VoiceScope::Private(_) => self.dm_call_label(&channel_id),
         }
     }
 
@@ -7636,6 +7758,7 @@ impl eframe::App for App {
             }
         }
         self.tick_pending_buttons(ui.ctx());
+        self.tick_slash_placeholders(ui.ctx());
         self.pump_stream_frames(ui.ctx());
         self.clear_viewed_mentions();
         self.track_unread_marker();
@@ -7818,6 +7941,7 @@ impl eframe::App for App {
         // notificaciones apiladas en una esquina y el popup modal actual.
         crate::ui::shell::overlay::show_toasts(self, ui);
         crate::ui::shell::notifications::show_in_app(self, ui);
+        crate::ui::shell::incoming_call::show(self, ui);
         crate::ui::shell::overlay::show_modal(self, ui);
         crate::ui::shell::overlay::show_component_modal(self, ui);
         crate::ui::shell::overlay::show_join_form(self, ui);

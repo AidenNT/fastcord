@@ -240,6 +240,16 @@ pub enum AppEvent {
     /// Cambio de voz en vivo (`VOICE_STATE_UPDATE`): alguien se conectó, se
     /// desconectó o cambió de canal de voz.
     VoiceStateUpdate(VoiceState),
+    /// `CALL_CREATE`: hay una llamada en curso en un DM/grupo. `ringing` son los
+    /// ids de quienes la están sonando ahora (si estamos nosotros, nos están
+    /// llamando). Los `voice_states` de quienes ya están dentro se reenvían
+    /// aparte como `VoiceStateUpdate`, así que acá no viajan.
+    CallCreate { channel_id: String, ringing: Vec<String> },
+    /// `CALL_UPDATE`: cambió quién está sonando (alguien atendió, se cortó el
+    /// ring o se volvió a llamar).
+    CallUpdate { channel_id: String, ringing: Vec<String> },
+    /// `CALL_DELETE`: la llamada del DM/grupo terminó.
+    CallDelete { channel_id: String },
     /// `VOICE_SERVER_UPDATE`: el endpoint y token para abrir el WebSocket de
     /// voz de la conexión que se acaba de pedir con `GatewayCommand::UpdateVoiceState`.
     VoiceServerUpdate(VoiceServerUpdate),
@@ -1474,6 +1484,29 @@ pub fn spawn_typing(token: String, channel_id: String) {
     });
 }
 
+/// Rechaza el ring de una llamada de DM/grupo
+/// (`POST /channels/{id}/call/stop-ringing`). El ring ya se cortó del lado
+/// local; si el pedido falla solo se registra.
+pub fn spawn_stop_ringing(token: String, channel_id: String, recipients: Vec<String>) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            return;
+        };
+        rt.block_on(async move {
+            let rest = match uwu_rest::UwuRest::for_token(token).await {
+                Ok(rest) => rest,
+                Err(e) => {
+                    log::warn!("No se pudo loguear el REST para rechazar la llamada: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = rest.stop_ringing(&channel_id, &recipients).await {
+                log::warn!("No se pudo rechazar la llamada de {channel_id}: {e}");
+            }
+        });
+    });
+}
+
 /// Borra un mensaje (`ui::chat`, menú del mensaje). El mensaje ya se sacó de
 /// la lista local; si falla (falta de permisos, por ejemplo) solo se registra.
 pub fn spawn_delete_message(token: String, channel_id: String, message_id: String) {
@@ -1731,7 +1764,8 @@ pub struct InteractionContext {
     pub channel_id: String,
 }
 
-/// Aprieta un botón de un mensaje (interacción tipo 3, `MESSAGE_COMPONENT`).
+/// Aprieta un botón de un mensaje, o elige en uno de sus menús de texto
+/// o de usuarios/roles/canales (`values` = `Some((tipo, valores))`), con una interacción tipo 3 (`MESSAGE_COMPONENT`).
 /// La respuesta del bot llega después por el Gateway (un mensaje nuevo, una
 /// edición o un modal); si el POST falla se avisa con
 /// `AppEvent::InteractionFailed`.
@@ -1741,6 +1775,7 @@ pub fn spawn_press_button(
     message_id: String,
     message_flags: u64,
     custom_id: String,
+    values: Option<(u8, Vec<String>)>,
     tx: std::sync::mpsc::Sender<AppEvent>,
 ) {
     std::thread::spawn(move || {
@@ -1750,13 +1785,24 @@ pub fn spawn_press_button(
         rt.block_on(async move {
             let result = async {
                 let rest = uwu_rest::UwuRest::for_token(token).await?;
-                rest.press_button(&ctx, &message_id, message_flags, &custom_id).await
+                match &values {
+                    Some((kind, values)) => {
+                        rest.select_option(&ctx, &message_id, message_flags, &custom_id, *kind, values)
+                            .await
+                    }
+                    None => rest.press_button(&ctx, &message_id, message_flags, &custom_id).await,
+                }
             }
             .await;
             if let Err(e) = result {
-                log::warn!("No se pudo apretar el botón {custom_id}: {e}");
+                log::warn!("No se pudo mandar la interacción {custom_id}: {e}");
                 let _ = tx.send(AppEvent::InteractionFailed {
-                    message: "La aplicación no respondió a ese botón.".to_string(),
+                    message: if values.is_some() {
+                        "La aplicación no respondió a ese menú."
+                    } else {
+                        "La aplicación no respondió a ese botón."
+                    }
+                    .to_string(),
                 });
             }
         });
@@ -1977,7 +2023,7 @@ pub fn spawn_run_slash_command(
             if let Err(e) = result {
                 log::warn!("No se pudo ejecutar /{}: {e}", command.name);
                 let _ = tx.send(AppEvent::InteractionFailed {
-                    message: format!("No se pudo ejecutar /{}.", command.name),
+                    message: format!("No se pudo ejecutar /{}: {e}", command.name),
                 });
             }
         });
