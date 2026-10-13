@@ -739,6 +739,10 @@ pub struct App {
     /// de la tarjeta chica del panel izquierdo. Se persiste solo; ver
     /// `set_new_call_ui`.
     pub new_call_ui: bool,
+    /// Pantalla de bienvenida de la primera vez (elegir interfaz clásica o
+    /// nueva). Se muestra justo después de iniciar sesión, solo a quien abre la
+    /// app por primera vez; ver `App::choose_interface` y `ui::auth::welcome`.
+    pub show_welcome: bool,
     /// Tamaño de toda la interfaz (zoom): 1.0 = tamaño original, menos = más
     /// chica. Se elige en Ajustes → Apariencia (o con Ctrl + / Ctrl -) y se
     /// persiste; ver `set_ui_scale`.
@@ -1065,9 +1069,29 @@ impl Default for App {
             video_paused: false,
             egui_ctx: None,
             new_call_ui,
+            show_welcome: false,
             ui_scale,
             ui_scale_applied: f32::NAN,
         };
+        // Bienvenida: se muestra DESPUÉS de iniciar sesión, solo a quien abre la
+        // app por primera vez. "Primera vez" se detecta ahora (sin cuentas ni
+        // sesión guardadas, sin interfaz elegida a mano) y se deja anotado en
+        // `welcome_pending`, para que siga pendiente aunque se cierre la app
+        // antes de elegir. Quien ya usaba la app (instalación anterior a esta
+        // pantalla) no cumple la condición y nunca la ve.
+        let welcome_done = matches!(web_local_storage_api::get_item("welcome_done"), Ok(Some(_)));
+        if !welcome_done
+            && !matches!(web_local_storage_api::get_item("new_call_ui"), Ok(Some(_)))
+            && app.accounts.is_empty()
+            && startup_token.is_none()
+        {
+            let _ = web_local_storage_api::set_item("welcome_pending", "1");
+        }
+        app.show_welcome = !welcome_done
+            && matches!(
+                web_local_storage_api::get_item("welcome_pending"),
+                Ok(Some(ref raw)) if raw == "1"
+            );
         // Con el modo ya cargado, calculamos la paleta que corresponde
         // (y, si es `Wallpaper`, arrancamos el hilo que lo vigila) antes
         // del primer frame.
@@ -3145,6 +3169,15 @@ impl App {
         // primera para no quedar en un índice que significa otra cosa.
         self.friends_tab = 0;
         self.home_scroll_req = [None; 2];
+    }
+
+    /// Cierra la bienvenida eligiendo interfaz (`true` = nueva, `false` =
+    /// clásica). Aplica la elección, la persiste y no vuelve a mostrarse.
+    pub fn choose_interface(&mut self, modern: bool) {
+        self.set_new_call_ui(modern);
+        self.show_welcome = false;
+        let _ = web_local_storage_api::set_item("welcome_done", "1");
+        let _ = web_local_storage_api::set_item("welcome_pending", "0");
     }
 
     /// Cambia el tamaño de toda la interfaz (zoom de egui) y lo persiste. El
@@ -7771,6 +7804,9 @@ impl eframe::App for App {
 
         match self.screen {
             Screen::Login => crate::ui::auth::login::show(self, ui),
+            // Ya con sesión iniciada: la bienvenida ocupa el lugar de la primera
+            // pantalla hasta que se elija interfaz.
+            _ if self.show_welcome => crate::ui::auth::welcome::show(self, ui),
             Screen::Home => crate::ui::home::show(self, ui),
             Screen::Dm(_) => crate::ui::dm::show(self, ui),
             Screen::Server(_) => crate::ui::server::show(self, ui),

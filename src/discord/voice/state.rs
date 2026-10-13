@@ -28,7 +28,7 @@ pub struct VoiceParticipantState {
 /// vez de fallar el parseo) son lo que le permite a `ui::settings`
 /// persistir esto en `web_local_storage_api`, igual que ya hace con
 /// `custom_themes` — ver `App::persist_voice_audio_settings`.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct VoiceAudioSettings {
     pub noise_suppression: bool,
@@ -36,6 +36,22 @@ pub struct VoiceAudioSettings {
     pub microphone_sensitivity: MicrophoneSensitivityDb,
     pub microphone_volume: VoiceVolumePercent,
     pub voice_output_volume: VoiceVolumePercent,
+}
+
+/// La supresión de ruido viene ACTIVADA por defecto: quien abre la app por
+/// primera vez (o no tiene este ajuste guardado) ya sale limpio en la llamada.
+/// Quien ya la apagó a mano conserva su elección: el `false` queda guardado en
+/// el JSON y `#[serde(default)]` solo rellena los campos que faltan.
+impl Default for VoiceAudioSettings {
+    fn default() -> Self {
+        Self {
+            noise_suppression: true,
+            microphone_buffer_ms: None,
+            microphone_sensitivity: MicrophoneSensitivityDb::default(),
+            microphone_volume: VoiceVolumePercent::default(),
+            voice_output_volume: VoiceVolumePercent::default(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
