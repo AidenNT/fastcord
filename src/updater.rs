@@ -16,10 +16,17 @@
 //!   el ayudante reemplaza el ejecutable y vuelve a abrir ecord. Si la versión
 //!   nueva no arranca, restaura la anterior.
 //!
+//! * [`elevation`] cubre las copias instaladas en una carpeta protegida (el
+//!   .msi instala en Program Files): pide permisos de administrador (UAC)
+//!   con un aviso previo, actualiza desde una instancia elevada sin ventana y
+//!   reabre eCord sin privilegios.
+//!
 //! Qué NO hace: actualizar copias instaladas por un gestor de paquetes (.deb,
 //! Flatpak, Homebrew, `cargo install`...) ni copias sin el archivo marcador de
 //! `packaging/` junto al ejecutable. En esos casos [`view`] devuelve
 //! [`View::Manual`] con el motivo y el enlace a la página de la versión.
+
+mod elevation;
 
 use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,6 +62,9 @@ pub const UPDATES: UpdateConfig = UpdateConfig {
     ..UpdateConfig::new(REPOSITORY, "eCord", "ecord", env!("CARGO_PKG_VERSION"))
 };
 
+pub use elevation::{needs_elevation, request_elevated_update, take_error as take_elevation_error};
+use elevation::{DEELEVATE_FLAG, ELEVATED_FLAG};
+
 /// Variable de entorno para apagar por completo el chequeo de versiones.
 pub const DISABLE_ENV: &str = "ECORD_DISABLE_UPDATES";
 
@@ -69,6 +79,11 @@ pub enum View {
     UpToDate,
     /// No se pudo consultar GitHub (sin red, límite de pedidos...).
     CheckFailed(String),
+    /// Hay una versión nueva, pero eCord está en una carpeta protegida
+    /// (Program Files): no se baja en segundo plano porque la descarga se
+    /// guarda junto al ejecutable. Se baja e instala con permisos de
+    /// administrador cuando el usuario lo pide (ver [`elevation`]).
+    NeedsElevation { version: String },
     /// Hay una versión nueva pero esta copia no puede instalarla sola.
     Manual { version: String, url: String, reason: String },
     /// Bajando y verificando la versión nueva.
@@ -88,6 +103,9 @@ struct Shared {
     checking: bool,
     checked: bool,
     check_error: Option<String>,
+    /// La versión nueva está disponible pero hay que bajarla con permisos de
+    /// administrador (la carpeta del ejecutable no es escribible).
+    needs_elevation: bool,
     /// Pedido de "buscar ahora" que despierta al hilo antes del próximo día.
     wake: bool,
 }
@@ -99,6 +117,7 @@ static SHARED: Mutex<Shared> = Mutex::new(Shared {
     checking: false,
     checked: false,
     check_error: None,
+    needs_elevation: false,
     wake: false,
 });
 static WAKE: Condvar = Condvar::new();
@@ -130,6 +149,15 @@ pub fn intercept() {
     *launch_slot() = Some(LaunchInfo { arguments, receipt, error });
 }
 
+/// Atiende las banderas de la actualización con permisos elevados
+/// (`--elevated-update` y `--deelevate`, ver [`elevation`]). Llamar justo
+/// después de [`answer_version_probe`], antes de abrir cualquier ventana y de
+/// `single_instance`. Si esta ejecución era una de esas dos, no vuelve.
+pub fn handle_elevation_flags() {
+    elevation::run_if_requested();
+    elevation::finish_deelevate_if_requested();
+}
+
 /// `ecord --version` imprime `ecord <versión>` y sale. El ayudante de la
 /// versión anterior ejecuta así el ejecutable descargado antes de instalarlo,
 /// y rechaza la actualización si no responde exactamente eso. Tiene que
@@ -147,7 +175,7 @@ pub fn answer_version_probe() {
 /// Argumentos con los que el ayudante vuelve a abrir ecord (sin el nombre del
 /// programa ni las banderas del updater).
 fn relaunch_arguments() -> Vec<String> {
-    launch_slot()
+    let mut arguments: Vec<String> = launch_slot()
         .as_ref()
         .map(|launch| {
             launch
@@ -155,9 +183,17 @@ fn relaunch_arguments() -> Vec<String> {
                 .iter()
                 .skip(1)
                 .map(|arg| arg.to_string_lossy().into_owned())
+                .filter(|arg| arg != ELEVATED_FLAG && arg != DEELEVATE_FLAG)
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // Si esta ejecución es la instancia elevada, lo que se reabra después de
+    // actualizar también lo estaría: `--deelevate` hace que se relance sin
+    // privilegios.
+    if elevation::is_elevated_run() {
+        arguments.push(DEELEVATE_FLAG.to_owned());
+    }
+    arguments
 }
 
 /// Mensaje del ayudante si tuvo que restaurar la versión anterior (una sola
@@ -233,6 +269,9 @@ pub fn view() -> View {
             url: release.url.clone(),
             reason: reason.clone(),
         };
+    }
+    if let (Some(release), true) = (&shared.release, shared.needs_elevation) {
+        return View::NeedsElevation { version: release.version.clone() };
     }
     if let Some(error) = &shared.check_error {
         return View::CheckFailed(error.clone());
@@ -330,6 +369,7 @@ fn run_cycle(updater: &Updater, repaint: &(dyn Fn() + Send + Sync)) {
         }
         shared.checking = true;
         shared.check_error = None;
+        shared.needs_elevation = false;
     }
     repaint();
 
@@ -348,22 +388,29 @@ fn run_cycle(updater: &Updater, repaint: &(dyn Fn() + Send + Sync)) {
             shared.checked = true;
             shared.release = None;
             shared.unsupported = None;
+            shared.needs_elevation = false;
         }
         Ok(Some(release)) => {
             log::info!("updater: hay una versión nueva: {}", release.version);
             let unsupported = updater.installation().err().map(|reason| explain(&reason));
+            // La descarga crea una carpeta temporal junto al ejecutable. Si
+            // está en una carpeta protegida, hacerlo desde acá falla con
+            // "acceso denegado (os error 5)": se deja para la instancia
+            // elevada, que baja e instala todo con permisos de administrador.
+            let protected = unsupported.is_none() && needs_elevation();
             {
                 let mut shared = shared();
                 shared.checking = false;
                 shared.checked = true;
                 shared.release = Some(release.clone());
                 shared.unsupported = unsupported.clone();
-                if unsupported.is_none() {
+                shared.needs_elevation = protected;
+                if unsupported.is_none() && !protected {
                     shared.state = DownloadState::Downloading { received: 0, total: 0 };
                 }
             }
             repaint();
-            if unsupported.is_none() {
+            if unsupported.is_none() && !protected {
                 download(updater, &release, repaint);
             }
         }

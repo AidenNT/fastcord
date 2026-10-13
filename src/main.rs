@@ -45,6 +45,10 @@ fn main() -> eframe::Result<()> {
     // `ecord --version`: el ayudante de la versión anterior lo ejecuta para
     // comprobar el binario descargado antes de instalarlo.
     updater::answer_version_probe();
+    // Actualización con permisos de administrador (copia en Program Files):
+    // `--elevated-update` actualiza sin ventana y `--deelevate` se relanza sin
+    // privilegios. Si es una de las dos, no vuelve.
+    updater::handle_elevation_flags();
     // Este mismo ejecutable también es la ventana del captcha de hCaptcha
     // (ver `discord::captcha`): en ese caso no se arranca eframe.
     if std::env::args().any(|arg| arg == discord::captcha::WINDOW_FLAG) {

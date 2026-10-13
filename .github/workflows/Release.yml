@@ -15,7 +15,6 @@
 # Archivos del release (los nombres los fija el actualizador, no los cambies):
 #   Windows : ecord-vX-x86_64-pc-windows-msvc.zip        (portable, se actualiza solo)
 #             ecord-vX-x86_64-pc-windows-msvc-setup.exe  (instalador por usuario, se actualiza solo)
-#             ecord-vX-windows-x64.msi                   (instalación manual/empresas, por equipo)
 #   Linux   : ecord-vX-x86_64-unknown-linux-gnu.tar.gz   (portable con FFmpeg, se actualiza solo)
 #             ecord-vX-linux-amd64.deb                   (FFmpeg incluido; lo actualiza apt/dpkg, no la app)
 #   macOS   : ecord-vX-macos-universal.dmg               (arm64 + x86_64, experimental)
@@ -68,7 +67,7 @@ jobs:
           else v="dev-${GITHUB_SHA::7}"; rel=false; fi
           echo "version=$v"  >> "$GITHUB_OUTPUT"
           echo "release=$rel" >> "$GITHUB_OUTPUT"
-          # MSI/deb y el actualizador toman la versión de Cargo.toml: tiene que coincidir con el tag.
+          # El .deb y el actualizador toman la versión de Cargo.toml: tiene que coincidir con el tag.
           if [ "$rel" = true ]; then
             cargo_v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
             if [ "v$cargo_v" != "$v" ]; then
@@ -227,10 +226,10 @@ jobs:
           # el zip portable lleva ecord-portable.txt (más abajo).
           Copy-Item packaging\ecord-installer.txt packaging\bundle-libs\
 
-      - name: Generar .msi y .exe (setup)
+      - name: Generar .exe (setup)
         shell: pwsh
         run: |
-          cargo packager --release --formats wix,nsis -vv
+          cargo packager --release --formats nsis -vv
           if ($LASTEXITCODE -ne 0) { throw "cargo packager falló (código $LASTEXITCODE)" }
           if (-not (Test-Path dist-installers)) {
             throw "cargo packager no creó dist-installers. ¿Está [package.metadata.packager] en el Cargo.toml commiteado?"
@@ -243,15 +242,10 @@ jobs:
         run: |
           $n = "ecord-$env:VERSION-$env:TARGET"
           New-Item -ItemType Directory -Force dist | Out-Null
-          $msi = Get-ChildItem dist-installers -Recurse -Filter *.msi | Select-Object -First 1
           $exe = Get-ChildItem dist-installers -Recurse -Filter *-setup.exe | Select-Object -First 1
-          if (-not $msi) { throw "No se generó ningún .msi en dist-installers (mirá el paso anterior)" }
           if (-not $exe) { throw "No se generó el instalador -setup.exe en dist-installers (mirá el paso anterior)" }
           # El .exe (NSIS) instala por usuario, sin elevación: es el que usa el actualizador.
           Copy-Item $exe.FullName "dist\$n-setup.exe"
-          # El .msi (WiX) instala por equipo y pide elevación, que el actualizador no puede
-          # dar. Va con otro nombre (sin el triple) para que no lo elija por error.
-          Copy-Item $msi.FullName "dist\ecord-$env:VERSION-windows-x64.msi"
           # ZIP portable: carpeta ecord-vX-<target>\ con ecord.exe, DLLs y ecord-portable.txt.
           $stage = "stage\$n"
           New-Item -ItemType Directory -Force $stage | Out-Null

@@ -25,6 +25,9 @@ pub enum UiAction {
     CheckNow,
     Restart,
     OpenPage(String),
+    /// Reiniciar para instalar pidiendo permisos de administrador (el usuario
+    /// ya aceptó el aviso). Ver `updater::elevation`.
+    RestartElevated,
 }
 
 /// Llamar una vez por frame, al final de `App::ui` (el primer frame ya se
@@ -49,10 +52,18 @@ pub fn poll(app: &mut App, ctx: &egui::Context) {
         }
     }
 
+    if let Some(message) = updater::take_elevation_error() {
+        app.push_toast(ToastKind::Warning, "No se pudo actualizar", message);
+    }
+
     let (key, dialog) = match updater::view() {
         View::Ready { version } => {
             let dialog = ready_dialog(&version);
             (format!("ready:{version}"), dialog)
+        }
+        View::NeedsElevation { version } => {
+            let dialog = elevation_dialog();
+            (format!("elevation:{version}"), dialog)
         }
         View::Manual { version, url, reason } => {
             let dialog = manual_dialog(&version, &url, &reason);
@@ -101,17 +112,52 @@ fn manual_dialog(version: &str, url: &str, reason: &str) -> Dialog {
         })
 }
 
+/// Aviso previo a pedir permisos de administrador: eCord está en una carpeta
+/// protegida (Program Files) y Windows va a mostrar su propio aviso UAC.
+fn elevation_dialog() -> Dialog {
+    Dialog::new("update_elevation", DialogKind::Info, "Hacen falta permisos de administrador")
+        .text(
+            "eCord está instalado en una carpeta protegida de Windows, así que para \
+             reemplazarlo Windows te va a pedir confirmación. eCord se cierra mientras \
+             se descarga e instala la actualización y vuelve a abrirse solo. Si estás \
+             en una llamada, se corta."
+                .to_owned(),
+        )
+        .button("cancel", "Cancelar", ButtonStyle::Secondary)
+        .button("continue", "Continuar", ButtonStyle::Primary)
+        .dismissable()
+        .on_result(|app, ctx, result| {
+            if result.is("continue") {
+                apply(app, ctx, UiAction::RestartElevated);
+            }
+        })
+}
+
 /// Ejecuta una acción de la UI.
-pub fn apply(_app: &mut App, ctx: &egui::Context, action: UiAction) {
+pub fn apply(app: &mut App, ctx: &egui::Context, action: UiAction) {
     match action {
         UiAction::CheckNow => {
             updater::check_now();
             ctx.request_repaint();
         }
         UiAction::Restart => {
+            // Carpeta protegida (Program Files): antes de instalar, avisar de
+            // que hacen falta permisos de administrador.
+            if updater::needs_elevation() {
+                app.open_dialog(elevation_dialog());
+                return;
+            }
             let repaint = ctx.clone();
             let quit = ctx.clone();
             updater::install_and_quit(
+                move || repaint.request_repaint(),
+                move || quit.send_viewport_cmd(egui::ViewportCommand::Close),
+            );
+        }
+        UiAction::RestartElevated => {
+            let repaint = ctx.clone();
+            let quit = ctx.clone();
+            updater::request_elevated_update(
                 move || repaint.request_repaint(),
                 move || quit.send_viewport_cmd(egui::ViewportCommand::Close),
             );
@@ -136,6 +182,13 @@ pub fn section(ui: &mut egui::Ui, palette: &Palette) -> Option<UiAction> {
         View::Manual { version, url, reason } => (
             format!("Hay una versión nueva ({version}). {reason}"),
             Some((Icon::Download, "Ver descarga", UiAction::OpenPage(url))),
+        ),
+        View::NeedsElevation { version } => (
+            format!(
+                "Hay una versión nueva ({version}). eCord está en una carpeta protegida: \
+                 para actualizar hacen falta permisos de administrador."
+            ),
+            Some((Icon::Download, "Actualizar", UiAction::Restart)),
         ),
         View::Downloading { version, received, total } => {
             let progress = if total > 0 {

@@ -282,3 +282,5 @@ ecord/
 ## License
 
 Released under the [MIT License](LICENSE). Components under `vendor/` keep their own licenses (also MIT).
+
+Third-party components (FFmpeg, fonts, icons, vendored code and more) are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). **The Linux `.deb` and the macOS `.dmg` bundle GPL-licensed FFmpeg libraries**, so those packages are distributed under the terms of the GPL; the Windows installers use an LGPL build of FFmpeg. eCord is an unofficial client and is not affiliated with Discord Inc.

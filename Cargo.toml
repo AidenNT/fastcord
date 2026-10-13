@@ -1,6 +1,6 @@
 [package]
 name = "ecord"
-version = "0.0.12"
+version = "0.0.13"
 edition = "2024"
 # bidi.rs y system_fonts.rs usan let-chains ("if let ... && ...", estabilizado
 # en la edición 2024), así que hace falta un rustc razonablemente reciente.
@@ -332,8 +332,8 @@ assets = [
   ["packaging/linux/ffmpeg-LICENSE.txt", "usr/share/doc/ecord/ffmpeg-LICENSE.txt", "644"],
 ]
 
-# --- Instaladores (.msi/.exe/.dmg) con cargo-packager ---
-# Uso: cargo packager --release --formats wix,nsis   (Windows)
+# --- Instaladores (.exe/.dmg) con cargo-packager ---
+# Uso: cargo packager --release --formats nsis        (Windows)
 #      cargo packager --release --formats dmg        (macOS)
 [package.metadata.packager]
 product-name = "eCord"
@@ -349,6 +349,12 @@ binaries = [{ path = "ecord", main = true }]
 icons = ["assets/packaging/icon.ico", "assets/packaging/icon.icns", "assets/packaging/icon.png"]
 # DLLs (Windows) o dylibs (macOS) que el CI copia aquí antes de empaquetar.
 resources = [{ src = "packaging/bundle-libs/*", target = "." }]
+
+# Instalador .exe (NSIS) por usuario: se instala en %LOCALAPPDATA%\eCord sin pedir
+# permisos de administrador, y el updater puede reemplazar el ejecutable sin UAC.
+# (No se genera .msi: el de WiX es siempre "por equipo", instala en Program Files y exige admin.)
+[package.metadata.packager.nsis]
+install-mode = "currentUser"
 
 # --- wreq / wreq-util desde la rama principal de GitHub ---
 # `[patch.crates-io]` reemplaza esos crates en TODO el grafo (este crate y
