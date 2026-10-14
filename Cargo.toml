@@ -353,8 +353,6 @@ resources = [{ src = "packaging/bundle-libs/*", target = "." }]
 # Instalador .exe (NSIS) por usuario: se instala en %LOCALAPPDATA%\eCord sin pedir
 # permisos de administrador, y el updater puede reemplazar el ejecutable sin UAC.
 # (No se genera .msi: el de WiX es siempre "por equipo", instala en Program Files y exige admin.)
-[package.metadata.packager.nsis]
-install-mode = "currentUser"
 
 # --- wreq / wreq-util desde la rama principal de GitHub ---
 # `[patch.crates-io]` reemplaza esos crates en TODO el grafo (este crate y
