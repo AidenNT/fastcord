@@ -31,6 +31,14 @@
 //! * Un captcha a la vez: si llegan varios pedidos juntos se atienden en
 //!   fila, cada uno con su ventana (el `rqtoken` es por request).
 //!
+//! ## Linux: ejecutable aparte (`ecord-captcha`)
+//!
+//! En Linux la ventana no es `ecord` sino `src/bin/ecord-captcha.rs`, el único
+//! que enlaza WebKitGTK/GTK. Así el portable arranca en cualquier escritorio
+//! aunque no tenga esas bibliotecas y no haya gestor de paquetes; solo el
+//! captcha las necesita, y si faltan se avisa qué instalar (ver
+//! `missing_library_message`). Windows/macOS siguen como se describe abajo.
+//!
 //! ## Por qué un proceso hijo
 //!
 //! `wry`/`tao` necesitan crear su propio event loop, y `eframe` ya tiene el
@@ -55,6 +63,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -65,21 +74,18 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::oneshot;
 
-/// Bandera con la que `main()` reconoce que este proceso es la ventana del
-/// captcha y no la app.
-pub const WINDOW_FLAG: &str = "--captcha-window";
+#[path = "captcha_proto.rs"]
+mod proto;
+#[cfg(not(target_os = "linux"))]
+#[path = "captcha_window.rs"]
+mod window;
 
-/// Cuántos captchas seguidos se le piden a la persona por una misma request
-/// antes de darse por vencido (si Discord los rechaza todos, no tiene
-/// sentido seguir abriendo ventanas).
-pub const MAX_SOLVES_PER_REQUEST: usize = 3;
-
-const TOKEN_PREFIX: &str = "ECORD_CAPTCHA_TOKEN:";
-const ERROR_PREFIX: &str = "ECORD_CAPTCHA_ERROR:";
-const ENV_SITEKEY: &str = "ECORD_CAPTCHA_SITEKEY";
-const ENV_RQDATA: &str = "ECORD_CAPTCHA_RQDATA";
-const ENV_USER_AGENT: &str = "ECORD_CAPTCHA_UA";
-const HOST_PAGE: &str = "https://discord.com/login";
+pub use proto::{MAX_SOLVES_PER_REQUEST, WINDOW_FLAG};
+use proto::{ENV_RQDATA, ENV_SITEKEY, ENV_USER_AGENT, ERROR_PREFIX, TOKEN_PREFIX};
+#[cfg(target_os = "linux")]
+use proto::HELPER_NAME;
+#[cfg(not(target_os = "linux"))]
+pub use window::run_window;
 
 /// La persona cerró la ventana sin resolver el captcha (o no se pudo abrir).
 #[derive(Debug)]
@@ -279,13 +285,87 @@ impl Drop for CaptchaWindow {
     }
 }
 
+/// Programa que muestra la ventana del captcha.
+///
+/// * Windows/macOS: este mismo ejecutable con `--captcha-window`.
+/// * Linux: el ejecutable aparte `ecord-captcha` (es el único que enlaza
+///   WebKitGTK/GTK; así `ecord` arranca aunque no estén instalados). Se busca
+///   junto a `ecord` (portable), en `/usr/lib/ecord` (.deb) o en la ruta de
+///   `ECORD_CAPTCHA_HELPER`.
+#[cfg(not(target_os = "linux"))]
+fn window_program() -> Result<PathBuf, String> {
+    std::env::current_exe()
+        .map_err(|error| format!("No se pudo ubicar el ejecutable para abrir el captcha: {error}"))
+}
+
+#[cfg(target_os = "linux")]
+fn window_program() -> Result<PathBuf, String> {
+    if let Some(custom) = std::env::var_os("ECORD_CAPTCHA_HELPER").map(PathBuf::from) {
+        if custom.is_file() {
+            return Ok(custom);
+        }
+    }
+    let mut candidates = Vec::new();
+    if let Some(dir) = std::env::current_exe().ok().and_then(|exe| exe.parent().map(PathBuf::from)) {
+        candidates.push(dir.join(HELPER_NAME));
+    }
+    candidates.push(PathBuf::from("/usr/lib/ecord").join(HELPER_NAME));
+    candidates.into_iter().find(|path| path.is_file()).ok_or_else(|| {
+        format!(
+            "No se encontró {HELPER_NAME} (la ventana del captcha). Si usás el portable, extraé la carpeta completa y dejá {HELPER_NAME} junto a ecord; también podés iniciar sesión con el QR."
+        )
+    })
+}
+
+/// Lee stderr del helper en segundo plano (lo reenvía a la consola y guarda
+/// las primeras líneas para diagnosticar).
+#[cfg(target_os = "linux")]
+fn capture_stderr(stderr: Option<std::process::ChildStderr>) -> Arc<Mutex<String>> {
+    let text = Arc::new(Mutex::new(String::new()));
+    if let Some(stderr) = stderr {
+        let sink = Arc::clone(&text);
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                eprintln!("[captcha-window] {line}");
+                if let Ok(mut text) = sink.lock() {
+                    if text.len() < 4096 {
+                        text.push_str(&line);
+                        text.push('\n');
+                    }
+                }
+            }
+        });
+    }
+    text
+}
+
+/// Si el stderr del helper es el error del cargador dinámico por una
+/// biblioteca que falta, devuelve un aviso para la persona.
+#[cfg(target_os = "linux")]
+fn missing_library_message(stderr: &str) -> Option<String> {
+    let line = stderr
+        .lines()
+        .find(|line| line.contains("error while loading shared libraries"))?;
+    let library = line
+        .split("shared libraries:")
+        .nth(1)
+        .and_then(|rest| rest.trim().split(':').next())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("una biblioteca del sistema");
+    Some(format!(
+        "Falta {library} para mostrar el captcha. Instalá WebKitGTK 4.1 \
+         (Debian/Ubuntu: sudo apt install libwebkit2gtk-4.1-0 · Fedora: sudo dnf install webkit2gtk4.1 · \
+         Arch: sudo pacman -S webkit2gtk-4.1) o iniciá sesión con el QR."
+    ))
+}
+
 /// Abre la ventana para el pedido `id`. Cuando termina entrega la respuesta
 /// con [`resolve`] y despierta a la UI.
 fn spawn_window(id: u64, challenge: &CaptchaChallenge) -> Result<CaptchaWindow, String> {
-    let exe = std::env::current_exe()
-        .map_err(|error| format!("No se pudo ubicar el ejecutable para abrir el captcha: {error}"))?;
+    let program = window_program()?;
 
-    let mut command = Command::new(exe);
+    let mut command = Command::new(program);
     command
         .arg(WINDOW_FLAG)
         .env(ENV_SITEKEY, &challenge.sitekey)
@@ -293,8 +373,9 @@ fn spawn_window(id: u64, challenge: &CaptchaChallenge) -> Result<CaptchaWindow, 
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         // Los errores de la ventana (WebView2 ausente, etc.) salen por la
-        // consola de la app, útil al probar con `cargo run`.
-        .stderr(Stdio::inherit());
+        // consola de la app, útil al probar con `cargo run`. En Linux se
+        // captura para detectar que faltan bibliotecas (WebKitGTK).
+        .stderr(if cfg!(target_os = "linux") { Stdio::piped() } else { Stdio::inherit() });
     if let Some(rqdata) = &challenge.rqdata {
         command.env(ENV_RQDATA, rqdata);
     }
@@ -312,6 +393,8 @@ fn spawn_window(id: u64, challenge: &CaptchaChallenge) -> Result<CaptchaWindow, 
         .stdout
         .take()
         .ok_or_else(|| "No se pudo leer la respuesta de la ventana del captcha".to_owned())?;
+    #[cfg(target_os = "linux")]
+    let stderr_text = capture_stderr(child.stderr.take());
     let child = Arc::new(Mutex::new(child));
     let outcome = Arc::new(AtomicU8::new(RUNNING));
 
@@ -322,6 +405,7 @@ fn spawn_window(id: u64, challenge: &CaptchaChallenge) -> Result<CaptchaWindow, 
     std::thread::spawn(move || {
         let mut token = None;
         let mut window_error = None;
+        let mut reported_error = false;
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             if let Some(found) = line.strip_prefix(TOKEN_PREFIX) {
                 if !found.is_empty() {
@@ -332,6 +416,7 @@ fn spawn_window(id: u64, challenge: &CaptchaChallenge) -> Result<CaptchaWindow, 
                 window_error = Some(message.to_owned());
             }
         }
+        reported_error |= window_error.is_some();
         if token.is_none() {
             if let Some(message) = window_error {
                 log::warn!("la ventana del captcha terminó con error: {message}");
@@ -353,6 +438,24 @@ fn spawn_window(id: u64, challenge: &CaptchaChallenge) -> Result<CaptchaWindow, 
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+
+        // Linux: si `ecord-captcha` ni arrancó porque el sistema no tiene
+        // WebKitGTK/GTK, el cargador dinámico lo dice por stderr (no hay
+        // línea ECORD_CAPTCHA_ERROR). Se traduce a un aviso con qué instalar.
+        #[cfg(target_os = "linux")]
+        if token.is_none() && !reported_error {
+            // Dar un instante al hilo que lee stderr para que termine de vaciar el pipe.
+            std::thread::sleep(Duration::from_millis(100));
+            let text = stderr_text.lock().map(|text| text.clone()).unwrap_or_default();
+            if let Some(message) = missing_library_message(&text) {
+                log::warn!("captcha: {message}");
+                if let Ok(mut slot) = LAST_WINDOW_ERROR.lock() {
+                    *slot = Some(message);
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = reported_error;
 
         let solved = token.is_some();
         resolve(
@@ -431,170 +534,6 @@ impl CaptchaController {
             drop(window);
         }
     }
-}
-
-// --- Ventana (proceso hijo) ---------------------------------------------------
-
-/// Cuerpo del proceso hijo: abre la ventana, espera el token, lo imprime
-/// por stdout y termina. Nunca vuelve.
-pub fn run_window() -> ! {
-    use std::io::Write;
-    use tao::dpi::LogicalSize;
-    use tao::event::{Event, WindowEvent};
-    use tao::event_loop::{ControlFlow, EventLoopBuilder};
-    use tao::window::WindowBuilder;
-    use wry::WebViewBuilder;
-
-    // Cualquier fallo de arranque (WebView2 ausente, carpeta de datos sin
-    // permisos, panic) se le avisa al proceso padre por stdout: en release
-    // este proceso no tiene consola y antes la ventana se cerraba sin dejar
-    // ningún rastro.
-    std::panic::set_hook(Box::new(|info| {
-        report_fatal(&format!("panic: {info}"));
-    }));
-    #[cfg(windows)]
-    if std::env::var_os("WEBVIEW2_USER_DATA_FOLDER").is_none() {
-        if let Some(dir) = crate::paths::webview_data_dir() {
-            let _ = std::fs::create_dir_all(&dir);
-            // SAFETY: todavía es el único hilo del proceso hijo.
-            unsafe { std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", dir) };
-        }
-    }
-
-    let sitekey = std::env::var(ENV_SITEKEY).unwrap_or_default();
-    let rqdata = std::env::var(ENV_RQDATA).ok();
-    let user_agent = std::env::var(ENV_USER_AGENT).ok();
-
-    let event_loop = EventLoopBuilder::<String>::with_user_event().build();
-    let proxy = event_loop.create_proxy();
-    let window = WindowBuilder::new()
-        .with_title("eCord — Verificación")
-        .with_inner_size(LogicalSize::new(500.0, 680.0))
-        .build(&event_loop)
-        .unwrap_or_else(|error| report_fatal(&format!("no se pudo crear la ventana: {error}")));
-
-    let script = init_script(&sitekey, rqdata.as_deref());
-    let mut builder = WebViewBuilder::new()
-        .with_url(HOST_PAGE)
-        .with_initialization_script(&script)
-        .with_ipc_handler(move |request: wry::http::Request<String>| {
-            let _ = proxy.send_event(request.body().clone());
-        });
-    if let Some(user_agent) = &user_agent {
-        builder = builder.with_user_agent(user_agent);
-    }
-    let webview = builder
-        .build(&window)
-        .unwrap_or_else(|error| {
-            report_fatal(&format!(
-                "no se pudo crear el WebView ({error}); ¿falta WebView2 (Windows) o webkit2gtk (Linux)?"
-            ))
-        });
-
-    event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
-        // El WebView tiene que vivir mientras dure el event loop.
-        let _keep_alive = &webview;
-        match event {
-            Event::UserEvent(token) => {
-                println!("{TOKEN_PREFIX}{token}");
-                let _ = std::io::stdout().flush();
-                *control_flow = ControlFlow::Exit;
-            }
-            Event::WindowEvent {
-                event: WindowEvent::CloseRequested,
-                ..
-            } => *control_flow = ControlFlow::Exit,
-            _ => {}
-        }
-    })
-}
-
-/// Avisa del error al proceso padre (stdout) y a stderr, y termina.
-fn report_fatal(message: &str) -> ! {
-    use std::io::Write;
-    let one_line = message.replace(['\r', '\n'], " ");
-    println!("{ERROR_PREFIX}{one_line}");
-    let _ = std::io::stdout().flush();
-    eprintln!("[captcha-window] {one_line}");
-    std::process::exit(1)
-}
-
-/// Script que corre al crear cada documento: en la página de discord.com
-/// (solo frame principal) frena la carga de la app, arma una página mínima
-/// con el widget de hCaptcha y manda el token por `window.ipc`.
-fn init_script(sitekey: &str, rqdata: Option<&str>) -> String {
-    let sitekey = serde_json::to_string(sitekey).unwrap_or_else(|_| "\"\"".to_owned());
-    let rqdata = match rqdata {
-        Some(data) => serde_json::to_string(data).unwrap_or_else(|_| "null".to_owned()),
-        None => "null".to_owned(),
-    };
-    format!(
-        r#"(function () {{
-  if (window.top !== window || location.hostname !== 'discord.com') return;
-  var SITEKEY = {sitekey};
-  var RQDATA = {rqdata};
-
-  function boot() {{
-    if (window.__ecordBooted) return;
-    window.__ecordBooted = true;
-    try {{ window.stop(); }} catch (e) {{}}
-    document.open();
-    document.write('<!doctype html><html><head><meta charset="utf-8"><title>eCord</title></head><body></body></html>');
-    document.close();
-
-    var style = document.createElement('style');
-    style.textContent = 'html,body{{margin:0;height:100%;background:#1e1f22;color:#dbdee1;font-family:system-ui,Segoe UI,sans-serif}}' +
-      'body{{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;text-align:center}}' +
-      'p{{margin:0;padding:0 24px;font-size:14px}}';
-    document.head.appendChild(style);
-
-    var msg = document.createElement('p');
-    msg.textContent = 'Necesitamos verificar que eres un humano.';
-    document.body.appendChild(msg);
-    var box = document.createElement('div');
-    box.id = 'ecord-hcaptcha';
-    document.body.appendChild(box);
-
-    var widgetId = null;
-    window.ecordCaptchaReady = function () {{
-      try {{
-        widgetId = hcaptcha.render('ecord-hcaptcha', {{
-          sitekey: SITEKEY,
-          theme: 'dark',
-          callback: function (token) {{
-            msg.textContent = 'Listo, volviendo a eCord…';
-            window.ipc.postMessage(token);
-          }},
-          'expired-callback': function () {{ try {{ hcaptcha.reset(widgetId); }} catch (e) {{}} }},
-          'error-callback': function (err) {{ msg.textContent = 'Error del captcha: ' + err; }}
-        }});
-        if (RQDATA) {{ hcaptcha.setData(widgetId, {{ rqdata: RQDATA }}); }}
-      }} catch (e) {{
-        msg.textContent = 'No se pudo mostrar el captcha: ' + e;
-      }}
-    }};
-
-    var script = document.createElement('script');
-    script.src = 'https://js.hcaptcha.com/1/api.js?render=explicit&onload=ecordCaptchaReady';
-    script.async = true;
-    script.onerror = function () {{ msg.textContent = 'No se pudo cargar hCaptcha (revisá tu conexión).'; }};
-    document.head.appendChild(script);
-
-    setTimeout(function () {{
-      if (typeof hcaptcha === 'undefined') {{
-        msg.textContent = 'hCaptcha no cargó. Cerrá esta ventana y probá de nuevo o usá el QR.';
-      }}
-    }}, 15000);
-  }}
-
-  if (document.readyState === 'loading') {{
-    document.addEventListener('DOMContentLoaded', boot);
-  }} else {{
-    boot();
-  }}
-}})();"#
-    )
 }
 
 #[cfg(test)]
@@ -696,5 +635,14 @@ mod tests {
 
         // Resolver dos veces no rompe nada.
         resolve(request.id, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detects_missing_webkit_from_loader_error() {
+        let stderr = "/usr/lib/ecord/ecord-captcha: error while loading shared libraries: libwebkit2gtk-4.1.so.0: cannot open shared object file: No such file or directory\n";
+        let message = missing_library_message(stderr).expect("should detect");
+        assert!(message.contains("libwebkit2gtk-4.1.so.0"));
+        assert!(missing_library_message("otra cosa\n").is_none());
     }
 }

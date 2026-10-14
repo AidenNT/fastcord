@@ -2,6 +2,8 @@
 name = "ecord"
 version = "0.0.13"
 edition = "2024"
+# Hay dos ejecutables (`ecord` y `ecord-captcha`, ver src/bin): `cargo run` arranca la app.
+default-run = "ecord"
 # bidi.rs y system_fonts.rs usan let-chains ("if let ... && ...", estabilizado
 # en la edición 2024), así que hace falta un rustc razonablemente reciente.
 rust-version = "1.88"
@@ -112,10 +114,10 @@ anyhow = "1"
 
 # --- Ventana del captcha (src/discord/captcha.rs) ---
 # El captcha de hCaptcha que pide Discord en el login se resuelve en un
-# WebView. Corre en un proceso hijo (este mismo ejecutable con
-# `--captcha-window`) para no pelear con el event loop de eframe. En Windows
-# usa WebView2 (viene con Edge / Windows 10+); en Linux hace falta
-# libwebkit2gtk-4.1-dev y gtk3. Si cargo se queja de versiones cruzadas,
+# WebView. Corre en un proceso hijo para no pelear con el event loop de eframe:
+# en Windows/macOS es este mismo ejecutable con `--captcha-window` (WebView2 /
+# WKWebView); en Linux es el ejecutable aparte `ecord-captcha` (src/bin), el
+# único que necesita libwebkit2gtk-4.1 y gtk3 — `ecord` ya no los enlaza. Si cargo se queja de versiones cruzadas,
 # `cargo update -p wry -p tao` o alinear ambas a las últimas compatibles.
 wry = "0.47"
 tao = "0.31"
@@ -305,9 +307,13 @@ section = "net"
 priority = "optional"
 # $auto = dpkg-shlibdeps mira las .so que usa el binario (FFmpeg, WebKitGTK,
 # ALSA, Pulse...) y arma el Depends con los nombres correctos de la distro.
-depends = "$auto"
+# Dependencias del sistema declaradas a mano. `$auto` solo no basta: si dpkg-shlibdeps
+# no las detecta, `apt install ./ecord.deb` no trae GTK/WebKit/ALSA y el binario no arranca.
+# Las alternativas "t64" cubren Ubuntu 24.04 y Debian trixie (renombraron esos paquetes).
+depends = "$auto, libasound2t64 | libasound2, libgtk-3-0t64 | libgtk-3-0, libglib2.0-0t64 | libglib2.0-0, libcairo2, libgdk-pixbuf-2.0-0, libsoup-3.0-0, libwebkit2gtk-4.1-0, libjavascriptcoregtk-4.1-0, libpulse0, libxkbcommon0, libwayland-client0"
 assets = [
   ["target/release/ecord", "usr/bin/", "755"],
+  ["target/release/ecord-captcha", "usr/lib/ecord/", "755"],
   ["packaging/linux/ecord.desktop", "usr/share/applications/", "644"],
   ["assets/packaging/icon-256.png", "usr/share/icons/hicolor/256x256/apps/ecord.png", "644"],
   ["THIRD_PARTY_NOTICES.md", "usr/share/doc/ecord/", "644"],
@@ -320,8 +326,13 @@ assets = [
 # Necesita packaging/linux/ffmpeg-libs/ con las .so (el CI las prepara).
 # Sin --variant, `cargo deb` usa el FFmpeg del sistema (bloque de arriba).
 [package.metadata.deb.variants.bundled]
+# Dependencias del sistema declaradas a mano. `$auto` solo no basta: si dpkg-shlibdeps
+# no las detecta, `apt install ./ecord.deb` no trae GTK/WebKit/ALSA y el binario no arranca.
+# Las alternativas "t64" cubren Ubuntu 24.04 y Debian trixie (renombraron esos paquetes).
+depends = "$auto, libasound2t64 | libasound2, libgtk-3-0t64 | libgtk-3-0, libglib2.0-0t64 | libglib2.0-0, libcairo2, libgdk-pixbuf-2.0-0, libsoup-3.0-0, libwebkit2gtk-4.1-0, libjavascriptcoregtk-4.1-0, libpulse0, libxkbcommon0, libwayland-client0"
 assets = [
   ["target/release/ecord", "usr/bin/", "755"],
+  ["target/release/ecord-captcha", "usr/lib/ecord/", "755"],
   ["packaging/linux/ecord.desktop", "usr/share/applications/", "644"],
   ["assets/packaging/icon-256.png", "usr/share/icons/hicolor/256x256/apps/ecord.png", "644"],
   ["THIRD_PARTY_NOTICES.md", "usr/share/doc/ecord/", "644"],

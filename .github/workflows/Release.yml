@@ -340,6 +340,11 @@ jobs:
           mkdir -p /usr/lib/ecord
           cp packaging/linux/ffmpeg-libs/* /usr/lib/ecord/
           ldd target/release/ecord | tee /tmp/ldd.txt
+          # `ecord` no debe depender de WebKit/GTK: eso es solo de `ecord-captcha`.
+          if grep -qE "webkit|libgtk|libsoup|javascriptcore" /tmp/ldd.txt; then
+            echo "::error::ecord enlaza WebKit/GTK; tiene que ir solo en ecord-captcha"; exit 1
+          fi
+          test -x target/release/ecord-captcha
           for f in /usr/lib/ecord/*.so.*; do echo "== $f"; ldd "$f"; done | tee -a /tmp/ldd.txt
           if grep -q "not found" /tmp/ldd.txt; then
             echo "::error::Hay bibliotecas sin resolver"; grep -B1 "not found" /tmp/ldd.txt; exit 1
@@ -352,7 +357,11 @@ jobs:
           mkdir -p dist
           cp target/debian/*.deb "dist/ecord-${VERSION}-linux-amd64.deb"
           dpkg-deb --info dist/*.deb
+          dpkg-deb --field dist/*.deb Depends | grep -q libwebkit2gtk-4.1-0 \
+            || { echo "::error::El Depends del .deb no incluye WebKitGTK"; exit 1; }
           dpkg-deb --contents dist/*.deb | grep -E "usr/bin|usr/lib/ecord"
+          dpkg-deb --contents dist/*.deb | grep -q "usr/lib/ecord/ecord-captcha" \
+            || { echo "::error::El .deb no incluye ecord-captcha"; exit 1; }
 
       # Portable: el que el actualizador sabe reemplazar. Carpeta ecord-vX-<target>/ con el
       # ejecutable `ecord`, ecord-portable.txt a su lado y las .so de FFmpeg en lib/.
@@ -363,6 +372,8 @@ jobs:
           mkdir -p "stage/$N/lib" dist
           # Copia del binario con otro rpath; el de target/release (para el .deb) no se toca.
           cp target/release/ecord "stage/$N/ecord"
+          # Ventana del captcha (necesita WebKitGTK del sistema; `ecord` arranca sin él).
+          cp target/release/ecord-captcha "stage/$N/ecord-captcha"
           patchelf --set-rpath '$ORIGIN/lib' "stage/$N/ecord"
           cp packaging/linux/ffmpeg-libs/* "stage/$N/lib/"
           cp packaging/ecord-portable.txt "stage/$N/"
@@ -432,6 +443,11 @@ jobs:
           ldd "$exe" | tee /tmp/ldd-portable.txt
           if grep -q "not found" /tmp/ldd-portable.txt; then
             echo "::error::El portable tiene bibliotecas sin resolver en ${{ matrix.image }}"; grep -B1 "not found" /tmp/ldd-portable.txt; exit 1
+          fi
+          # El helper del captcha sí usa WebKitGTK: aquí ya lo trajo el .deb. Solo informa.
+          ldd "$(dirname "$exe")/ecord-captcha" | tee /tmp/ldd-captcha.txt
+          if grep -q "not found" /tmp/ldd-captcha.txt; then
+            echo "::warning::ecord-captcha tiene bibliotecas sin resolver en ${{ matrix.image }}"; grep "not found" /tmp/ldd-captcha.txt
           fi
 
   # ---------------------------------------------------------------- macOS

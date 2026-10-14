@@ -49,8 +49,11 @@ fn main() -> eframe::Result<()> {
     // `--elevated-update` actualiza sin ventana y `--deelevate` se relanza sin
     // privilegios. Si es una de las dos, no vuelve.
     updater::handle_elevation_flags();
-    // Este mismo ejecutable también es la ventana del captcha de hCaptcha
-    // (ver `discord::captcha`): en ese caso no se arranca eframe.
+    // Windows/macOS: este mismo ejecutable también es la ventana del captcha
+    // de hCaptcha (ver `discord::captcha`): en ese caso no se arranca eframe.
+    // En Linux la ventana es el ejecutable aparte `ecord-captcha`, para que
+    // `ecord` no dependa de WebKitGTK/GTK.
+    #[cfg(not(target_os = "linux"))]
     if std::env::args().any(|arg| arg == discord::captcha::WINDOW_FLAG) {
         discord::captcha::run_window();
     }
