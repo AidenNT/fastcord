@@ -85,6 +85,7 @@ pub fn content(app: &mut App, ui: &mut egui::Ui) {
             .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     let mut clicked_server = None;
+                    let mut want_members: Option<usize> = None;
                     let mut toggled_folder = None;
                     join_requests_button(&*app, ui, SLOT, 24, rail_bg(&palette));
 
@@ -113,7 +114,9 @@ pub fn content(app: &mut App, ui: &mut egui::Ui) {
                                     &palette,
                                     rail_bg(&palette),
                                 );
-                                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                if server_hover(&*app, i, resp.on_hover_cursor(egui::CursorIcon::PointingHand), &palette, &mut want_members)
+                                    .clicked()
+                                {
                                     clicked_server = Some(i);
                                 }
                                 ui.add_space(8.0);
@@ -186,7 +189,9 @@ pub fn content(app: &mut App, ui: &mut egui::Ui) {
                                             &palette,
                                             rail_bg(&palette),
                                         );
-                                        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                        if server_hover(&*app, i, resp.on_hover_cursor(egui::CursorIcon::PointingHand), &palette, &mut want_members)
+                                            .clicked()
+                                        {
                                             clicked_server = Some(i);
                                         }
                                         ui.add_space(8.0);
@@ -213,6 +218,9 @@ pub fn content(app: &mut App, ui: &mut egui::Ui) {
                         }
                     }
 
+                    if let Some(i) = want_members {
+                        app.on_server_hover(i);
+                    }
                     if let Some(i) = clicked_server {
                         app.open_server(i);
                     }
@@ -523,6 +531,7 @@ pub fn content_modern(app: &mut App, ui: &mut egui::Ui) {
                     ui.vertical_centered(|ui| {
                         ui.add_space(6.0);
                         let mut clicked_server = None;
+                    let mut want_members: Option<usize> = None;
                         let mut toggled_folder = None;
                         join_requests_button(&*app, ui, M_ICON, 16, palette.panel);
 
@@ -552,9 +561,7 @@ pub fn content_modern(app: &mut App, ui: &mut egui::Ui) {
                                         &palette,
                                         palette.panel,
                                     );
-                                    if resp
-                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                        .on_hover_text(&server.name)
+                                    if server_hover(&*app, i, resp.on_hover_cursor(egui::CursorIcon::PointingHand), &palette, &mut want_members)
                                         .clicked()
                                     {
                                         clicked_server = Some(i);
@@ -623,9 +630,7 @@ pub fn content_modern(app: &mut App, ui: &mut egui::Ui) {
                                                 &palette,
                                                 palette.panel,
                                             );
-                                            if resp
-                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                                .on_hover_text(&server.name)
+                                            if server_hover(&*app, i, resp.on_hover_cursor(egui::CursorIcon::PointingHand), &palette, &mut want_members)
                                                 .clicked()
                                             {
                                                 clicked_server = Some(i);
@@ -653,7 +658,10 @@ pub fn content_modern(app: &mut App, ui: &mut egui::Ui) {
                             }
                         }
 
-                        if let Some(i) = clicked_server {
+                        if let Some(i) = want_members {
+                        app.on_server_hover(i);
+                    }
+                    if let Some(i) = clicked_server {
                             app.open_server(i);
                         }
                         if let Some(id) = toggled_folder {
@@ -956,4 +964,152 @@ fn join_requests_button(app: &App, ui: &mut egui::Ui, size: f32, corner: u8, rin
         }
     }
     ctx.data_mut(|d| d.insert_temp(open_id, open));
+}
+
+
+/// Tarjeta que aparece al pasar el mouse sobre un servidor del rail:
+/// nombre, si está silenciado, en línea / total, quiénes están en voz (de
+/// todos los canales de voz juntos) y, aparte y abajo, quiénes transmiten.
+/// La gente va como avatares apilados (uno sobre otro), sin nombres.
+///
+/// Apenas el mouse está encima (sin esperar a que el tooltip se dibuje)
+/// deja `want_members = Some(i)`: el llamador corre `App::on_server_hover`,
+/// que le pide al Gateway el conteo en línea / total y los datos de quienes
+/// están en voz y todavía no conocemos.
+fn server_hover(
+    app: &App,
+    index: usize,
+    resp: egui::Response,
+    palette: &theme::Palette,
+    want_members: &mut Option<usize>,
+) -> egui::Response {
+    /// Avatares visibles en una pila antes de resumir con el círculo "+N".
+    const MAX_STACK: usize = 8;
+
+    let Some(server) = app.servers.get(index) else {
+        return resp;
+    };
+    if resp.hovered() {
+        *want_members = Some(index);
+    }
+    // Instantáneo, como Discord: `on_hover_ui` espera `tooltip_delay` antes de
+    // mostrar nada; `show_tooltip_ui` la muestra apenas el mouse está encima.
+    // (No se muestra mientras hay un botón apretado, p. ej. arrastrando.)
+    let pressed = resp.ctx.input(|i| i.pointer.any_down());
+    if resp.hovered() && !pressed {
+    resp.show_tooltip_ui(|ui| {
+        ui.set_min_width(190.0);
+        ui.set_max_width(300.0);
+
+        theme::text(ui, extra::shorten(&server.name, 32), theme::semibold(14.0), palette.text);
+        if app.server_muted(index) {
+            theme::text(ui, "Silenciado", theme::regular(12.0), palette.dim);
+        }
+
+        // En línea / total.
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let online = Color32::from_rgb(0x37, 0xa6, 0x62);
+            let (dot, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+            ui.painter().circle_filled(dot.center(), 4.5, online);
+            theme::text(ui, server.online_count.to_string(), theme::semibold(13.0), palette.secondary);
+            if server.total_count > 0 {
+                ui.add_space(8.0);
+                let (ring, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+                ui.painter().circle_stroke(ring.center(), 4.0, Stroke::new(2.0, palette.dim));
+                theme::text(ui, server.total_count.to_string(), theme::semibold(13.0), palette.secondary);
+            }
+        });
+
+        // Todos los canales de voz del server juntos (una persona está en uno
+        // solo, pero se deduplica igual por las dudas).
+        let mut seen = std::collections::HashSet::new();
+        let voice: Vec<&crate::lib::data::VoiceOccupant> = server
+            .categories
+            .iter()
+            .flat_map(|category| category.channels.iter())
+            .flat_map(|channel| channel.voice_members.iter())
+            .filter(|occupant| seen.insert(occupant.user_id.as_str()))
+            .collect();
+
+        // Pila de avatares: cada uno tapa un poco al anterior (como los
+        // avatares del aviso "está escribiendo"), con un aro del color de la
+        // tarjeta para separarlos. Sin nombres. Si hay más de `MAX_STACK`, el
+        // último círculo dice cuántos faltan.
+        let stack = |ui: &mut egui::Ui, people: &[&crate::lib::data::VoiceOccupant]| {
+            const RADIUS: f32 = 12.0;
+            const RING: f32 = 2.0;
+            // Distancia entre centros: menos que el diámetro => se solapan.
+            const STEP: f32 = 17.0;
+
+            let shown = people.len().min(MAX_STACK);
+            let extra_count = people.len() - shown;
+            let slots = shown + usize::from(extra_count > 0);
+            let width = (RADIUS + RING) * 2.0 + STEP * slots.saturating_sub(1) as f32;
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(width, (RADIUS + RING) * 2.0), Sense::hover());
+            let y = rect.center().y;
+            let x0 = rect.left() + RADIUS + RING;
+
+            for (i, occupant) in people.iter().take(shown).enumerate() {
+                let center = egui::pos2(x0 + STEP * i as f32, y);
+                ui.painter().circle_filled(center, RADIUS + RING, palette.overlay);
+                extra::avatar(
+                    ui,
+                    center,
+                    RADIUS,
+                    occupant.avatar_url.as_deref(),
+                    occupant.avatar_color,
+                    &occupant.initial(),
+                    palette,
+                );
+            }
+            if extra_count > 0 {
+                let center = egui::pos2(x0 + STEP * shown as f32, y);
+                ui.painter().circle_filled(center, RADIUS + RING, palette.overlay);
+                ui.painter().circle_filled(center, RADIUS, palette.surface_active);
+                ui.painter().text(
+                    center,
+                    egui::Align2::CENTER_CENTER,
+                    format!("+{extra_count}"),
+                    theme::semibold(10.5),
+                    palette.secondary,
+                );
+            }
+        };
+
+        if !voice.is_empty() {
+            ui.add_space(4.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                theme::icon(ui, Icon::Volume2, 13.0, palette.dim);
+                theme::text(ui, format!("En voz — {}", voice.len()), theme::semibold(12.0), palette.dim);
+            });
+            ui.add_space(2.0);
+            stack(ui, &voice);
+        }
+
+        // Transmisiones (Go Live): aparte y abajo, con su propio ícono.
+        let streamers: Vec<&crate::lib::data::VoiceOccupant> =
+            voice.iter().copied().filter(|occupant| occupant.streaming).collect();
+        if !streamers.is_empty() {
+            ui.add_space(4.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                theme::icon(ui, Icon::Cast, 13.0, palette.danger);
+                let label = if streamers.len() == 1 {
+                    "Transmitiendo".to_string()
+                } else {
+                    format!("Transmitiendo — {}", streamers.len())
+                };
+                theme::text(ui, label, theme::semibold(12.0), palette.danger);
+            });
+            ui.add_space(2.0);
+            stack(ui, &streamers);
+        }
+    });
+    }
+    resp
 }

@@ -2614,6 +2614,32 @@ impl Server {
         self.cache_member(&user.id, nick, roles)
     }
 
+    /// Id real de un canal de texto del server para suscribirse a su lista de
+    /// miembros sin abrirlo. Solo sirven canales que esta cuenta puede VER
+    /// (`access.can_view`): si se le pide la lista a un canal oculto, Discord
+    /// no contesta y el server se queda sin conteo en línea / total. Los
+    /// foros tampoco sirven. `attempt` rota entre los canales candidatos para
+    /// que un reintento no vuelva a caer en uno que no respondió. `None` si
+    /// todavía no se cargaron los canales (o no hay ninguno visible).
+    pub fn peek_channel_id(&self, attempt: usize) -> Option<String> {
+        let candidates: Vec<&Channel> = self
+            .categories
+            .iter()
+            .flat_map(|category| category.channels.iter())
+            .filter(|channel| {
+                !channel.is_voice
+                    && !channel.is_thread
+                    && !channel.is_forum
+                    && channel.channel_id.is_some()
+                    && channel.access.can_view
+            })
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        candidates[attempt % candidates.len()].channel_id.clone()
+    }
+
     /// Ids de los conectados a voz cuyo nombre todavía es el placeholder
     /// (`VoiceOccupant::known == false`), o sea a los que hay que ir a
     /// buscar por REST.

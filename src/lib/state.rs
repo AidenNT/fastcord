@@ -553,6 +553,10 @@ pub struct App {
     /// si el usuario sigue cambiando de canal (ver
     /// `App::flush_member_subscription`): (guild, canal, desde cuándo).
     pending_member_subscription: Option<(String, String, Instant)>,
+    /// Cuándo se le pidió al Gateway, por pasar el mouse, el conteo de cada
+    /// server (guild id → instante). Evita repetir el pedido en cada frame
+    /// (ver `App::on_server_hover`). Se vacía al cambiar de conexión.
+    hover_peeks: std::collections::HashMap<String, (Instant, usize)>,
     pub friends: Vec<Friend>,
     pub dms: Vec<PrivateChannel>,
     pub activity: Vec<ActivityCard>,
@@ -984,6 +988,7 @@ impl Default for App {
             gateway_commands: None,
             member_subscription: None,
             pending_member_subscription: None,
+            hover_peeks: std::collections::HashMap::new(),
             friends: demo_friends(),
             dms: Vec::new(),
             activity: demo_activity(),
@@ -1480,6 +1485,7 @@ impl App {
         }
         self.member_subscription = None;
         self.pending_member_subscription = None;
+        self.hover_peeks.clear();
         self.gateway_session_id.clear();
         self.slash_catalogs.clear();
         self.slash_pending.clear();
@@ -4442,6 +4448,7 @@ impl App {
                 // Conexión nueva: no hereda ninguna suscripción anterior.
                 self.member_subscription = None;
                 self.pending_member_subscription = None;
+                self.hover_peeks.clear();
                 self.subscribe_member_list();
             }
             AppEvent::GuildRoles { guild_id, roles } => {
@@ -5114,6 +5121,84 @@ impl App {
             .iter()
             .map(|dm| self.unread_mentions.get(&dm.id).copied().unwrap_or(0))
             .sum::<u32>()
+    }
+
+    /// `true` si `servers[server_index]` está silenciado en la cuenta.
+    pub fn server_muted(&self, server_index: usize) -> bool {
+        self.servers
+            .get(server_index)
+            .is_some_and(|s| !s.guild_id.is_empty() && self.mute_rules.guild_muted(&s.guild_id))
+    }
+
+    /// El mouse está sobre `servers[server_index]` en el rail: le pide al
+    /// Gateway lo que la tarjeta necesita, sin esperar a que se abra el server.
+    ///
+    /// * Quiénes están en voz y todavía no conocemos (opcode 8), ver
+    ///   [`App::request_voice_members`].
+    /// * El conteo en línea / total (opcode 37 sobre un canal de texto del
+    ///   server). Va por `PeekMemberList`, que no pisa la suscripción del
+    ///   server abierto. Se repite como mucho cada `PEEK_EVERY` por server,
+    ///   porque esto corre en cada frame mientras el mouse esté encima.
+    pub fn on_server_hover(&mut self, server_index: usize) {
+        const PEEK_EVERY: std::time::Duration = std::time::Duration::from_secs(45);
+
+        self.request_voice_members(server_index);
+
+        let Some(commands) = self.gateway_commands.clone() else { return };
+        let Some(server) = self.servers.get(server_index) else { return };
+        let guild_id = server.guild_id.clone();
+        if guild_id.is_empty() {
+            return;
+        }
+        // El server que se está viendo ya tiene su suscripción viva.
+        if self
+            .member_subscription
+            .as_ref()
+            .is_some_and(|(guild, _)| *guild == guild_id)
+        {
+            return;
+        }
+        // Si todavía no hay conteo (el canal pedido no respondió), se reintenta
+        // más rápido y con otro canal; si ya hay, solo se refresca cada tanto.
+        let has_counts = server.total_count > 0 || server.online_count > 0;
+        let retry_every = if has_counts { PEEK_EVERY } else { std::time::Duration::from_secs(4) };
+        let (last_at, tries) = self
+            .hover_peeks
+            .get(&guild_id)
+            .map(|(at, tries)| (Some(*at), *tries))
+            .unwrap_or((None, 0));
+        if last_at.is_some_and(|at| at.elapsed() < retry_every) {
+            return;
+        }
+        let attempt = if has_counts { 0 } else { tries };
+        let Some(channel_id) = server.peek_channel_id(attempt) else { return };
+        let sent = commands
+            .send(crate::discord::gateway::GatewayCommand::PeekMemberList {
+                guild_id: guild_id.clone(),
+                channel_id: channel_id.clone(),
+            })
+            .is_ok();
+        if sent {
+            // La respuesta (`SYNC`) le asigna su lista a este canal.
+            if let Some(server) = self.servers.get_mut(server_index) {
+                server.pending_list_channel = Some(channel_id);
+            }
+            self.hover_peeks.insert(guild_id, (Instant::now(), attempt + 1));
+        }
+    }
+
+    /// Pide por el Gateway (opcode 8) los datos de quienes están en voz en
+    /// `servers[server_index]` y todavía no conocemos (nombre/avatar). Cada id
+    /// se pide una sola vez (`Server::requested_members`); la respuesta llega
+    /// como `GUILD_MEMBERS_CHUNK` y completa los conectados a voz.
+    pub fn request_voice_members(&mut self, server_index: usize) {
+        let Some(server) = self.servers.get(server_index) else { return };
+        let guild_id = server.guild_id.clone();
+        let ids: Vec<String> = server.unknown_voice_user_ids().into_iter().collect();
+        if guild_id.is_empty() || ids.is_empty() {
+            return;
+        }
+        self.request_members(&guild_id, ids);
     }
 
     /// Menciones sin leer de `servers[server_index]`.

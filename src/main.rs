@@ -60,6 +60,12 @@ fn main() -> eframe::Result<()> {
     if single_instance::acquire() == single_instance::Role::Secondary {
         return Ok(());
     }
+    // La ventana transparente da parpadeo (frames que alternan entre pantallas)
+    // en Linux dentro de ChromeOS (Crostini: Wayland vía sommelier + GL virtual).
+    // Ahí se pide opaca; también se puede forzar con `ECORD_OPAQUE=1`.
+    let opaque = std::env::var_os("ECORD_OPAQUE").is_some()
+        || std::env::var_os("SOMMELIER_VERSION").is_some()
+        || std::path::Path::new("/dev/.cros_milestone").exists();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
@@ -72,7 +78,7 @@ fn main() -> eframe::Result<()> {
             // con la ventana ya creada, así que se pide siempre; con un tema
             // opaco el fondo se pinta al 100 % y no cambia nada. Si el
             // sistema no tiene compositor, la transparencia se ve negra.
-            .with_transparent(true)
+            .with_transparent(!opaque)
             // Ícono de la ventana / barra de tareas.
             .with_icon(load_icon()),
         ..Default::default()

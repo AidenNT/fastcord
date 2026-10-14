@@ -193,6 +193,12 @@ pub enum GatewayCommand {
     /// server ni las presencias de sus miembros: para las cuentas de usuario
     /// esos datos son "perezosos" y hay que pedirlos (opcode 37).
     SubscribeMemberList { guild_id: String, channel_id: String },
+    /// Igual que `SubscribeMemberList` (opcode 37) pero "de pasada": se usa al
+    /// pasar el mouse sobre un servidor del rail para traer su conteo de
+    /// en línea / total sin abrirlo. NO reemplaza la suscripción vigente (la
+    /// del servidor que se está viendo), así que tampoco se re-manda al
+    /// re-identificar la sesión: si hace falta, la UI vuelve a pedirla.
+    PeekMemberList { guild_id: String, channel_id: String },
     /// Pedir el apodo y los roles de estos usuarios en `guild_id`
     /// (opcode 8). El historial de mensajes por REST no trae `member`, así
     /// que es la forma de saber cómo se llama cada autor en el server y de
@@ -632,6 +638,16 @@ async fn connect_and_run(
                             if *established {
                                 write.send(Message::Text(payload.into())).await?;
                             }
+                        }
+                    }
+                    GatewayCommand::PeekMemberList { guild_id, channel_id } => {
+                        // Sin tocar `member_list`: solo se manda el opcode 37
+                        // de ese servidor (Discord mantiene una suscripción
+                        // por guild, así que la del servidor abierto sigue).
+                        if *established {
+                            let peek = MemberListSubscription { guild_id, channel_id };
+                            let payload = member_list_subscribe_payload(&peek);
+                            write.send(Message::Text(payload.into())).await?;
                         }
                     }
                     GatewayCommand::RequestGuildMembers { guild_id, user_ids } => {

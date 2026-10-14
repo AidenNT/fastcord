@@ -163,6 +163,12 @@ impl MuteRules {
         Self { guilds }
     }
 
+    /// `true` si el server está silenciado ahora mismo (un silencio con fecha
+    /// de fin ya vencida no cuenta). Para el cartel al pasar el mouse por el rail.
+    pub fn guild_muted(&self, guild_id: &str) -> bool {
+        self.guilds.get(guild_id).is_some_and(|rule| rule.muted)
+    }
+
     /// `true` si un mensaje debe contar como mención y notificar, según lo
     /// que la cuenta tiene silenciado / el nivel elegido.
     ///
