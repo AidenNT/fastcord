@@ -74,6 +74,7 @@ use web_local_storage_api;
 // los campos privados de `App`. Ver `lib/state/memory.rs`.
 pub mod dm_calls;
 pub mod memory;
+mod resident;
 
 /// Pantalla completa que se está mostrando.
 pub enum Screen {
@@ -881,10 +882,10 @@ pub struct App {
     /// La ventana lleva un rato en segundo plano: se deja de procesar el video
     /// de los streams (el que se ve y la vista previa del propio).
     pub video_paused: bool,
-    /// Contexto de egui, guardado para que el hilo de video pueda pedir un
-    /// repintado cada vez que hay un frame nuevo (los eventos de Discord se
-    /// procesan sin acceso al contexto).
-    egui_ctx: Option<egui::Context>,
+    /// Bandeja y estado de "esconder a la bandeja" (ver `state::resident`).
+    /// Los hilos de fondo despiertan a la UI con `app_shell::wake`, no con un
+    /// `egui::Context`: cada ventana tiene el suyo y sin ventana no hay ninguno.
+    shell: resident::ShellState,
 }
 
 impl Default for App {
@@ -1096,7 +1097,7 @@ impl Default for App {
             stream_previews: std::collections::HashMap::new(),
             window_inactive_since: None,
             video_paused: false,
-            egui_ctx: None,
+            shell: resident::ShellState::default(),
             new_call_ui,
             show_welcome: false,
             ui_scale,
@@ -1988,7 +1989,7 @@ impl App {
     /// se marca `has_more` para que el scroll hacia arriba vuelva a pedir lo
     /// viejo por REST. El chat abierto (y el hilo del panel lateral) no se
     /// tocan, así no se pierde el punto de scroll.
-    fn trim_inactive_history(&mut self, now: f64) {
+    pub(super) fn trim_inactive_history(&mut self, now: f64) {
         const EVERY: f64 = 10.0;
         const KEEP_INACTIVE: usize = 50;
         // Margen para no recortar por 2-3 mensajes nuevos cada vez.
@@ -3038,9 +3039,7 @@ impl App {
             return;
         }
         self.dialogs.push_back(dialog);
-        if let Some(ctx) = &self.egui_ctx {
-            ctx.request_repaint();
-        }
+        crate::app_shell::wake();
     }
 
     /// Abre el historial completo de novedades (Ajustes → Cuenta).
@@ -3581,16 +3580,12 @@ impl App {
     /// frame, antes de dibujar. Mientras el login/la conexión están en
     /// curso pedimos repintar seguido para que el spinner se vea fluido
     /// aunque no haya otra interacción del usuario.
-    fn poll_discord_events(&mut self, ctx: &egui::Context) {
-        if self.egui_ctx.is_none() {
-            self.egui_ctx = Some(ctx.clone());
-            // Los pedidos de captcha nacen en hilos de fondo: necesitan poder
-            // despertar a la UI aunque esté quieta.
-            crate::discord::captcha::set_repaint_context(ctx);
-            // Idem para el spinner de la barra superior: las requests REST
-            // empiezan y terminan en hilos de fondo.
-            crate::discord::activity::set_repaint_context(ctx);
-        }
+    ///
+    /// Procesa eventos hasta agotar `budget` y devuelve `true` si quedan en la
+    /// cola. Antes se vaciaba toda la cola de una vez: tras un rato con la
+    /// ventana minimizada (eframe no llama a `ui`) se juntaban miles de
+    /// eventos y el primer frame al volver se colgaba procesándolos todos.
+    fn poll_discord_events(&mut self, ctx: &egui::Context, budget: std::time::Duration) -> bool {
         for notice in self.captcha.poll() {
             match notice {
                 crate::discord::captcha::CaptchaNotice::Opened => self.push_toast(
@@ -3627,16 +3622,27 @@ impl App {
         // Llamada entrante: arranca/corta el tono y la tarjeta según el estado de
         // cada frame (ring vigente, "No molestar", ya estar en la llamada...).
         self.update_incoming_ring();
-        let Some(rx) = &self.event_rx else { return };
-        let pending: Vec<AppEvent> = rx.try_iter().collect();
-        for event in pending {
+        let started = Instant::now();
+        let mut backlog = false;
+        loop {
+            let Some(rx) = &self.event_rx else { break };
+            let Ok(event) = rx.try_recv() else { break };
+            // Un evento que no es de canales ve las categorías: que ya estén al día.
+            if !matches!(event, AppEvent::ChannelUpsert { .. } | AppEvent::ChannelDelete { .. }) {
+                self.flush_channel_rebuilds();
+            }
             self.handle_discord_event(event);
             // Si ese evento tiró la conexión (sesión inválida, Gateway
             // perdido) lo que queda en la cola es de la conexión muerta.
             if self.event_rx.is_none() {
                 break;
             }
+            if started.elapsed() >= budget {
+                backlog = true;
+                break;
+            }
         }
+        self.flush_channel_rebuilds();
 
         if matches!(
             self.auth,
@@ -3649,6 +3655,7 @@ impl App {
         ) {
             ctx.request_repaint();
         }
+        backlog
     }
 
     fn handle_discord_event(&mut self, event: AppEvent) {
@@ -4492,19 +4499,21 @@ impl App {
             // Un admin creó/modificó un canal: se rearman las categorías. Los
             // índices pueden correrse, así que se vuelve a ubicar el canal
             // abierto por su id.
+            // Los cambios de canal se anotan y se rearman UNA vez por ráfaga
+            // (ver `flush_channel_rebuilds`), no uno por evento.
             AppEvent::ChannelUpsert { guild_id, channel } => {
-                let previous = self.current_channel_id();
                 if let Some(server) = self.servers.iter_mut().find(|s| s.guild_id == guild_id) {
-                    server.upsert_channel(channel);
+                    if server.stage_channel_upsert(channel) {
+                        self.queue_channel_rebuild(&guild_id);
+                    }
                 }
-                self.restore_current_channel(&guild_id, previous);
             }
             AppEvent::ChannelDelete { guild_id, channel_id } => {
-                let previous = self.current_channel_id();
                 if let Some(server) = self.servers.iter_mut().find(|s| s.guild_id == guild_id) {
-                    server.remove_channel(&channel_id);
+                    if server.stage_channel_remove(&channel_id) {
+                        self.queue_channel_rebuild(&guild_id);
+                    }
                 }
-                self.restore_current_channel(&guild_id, previous);
             }
             AppEvent::DmChannelUpsert(dm) => {
                 let dm = PrivateChannel::from_dm(&dm);
@@ -5802,7 +5811,7 @@ impl App {
                 self.push_in_app_notification(title, body, avatar_url, initial, target);
             }
         } else if policy.desktop {
-            notif::send_desktop(title, body);
+            notif::send_desktop_with_avatar(title, body, msg.author.avatar_url());
         }
     }
 
@@ -7586,12 +7595,7 @@ impl App {
         if self.gateway_session_id.is_empty() {
             return;
         }
-        let repaint_ctx = self.egui_ctx.clone();
-        let repaint: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
-            if let Some(ctx) = &repaint_ctx {
-                ctx.request_repaint();
-            }
-        });
+        let repaint: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(crate::app_shell::wake);
         let params = StreamWatchParams {
             stream_key: stream_key.to_string(),
             rtc_server_id,
@@ -7828,8 +7832,8 @@ impl eframe::App for App {
 
         // Foco de la ventana ANTES de procesar eventos: decide si un mensaje
         // nuevo se avisa dentro de la app o en el escritorio.
-        self.window_focused = ui.ctx().input(|i| i.viewport().focused.unwrap_or(true));
-        self.poll_discord_events(ui.ctx());
+        // (`window_focused` y el sondeo de eventos del Gateway se hacen en
+        // `window_logic`: eframe no llama a `ui` con la ventana minimizada.)
         // "Ir al servidor" de una tarjeta de invitación (`ui::server::invite_card`).
         if let Some(index) =
             crate::discord::invites::poll_goto(|guild_id| self.servers.iter().position(|s| s.guild_id == guild_id))
@@ -7850,6 +7854,26 @@ impl eframe::App for App {
         self.ack_viewed_channel();
         self.sync_window_title(ui.ctx());
         // Herramientas de desarrollo (no hace nada sin `use_developer_features`).
+        // La sesión se le pasa solo mientras el panel está abierto.
+        if self.devtools.is_open() {
+            let status = match &self.auth {
+                AuthStatus::Connected => "Conectado",
+                AuthStatus::Connecting => "Conectando",
+                AuthStatus::SignedOut => "Sin sesión",
+                AuthStatus::Failed(_) => "Falló el inicio de sesión",
+                _ => "Iniciando sesión",
+            };
+            let session = crate::ui::devtools::SessionInfo {
+                token: self.discord_token.clone(),
+                status: status.to_owned(),
+                username: self.me.as_ref().map(|user| user.global_name.clone().unwrap_or_else(|| user.username.clone())),
+                user_id: self.me.as_ref().map(|user| user.id.clone()),
+                servers: self.servers.len(),
+                dms: self.dms.len(),
+                friends: self.friends.len(),
+            };
+            self.devtools.set_session(session);
+        }
         self.devtools.show(ui.ctx());
         // El hilo de Discord no despierta la UI al llegar un evento, y sin
         // input/animaciones eframe no repinta: con la ventana en segundo
@@ -7888,7 +7912,7 @@ impl eframe::App for App {
             _ => 1,
         };
         crate::ui::chat::anim::on_view_change(ui.ctx(), view_key);
-        self.trim_inactive_history(ui.ctx().input(|i| i.time));
+        // (`trim_inactive_history` corre en `window_logic` y en los ticks sin ventana.)
         // Roles del server abierto para las menciones `@rol` del chat, y
         // clics en menciones de canal/rol (ver `ui::chat::markdown`).
         {
@@ -7991,6 +8015,9 @@ impl eframe::App for App {
         }
         if !matches!(self.screen, Screen::Login) {
             crate::ui::shell::topbar::show(self, ui);
+            // Barra de estado (modelo de voz, conexión, actualización): fina,
+            // debajo de la barra superior y solo cuando hay algo que contar.
+            crate::ui::shell::status_bar::show(self, ui);
             // Interfaz nueva: franja vacía en el borde derecho para que la
             // última tarjeta no quede pegada a la ventana (GAP/2 de la
             // tarjeta + esta franja = GAP, igual que a la izquierda).

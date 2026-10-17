@@ -482,6 +482,23 @@ foreach ($src in $dllSources) {
 }
 Write-Ok "$copied DLLs copiadas a $outDir"
 
+# ONNX Runtime (DeepFilterNet). El build.rs de vendor\deepfilter-rt lo baja y copia
+# onnxruntime.dll a target\<perfil>; si algo falló (sin curl/internet, caché vieja de
+# cargo) se intenta copiar desde la carpeta que deja el build.rs. Sin esta DLL ecord
+# arranca igual, pero la supresión de ruido usa RNNoise en vez de DeepFilterNet.
+if (-not (Test-Path (Join-Path $outDir "onnxruntime.dll"))) {
+    $ortDll = Get-ChildItem (Join-Path $ProjectRoot "vendor\deepfilter-rt") -Filter "onnxruntime.dll" -Recurse -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match "onnxruntime-win-x64" } | Select-Object -First 1
+    if ($ortDll) {
+        Copy-Item $ortDll.FullName $outDir -Force
+        Write-Ok "onnxruntime.dll copiada desde $($ortDll.DirectoryName)"
+    } else {
+        Write-Warn "No se encontró onnxruntime.dll: DeepFilterNet no funcionará (se usará RNNoise). Revisa que 'cargo build' haya podido bajar ONNX Runtime (curl + internet)."
+    }
+} else {
+    Write-Ok "onnxruntime.dll presente en $outDir"
+}
+
 # ============================================================
 # 10. Empaquetar (opcional)
 # ============================================================

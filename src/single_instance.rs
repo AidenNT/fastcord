@@ -4,7 +4,7 @@
 //! que lo escucha. Si se abre ecord otra vez, la nueva instancia no consigue
 //! el puerto: se conecta a ese socket, le pide a la primera que se muestre y
 //! se cierra. La primera, al recibir el pedido, restaura la ventana (si
-//! estaba minimizada u oculta) y le da el foco.
+//! estaba minimizada) o crea una nueva (si estaba en la bandeja) y le da el foco.
 //!
 //! Se eligió un socket local en vez de un mutex/archivo del sistema porque
 //! sirve igual en Windows, Linux y macOS, no deja archivos colgados si ecord
@@ -17,8 +17,6 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Puerto local reservado para esto.
@@ -140,33 +138,10 @@ fn handle_connection(stream: &mut TcpStream) {
 // Mostrar la ventana
 // ---------------------------------------------------------------------
 
-/// Contexto de egui de la ventana, disponible recién cuando eframe la crea.
-static CONTEXT: OnceLock<egui::Context> = OnceLock::new();
-/// Pedido de foco que llegó antes de que existiera la ventana.
-static PENDING_FOCUS: AtomicBool = AtomicBool::new(false);
-
-/// Registra el contexto de la ventana (llamar desde el creador de eframe). Si
-/// ya había llegado un pedido de foco mientras la ventana se abría, lo cumple.
-pub fn set_context(ctx: &egui::Context) {
-    let _ = CONTEXT.set(ctx.clone());
-    if PENDING_FOCUS.swap(false, Ordering::SeqCst) {
-        focus(ctx);
-    }
-}
-
+/// Pide que se vea la ventana. Con ventana abierta `App::window_logic` la
+/// restaura y le da el foco; con eCord en la bandeja (sin ventana) el loop del
+/// `Shell` crea una nueva (ver `app_shell::request_show`). El pedido no se
+/// pierde si llega antes de que exista la primera ventana: queda marcado.
 fn request_focus() {
-    PENDING_FOCUS.store(true, Ordering::SeqCst);
-    if let Some(ctx) = CONTEXT.get() {
-        if PENDING_FOCUS.swap(false, Ordering::SeqCst) {
-            focus(ctx);
-        }
-    }
-}
-
-/// Restaura la ventana (minimizada u oculta) y le da el foco.
-fn focus(ctx: &egui::Context) {
-    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-    ctx.request_repaint();
+    crate::app_shell::request_show();
 }

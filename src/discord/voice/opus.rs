@@ -258,7 +258,28 @@ impl VoiceDecodedAudioOutput {
 #[allow(dead_code)]
 impl VoiceOpusEncode {
     pub(super) fn new() -> Result<Self, String> {
-        Self::new_with_application(OpusApplication::Voip)
+        let mut encoder = Self::new_with_application(OpusApplication::Voip)?;
+        // Valores explícitos para el micrófono (antes quedaban los de libopus
+        // por defecto): 64 kbps es el bitrate estándar de un canal de voz de
+        // Discord, `Voice` ajusta el modelo a habla y el FEC en banda tapa
+        // pérdidas leves de paquetes sin cortes audibles.
+        encoder
+            .encoder
+            .set_bitrate(OpusBitrate::Value(64_000))
+            .map_err(|error| format!("voice Opus bitrate setup failed: {}", error.message()))?;
+        encoder
+            .encoder
+            .set_signal(OpusSignal::Voice)
+            .map_err(|error| format!("voice Opus signal setup failed: {}", error.message()))?;
+        encoder
+            .encoder
+            .set_inband_fec(OpusInbandFec::Mode1)
+            .map_err(|error| format!("voice Opus FEC setup failed: {}", error.message()))?;
+        encoder
+            .encoder
+            .set_packet_loss(5)
+            .map_err(|error| format!("voice Opus packet loss setup failed: {}", error.message()))?;
+        Ok(encoder)
     }
 
     pub(super) fn new_system_audio() -> Result<Self, String> {

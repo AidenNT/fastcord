@@ -20,6 +20,13 @@
 #   macOS   : ecord-vX-macos-universal.dmg               (arm64 + x86_64, experimental)
 #   Todos   : checksums.txt + checksums.txt.sig          (SHA-256 firmado con Ed25519)
 #
+# DeepFilterNet (supresión de ruido): `deepfilter-rt` carga ONNX Runtime EN EJECUCIÓN
+# (load-dynamic, no se ve con ldd ni con dylibbundler), así que su biblioteca tiene que
+# viajar en cada paquete: onnxruntime.dll junto al .exe (Windows) y libonnxruntime.so en
+# lib/ (.tar.gz) o /usr/lib/ecord (.deb). La versión (ORT_VERSION) debe coincidir con la de
+# vendor/deepfilter-rt/build.rs. El modelo (dfn3) se descarga en el primer uso.
+# En macOS va como libonnxruntime.dylib en Contents/Resources (arm64 + x86_64 unidas con lipo).
+#
 # Por qué un runner por sistema y no cross-compile: el proyecto enlaza FFmpeg,
 # WebKitGTK/WebView2, ALSA/Pulse y BoringSSL (nasm/cmake). Todo eso se compila
 # mucho más fácil de forma nativa.
@@ -45,6 +52,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Igual que ORT_VERSION en vendor/deepfilter-rt/build.rs.
+  ORT_VERSION: "1.23.2"
 
 jobs:
   # ---------------------------------------------------------------- versión
@@ -161,6 +170,33 @@ jobs:
           }
           if (-not (Get-ChildItem "$env:FFMPEG_DIR\bin" -Filter "avcodec-*.dll")) { throw "Faltan las DLL en $env:FFMPEG_DIR\bin" }
 
+      # ONNX Runtime para DeepFilterNet. Se deja en la carpeta donde lo busca build.rs
+      # (así no lo vuelve a bajar) y de ahí se copia a los paquetes.
+      - name: Caché de ONNX Runtime
+        id: ort-cache
+        uses: actions/cache@v4
+        with:
+          path: vendor/deepfilter-rt/onnxruntime-win-x64-${{ env.ORT_VERSION }}
+          key: onnxruntime-win-x64-${{ env.ORT_VERSION }}
+
+      - name: Descargar ONNX Runtime
+        if: steps.ort-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $name = "onnxruntime-win-x64-$env:ORT_VERSION"
+          $url = "https://github.com/microsoft/onnxruntime/releases/download/v$env:ORT_VERSION/$name.zip"
+          $zip = Join-Path $env:RUNNER_TEMP "ort.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+          Expand-Archive -Path $zip -DestinationPath vendor\deepfilter-rt -Force
+
+      - name: Verificar ONNX Runtime
+        shell: pwsh
+        run: |
+          $dll = "vendor\deepfilter-rt\onnxruntime-win-x64-$env:ORT_VERSION\lib\onnxruntime.dll"
+          if (-not (Test-Path $dll)) { throw "Falta $dll" }
+          "ORT_DLL=$((Resolve-Path $dll).Path)" >> $env:GITHUB_ENV
+          Get-Item $dll | Format-Table Name, Length
+
       - name: Herramientas y entorno de compilación
         shell: pwsh
         run: |
@@ -220,6 +256,10 @@ jobs:
           Copy-Item assets\fonts\Inter-LICENSE.txt, assets\fonts\NotoEmoji-LICENSE.txt packaging\notices\
           Copy-Item assets\icons\LICENSE.txt packaging\notices\Lucide-LICENSE.txt
           if (Test-Path "$env:FFMPEG_DIR\LICENSE.txt") { Copy-Item "$env:FFMPEG_DIR\LICENSE.txt" packaging\notices\FFmpeg-LICENSE.txt }
+          # ONNX Runtime (DeepFilterNet): la DLL y su licencia.
+          Copy-Item $env:ORT_DLL packaging\bundle-libs\
+          $ortRoot = Split-Path (Split-Path $env:ORT_DLL -Parent) -Parent
+          if (Test-Path "$ortRoot\LICENSE") { Copy-Item "$ortRoot\LICENSE" packaging\notices\ONNXRuntime-LICENSE.txt }
           Copy-Item packaging\notices\* packaging\bundle-libs\
           # Marcador que le dice al actualizador "esto es una copia instalada por el
           # instalador": sin él, esa copia no se actualiza sola. Solo va en el instalador;
@@ -251,8 +291,10 @@ jobs:
           New-Item -ItemType Directory -Force $stage | Out-Null
           Copy-Item target\release\ecord.exe $stage
           Copy-Item "$env:FFMPEG_DIR\bin\*.dll" $stage
+          Copy-Item $env:ORT_DLL $stage
           Copy-Item packaging\notices\* $stage
           Copy-Item packaging\ecord-portable.txt $stage
+          if (-not (Test-Path "$stage\onnxruntime.dll")) { throw "El zip portable no lleva onnxruntime.dll" }
           Compress-Archive -Path $stage -DestinationPath "dist\$n.zip" -Force
           Get-ChildItem dist | Format-Table Name, Length
 
@@ -315,6 +357,23 @@ jobs:
           test -f "$FFMPEG_DIR/include/libavcodec/avcodec.h"
           ls -l "$FFMPEG_DIR/lib" | head -40
 
+      # ONNX Runtime para DeepFilterNet, en la carpeta donde lo busca build.rs.
+      - name: Caché de ONNX Runtime
+        id: ort-cache
+        uses: actions/cache@v4
+        with:
+          path: vendor/deepfilter-rt/onnxruntime-linux-x64-${{ env.ORT_VERSION }}
+          key: onnxruntime-linux-x64-${{ env.ORT_VERSION }}
+
+      - name: Descargar ONNX Runtime
+        if: steps.ort-cache.outputs.cache-hit != 'true'
+        run: |
+          name="onnxruntime-linux-x64-${ORT_VERSION}"
+          curl -fL --retry 3 -o /tmp/ort.tgz \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${name}.tgz"
+          tar -xzf /tmp/ort.tgz -C vendor/deepfilter-rt
+          test -e "vendor/deepfilter-rt/${name}/lib/libonnxruntime.so"
+
       - name: cargo build --release
         run: cargo build --release --locked
 
@@ -329,6 +388,11 @@ jobs:
           done
           # Que las bibliotecas se encuentren entre sí dentro de /usr/lib/ecord.
           patchelf --set-rpath '$ORIGIN' packaging/linux/ffmpeg-libs/*.so.*
+          # ONNX Runtime (DeepFilterNet), con el nombre exacto que busca deepfilter-rt.
+          # Va en la misma carpeta que FFmpeg: /usr/lib/ecord en el .deb y lib/ en el .tar.gz.
+          ort="vendor/deepfilter-rt/onnxruntime-linux-x64-${ORT_VERSION}"
+          cp -L "$ort/lib/libonnxruntime.so" packaging/linux/ffmpeg-libs/libonnxruntime.so
+          cp "$ort/LICENSE" packaging/linux/onnxruntime-LICENSE.txt
           ls -l packaging/linux/ffmpeg-libs
           cp "$FFMPEG_DIR/LICENSE.txt" packaging/linux/ffmpeg-LICENSE.txt 2>/dev/null \
             || echo "FFmpeg (compilación GPL de BtbN): https://ffmpeg.org/legal.html" > packaging/linux/ffmpeg-LICENSE.txt
@@ -345,7 +409,9 @@ jobs:
             echo "::error::ecord enlaza WebKit/GTK; tiene que ir solo en ecord-captcha"; exit 1
           fi
           test -x target/release/ecord-captcha
-          for f in /usr/lib/ecord/*.so.*; do echo "== $f"; ldd "$f"; done | tee -a /tmp/ldd.txt
+          # libonnxruntime.so (DeepFilterNet) se carga con dlopen: ldd del ejecutable no la ve.
+          test -f /usr/lib/ecord/libonnxruntime.so
+          for f in /usr/lib/ecord/*.so.* /usr/lib/ecord/libonnxruntime.so; do echo "== $f"; ldd "$f"; done | tee -a /tmp/ldd.txt
           if grep -q "not found" /tmp/ldd.txt; then
             echo "::error::Hay bibliotecas sin resolver"; grep -B1 "not found" /tmp/ldd.txt; exit 1
           fi
@@ -382,6 +448,8 @@ jobs:
           cp assets/fonts/Inter-LICENSE.txt assets/fonts/NotoEmoji-LICENSE.txt "stage/$N/"
           cp assets/icons/LICENSE.txt "stage/$N/Lucide-LICENSE.txt"
           cp packaging/linux/ffmpeg-LICENSE.txt "stage/$N/FFmpeg-LICENSE.txt"
+          cp packaging/linux/onnxruntime-LICENSE.txt "stage/$N/ONNXRuntime-LICENSE.txt"
+          test -f "stage/$N/lib/libonnxruntime.so"
           # Que el ejecutable portable encuentre FFmpeg en lib/ (y no en /usr/lib/ecord).
           ldd "stage/$N/ecord" | tee /tmp/ldd-portable.txt
           if grep -q "not found" /tmp/ldd-portable.txt; then
@@ -429,7 +497,7 @@ jobs:
       - name: Comprobar bibliotecas del .deb
         run: |
           ldd /usr/bin/ecord | tee /tmp/ldd.txt
-          for f in /usr/lib/ecord/*.so.*; do echo "== $f"; ldd "$f"; done | tee -a /tmp/ldd.txt
+          for f in /usr/lib/ecord/*.so.* /usr/lib/ecord/libonnxruntime.so; do echo "== $f"; ldd "$f"; done | tee -a /tmp/ldd.txt
           if grep -q "not found" /tmp/ldd.txt; then
             echo "::error::Faltan bibliotecas en ${{ matrix.image }}"; grep -B1 "not found" /tmp/ldd.txt; exit 1
           fi
@@ -455,6 +523,10 @@ jobs:
   # una vez por arquitectura (cada una con su Homebrew y su FFmpeg) y un job aparte las
   # une con lipo. Experimental: si falla, no bloquea Windows/Linux (pero ese release
   # saldrá sin .dmg).
+  # DeepFilterNet: ONNX Runtime 1.23.x no publica un build `osx-x64`, así que el job Intel
+  # usa el `universal2` (y se queda con su parte x86_64); el de Apple Silicon usa `osx-arm64`.
+  # Cada job deja su libonnxruntime.dylib en out/libs, y el job `macos` las une con lipo
+  # igual que a las de FFmpeg. deepfilter-rt la busca en Contents/Resources.
   macos-build:
     name: macOS ${{ matrix.arch }} (compilación)
     needs: meta
@@ -465,8 +537,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arch: arm64,  runner: macos-14 }
-          - { arch: x86_64, runner: macos-15-intel }
+          - { arch: arm64,  runner: macos-14,       ort: osx-arm64 }
+          - { arch: x86_64, runner: macos-15-intel, ort: osx-universal2 }
     steps:
       - uses: actions/checkout@v4
 
@@ -480,6 +552,23 @@ jobs:
         with:
           key: macos-${{ matrix.arch }}
 
+      # ONNX Runtime para DeepFilterNet, en la carpeta donde lo busca build.rs.
+      - name: Caché de ONNX Runtime
+        id: ort-cache
+        uses: actions/cache@v4
+        with:
+          path: vendor/deepfilter-rt/onnxruntime-${{ matrix.ort }}-${{ env.ORT_VERSION }}
+          key: onnxruntime-${{ matrix.ort }}-${{ env.ORT_VERSION }}
+
+      - name: Descargar ONNX Runtime
+        if: steps.ort-cache.outputs.cache-hit != 'true'
+        run: |
+          name="onnxruntime-${{ matrix.ort }}-${ORT_VERSION}"
+          curl -fL --retry 3 -o "$RUNNER_TEMP/ort.tgz" \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${name}.tgz"
+          tar -xzf "$RUNNER_TEMP/ort.tgz" -C vendor/deepfilter-rt
+          test -f "vendor/deepfilter-rt/${name}/lib/libonnxruntime.dylib"
+
       - name: cargo build --release
         run: cargo build --release --locked
 
@@ -492,6 +581,23 @@ jobs:
           cp target/release/ecord out/ecord
           cp -R packaging/bundle-libs out/libs
           file out/ecord
+
+      # ONNX Runtime (DeepFilterNet) se carga con dlopen: dylibbundler no la ve, hay que
+      # copiarla a mano. Cada job deja SOLO su arquitectura, para que el lipo del job
+      # `macos` pueda unirlas (el universal2 del job Intel se recorta a x86_64).
+      - name: Empaquetar ONNX Runtime
+        run: |
+          ort="vendor/deepfilter-rt/onnxruntime-${{ matrix.ort }}-${ORT_VERSION}"
+          src="$ort/lib/libonnxruntime.dylib"
+          test -f "$src"
+          lipo -archs "$src"
+          if [ "${{ matrix.arch }}" = x86_64 ]; then
+            lipo -thin x86_64 "$src" -output out/libs/libonnxruntime.dylib
+          else
+            cp -L "$src" out/libs/libonnxruntime.dylib
+          fi
+          test "$(lipo -archs out/libs/libonnxruntime.dylib)" = "${{ matrix.arch }}"
+          cp "$ort/LICENSE" out/ONNXRuntime-LICENSE.txt
 
       # Nombre `build-*` (no `ecord-*`) a propósito: el job de publicación sube todo lo
       # que empieza con `ecord-`, y esto son piezas intermedias.
@@ -552,6 +658,9 @@ jobs:
           cp LICENSE packaging/bundle-libs/LICENSE.txt
           cp assets/fonts/Inter-LICENSE.txt assets/fonts/NotoEmoji-LICENSE.txt packaging/bundle-libs/
           cp assets/icons/LICENSE.txt packaging/bundle-libs/Lucide-LICENSE.txt
+          cp parts/arm64/ONNXRuntime-LICENSE.txt packaging/bundle-libs/
+          # libonnxruntime.dylib (DeepFilterNet) ya quedó unida por el bucle de lipo de arriba.
+          test "$(lipo -archs packaging/bundle-libs/libonnxruntime.dylib | tr ' ' '\n' | sort | tr '\n' ' ')" = "arm64 x86_64 "
 
       - name: Generar .dmg
         run: |

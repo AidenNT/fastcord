@@ -2054,11 +2054,17 @@ impl Server {
         // casi siempre es porque falta algún dato y el cálculo cae a "todo
         // visible" (fail-open) — esto lo deja en el log.
         let complete = self.access_ctx.my_roles.is_some() && !self.access_ctx.my_id.is_empty();
+        // Solo se loguea (nivel debug, target "access") cuando un canal pasa
+        // de verse a no verse. La carga inicial no cuenta: antes de tener
+        // todos los datos el cálculo es fail-open.
+        let was_primed = self.access_ctx.access_primed;
+        let mut newly_hidden: Vec<String> = Vec::new();
         for category in &mut self.categories {
             for channel in &mut category.channels {
                 if channel.is_thread {
                     continue; // hereda del foro; se muestra aparte
                 }
+                let was_visible = channel.access.can_view;
                 channel.access = crate::lib::permissions::channel_access(
                     &guild_id,
                     &self.access_ctx,
@@ -2066,23 +2072,19 @@ impl Server {
                     &channel.overwrites,
                     channel.is_voice,
                 );
+                if was_primed && was_visible && !channel.access.can_view {
+                    newly_hidden.push(channel.name.clone());
+                }
             }
         }
-        if crate::logging::debug_logging_enabled() {
-            let hidden = self
-                .categories
-                .iter()
-                .flat_map(|c| c.channels.iter())
-                .filter(|c| !c.is_thread && !c.access.can_view)
-                .count();
+        self.access_ctx.access_primed = complete;
+        if !newly_hidden.is_empty() && crate::logging::debug_logging_enabled() {
             crate::logging::debug(
                 "access",
                 format!(
-                    "server {}: datos completos={complete} (roles propios={:?}, dueño conocido={}, roles del server={}) -> {hidden} canales ocultos",
-                    guild_id,
-                    self.access_ctx.my_roles,
-                    self.access_ctx.owner_id.is_some(),
-                    self.roles.len(),
+                    "server {guild_id}: ya no puedes ver {} canal(es): {}",
+                    newly_hidden.len(),
+                    newly_hidden.join(", ")
                 ),
             );
         }
@@ -2091,6 +2093,29 @@ impl Server {
     /// Guarda los roles propios (`READY.merged_members`, `GUILD_MEMBER_UPDATE`
     /// de la propia cuenta) y recalcula el acceso.
     pub fn set_my_roles(&mut self, roles: Vec<String>) {
+        // Roles nuevos respecto a los que ya se conocían (la primera carga,
+        // con `my_roles == None`, no se loguea).
+        if crate::logging::debug_logging_enabled() {
+            if let Some(old) = self.access_ctx.my_roles.as_ref() {
+                let added: Vec<String> = roles
+                    .iter()
+                    .filter(|id| !old.contains(id))
+                    .map(|id| {
+                        self.roles
+                            .iter()
+                            .find(|r| &r.id == id)
+                            .map(|r| r.name.clone())
+                            .unwrap_or_else(|| id.clone())
+                    })
+                    .collect();
+                if !added.is_empty() {
+                    crate::logging::debug(
+                        "access",
+                        format!("server {}: te asignaron rol(es): {}", self.guild_id, added.join(", ")),
+                    );
+                }
+            }
+        }
         self.access_ctx.my_roles = Some(roles);
         self.recompute_access();
     }
@@ -2277,6 +2302,41 @@ impl Server {
         match self.raw_channels.iter().position(|c| c.id == channel.id) {
             Some(index) => self.raw_channels[index] = channel,
             None => self.raw_channels.push(channel),
+        }
+        let raw = self.raw_channels.clone();
+        self.rebuild_channels(raw);
+    }
+
+    /// Como [`Self::upsert_channel`] pero SIN rearmar las categorías: solo
+    /// anota el canal en `raw_channels`. Devuelve `false` si todavía no hay
+    /// canales cargados. Quien llama rearma una sola vez con
+    /// [`Self::rebuild_staged_channels`] al terminar la ráfaga de eventos:
+    /// rearmar por cada `CHANNEL_UPDATE` es O(canales) cada vez, y un server
+    /// que reordena 200 canales mandaba 200 rearmados seguidos en un frame.
+    pub fn stage_channel_upsert(&mut self, channel: crate::discord::models::Channel) -> bool {
+        if self.raw_channels.is_empty() {
+            return false;
+        }
+        match self.raw_channels.iter().position(|c| c.id == channel.id) {
+            Some(index) => self.raw_channels[index] = channel,
+            None => self.raw_channels.push(channel),
+        }
+        true
+    }
+
+    /// Como [`Self::remove_channel`] pero sin rearmar (ver `stage_channel_upsert`).
+    pub fn stage_channel_remove(&mut self, channel_id: &str) -> bool {
+        if self.raw_channels.is_empty() {
+            return false;
+        }
+        self.raw_channels.retain(|c| c.id != channel_id);
+        true
+    }
+
+    /// Rearma las categorías con lo anotado por `stage_channel_*`.
+    pub fn rebuild_staged_channels(&mut self) {
+        if self.raw_channels.is_empty() {
+            return;
         }
         let raw = self.raw_channels.clone();
         self.rebuild_channels(raw);

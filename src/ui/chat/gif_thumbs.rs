@@ -67,6 +67,12 @@ thread_local! {
     static THUMBS: RefCell<HashMap<String, Slot>> = RefCell::new(HashMap::new());
 }
 
+/// Suelta todas las miniaturas: sus texturas son del contexto de la ventana
+/// que se cerró (ver `state::resident`) y no sirven en la siguiente.
+pub fn clear() {
+    THUMBS.with_borrow_mut(HashMap::clear);
+}
+
 /// Miniatura de `url` (primer cuadro, lado mayor `max_side` px). Hay que
 /// llamarla cada frame mientras se dibuja la celda hasta que devuelva
 /// `Ready`; el pedido de red y la decodificación ocurren una sola vez.

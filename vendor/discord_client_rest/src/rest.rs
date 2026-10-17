@@ -33,6 +33,8 @@ use crate::api::webhook::WebhookRest;
 use crate::bootstrap::{DEFAULT_API_VERSION, bootstrap_client, build_bot_client};
 use crate::captcha::{CaptchaRequiredError, SolvedCaptcha};
 use crate::mfa::{MfaRequiredError, MfaVerificationRequest};
+use crate::netlog;
+use crate::nettrace;
 use crate::rate_limit::{RateLimitError, RateLimiter};
 use crate::response::{parse_error_body, rate_limit_from_body};
 use crate::structs::context::{Context, ContextHeader};
@@ -220,14 +222,18 @@ impl RestClient {
         if authentication == Authentication::User {
             // get experiments cookies
             // todo: parse assignments
+            let experiments_url = format!(
+                "{}v{}/experiments?with_guild_experiments=true",
+                API_BASE, api_version
+            );
+            let trace = nettrace::begin("GET", &experiments_url, "vendor::RestClient::connect (arranque)");
             let resp = client
-                .get(format!(
-                    "{}v{}/experiments?with_guild_experiments=true",
-                    API_BASE, api_version
-                ))
+                .get(experiments_url)
                 .header("Authorization", authorization.clone())
                 .send()
-                .await?;
+                .await;
+            nettrace::observe(&trace, &resp);
+            let resp = resp?;
             let code = resp.status().as_u16();
             if code == 401 {
                 return Err(Box::from("Invalid token"));
@@ -240,11 +246,15 @@ impl RestClient {
             }
             let _ = resp.text().await?; // ignore the response
         } else {
+            let bot_url = format!("{}v{}/users/@me", API_BASE, api_version);
+            let trace = nettrace::begin("GET", &bot_url, "vendor::RestClient::connect (arranque)");
             let resp = client
-                .get(format!("{}v{}/users/@me", API_BASE, api_version))
+                .get(bot_url)
                 .header("Authorization", authorization.clone())
                 .send()
-                .await?;
+                .await;
+            nettrace::observe(&trace, &resp);
+            let resp = resp?;
             let code = resp.status().as_u16();
             if code == 401 {
                 return Err(Box::from("Invalid token"));
@@ -265,11 +275,13 @@ impl RestClient {
         let application_command_index = match authentication {
             Authentication::User => {
                 // get application command index
+                let index_url = format!(
+                    "{}v{}/users/@me/application-command-index",
+                    API_BASE, api_version
+                );
+                let trace = nettrace::begin("GET", &index_url, "vendor::RestClient::connect (arranque)");
                 let resp = client
-                    .get(format!(
-                        "{}v{}/users/@me/application-command-index",
-                        API_BASE, api_version
-                    ))
+                    .get(index_url)
                     .header("Authorization", authorization.clone())
                     .header("x-debug-options", "bugReporterEnabled")
                     .header("x-discord-locale", locale.clone())
@@ -279,7 +291,9 @@ impl RestClient {
                         build_super_props(build_numbers.clone(), client_session.clone()),
                     )
                     .send()
-                    .await?;
+                    .await;
+                nettrace::observe(&trace, &resp);
+                let resp = resp?;
 
                 let code = resp.status().as_u16();
                 if code == 401 {
@@ -629,10 +643,24 @@ impl RestClient {
                 .join("&");
             full_url.push_str(&format!("?{}", query_string));
         }
-        let mut request = self
-            .client
-            .request(method, &full_url)
-            .headers(self.build_headers(req_properties)?);
+        let headers = self.build_headers(req_properties)?;
+
+        // Registro de tráfico de las devtools (no hace nada si están apagadas).
+        let trace = if netlog::enabled() {
+            let body_bytes = body.as_ref().and_then(|body| serde_json::to_vec(body).ok());
+            netlog::http_begin(
+                method.as_str(),
+                &full_url,
+                nettrace::pairs(&headers),
+                body_bytes.as_deref(),
+                None,
+                "vendor::RestClient (REST de Discord)",
+            )
+        } else {
+            netlog::HttpTrace::none()
+        };
+
+        let mut request = self.client.request(method, &full_url).headers(headers);
 
         if let Some(body_data) = body {
             request = request
@@ -640,12 +668,15 @@ impl RestClient {
                 .json(&body_data);
         }
 
-        let resp = request
-            .send()
-            .await
-            .map_err(|e| Box::new(e) as BoxedError)?;
+        let resp = match request.send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                trace.fail(&e.to_string());
+                return Err(Box::new(e) as BoxedError);
+            }
+        };
 
-        self.handle_response(resp, &full_url, path).await
+        self.handle_response(resp, &full_url, path, &trace).await
     }
 
     async fn handle_response<T: DeserializeOwned + Default>(
@@ -653,11 +684,25 @@ impl RestClient {
         resp: Response,
         url: &str,
         path: &str,
+        trace: &netlog::HttpTrace,
     ) -> BoxedResult<T> {
         let status = resp.status();
-        match status.as_u16() {
+        let code = status.as_u16();
+        // Lo que se necesita para cerrar el registro de tráfico: se arma una
+        // sola vez, antes de que `resp` se consuma.
+        let version = if trace.is_active() {
+            format!("{:?}", resp.version())
+        } else {
+            String::new()
+        };
+        let resp_headers = if trace.is_active() {
+            nettrace::pairs(resp.headers())
+        } else {
+            Vec::new()
+        };
+        match code {
             401 => {
-                let bytes = resp.bytes().await?;
+                let bytes = read_traced(resp, trace, code, &version, resp_headers).await?;
                 let json = parse_error_body(&bytes, 401, url)?;
 
                 if json["code"].is_i64() {
@@ -678,20 +723,23 @@ impl RestClient {
 
                 return Err("Invalid token".into());
             }
-            204 => return Ok(T::default()),
+            204 => {
+                trace.complete(code, &version, resp_headers, &[], 0);
+                return Ok(T::default());
+            }
             202 if should_retry_search_indexing(self.authentication, status.as_u16(), path) => {
-                let bytes = resp.bytes().await?;
+                let bytes = read_traced(resp, trace, code, &version, resp_headers).await?;
                 return Err(Box::new(SearchIndexingError {
                     retry_after: search_indexing_retry_after(&bytes),
                 }));
             }
             200..=299 => (),
             429 => {
-                let bytes = resp.bytes().await?;
+                let bytes = read_traced(resp, trace, code, &version, resp_headers).await?;
                 return Err(Box::new(rate_limit_from_body(&bytes, url)));
             }
             400 => {
-                let bytes = resp.bytes().await?;
+                let bytes = read_traced(resp, trace, code, &version, resp_headers).await?;
                 let resp_json = parse_error_body(&bytes, 400, url)?;
 
                 if resp_json["captcha_key"].is_array() {
@@ -706,14 +754,15 @@ impl RestClient {
                     message: resp_json["message"].as_str().map(str::to_owned),
                 }));
             }
-            code => {
-                let body = resp.text().await?;
-                let msg = format!("Request to {} failed with code {}: {}", url, code, body);
+            other => {
+                let bytes = read_traced(resp, trace, code, &version, resp_headers).await?;
+                let body = String::from_utf8_lossy(&bytes);
+                let msg = format!("Request to {} failed with code {}: {}", url, other, body);
                 return Err(msg.into());
             }
         }
 
-        let bytes = resp.bytes().await?;
+        let bytes = read_traced(resp, trace, code, &version, resp_headers).await?;
         if bytes.is_empty() {
             Ok(T::default())
         } else {
@@ -792,6 +841,28 @@ impl RestClient {
 
     pub fn get_http_client(&self) -> &Client {
         &self.client
+    }
+}
+
+/// Lee el cuerpo completo de la respuesta y, de paso, cierra su registro de
+/// tráfico (estado, headers y cuerpo). Si leerlo falla, el pedido queda
+/// registrado con ese error.
+pub(crate) async fn read_traced(
+    resp: Response,
+    trace: &netlog::HttpTrace,
+    status: u16,
+    version: &str,
+    headers: Vec<(String, String)>,
+) -> BoxedResult<Vec<u8>> {
+    match resp.bytes().await {
+        Ok(bytes) => {
+            trace.complete(status, version, headers, &bytes, bytes.len());
+            Ok(bytes.to_vec())
+        }
+        Err(error) => {
+            trace.fail(&error.to_string());
+            Err(Box::new(error) as BoxedError)
+        }
     }
 }
 

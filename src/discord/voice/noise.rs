@@ -7,6 +7,7 @@
 //! (AEC3, `echo.rs`). La API hacia `microphone.rs` no cambió.
 
 mod chain;
+mod deepfilter;
 mod echo;
 
 use chain::{Chain, FRAME};

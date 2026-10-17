@@ -324,7 +324,10 @@ async fn watch_stream_session(
 ) -> Result<(), String> {
     let url = voice_gateway_url(&params.endpoint)?;
     logging::debug("stream", format!("connecting stream websocket: {url}"));
-    let ws = timeout(VOICE_WEBSOCKET_CONNECT_TIMEOUT, websocket::connect(&url))
+    let ws = timeout(
+        VOICE_WEBSOCKET_CONNECT_TIMEOUT,
+        websocket::connect(&url, websocket::NetKind::StreamWatch, "voice::stream_watch (mirar un stream)"),
+    )
         .await
         .map_err(|_| "stream websocket connect timed out after 10s".to_owned())?
         .map_err(|error| format!("stream websocket connect failed: {error}"))?;

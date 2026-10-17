@@ -17,7 +17,7 @@ use egui::{
 };
 
 use crate::discord::VoiceVolumePercent;
-use crate::discord::clean_mic::{self, CleanMicSettings, EQ_BAND_NAMES, MeterSnapshot, PRESETS};
+use crate::discord::clean_mic::{self, CleanMicSettings, EQ_BAND_NAMES, MeterSnapshot, NoiseEngine, PRESETS};
 use crate::lib::state::App;
 use crate::ui::theme::{self, Icon, Palette};
 
@@ -169,6 +169,47 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                         ui.add_space(8.0);
                         toggle(ui, &palette, "Cancelación de eco (AEC3)", &mut s.echo_cancel);
                         hint(ui, &palette, "Resta de tu micrófono lo que suena en tus parlantes. Casi no hace falta con auriculares.");
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.add_sized(
+                                Vec2::new(150.0, 20.0),
+                                egui::Label::new(
+                                    RichText::new("Motor de supresión").font(theme::regular(13.0)).color(palette.text),
+                                ),
+                            );
+                            let label = |engine: NoiseEngine| match engine {
+                                NoiseEngine::RnNoise => "RNNoise (liviano)",
+                                NoiseEngine::DeepFilterNet => "DeepFilterNet (más calidad)",
+                            };
+                            egui::ComboBox::from_id_salt("clean_mic_noise_engine")
+                                .selected_text(label(s.engine))
+                                .width(240.0)
+                                .show_ui(ui, |ui| {
+                                    for engine in [NoiseEngine::DeepFilterNet, NoiseEngine::RnNoise] {
+                                        ui.selectable_value(&mut s.engine, engine, label(engine));
+                                    }
+                                });
+                        });
+                        if s.engine == NoiseEngine::DeepFilterNet {
+                            let text: &str = if !clean_mic::DEEPFILTER_COMPILED {
+                                "Este build no incluye DeepFilterNet (compila con --features deepfilternet-ort); se usa RNNoise."
+                            } else {
+                                match clean_mic::deepfilter_status() {
+                                    clean_mic::DeepFilterStatus::DownloadingModel => {
+                                        "Descargando el modelo de DeepFilterNet (una sola vez). Mientras tanto se usa RNNoise."
+                                    }
+                                    clean_mic::DeepFilterStatus::Loading => {
+                                        "Cargando el modelo. Hasta que esté listo se usa RNNoise."
+                                    }
+                                    clean_mic::DeepFilterStatus::Ready => "Activo. Usa más CPU que RNNoise.",
+                                    clean_mic::DeepFilterStatus::Failed => {
+                                        "No se pudo descargar o cargar el modelo (¿sin conexión o falta onnxruntime?); se usa RNNoise."
+                                    }
+                                    clean_mic::DeepFilterStatus::Idle => "Usa más CPU. Mientras carga el modelo se usa RNNoise.",
+                                }
+                            };
+                            hint(ui, &palette, text);
+                        }
                         ui.add_space(8.0);
                         pct_slider(ui, &mut s.strength, "Fuerza de la limpieza (cuánto baja el fondo entre palabras)");
 

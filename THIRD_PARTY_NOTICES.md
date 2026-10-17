@@ -21,7 +21,7 @@ into the executable.
 | Release build | FFmpeg build bundled | License of that build |
 | --- | --- | --- |
 | Linux `.deb` | Shared libraries from [BtbN FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds) (`gpl-shared`), installed in `/usr/lib/ecord` | **GNU GPL** (it includes GPL components such as libx264) |
-| Windows installers (`.msi`, `-setup.exe`) and portable `.zip` | DLLs from BtbN FFmpeg-Builds (`lgpl-shared`), installed next to `ecord.exe` | **GNU LGPL 2.1 or later** |
+| Windows installer (`-setup.exe`) and portable `.zip` | DLLs from BtbN FFmpeg-Builds (`lgpl-shared`), installed next to `ecord.exe` | **GNU LGPL 2.1 or later** |
 | macOS `.dmg` (experimental) | Libraries from Homebrew's `ffmpeg@7`, copied into the app bundle | Treat as **GNU GPL**: Homebrew builds FFmpeg with GPL components |
 
 The exact FFmpeg license terms of each build are in the `FFmpeg-LICENSE.txt` /
@@ -40,13 +40,31 @@ with another build of the same FFmpeg major version.
 
 - FFmpeg: <https://ffmpeg.org/download.html> (the release matching the build
   used; the build is named by `FFMPEG_ASSET` in
-  [`.github/workflows/Release.yml`](.github/workflows/Release.yml)).
+  [`.github/workflows/release.yml`](.github/workflows/release.yml)).
 - Build scripts and configuration of the bundled binaries:
   <https://github.com/BtbN/FFmpeg-Builds>.
 - x264: <https://www.videolan.org/developers/x264.html>.
 - eCord: the repository this software was downloaded from. If you cannot get
   any of the above, open an issue there and the corresponding source will be
   provided.
+
+## ONNX Runtime and DeepFilterNet (noise suppression)
+
+The optional DeepFilterNet noise suppression ("Clean Mic") runs on ONNX Runtime,
+which `vendor/deepfilter-rt` loads at run time as a shared library
+(`onnxruntime.dll` / `libonnxruntime.so`) shipped next to or alongside eCord. It
+is not merged into the executable. On macOS it is `libonnxruntime.dylib` inside the app bundle (`Contents/Resources`).
+
+| Component | License | Origin |
+| --- | --- | --- |
+| ONNX Runtime 1.23.2 (CPU build; on macOS the arm64 and universal2 builds) | MIT, © Microsoft Corporation | <https://github.com/microsoft/onnxruntime> (full text in `ONNXRuntime-LICENSE.txt`, shipped with the package; on Linux: `/usr/share/doc/ecord/onnxruntime-LICENSE.txt`) |
+| DeepFilterNet (`deep_filter` crate, used for the STFT/ISTFT processing) | MIT or Apache-2.0, © Hendrik Schröter | <https://github.com/Rikorose/DeepFilterNet> |
+| DeepFilterNet3 model (`dfn3`) | Same terms as DeepFilterNet (MIT or Apache-2.0) | Not bundled: downloaded once, on first use, from <https://github.com/shimondoodkin/deepfilter-rt> into eCord's cache folder. If it cannot be downloaded, eCord keeps using RNNoise. |
+
+<!-- TODO: confirm the license of the DeepFilterNet3 `.onnx` export published in
+     shimondoodkin/deepfilter-rt, and of `vendor/deepfilter-rt` itself (its
+     Cargo.toml declares none and the folder has no LICENSE file). Add its
+     LICENSE text under vendor/deepfilter-rt/ and list it in the vendor table. -->
 
 ## Embedded fonts
 
@@ -72,6 +90,7 @@ with another build of the same FFmpeg major version.
 | `egui-video` (fork ported to egui 0.36) | MIT, © 2023 n00kii | <https://github.com/n00kii/egui-video> (full text in `vendor/egui-video/LICENSE`) |
 | `discord_client_rest`, `discord_client_structs`, `discord_client_macros` | MIT, as declared in each crate's `Cargo.toml` | <https://github.com/UwUDev/discord-client-rs> by UwUDev |
 | `discord_client_utils` | See the upstream repository | <https://github.com/UwUDev/discord-client-rs> by UwUDev |
+| `deepfilter-rt` (real-time DeepFilterNet on ONNX Runtime) | See the TODO under "ONNX Runtime and DeepFilterNet" | <https://github.com/shimondoodkin/deepfilter-rt> |
 
 <!-- TODO: add the upstream LICENSE text (with its copyright line) for the
      discord_client_* crates under vendor/, and confirm the license of
@@ -86,6 +105,11 @@ with another build of the same FFmpeg major version.
 | Zstandard | `zstd-sys` | BSD-3-Clause (zstd is dual-licensed BSD / GPLv2; used under BSD) |
 | mimalloc | `libmimalloc-sys` | MIT |
 | ring | `ring` | ISC / OpenSSL-style licenses |
+
+<!-- TODO: the audio chain also uses `nnnoiseless` (RNNoise port) and `sonora`
+     (echo cancellation, AEC3). Confirm their licenses (and, for RNNoise, the
+     Xiph.Org / Jean-Marc Valin BSD-3-Clause notice) and list them here. They are
+     compiled into the executable. -->
 
 ## Rust crates
 

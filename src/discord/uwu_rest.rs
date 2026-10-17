@@ -1187,7 +1187,16 @@ impl UwuRest {
             for _attempt in 0..2 {
                 let bytes =
                     std::fs::read(&file.path).map_err(|e| anyhow::anyhow!("No se pudo leer {}: {e}", file.filename))?;
-                match self
+                let upload_trace = discord_client_rest::netlog::http_begin(
+                    "PUT",
+                    // Sin la query: trae la firma temporal de la subida.
+                    upload_url.split('?').next().unwrap_or(upload_url),
+                    Vec::new(),
+                    None,
+                    None,
+                    "uwu_rest (subir adjunto)",
+                );
+                let upload_result = self
                     .get_http_client()
                     .put(upload_url)
                     .header("Content-Type", file.mime.as_str())
@@ -1195,8 +1204,12 @@ impl UwuRest {
                     .header("Referer", "https://discord.com/")
                     .body(bytes)
                     .send()
-                    .await
-                {
+                    .await;
+                match &upload_result {
+                    Ok(resp) => upload_trace.complete(resp.status().as_u16(), "", Vec::new(), &[], 0),
+                    Err(e) => upload_trace.fail(&e.to_string()),
+                }
+                match upload_result {
                     Ok(resp) if resp.status().is_success() => {
                         uploaded = true;
                         break;

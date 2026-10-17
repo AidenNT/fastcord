@@ -525,6 +525,7 @@ pub enum Icon {
     BookmarkFilled,
     Car,
     Cast,
+    FastForwardFilled,
     Check,
     ChevronDown,
     ChevronLeft,
@@ -619,6 +620,7 @@ pub enum Icon {
     // Barra de llamada nueva (`ui::call::call_bar::show_bottom`).
     MessageCircle,
     SquareArrowUp,
+    ScreenShare,
     Video,
     Zap,
     // Visor multimedia (`ui::chat::media_viewer`).
@@ -646,6 +648,7 @@ const ICONS: &[(Icon, &str, &[u8])] = icons! {
     BookmarkFilled => "bookmark-filled",
     Car => "car",
     Cast => "cast",
+    FastForwardFilled => "fast-forward-filled",
     Check => "check",
     ChevronDown => "chevron-down",
     ChevronLeft => "chevron-left",
@@ -732,6 +735,7 @@ const ICONS: &[(Icon, &str, &[u8])] = icons! {
     X => "x",
     MessageCircle => "message-circle",
     SquareArrowUp => "square-arrow-up",
+    ScreenShare => "screen-share",
     Video => "video",
     Zap => "zap",
     ZoomIn => "zoom-in",
@@ -844,16 +848,16 @@ pub fn play_glyph_offset(icon: Icon, icon_size: f32) -> Vec2 {
     }
 }
 
-/// The app's mark, the accent disc with the play triangle, drawn the same
-/// wherever it appears.
+/// The app's mark: the accent disc with the Lucide "fast-forward" glyph (filled),
+/// drawn the same wherever it appears. It matches
+/// `assets/packaging/icon*.png|ico|icns` (the window/tray icon).
 pub fn logo(ui: &egui::Ui, center: egui::Pos2, diameter: f32, disc: Color32, glyph: Color32) {
     ui.painter().circle_filled(center, diameter / 2.0, disc);
-    let icon_size = diameter * 0.45;
-    let icon_rect = egui::Rect::from_center_size(
-        center + play_glyph_offset(Icon::PlayFilled, icon_size),
-        Vec2::splat(icon_size),
-    );
-    Icon::PlayFilled.image(glyph, icon_size).paint_at(ui, icon_rect);
+    // The glyph spans ~87.5% of its 24x24 box; 0.6 makes it ~53% of the disc,
+    // as in the packaged icon.
+    let icon_size = diameter * 0.6;
+    let icon_rect = egui::Rect::from_center_size(center, Vec2::splat(icon_size));
+    Icon::FastForwardFilled.image(glyph, icon_size).paint_at(ui, icon_rect);
 }
 
 pub fn circle_button(

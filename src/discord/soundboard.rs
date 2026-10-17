@@ -97,11 +97,12 @@ pub fn fetch_audio(sound_id: &str) -> Result<Vec<u8>, String> {
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| e.to_string())?;
-    let response = client
-        .get(audio_url(sound_id))
-        .send()
-        .and_then(|r| r.error_for_status())
-        .map_err(|e| e.to_string())?;
+    let sound_url = audio_url(sound_id);
+    let _who = discord_client_rest::netlog::origin("soundboard (bajar audio)");
+    let trace = crate::support::nettrace::begin("GET", &sound_url, "soundboard");
+    let sent = client.get(&sound_url).send();
+    crate::support::nettrace::observe_blocking(&trace, &sent);
+    let response = sent.and_then(|r| r.error_for_status()).map_err(|e| e.to_string())?;
     let bytes = response.bytes().map_err(|e| e.to_string())?;
     if bytes.len() > AUDIO_MAX_BYTES {
         return Err("el audio es demasiado grande".to_owned());

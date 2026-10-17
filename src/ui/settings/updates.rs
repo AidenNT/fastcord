@@ -151,7 +151,7 @@ pub fn apply(app: &mut App, ctx: &egui::Context, action: UiAction) {
             let quit = ctx.clone();
             updater::install_and_quit(
                 move || repaint.request_repaint(),
-                move || quit.send_viewport_cmd(egui::ViewportCommand::Close),
+                move || quit_now(&quit),
             );
         }
         UiAction::RestartElevated => {
@@ -159,7 +159,7 @@ pub fn apply(app: &mut App, ctx: &egui::Context, action: UiAction) {
             let quit = ctx.clone();
             updater::request_elevated_update(
                 move || repaint.request_repaint(),
-                move || quit.send_viewport_cmd(egui::ViewportCommand::Close),
+                move || quit_now(&quit),
             );
         }
         UiAction::OpenPage(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),
@@ -216,4 +216,11 @@ pub fn section(ui: &mut egui::Ui, palette: &Palette) -> Option<UiAction> {
         }
     }
     action
+}
+
+/// Cierra eCord de verdad: la actualización reemplaza el ejecutable, así que
+/// cerrar la ventana no puede mandarlo a la bandeja.
+fn quit_now(ctx: &egui::Context) {
+    crate::app_shell::request_quit();
+    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
 }

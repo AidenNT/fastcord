@@ -94,6 +94,10 @@ pub struct AccessContext {
     pub my_id: String,
     /// Roles propios en este server. `None` = todavía no se sabe.
     pub my_roles: Option<Vec<String>>,
+    /// El último `recompute_access` ya tenía todos los datos. Sirve para no
+    /// loguear como "canal ocultado" lo que en realidad es la carga inicial
+    /// (antes de eso el cálculo es fail-open y todo se ve).
+    pub access_primed: bool,
 }
 
 /// Permisos base (sin overwrites) de un miembro con `member_roles`.

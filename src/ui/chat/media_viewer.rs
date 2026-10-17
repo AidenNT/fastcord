@@ -835,7 +835,11 @@ fn spawn_download(ctx: &egui::Context, item: Item) -> Receiver<Result<PathBuf, S
                 .user_agent("Mozilla/5.0")
                 .build()
                 .map_err(|e| e.to_string())?;
-            let resp = client.get(item.download_url()).send().map_err(|e| e.to_string())?;
+            let _who = discord_client_rest::netlog::origin("media_viewer (descargar archivo)");
+            let trace = crate::support::nettrace::begin("GET", item.download_url(), "media_viewer (descarga)");
+            let sent = client.get(item.download_url()).send();
+            crate::support::nettrace::observe_blocking(&trace, &sent);
+            let resp = sent.map_err(|e| e.to_string())?;
             if !resp.status().is_success() {
                 return Err(format!("El servidor respondió {}", resp.status()));
             }

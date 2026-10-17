@@ -196,8 +196,6 @@ struct Broker {
     inbox: VecDeque<CaptchaRequest>,
     /// Quién espera la respuesta de cada pedido.
     waiting: HashMap<u64, oneshot::Sender<Option<CaptchaSolution>>>,
-    /// Para despertar a la UI cuando llega algo (egui no repinta solo).
-    repaint: Option<egui::Context>,
 }
 
 /// Último motivo por el que la ventana del captcha se cerró sin token (lo
@@ -210,20 +208,10 @@ fn broker() -> std::sync::MutexGuard<'static, Broker> {
     BROKER.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// La UI registra su contexto una vez, para que un pedido de captcha
-/// (que llega desde un hilo de fondo) la despierte aunque esté quieta.
-pub fn set_repaint_context(ctx: &egui::Context) {
-    let mut broker = broker();
-    if broker.repaint.is_none() {
-        broker.repaint = Some(ctx.clone());
-    }
-}
-
+/// Un pedido de captcha llega desde un hilo de fondo: despierta a la UI
+/// (egui no repinta solo) y, si eCord está en la bandeja, la ventana se abre.
 fn wake_ui() {
-    let ctx = broker().repaint.clone();
-    if let Some(ctx) = ctx {
-        ctx.request_repaint();
-    }
+    crate::app_shell::wake();
 }
 
 /// Pide que la persona resuelva `challenge` y espera la respuesta. Se llama

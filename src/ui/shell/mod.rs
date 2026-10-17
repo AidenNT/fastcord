@@ -8,4 +8,5 @@ pub mod nav;
 pub mod notifications;
 pub mod overlay;
 pub mod rail;
+pub mod status_bar;
 pub mod topbar;

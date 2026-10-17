@@ -16,6 +16,7 @@ pub mod frecency;
 pub mod gateway;
 pub mod invites;
 pub mod join_form;
+pub mod launch_signature;
 pub mod models;
 pub mod password_auth;
 pub mod remote_auth;
@@ -553,6 +554,7 @@ pub enum AppEvent {
 /// debajo). Devuelve enseguida; los resultados llegan por `tx`.
 pub fn spawn_login_flow(tx: std::sync::mpsc::Sender<AppEvent>) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("login_flow");
         let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(rt) => rt,
             Err(e) => {
@@ -623,6 +625,7 @@ async fn init_fingerprint() -> std::sync::Arc<fingerprint::ClientFingerprint> {
 /// resultado llega como `AppEvent::DmOpened`.
 pub fn spawn_fetch_dm(token: String, user_id: String, tx: std::sync::mpsc::Sender<AppEvent>) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("fetch_dm");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
@@ -659,6 +662,7 @@ pub fn spawn_fetch_dm(token: String, user_id: String, tx: std::sync::mpsc::Sende
 /// `AppEvent::GuildChannels`.
 pub fn spawn_fetch_guild_channels(token: String, guild_id: String, tx: std::sync::mpsc::Sender<AppEvent>) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("fetch_guild_channels");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
@@ -691,6 +695,7 @@ pub fn spawn_fetch_guild_channels(token: String, guild_id: String, tx: std::sync
 /// `AppEvent::ChannelMessages`.
 pub fn spawn_fetch_channel_messages(token: String, channel_id: String, tx: std::sync::mpsc::Sender<AppEvent>) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("fetch_channel_messages");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
@@ -724,6 +729,7 @@ pub fn spawn_fetch_forum_posts(
     tx: std::sync::mpsc::Sender<AppEvent>,
 ) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("fetch_forum_posts");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             let _ = tx.send(AppEvent::ForumPostsFailed { channel_id });
             return;
@@ -764,6 +770,7 @@ pub fn spawn_create_forum_post(
     tx: std::sync::mpsc::Sender<AppEvent>,
 ) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("create_forum_post");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             let _ = tx.send(AppEvent::ForumPostCreateFailed { forum_id });
             return;
@@ -798,6 +805,7 @@ pub fn spawn_fetch_more_channel_messages(
     tx: std::sync::mpsc::Sender<AppEvent>,
 ) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("fetch_more_channel_messages");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
@@ -840,6 +848,7 @@ pub fn spawn_fetch_messages_around(
     tx: std::sync::mpsc::Sender<AppEvent>,
 ) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("fetch_messages_around");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             let _ = tx.send(AppEvent::MessageWindowFailed { channel_id });
             return;
@@ -884,6 +893,7 @@ pub fn spawn_fetch_newer_channel_messages(
     tx: std::sync::mpsc::Sender<AppEvent>,
 ) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("fetch_newer_channel_messages");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             let _ = tx.send(AppEvent::MessageWindowFailed { channel_id });
             return;
@@ -931,6 +941,7 @@ pub fn spawn_fetch_newer_channel_messages(
 /// entera hasta el próximo login.
 pub fn spawn_fetch_user_settings(token: String, tx: std::sync::mpsc::Sender<AppEvent>) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("fetch_user_settings");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
@@ -964,6 +975,7 @@ pub fn spawn_fetch_user_settings(token: String, tx: std::sync::mpsc::Sender<AppE
 /// quedó aplicado en esta sesión.
 pub fn spawn_patch_user_settings(token: String, partial: user_settings::PreloadedUserSettings) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("patch_user_settings");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
@@ -991,6 +1003,7 @@ pub fn spawn_patch_user_settings(token: String, partial: user_settings::Preloade
 /// `frecency::is_loaded`), así que se reintenta como los ajustes generales.
 pub fn spawn_fetch_frecency_settings(token: String, tx: std::sync::mpsc::Sender<AppEvent>) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("fetch_frecency_settings");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
@@ -1018,6 +1031,7 @@ pub fn spawn_fetch_frecency_settings(token: String, tx: std::sync::mpsc::Sender<
 /// normal. Cada mitad se manda en cuanto llega, sin esperar a la otra.
 pub fn spawn_fetch_affinities(token: String, tx: std::sync::mpsc::Sender<AppEvent>) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("fetch_affinities");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
@@ -1060,6 +1074,7 @@ pub fn spawn_fetch_affinities(token: String, tx: std::sync::mpsc::Sender<AppEven
 /// hay miniatura todavía) no manda nada y el tile sigue sin imagen.
 pub fn spawn_fetch_stream_preview(token: String, stream_key: String, tx: std::sync::mpsc::Sender<AppEvent>) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("fetch_stream_preview");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
@@ -1076,6 +1091,7 @@ pub fn spawn_fetch_stream_preview(token: String, stream_key: String, tx: std::sy
 
 pub fn spawn_fetch_user(token: String, user_id: String, tx: std::sync::mpsc::Sender<AppEvent>) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("fetch_user");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
@@ -1267,6 +1283,7 @@ pub fn spawn_fetch_user_profile(
         None => None,
     };
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("fetch_user_profile");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             let _ = tx.send(AppEvent::UserProfileFailed { user_id });
             return;
@@ -1338,6 +1355,7 @@ pub fn spawn_send_message(
     reply_to: Option<String>,
 ) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("send_message");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
@@ -1366,6 +1384,7 @@ pub fn spawn_send_sticker(
     reply_to: Option<String>,
 ) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("send_sticker");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
@@ -1393,6 +1412,7 @@ pub fn spawn_fetch_gifs(
     done: impl FnOnce(Result<serde_json::Value, String>) + Send + 'static,
 ) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("fetch_gifs");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             done(Err("no se pudo crear el runtime".to_string()));
             return;
@@ -1413,6 +1433,7 @@ pub fn spawn_fetch_gifs(
 /// el eco local ya se aplicó optimistamente en `ChatMessage::toggle_reaction`.
 pub fn spawn_toggle_reaction(token: String, channel_id: String, message_id: String, emoji: String, adding: bool) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("toggle_reaction");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
@@ -1443,6 +1464,7 @@ pub fn spawn_toggle_reaction(token: String, channel_id: String, message_id: Stri
 /// interrumpir al usuario con un toast por esto.
 pub fn spawn_ack_message(token: String, channel_id: String, message_id: String) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("ack_message");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
@@ -1466,6 +1488,7 @@ pub fn spawn_ack_message(token: String, channel_id: String, message_id: String) 
 /// escribiendo. Si falla solo se registra: no vale un toast.
 pub fn spawn_typing(token: String, channel_id: String) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("typing");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
@@ -1489,6 +1512,7 @@ pub fn spawn_typing(token: String, channel_id: String) {
 /// local; si el pedido falla solo se registra.
 pub fn spawn_stop_ringing(token: String, channel_id: String, recipients: Vec<String>) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("stop_ringing");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
@@ -1511,6 +1535,7 @@ pub fn spawn_stop_ringing(token: String, channel_id: String, recipients: Vec<Str
 /// la lista local; si falla (falta de permisos, por ejemplo) solo se registra.
 pub fn spawn_delete_message(token: String, channel_id: String, message_id: String) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("delete_message");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
@@ -1532,6 +1557,7 @@ pub fn spawn_delete_message(token: String, channel_id: String, message_id: Strin
 /// Saca todas las reacciones de un mensaje, o solo las de `emoji`.
 pub fn spawn_clear_reactions(token: String, channel_id: String, message_id: String, emoji: Option<String>) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("clear_reactions");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
@@ -1554,6 +1580,7 @@ pub fn spawn_clear_reactions(token: String, channel_id: String, message_id: Stri
 /// (ver `UwuRest::ack_message_manual`).
 pub fn spawn_ack_message_manual(token: String, channel_id: String, message_id: String) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("ack_message_manual");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
@@ -1603,6 +1630,7 @@ pub enum UserAction {
 /// salió bien, actualiza el estado local).
 pub fn spawn_user_action(token: String, user_id: String, action: UserAction, tx: std::sync::mpsc::Sender<AppEvent>) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("user_action");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
@@ -1658,6 +1686,7 @@ pub fn spawn_user_action(token: String, user_id: String, action: UserAction, tx:
 /// bloquear el frame; avisa con `AppEvent::FriendRequestSent`.
 pub fn spawn_send_friend_request(token: String, username: String, tx: std::sync::mpsc::Sender<AppEvent>) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("send_friend_request");
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
         let Ok(rt) = runtime else {
             let _ = tx.send(AppEvent::FriendRequestSent {
@@ -1684,6 +1713,7 @@ pub fn spawn_send_friend_request(token: String, username: String, tx: std::sync:
 /// Pide la nota privada de `user_id` (para precargarla en el editor de notas).
 pub fn spawn_fetch_note(token: String, user_id: String, tx: std::sync::mpsc::Sender<AppEvent>) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("fetch_note");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
@@ -1705,6 +1735,7 @@ pub fn spawn_fetch_note(token: String, user_id: String, tx: std::sync::mpsc::Sen
 /// solo se registra: el token igual se borra del disco.
 pub fn spawn_logout(token: String) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("logout");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
@@ -1728,6 +1759,7 @@ pub fn spawn_logout(token: String) {
 /// `lib::state::UserDB`) y va directo al Gateway.
 pub fn spawn_gateway_with_token(token: String, tx: std::sync::mpsc::Sender<AppEvent>) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("gateway_with_token");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             let _ = tx.send(AppEvent::Error("No se pudo iniciar el runtime async".into()));
             return;
@@ -1779,6 +1811,7 @@ pub fn spawn_press_button(
     tx: std::sync::mpsc::Sender<AppEvent>,
 ) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("press_button");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
@@ -1821,6 +1854,7 @@ pub fn spawn_submit_modal(
     tx: std::sync::mpsc::Sender<AppEvent>,
 ) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("submit_modal");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
@@ -1845,6 +1879,7 @@ pub fn spawn_submit_modal(
 /// `Some`, los de ese server) y avisa con `AppEvent::SoundboardLoaded`.
 pub fn spawn_fetch_soundboard(token: String, guild_id: Option<String>, tx: std::sync::mpsc::Sender<AppEvent>) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("fetch_soundboard");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
@@ -1894,6 +1929,7 @@ pub fn spawn_send_soundboard_sound(
     tx: std::sync::mpsc::Sender<AppEvent>,
 ) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("send_soundboard_sound");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
@@ -1928,6 +1964,7 @@ pub fn spawn_play_soundboard_sound(sound_id: String, volume: f32) {
 /// o `AppEvent::JoinFormFailed`.
 pub fn spawn_submit_join_form(token: String, form: join_form::JoinForm, tx: std::sync::mpsc::Sender<AppEvent>) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("submit_join_form");
         let guild_name = form.guild_name.clone();
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             let _ = tx.send(AppEvent::JoinFormFailed {
@@ -1976,6 +2013,7 @@ pub fn spawn_fetch_slash_catalog(
     tx: std::sync::mpsc::Sender<AppEvent>,
 ) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("fetch_slash_catalog");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             let _ = tx.send(AppEvent::SlashCatalogFailed { key });
             return;
@@ -2011,6 +2049,7 @@ pub fn spawn_run_slash_command(
     tx: std::sync::mpsc::Sender<AppEvent>,
 ) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("run_slash_command");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };
@@ -2040,6 +2079,7 @@ pub fn spawn_create_thread(
     tx: std::sync::mpsc::Sender<AppEvent>,
 ) {
     std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("create_thread");
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             return;
         };

@@ -63,7 +63,10 @@ pub(super) async fn connect_voice_gateway(
         .await;
     logging::debug("voice", format!("connecting voice websocket: {url}"));
     let connect_started = Instant::now();
-    let ws = timeout(VOICE_WEBSOCKET_CONNECT_TIMEOUT, websocket::connect(&url))
+    let ws = timeout(
+        VOICE_WEBSOCKET_CONNECT_TIMEOUT,
+        websocket::connect(&url, websocket::NetKind::Voice, "voice::gateway (llamada de voz)"),
+    )
         .await
         .map_err(|_| "voice websocket connect timed out after 10s".to_owned())?
         .map_err(|error| format!("voice websocket connect failed: {error}"))?;
@@ -569,7 +572,10 @@ async fn resume_voice_gateway(
     child_tasks.heartbeat.abort();
     heartbeat_ack.lock().await.reset();
 
-    let ws = timeout(VOICE_WEBSOCKET_CONNECT_TIMEOUT, websocket::connect(url))
+    let ws = timeout(
+        VOICE_WEBSOCKET_CONNECT_TIMEOUT,
+        websocket::connect(url, websocket::NetKind::Voice, "voice::gateway (reanudación de la llamada)"),
+    )
         .await
         .map_err(|_| "voice resume websocket connect timed out after 10s".to_owned())?
         .map_err(|error| format!("voice resume websocket connect failed: {error}"))?;
@@ -863,6 +869,14 @@ pub(super) async fn run_voice_udp_receive(
         }
     };
     logging::debug("voice", format!("voice UDP receive decrypt active: mode={mode}"));
+    // Registro de tráfico de las devtools: solo se cuenta lo que ENTRA por este
+    // socket (los paquetes de salida salen desde otras tareas y no se cuentan).
+    let net_conn = discord_client_rest::netlog::conn_open(
+        discord_client_rest::netlog::Kind::Udp,
+        &format!("udp://{}", socket.peer_addr().map(|a| a.to_string()).unwrap_or_default()),
+        "voice::gateway (audio RTP recibido)",
+    );
+    let _net_guard = discord_client_rest::netlog::ConnGuard(net_conn);
     let mut packet = vec![0u8; 2048];
     let mut rtp_packets = 0u64;
     let mut decrypted_packets = 0u64;
@@ -876,6 +890,7 @@ pub(super) async fn run_voice_udp_receive(
     loop {
         match socket.recv(&mut packet).await {
             Ok(len) => {
+                discord_client_rest::netlog::conn_add_bytes(net_conn, discord_client_rest::netlog::Dir::In, len);
                 if let Some(sequence) = parse_udp_ping_response(&packet[..len]) {
                     udp_ping_responses = udp_ping_responses.saturating_add(1);
                     if udp_ping_responses == 1 || udp_ping_responses.is_multiple_of(12) {

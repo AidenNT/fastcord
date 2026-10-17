@@ -81,6 +81,7 @@ pub fn detect() -> Option<Dialog> {
                 } else {
                     // "Cerrar ecord" (o cualquier otra salida): el token no
                     // llega a salir nunca.
+                    crate::app_shell::request_quit();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }),

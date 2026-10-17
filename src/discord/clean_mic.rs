@@ -8,7 +8,7 @@
 //! Este módulo no depende de la feature `voice-playback`, así la UI compila
 //! igual aunque no haya captura real de audio.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
@@ -92,9 +92,27 @@ pub fn bands_for(preset: &str) -> [EqBand; EQ_BANDS] {
     })
 }
 
+/// Motor de supresión de ruido de la cadena.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NoiseEngine {
+    /// RNNoise (liviano, el de antes).
+    RnNoise,
+    /// DeepFilterNet (más calidad, más CPU): el motor por defecto. Viene en el
+    /// feature `deepfilternet-ort` (ONNX Runtime, activo por defecto); si el
+    /// build no lo incluye, el modelo aún no cargó o algo falla, se usa RNNoise.
+    #[default]
+    DeepFilterNet,
+}
+
+/// `true` si este build incluye DeepFilterNet (`--features deepfilternet-ort`).
+pub const DEEPFILTER_COMPILED: bool = cfg!(feature = "deepfilternet-ort");
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CleanMicSettings {
+    /// Motor de supresión de ruido (RNNoise o DeepFilterNet).
+    pub engine: NoiseEngine,
+
     /// Cancelación de eco (AEC3) usando lo que suena en tus parlantes.
     pub echo_cancel: bool,
 
@@ -135,6 +153,7 @@ pub struct CleanMicSettings {
 impl Default for CleanMicSettings {
     fn default() -> Self {
         Self {
+            engine: NoiseEngine::default(),
             echo_cancel: true,
             high_pass: true,
             high_pass_hz: 80.0,
@@ -254,5 +273,76 @@ pub fn meter() -> MeterSnapshot {
         voice: f32::from_bits(meter.voice.load(Ordering::Relaxed)),
         gate_open: meter.gate_open.load(Ordering::Relaxed),
         active: last != 0 && now_ms().saturating_sub(last) < 500,
+    }
+}
+
+/// Estado del motor DeepFilterNet: lo publica `voice/noise/deepfilter.rs` (hilo de
+/// carga) y lo lee el popup de Clean Mic para explicar por qué todavía suena RNNoise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeepFilterStatus {
+    /// Todavía no se pidió (o este build no lo incluye).
+    Idle,
+    /// Bajando el modelo la primera vez.
+    DownloadingModel,
+    /// Cargando el modelo y ONNX Runtime.
+    Loading,
+    /// Procesando con DeepFilterNet.
+    Ready,
+    /// Falló la descarga, la carga o la inferencia; se usa RNNoise.
+    Failed,
+}
+
+static DEEPFILTER_STATUS: AtomicU8 = AtomicU8::new(0);
+
+pub fn set_deepfilter_status(status: DeepFilterStatus) {
+    DEEPFILTER_STATUS.store(status as u8, Ordering::Relaxed);
+}
+
+pub fn deepfilter_status() -> DeepFilterStatus {
+    match DEEPFILTER_STATUS.load(Ordering::Relaxed) {
+        1 => DeepFilterStatus::DownloadingModel,
+        2 => DeepFilterStatus::Loading,
+        3 => DeepFilterStatus::Ready,
+        4 => DeepFilterStatus::Failed,
+        _ => DeepFilterStatus::Idle,
+    }
+}
+
+/// Progreso de la descarga del modelo (archivos bajados, total). Lo publica
+/// `voice/noise/deepfilter.rs` y lo muestra la barra de estado.
+static DEEPFILTER_DL_DONE: AtomicU8 = AtomicU8::new(0);
+static DEEPFILTER_DL_TOTAL: AtomicU8 = AtomicU8::new(0);
+
+pub fn set_deepfilter_download_progress(done: u8, total: u8) {
+    DEEPFILTER_DL_DONE.store(done, Ordering::Relaxed);
+    DEEPFILTER_DL_TOTAL.store(total, Ordering::Relaxed);
+}
+
+/// `(archivos bajados, total)`; el total es 0 si todavía no empezó.
+pub fn deepfilter_download_progress() -> (u8, u8) {
+    (
+        DEEPFILTER_DL_DONE.load(Ordering::Relaxed),
+        DEEPFILTER_DL_TOTAL.load(Ordering::Relaxed),
+    )
+}
+
+#[cfg(test)]
+mod engine_tests {
+    use super::*;
+
+    #[test]
+    fn settings_saved_before_engine_existed_get_the_default_engine() {
+        let mut value = serde_json::to_value(CleanMicSettings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("engine");
+        let loaded: CleanMicSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded.engine, NoiseEngine::DeepFilterNet);
+    }
+
+    #[test]
+    fn engine_round_trips() {
+        let mut s = CleanMicSettings::default();
+        s.engine = NoiseEngine::RnNoise;
+        let back: CleanMicSettings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.engine, NoiseEngine::RnNoise);
     }
 }

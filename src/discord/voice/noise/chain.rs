@@ -6,7 +6,8 @@
 
 use nnnoiseless::DenoiseState;
 
-use crate::discord::clean_mic::{CleanMicSettings, EQ_BANDS, EqBand};
+use super::deepfilter::DeepFilter;
+use crate::discord::clean_mic::{CleanMicSettings, EQ_BANDS, EqBand, NoiseEngine};
 use std::f32::consts::PI;
 
 pub const SAMPLE_RATE: f32 = 48_000.0;
@@ -145,6 +146,7 @@ pub struct Chain {
     hpf_hz: f32,
     denoise: Box<DenoiseState<'static>>,
     denoise_out: Vec<f32>,
+    deep: DeepFilter,
     eq: [Biquad; EQ_BANDS],
 
     // voice gate
@@ -175,6 +177,7 @@ impl Chain {
             hpf_hz: 80.0,
             denoise: DenoiseState::new(),
             denoise_out: vec![0.0; FRAME],
+            deep: DeepFilter::new(),
             eq: std::array::from_fn(|i| band_filter(i, &defaults.eq_bands[i])),
             gate_gain: 0.0,
             gate_hold: 0,
@@ -236,11 +239,24 @@ impl Chain {
             self.noise_floor *= 1.0116;
         }
 
-        // 2. AI noise suppression
-        let vad = self.denoise.process_frame(&mut self.denoise_out, buf);
-        for (x, y) in buf.iter_mut().zip(self.denoise_out.iter()) {
-            *x = *y / 32768.0;
-        }
+        // 2. AI noise suppression: DeepFilterNet si está elegido y ya cargó;
+        // si no, RNNoise. Ambos dejan `buf` en -1..1.
+        let deep_vad = if s.engine == NoiseEngine::DeepFilterNet {
+            let atten_db = 6.0 + 54.0 * s.strength.clamp(0.0, 1.0);
+            self.deep.process(buf, atten_db)
+        } else {
+            None
+        };
+        let vad = match deep_vad {
+            Some(vad) => vad,
+            None => {
+                let vad = self.denoise.process_frame(&mut self.denoise_out, buf);
+                for (x, y) in buf.iter_mut().zip(self.denoise_out.iter()) {
+                    *x = *y / 32768.0;
+                }
+                vad
+            }
+        };
 
         // 3. voice gate: RNNoise's voice detector AND clearly louder than the background
         self.vad_smooth = self.vad_smooth * 0.6 + vad * 0.4;

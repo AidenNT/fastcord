@@ -227,7 +227,11 @@ fn fetch(
         }
         return Ok((body, mime));
     }
-    let resp = client.get(url).send().map_err(|e| (e.to_string(), false))?;
+    let trace = crate::support::nettrace::begin("GET", url, "http_cache (imágenes y archivos de la UI)");
+    let sent = client.get(url).send();
+    crate::support::nettrace::observe_blocking(&trace, &sent);
+    let resp = sent.map_err(|e| (e.to_string(), false))?;
+    let snap = crate::support::nettrace::snap_blocking(&resp);
     let status = resp.status();
     if !status.is_success() {
         // 404/410: no existe, no tiene sentido reintentar cada 30 s.
@@ -240,6 +244,7 @@ fn fetch(
         .and_then(|v| v.to_str().ok())
         .map(|v| v.split(';').next().unwrap_or(v).trim().to_ascii_lowercase());
     let data = resp.bytes().map_err(|e| (e.to_string(), false))?;
+    snap.complete(&trace, data.len());
     let mime = pick_mime(header_mime, &data);
     let (body, mime): (Arc<[u8]>, Option<String>) = match shrink_if_huge(&data, mime.as_deref()) {
         Some((small, small_mime)) => (Arc::from(small), Some(small_mime)),

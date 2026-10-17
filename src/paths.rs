@@ -38,6 +38,20 @@ pub fn video_cache_dir() -> Option<PathBuf> {
     cache_dir().map(|dir| dir.join("video"))
 }
 
+/// Logo de eCord volcado desde el binario para las notificaciones de
+/// escritorio de Windows (el toast necesita un archivo; `lib::win_toast`).
+#[cfg(windows)]
+pub fn toast_icon_file() -> Option<PathBuf> {
+    cache_dir().map(|dir| dir.join("toast-icon.png"))
+}
+
+/// Avatares ya bajados para las notificaciones de escritorio de Windows
+/// (`lib::win_toast`); el toast necesita un archivo local.
+#[cfg(windows)]
+pub fn toast_avatar_dir() -> Option<PathBuf> {
+    cache_dir().map(|dir| dir.join("toast-avatars"))
+}
+
 /// Imágenes/bytes bajados por HTTP (`support::http_cache`).
 pub fn http_cache_dir() -> Option<PathBuf> {
     cache_dir().map(|dir| dir.join("http"))
@@ -52,6 +66,11 @@ pub fn json_cache_dir() -> Option<PathBuf> {
 /// pueda abrir por ruta (`support::sound_alerts`). Se regeneran solos.
 pub fn sound_cache_dir() -> Option<PathBuf> {
     cache_dir().map(|dir| dir.join("sounds"))
+}
+
+/// Log de la sesión (`%LOCALAPPDATA%\ecord\data\ecord.log` en Windows).
+pub fn log_file() -> Option<PathBuf> {
+    state_dir().map(|dir| dir.join("ecord.log"))
 }
 
 /// Cookie jar de Discord (JSON de `cookie_store`).

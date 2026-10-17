@@ -13,27 +13,17 @@
 //!
 //! eframe no repinta si no pasa nada, y el hilo de Discord no despierta a la
 //! UI al llegar un evento. Por eso, al empezar y al terminar una request se
-//! pide un repintado con el `Context` que registra
-//! [`set_repaint_context`]: sin eso el spinner aparecería (y se iría) recién
+//! pide un repintado con `app_shell::wake` (el `Waker` de la app, que no
+//! depende de qué ventana exista): sin eso el spinner aparecería (y se iría) recién
 //! en el siguiente repintado de respaldo, hasta medio segundo después.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
-static REPAINT: OnceLock<egui::Context> = OnceLock::new();
 
-/// Registra el `Context` al que hay que despertar cuando cambia el contador.
-/// Se llama una sola vez (`App::poll_discord_events`); las siguientes no
-/// hacen nada.
-pub fn set_repaint_context(ctx: &egui::Context) {
-    let _ = REPAINT.set(ctx.clone());
-}
-
+/// Despierta a la UI (ventana abierta o no) cuando cambia el contador.
 fn wake_ui() {
-    if let Some(ctx) = REPAINT.get() {
-        ctx.request_repaint();
-    }
+    crate::app_shell::wake();
 }
 
 /// Marca una request como en vuelo mientras viva este valor.

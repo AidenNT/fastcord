@@ -72,10 +72,11 @@ pub(crate) fn build_bot_client(proxy: Option<&str>) -> BoxedResult<Client> {
 }
 
 async fn fetch_app_shell(client: &Client) -> BoxedResult<String> {
-    let resp = client
-        .get("https://discord.com/channels/@me")
-        .send()
-        .await?;
+    let url = "https://discord.com/channels/@me";
+    let trace = crate::nettrace::begin("GET", url, "vendor::bootstrap (shell de la app web)");
+    let resp = client.get(url).send().await;
+    crate::nettrace::observe(&trace, &resp);
+    let resp = resp?;
 
     Ok(resp.text().await?)
 }

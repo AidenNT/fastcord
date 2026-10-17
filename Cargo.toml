@@ -1,6 +1,6 @@
 [package]
 name = "ecord"
-version = "0.0.13"
+version = "0.0.14"
 edition = "2024"
 # Hay dos ejecutables (`ecord` y `ecord-captcha`, ver src/bin): `cargo run` arranca la app.
 default-run = "ecord"
@@ -197,6 +197,14 @@ nnnoiseless = { version = "0.5", default-features = false, optional = true }
 # Cancelación de eco (WebRTC AEC3, puro Rust) usada por voice/noise/echo.rs:
 # resta del micrófono lo que suena por los parlantes.
 sonora = { version = "0.2.0", optional = true }
+# Supresión de ruido DeepFilterNet por ONNX Runtime (feature opcional
+# `deepfilternet-ort`): vendor/deepfilter-rt (de github.com/shimondoodkin/deepfilter-rt,
+# MIT/Apache-2.0, con dos parches: ruta de la biblioteca de ONNX Runtime y
+# `last_lsnr()`). Corre en streaming frame a frame con el estado de las GRU, a
+# 48 kHz / 10 ms, igual que la cadena de Clean Mic. Necesita en tiempo de
+# ejecución `onnxruntime` (.dll/.so/.dylib) y una carpeta de modelo; ver
+# src/discord/voice/noise/deepfilter.rs.
+deepfilter-rt = { path = "vendor/deepfilter-rt", optional = true }
 
 # --- Adjuntar archivos (src/ui/attachments.rs) ---
 # Selector de archivos nativo del SO (botón "+" del compositor).
@@ -210,12 +218,26 @@ arboard = "3"
 # reemplaza el ejecutable con un ayudante que restaura la anterior si la
 # nueva no arranca. `reqwest` = el transporte sobre reqwest 0.12 blocking
 # (el cliente de arriba ya lo compila con rustls y proxy del sistema).
-fastframe-update = { git = "https://github.com/crmne/fastframe", rev = "491f7194d555578bf75e2ce9706b2b2b4d42cf31", features = ["reqwest"] }
+fastframe-update = { git = "https://github.com/crmne/fastframe", rev = "3339a8bc524a51c47f87ca78c368dde3569d90f5", features = ["reqwest"] }
+
+# --- Segundo plano (src/app_shell.rs, src/lib/state/resident.rs) ---
+# De fastframe, MISMO commit que fastframe-update (Cargo cuenta cada `rev`
+# como una fuente distinta y compilaría dos copias de fastframe-file).
+# fastframe-shell: mantiene eCord corriendo sin ventana (gateway, voz,
+# notificaciones), recrea la ventana a pedido y recupera ventanas fuera de
+# pantalla. fastframe-tray: ícono de bandeja / barra de menú con su menú.
+fastframe-shell = { git = "https://github.com/crmne/fastframe", rev = "3339a8bc524a51c47f87ca78c368dde3569d90f5" }
+fastframe-tray = { git = "https://github.com/crmne/fastframe", rev = "3339a8bc524a51c47f87ca78c368dde3569d90f5" }
 
 # --- Notificaciones de escritorio (src/lib/notifications.rs) ---
-# Notificación nativa del SO (D-Bus en Linux, centro de notificaciones en
-# Windows/macOS) para cuando llega una mención/DM con la ventana sin foco.
-notify-rust = "4"
+# De fastframe: notificación nativa (D-Bus en Linux, Notification Center en
+# macOS, toasts en Windows) con clic y reemplazo por clave, sin hilo por
+# notificación. Reemplaza a notify-rust.
+
+# Solo Linux y macOS: en Windows las notificaciones van directo por WinRT
+# (src/lib/win_toast.rs).
+[target.'cfg(not(windows))'.dependencies]
+fastframe-notifications = { git = "https://github.com/crmne/fastframe", rev = "3339a8bc524a51c47f87ca78c368dde3569d90f5" }
 
 [target.'cfg(all(target_arch = "arm", target_os = "linux"))'.dependencies]
 opus = { version = "1.6.1", package = "opusic-c", features = ["no-simd"] }
@@ -251,12 +273,18 @@ lto = "off"
 codegen-units = 16
 
 [features]
-default = ["voice-playback"]
+# `deepfilternet-ort` va por defecto: es el motor de supresión de ruido que se elige
+# salvo que el usuario cambie a RNNoise. Para un build sin ONNX Runtime:
+# `cargo build --no-default-features --features voice-playback`.
+default = ["voice-playback", "deepfilternet-ort"]
 # Captura/reproducción real de audio de voz (micrófono y parlantes). Sin
 # este feature, el cliente igual puede unirse a canales de voz y ver quién
 # está hablando, pero no transmite ni reproduce audio (útil para compilar
 # en una plataforma sin `cpal`/ALSA andando, o para un build más liviano).
 voice-playback = ["dep:cpal", "dep:alsa", "dep:nnnoiseless", "dep:sonora"]
+# DeepFilterNet (ONNX Runtime) como motor de supresión alternativo a RNNoise
+# (streaming con el estado de las GRU entre frames, ~2 ms por frame de 10 ms).
+deepfilternet-ort = ["voice-playback", "dep:deepfilter-rt"]
 
 # system_fonts.rs: lee el idioma de la UI de Windows para elegir la variante
 # de fuente CJK correcta.
@@ -265,11 +293,15 @@ voice-playback = ["dep:cpal", "dep:alsa", "dep:nnnoiseless", "dep:sonora"]
 # ventanas del selector de "Compartir pantalla": ventanas ocultas por DWM,
 # proceso dueño y nombre del ejecutable). `Win32_Graphics_Gdi` y `Win32_Storage_Xps`:
 # voice/source_thumbs.rs (miniaturas con PrintWindow/StretchBlt) y la lista de
-# pantallas (EnumDisplayMonitors).
-windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+# pantallas (EnumDisplayMonitors). `Win32_System_Console`: logging.rs
+# (AttachConsole, para mostrar los logs en la terminal desde la que se lanzó).
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_System_Console", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 # voice/window_capture.rs: captura de una ventana con Windows Graphics Capture
 # (WGC) + Direct3D 11 para leer los cuadros. Reemplaza al `gdigrab title=...`.
 windows = { version = "0.61", features = [
+    "Data_Xml_Dom",
+    "UI_Notifications",
+    "Win32_System_Registry",
     "Foundation",
     "Graphics_Capture",
     "Graphics_DirectX",
@@ -341,6 +373,7 @@ assets = [
   ["assets/icons/LICENSE.txt", "usr/share/doc/ecord/licenses/Lucide-LICENSE.txt", "644"],
   ["packaging/linux/ffmpeg-libs/*", "usr/lib/ecord/", "755"],
   ["packaging/linux/ffmpeg-LICENSE.txt", "usr/share/doc/ecord/ffmpeg-LICENSE.txt", "644"],
+  ["packaging/linux/onnxruntime-LICENSE.txt", "usr/share/doc/ecord/onnxruntime-LICENSE.txt", "644"],
 ]
 
 # --- Instaladores (.exe/.dmg) con cargo-packager ---

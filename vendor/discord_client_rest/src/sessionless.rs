@@ -4,7 +4,7 @@ use crate::bootstrap::{DEFAULT_API_VERSION, build_emulated_client, solve_cloudfl
 use crate::captcha::CaptchaRequiredError;
 use crate::rate_limit::{RateLimitError, RateLimiter};
 use crate::response::{parse_error_body, rate_limit_from_body};
-use crate::rest::RequestProperties;
+use crate::rest::{RequestProperties, read_traced};
 use crate::structs::context::ContextHeader;
 use crate::structs::referer::RefererHeader;
 use crate::super_prop::build_super_props;
@@ -217,10 +217,24 @@ impl SessionlessClient {
                 .join("&");
             full_url.push_str(&format!("?{}", query_string));
         }
-        let mut request = self
-            .client
-            .request(method, &full_url)
-            .headers(self.build_headers(req_properties).await?);
+        let headers = self.build_headers(req_properties).await?;
+
+        // Registro de tráfico de las devtools (no hace nada si están apagadas).
+        let trace = if crate::netlog::enabled() {
+            let body_bytes = body.as_ref().and_then(|body| serde_json::to_vec(body).ok());
+            crate::netlog::http_begin(
+                method.as_str(),
+                &full_url,
+                crate::nettrace::pairs(&headers),
+                body_bytes.as_deref(),
+                None,
+                "vendor::SessionlessClient (REST sin sesión)",
+            )
+        } else {
+            crate::netlog::HttpTrace::none()
+        };
+
+        let mut request = self.client.request(method, &full_url).headers(headers);
 
         if let Some(body_data) = body {
             request = request
@@ -228,29 +242,48 @@ impl SessionlessClient {
                 .json(&body_data);
         }
 
-        let resp = request
-            .send()
-            .await
-            .map_err(|e| Box::new(e) as BoxedError)?;
+        let resp = match request.send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                trace.fail(&e.to_string());
+                return Err(Box::new(e) as BoxedError);
+            }
+        };
 
-        self.handle_response(resp, &full_url).await
+        self.handle_response(resp, &full_url, &trace).await
     }
 
     async fn handle_response<T: DeserializeOwned + Default>(
         &self,
         resp: Response,
         url: &str,
+        trace: &crate::netlog::HttpTrace,
     ) -> BoxedResult<T> {
         let status = resp.status();
-        match status.as_u16() {
-            204 => return Ok(T::default()),
+        let code = status.as_u16();
+        // Para cerrar el registro de tráfico antes de consumir `resp`.
+        let version = if trace.is_active() {
+            format!("{:?}", resp.version())
+        } else {
+            String::new()
+        };
+        let resp_headers = if trace.is_active() {
+            crate::nettrace::pairs(resp.headers())
+        } else {
+            Vec::new()
+        };
+        match code {
+            204 => {
+                trace.complete(code, &version, resp_headers, &[], 0);
+                return Ok(T::default());
+            }
             200..=299 => (),
             429 => {
-                let bytes = resp.bytes().await?;
+                let bytes = read_traced(resp, trace, code, &version, resp_headers).await?;
                 return Err(Box::new(rate_limit_from_body(&bytes, url)));
             }
             400 => {
-                let bytes = resp.bytes().await?;
+                let bytes = read_traced(resp, trace, code, &version, resp_headers).await?;
                 let resp_json = parse_error_body(&bytes, status.as_u16(), url)?;
 
                 if resp_json["captcha_key"].is_array() {
@@ -262,14 +295,15 @@ impl SessionlessClient {
                 error!("Bad request to {}: {}", url, resp_json.to_string());
                 return Err("Bad request".into());
             }
-            code => {
-                let body = resp.text().await?;
-                let msg = format!("Request to {} failed with code {}: {}", url, code, body);
+            other => {
+                let bytes = read_traced(resp, trace, code, &version, resp_headers).await?;
+                let body = String::from_utf8_lossy(&bytes);
+                let msg = format!("Request to {} failed with code {}: {}", url, other, body);
                 return Err(msg.into());
             }
         }
 
-        let bytes = resp.bytes().await?;
+        let bytes = read_traced(resp, trace, code, &version, resp_headers).await?;
         if bytes.is_empty() {
             Ok(T::default())
         } else {

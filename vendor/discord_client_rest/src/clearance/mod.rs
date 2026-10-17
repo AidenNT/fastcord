@@ -19,10 +19,11 @@ pub(crate) struct Invisible {
 }
 
 pub(crate) async fn get_invisible(client: &Client) -> BoxedResult<Invisible> {
-    let response = client
-        .get("https://discord.com/cdn-cgi/challenge-platform/scripts/jsd/main.js")
-        .send()
-        .await?;
+    let script_url = "https://discord.com/cdn-cgi/challenge-platform/scripts/jsd/main.js";
+    let trace = crate::nettrace::begin("GET", script_url, "vendor::clearance (desafío de Cloudflare)");
+    let response = client.get(script_url).send().await;
+    crate::nettrace::observe(&trace, &response);
+    let response = response?;
 
     let final_url = response.uri().to_string();
     let path_re = regex::Regex::new(r"/h/([^/]+)/scripts/jsd/([^/]+)/main\.js")?;
@@ -78,12 +79,15 @@ pub(crate) async fn get_clearance_cookie(
     let compressor = compressor::Compressor::new(key.as_bytes().to_vec());
     let payload = compressor.compress(&data);
 
+    let trace = crate::nettrace::begin("POST", &url, "vendor::clearance (desafío de Cloudflare)");
     let response = client
         .post(&url)
         .header("Content-Type", "text/plain;charset=UTF-8")
         .body(payload)
         .send()
-        .await?;
+        .await;
+    crate::nettrace::observe(&trace, &response);
+    let response = response?;
     if !response.status().is_success() {
         return Err(format!("Failed to get clearance cookie: {}", response.status()).into());
     }

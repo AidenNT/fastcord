@@ -1,35 +1,59 @@
-//! Herramientas de desarrollo: una ventana flotante para probar, a mano, cómo
-//! se comporta la pila de red de eCord (`wreq` + `wreq-util`) contra Discord u
-//! otro servidor.
+//! Herramientas de desarrollo de eCord: un panel flotante, con la forma de un
+//! IDE (barra superior con pestañas, lista a la izquierda, contenido al centro,
+//! inspector a la derecha y consola abajo), para ver y probar cómo se comporta
+//! el cliente.
 //!
 //! # Cómo se activa (`use_developer_features`)
 //!
-//! La ventana NO existe para un usuario normal. Solo se habilita si se cumple
+//! El panel NO existe para un usuario normal. Solo se habilita si se cumple
 //! alguna de estas (se lee una vez al arrancar, ver [`enabled`]):
 //!
 //! - variable de entorno `USE_DEVELOPER_FEATURES=1` (o `ECORD_USE_DEVELOPER_FEATURES=1`);
 //! - argumento de línea de comandos `--use_developer_features` (o `--use-developer-features`);
-//! - la opción persistida `use_developer_features` (se guarda desde la propia
-//!   ventana con "Recordar activado", para no tener que repetir lo anterior).
+//! - la opción persistida `use_developer_features` (se guarda desde la pestaña
+//!   Cliente → Entorno con "Recordar activado", para no repetir lo anterior).
 //!
-//! Ya habilitada, se abre/cierra con **Ctrl+Shift+D** o con el botón `DEV` de
-//! la esquina inferior derecha.
+//! Ya habilitado, se abre/cierra con **Ctrl+Shift+D** o con el botón `DEV` de
+//! la esquina inferior derecha (que muestra la cantidad de errores del log).
 //!
-//! # Qué permite probar
+//! # Dónde se muestra (botones de la barra superior)
 //!
-//! - **HTTP**: cualquier método/URL/headers/cuerpo con una conexión emulada.
-//! - **WebSocket**: conectar, mandar texto y ver lo que llega (Gateway, QR, eco...).
-//! - **Todos los profiles**: la misma prueba (HTTP o WebSocket) lanzada con
-//!   CADA profile de `wreq-util` y una tabla de resultados, para ver cuáles
-//!   acepta un servidor y cuáles rechaza (por ejemplo, un `403`).
-//! - **Perfil / headers**: elegir profile y plataforma, apagar el HTTP/2 o los
-//!   headers de la emulación, editar TODOS los headers a mano y guardar
-//!   perfiles propios con nombre.
+//! - **Ventana flotante** (por omisión): se mueve arrastrando la barra superior
+//!   (doble clic la vuelve a centrar) y cambia de tamaño desde cualquier borde o esquina.
+//! - **Acoplada abajo**: a todo el ancho; el alto se cambia arrastrando su borde de arriba.
+//! - **Ventana aparte**: una ventana del sistema operativo, independiente de la de
+//!   eCord (se puede poner en otro monitor). Al cerrarla se cierran las devtools.
 //!
-//! Las pruebas corren en su propio runtime de tokio (`runtime`), aparte del
-//! hilo de Discord, y avisan a la UI con `request_repaint`. Nada de esto toca
-//! la sesión de Discord ni el token de la cuenta: salvo que el usuario ponga a
-//! mano un header `Authorization`, los pedidos salen sin credenciales.
+//! # Pestañas
+//!
+//! - **Consola** (`console`): todo lo que eCord escribe por `log` (también los
+//!   pánicos), con filtros por nivel y origen, búsqueda, inspector de cada línea
+//!   y una línea de comandos (`help` para la lista). El registro vive en
+//!   `logging::capture`.
+//! - **Red**: HTTP, WebSocket y "Todos los profiles" contra cualquier servidor
+//!   con una conexión emulada (`wreq` + `wreq-util`), más el editor de profile,
+//!   plataforma y headers propios. Estas pruebas salen sin credenciales.
+//! - **Discord** (`discord_api`): pedidos REST a la API de Discord con el mismo
+//!   cliente que usa la app (cookies, huella TLS, headers del fingerprint) y, si
+//!   se quiere, el token de la sesión. Historial, "copiar como curl" y repetir.
+//! - **Tráfico** (`traffic`): todo lo que el cliente manda y recibe por la red
+//!   (frames de WebSocket con su sentido, pedidos REST/CDN/HTTP), el tipo de
+//!   cada conexión, la API a la que va y quién lo pidió. Lo graba
+//!   `discord_client_rest::netlog`.
+//! - **Cliente** (`client`): resumen del proceso y del sistema, rendimiento,
+//!   memoria, identidad ante Discord (`X-Super-Properties`, `launch_signature`,
+//!   IDs), entorno, y un informe de diagnóstico listo para copiar.
+//!
+//! Las pruebas de red corren en su propio runtime de tokio (`runtime`), aparte
+//! del hilo de Discord, y avisan a la UI con `request_repaint`. Nada de esto
+//! toca la sesión de Discord ni el token de la cuenta, salvo la pestaña Discord
+//! cuando el usuario marca "Token de la cuenta" a propósito.
+
+mod client;
+mod console;
+mod discord_api;
+mod style;
+mod traffic;
 
 use std::{
     fmt::Write as _,
@@ -40,9 +64,17 @@ use std::{
     time::{Duration, Instant},
 };
 
+use egui_extras::{Size, StripBuilder};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use wreq_util::{Emulation, Platform, Profile};
+
+use crate::logging::capture::{self, Level};
+use crate::theme::{self, Palette};
+use crate::discord::{
+    fingerprint::ClientIdentity,
+    launch_signature::{self, LaunchSignatureError, LaunchSignatureReport},
+};
 
 const STORAGE_FLAG: &str = "use_developer_features";
 const STORAGE_PROFILES: &str = "devtools_custom_profiles";
@@ -556,10 +588,66 @@ fn truncate_chars(text: &str, max: usize) -> String {
     out
 }
 
+
+// ---------------------------------------------------------------------------
+// Datos que la app le pasa al panel
+// ---------------------------------------------------------------------------
+
+/// Lo que el panel necesita saber de la sesión de Discord. Lo arma `App` cada
+/// frame mientras el panel está abierto (ver `DevTools::is_open`).
+#[derive(Clone, Default)]
+pub struct SessionInfo {
+    /// Token de la cuenta, para la pestaña Discord. Nunca se muestra.
+    pub token: Option<String>,
+    /// Estado de la conexión, en palabras ("Conectado", "Sin sesión"...).
+    pub status: String,
+    pub username: Option<String>,
+    pub user_id: Option<String>,
+    pub servers: usize,
+    pub dms: usize,
+    pub friends: usize,
+}
+
 // ---------------------------------------------------------------------------
 // Estado de la ventana
 // ---------------------------------------------------------------------------
 
+const TOP_H: f32 = 52.0;
+const FOOT_H: f32 = 36.0;
+/// Tamaño mínimo de la ventana flotante.
+const MIN_W: f32 = 760.0;
+const MIN_H: f32 = 460.0;
+const SIDEBAR_W: f32 = 224.0;
+const INSPECTOR_W: f32 = 330.0;
+const DOCK_H: f32 = 230.0;
+const TOAST_SECS: f32 = 2.2;
+
+const HELP: [&str; 13] = [
+    "Comandos de la consola:",
+    "  help                 esta lista",
+    "  clear                vacía el registro",
+    "  info                 informe de diagnóstico del cliente",
+    "  mem                  memoria del proceso y caché en disco",
+    "  level <nivel>        muestra solo ese nivel y los más graves (error|warn|info|debug|trace)",
+    "  copy                 copia al portapapeles las líneas visibles",
+    "  tab <nombre>         consola | red | discord | trafico | cliente",
+    "  get <ruta>           pedido a la API de Discord con la sesión, p. ej. get /users/@me",
+    "  post|put|patch|delete <ruta> [json]   igual, con método y cuerpo opcional",
+    "  toast [ps|app|<aumid>]  prueba de notificación de escritorio (Windows)",
+    "Las flechas ↑ ↓ recorren el historial. Doble clic en una línea del registro la copia.",
+    "Los pedidos de Discord muestran su respuesta completa en la pestaña Discord.",
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MainTab {
+    Console,
+    Network,
+    Discord,
+    Traffic,
+    Client,
+}
+
+/// Páginas de la pestaña Red.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Http,
@@ -568,16 +656,76 @@ enum Tab {
     Profile,
 }
 
+impl Tab {
+    fn title(self) -> &'static str {
+        match self {
+            Tab::Http => "HTTP",
+            Tab::WebSocket => "WebSocket",
+            Tab::Matrix => "Todos los profiles",
+            Tab::Profile => "Perfil / headers",
+        }
+    }
+
+    fn subtitle(self) -> &'static str {
+        match self {
+            Tab::Http => "Una petición con la conexión emulada activa.",
+            Tab::WebSocket => "Conecta, manda texto y mira lo que llega.",
+            Tab::Matrix => "La misma prueba con cada profile, para ver cuáles acepta un servidor.",
+            Tab::Profile => "Profile, plataforma, headers propios y perfiles guardados.",
+        }
+    }
+
+    fn color(self) -> egui::Color32 {
+        match self {
+            Tab::Http => style::BLUE,
+            Tab::WebSocket => style::GREEN,
+            Tab::Matrix => style::ORANGE,
+            Tab::Profile => style::PURPLE,
+        }
+    }
+}
+
+/// Dónde se dibuja el panel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Ventana flotante dentro de eCord: se mueve y se redimensiona.
+    Window,
+    /// Acoplado abajo, a todo el ancho (como las devtools de un navegador).
+    Dock,
+    /// Ventana propia del sistema operativo (viewport de egui), aparte de la de eCord.
+    Detached,
+}
+
 pub struct DevTools {
     open: bool,
+    mode: Mode,
+    /// Posición y tamaño de la ventana flotante (`None`: centrada con el tamaño por omisión).
+    float_rect: Option<egui::Rect>,
+    /// Alto del panel acoplado abajo (`None`: automático).
+    dock_height: Option<f32>,
+    main_tab: MainTab,
+    /// Página activa dentro de Red.
     tab: Tab,
-    /// Configuración activa, común a las cuatro pestañas.
+    show_left: bool,
+    show_right: bool,
+    show_dock: bool,
+    session: SessionInfo,
+    /// Aviso breve ("Copiado") y desde cuándo se muestra.
+    toast: Option<(String, Instant)>,
+    /// Lo piden los métodos de dibujo; `ui` lo convierte en `toast`.
+    pending_toast: Option<&'static str>,
+    console: console::ConsoleState,
+    discord: discord_api::DiscordState,
+    traffic: traffic::TrafficState,
+    client: client::ClientState,
+    /// Configuración activa, común a las pestañas de red.
     cfg: EmuConfig,
 
     // HTTP
     method: String,
     http_url: String,
     http_body: String,
+    http_body_open: bool,
     http_out: Arc<Mutex<HttpOut>>,
     show_resp_headers: bool,
 
@@ -614,11 +762,26 @@ impl Default for DevTools {
         };
         Self {
             open: false,
+            mode: Mode::Window,
+            float_rect: None,
+            dock_height: None,
+            main_tab: MainTab::Console,
             tab: Tab::Http,
+            show_left: true,
+            show_right: true,
+            show_dock: true,
+            session: SessionInfo::default(),
+            toast: None,
+            pending_toast: None,
+            console: console::ConsoleState::default(),
+            discord: discord_api::DiscordState::default(),
+            traffic: traffic::TrafficState::default(),
+            client: client::ClientState::default(),
             cfg: EmuConfig::default(),
             method: "GET".to_owned(),
             http_url: HTTP_PRESETS[0].1.to_owned(),
             http_body: String::new(),
+            http_body_open: false,
             http_out: Arc::new(Mutex::new(HttpOut::default())),
             show_resp_headers: true,
             ws_url: WS_PRESETS[0].1.to_owned(),
@@ -638,7 +801,43 @@ impl Default for DevTools {
     }
 }
 
+/// Estado de la sesión en una palabra, para el chip de la barra superior.
+fn status_chip(ui: &mut egui::Ui, palette: &Palette, session: &SessionInfo) {
+    let (text, color) = match (&session.username, session.status.as_str()) {
+        (Some(name), _) => (name.clone(), style::GREEN),
+        (None, "") => ("Sin sesión".to_owned(), palette.dim),
+        (None, status) => (status.to_owned(), style::ORANGE),
+    };
+    let font = theme::medium(12.5);
+    let galley = ui.painter().layout_no_wrap(text.clone(), font.clone(), palette.text);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(galley.size().x + 36.0, 26.0), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 13.0, palette.surface);
+    painter.rect_stroke(rect, 13.0, egui::Stroke::new(1.0, palette.outline), egui::StrokeKind::Inside);
+    painter.circle_filled(egui::pos2(rect.left() + 14.0, rect.center().y), 4.0, color);
+    painter.text(
+        egui::pos2(rect.left() + 26.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        font,
+        palette.text,
+    );
+    response.on_hover_text(format!(
+        "Sesión de Discord: {}",
+        if session.status.is_empty() { "sin información" } else { session.status.as_str() }
+    ));
+}
+
 impl DevTools {
+    /// ¿Está el panel abierto? La app arma el [`SessionInfo`] solo en ese caso.
+    pub fn is_open(&self) -> bool {
+        enabled() && self.open
+    }
+
+    pub fn set_session(&mut self, session: SessionInfo) {
+        self.session = session;
+    }
+
     /// Se llama una vez por frame. No hace nada si las herramientas no están
     /// habilitadas (ver [`enabled`]).
     pub fn show(&mut self, ctx: &egui::Context) {
@@ -651,78 +850,738 @@ impl DevTools {
             self.open = !self.open;
         }
 
-        self.show_pill(ctx);
         if !self.open {
+            self.show_pill(ctx);
             return;
         }
 
-        let mut open = self.open;
-        egui::Window::new("Developer tools")
-            .id(egui::Id::new("ecord_devtools_window"))
-            .open(&mut open)
-            .default_size([860.0, 620.0])
-            .min_size([560.0, 360.0])
-            .resizable(true)
-            .collapsible(true)
-            .show(ctx, |ui| self.ui(ui, ctx));
-        self.open = open;
+        let palette = theme::current(ctx);
+        self.client.sample_frame(ctx.input(|i| i.unstable_dt));
+        match self.mode {
+            Mode::Window | Mode::Dock => self.show_overlay(ctx, &palette),
+            Mode::Detached => self.show_detached(ctx, &palette),
+        }
 
         // Mientras algo está corriendo, refrescar para mostrar el avance.
         let busy = lock(&self.http_out).running
             || lock(&self.ws.shared).connecting
             || lock(&self.ws.shared).connected
-            || lock(&self.matrix).running;
+            || lock(&self.matrix).running
+            || self.discord.busy();
         if busy {
             ctx.request_repaint_after(Duration::from_millis(120));
+        } else if self.main_tab == MainTab::Traffic {
+            // El tráfico llega desde otros hilos sin despertar a la UI.
+            ctx.request_repaint_after(Duration::from_millis(250));
         }
     }
 
-    /// Botón pequeño `DEV` en la esquina inferior derecha.
+    /// Ventana flotante o acoplada: se dibuja encima de la app, en su misma ventana.
+    fn show_overlay(&mut self, ctx: &egui::Context, palette: &Palette) {
+        let screen = ctx.viewport_rect();
+        let rect = self.overlay_rect(screen);
+        egui::Area::new(egui::Id::new("ecord_devtools_overlay_v4"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(rect.min)
+            .show(ctx, |ui| {
+                self.panel_in(ui, ctx, palette, rect, true);
+                // Después del contenido: los bordes ganan el clic sobre lo que haya debajo.
+                self.resize_handles(ui, rect);
+            });
+    }
+
+    /// Ventana propia del sistema operativo. El viewport es "inmediato": se dibuja
+    /// dentro de esta misma llamada, así que puede usar `self` sin compartirlo.
+    fn show_detached(&mut self, ctx: &egui::Context, palette: &Palette) {
+        let id = egui::ViewportId::from_hash_of("ecord_devtools_window");
+        let builder = egui::ViewportBuilder::default()
+            .with_title("eCord · Developer tools")
+            .with_inner_size([1180.0, 760.0])
+            .with_min_inner_size([MIN_W, MIN_H]);
+        let shortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::D);
+        let mut close = false;
+        ctx.show_viewport_immediate(id, builder, |surface, _class| {
+            surface.paint(|ui, vctx| {
+                if vctx.input(|i| i.viewport().close_requested()) || vctx.input_mut(|i| i.consume_shortcut(&shortcut)) {
+                    close = true;
+                }
+                let rect = vctx.viewport_rect();
+                self.panel_in(ui, vctx, palette, rect, false);
+            });
+        });
+        if close {
+            self.open = false;
+        }
+    }
+
+    /// El panel completo (barra superior, cuerpo y barra inferior) dentro de `rect`.
+    fn panel_in(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, palette: &Palette, rect: egui::Rect, shadow: bool) {
+        ui.set_min_size(rect.size());
+        // Se registra antes que el contenido: los widgets del panel
+        // ganan el clic, y lo demás no le llega a la app de abajo.
+        ui.interact(rect, egui::Id::new("ecord_devtools_block"), egui::Sense::click_and_drag());
+        let mut panel = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("ecord_devtools_panel")
+                .max_rect(rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        let shadow = if shadow {
+            egui::epaint::Shadow { offset: [0, 8], blur: 24, spread: 0, color: palette.shadow }
+        } else {
+            egui::epaint::Shadow::NONE
+        };
+        egui::Frame::new()
+            .fill(palette.window_solid)
+            .stroke(egui::Stroke::new(1.0, palette.outline))
+            .corner_radius(egui::CornerRadius::same(self.corner()))
+            .inner_margin(egui::Margin::same(0))
+            .shadow(shadow)
+            .show(&mut panel, |ui| {
+                let inner = rect.size() - egui::vec2(2.0, 2.0);
+                ui.set_min_size(inner);
+                ui.set_max_size(inner);
+                self.ui(ui, ctx, palette);
+            });
+    }
+
+    /// Radio de las esquinas del panel (acoplado y en ventana aparte van cuadrados).
+    fn corner(&self) -> u8 {
+        match self.mode {
+            Mode::Window => 10,
+            Mode::Dock | Mode::Detached => 0,
+        }
+    }
+
+    fn overlay_rect(&mut self, screen: egui::Rect) -> egui::Rect {
+        match self.mode {
+            Mode::Window => {
+                let default = egui::Rect::from_center_size(
+                    screen.center(),
+                    egui::vec2(
+                        (screen.width() - 48.0).max(MIN_W).min(screen.width()),
+                        (screen.height() - 48.0).max(MIN_H).min(screen.height()),
+                    ),
+                );
+                let rect = clamp_floating(self.float_rect.unwrap_or(default), screen);
+                self.float_rect = Some(rect);
+                rect
+            }
+            Mode::Dock => {
+                let auto = (screen.height() * 0.5).clamp(340.0, 760.0);
+                let height = self
+                    .dock_height
+                    .unwrap_or(auto)
+                    .max(240.0)
+                    .min(screen.height() - 40.0)
+                    .min(screen.height());
+                egui::Rect::from_min_size(
+                    egui::pos2(screen.left(), screen.bottom() - height),
+                    egui::vec2(screen.width(), height),
+                )
+            }
+            // No se usa: la ventana aparte ocupa todo su propio viewport.
+            Mode::Detached => screen,
+        }
+    }
+
+    /// Bordes y esquinas para cambiar el tamaño: los 8 de la ventana flotante o, si
+    /// está acoplada abajo, el borde de arriba (cambia el alto).
+    fn resize_handles(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        const EDGE: f32 = 6.0;
+        const CORNER: f32 = 14.0;
+        let half = EDGE / 2.0;
+        let (left, right, top, bottom) = (rect.left(), rect.right(), rect.top(), rect.bottom());
+
+        match self.mode {
+            Mode::Dock => {
+                let strip = egui::Rect::from_min_max(egui::pos2(left, top - half), egui::pos2(right, top + half));
+                let response = ui
+                    .interact(strip, egui::Id::new("dev_dock_resize"), egui::Sense::drag())
+                    .on_hover_cursor(egui::CursorIcon::ResizeVertical);
+                if response.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                    self.dock_height = Some(rect.height() - response.drag_delta().y);
+                }
+            }
+            Mode::Window => {
+                use egui::CursorIcon::{ResizeHorizontal, ResizeNeSw, ResizeNwSe, ResizeVertical};
+                let area = |min: (f32, f32), max: (f32, f32)| {
+                    egui::Rect::from_min_max(egui::pos2(min.0, min.1), egui::pos2(max.0, max.1))
+                };
+                // (nombre, zona, [izquierda, derecha, arriba, abajo] que se mueven, cursor)
+                let handles: [(&str, egui::Rect, [bool; 4], egui::CursorIcon); 8] = [
+                    ("w", area((left - half, top + CORNER), (left + half, bottom - CORNER)), [true, false, false, false], ResizeHorizontal),
+                    ("e", area((right - half, top + CORNER), (right + half, bottom - CORNER)), [false, true, false, false], ResizeHorizontal),
+                    ("n", area((left + CORNER, top - half), (right - CORNER, top + half)), [false, false, true, false], ResizeVertical),
+                    ("s", area((left + CORNER, bottom - half), (right - CORNER, bottom + half)), [false, false, false, true], ResizeVertical),
+                    ("nw", area((left - half, top - half), (left + CORNER, top + CORNER)), [true, false, true, false], ResizeNwSe),
+                    ("ne", area((right - CORNER, top - half), (right + half, top + CORNER)), [false, true, true, false], ResizeNeSw),
+                    ("sw", area((left - half, bottom - CORNER), (left + CORNER, bottom + half)), [true, false, false, true], ResizeNeSw),
+                    ("se", area((right - CORNER, bottom - CORNER), (right + half, bottom + half)), [false, true, false, true], ResizeNwSe),
+                ];
+                let mut next = rect;
+                let mut changed = false;
+                for (name, zone, [move_left, move_right, move_top, move_bottom], cursor) in handles {
+                    let response = ui
+                        .interact(zone, egui::Id::new(("dev_resize", name)), egui::Sense::drag())
+                        .on_hover_cursor(cursor);
+                    if !response.dragged() {
+                        continue;
+                    }
+                    ui.ctx().set_cursor_icon(cursor);
+                    let delta = response.drag_delta();
+                    if move_left {
+                        next.min.x = (next.min.x + delta.x).min(next.max.x - MIN_W);
+                    }
+                    if move_right {
+                        next.max.x = (next.max.x + delta.x).max(next.min.x + MIN_W);
+                    }
+                    if move_top {
+                        next.min.y = (next.min.y + delta.y).min(next.max.y - MIN_H);
+                    }
+                    if move_bottom {
+                        next.max.y = (next.max.y + delta.y).max(next.min.y + MIN_H);
+                    }
+                    changed = true;
+                }
+                if changed {
+                    self.float_rect = Some(next);
+                }
+            }
+            Mode::Detached => {}
+        }
+    }
+
+    /// Botón pequeño `DEV` en la esquina inferior derecha (con los errores del log).
     fn show_pill(&mut self, ctx: &egui::Context) {
+        let errors = capture::counts()[Level::Error.index()];
         egui::Area::new(egui::Id::new("ecord_devtools_pill"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::RIGHT_BOTTOM, [-10.0, -10.0])
             .show(ctx, |ui| {
-                let label = egui::RichText::new("DEV").small().strong();
+                let text = if errors > 0 { format!("DEV · {errors}") } else { "DEV".to_owned() };
+                let mut label = egui::RichText::new(text).small().strong();
+                if errors > 0 {
+                    label = label.color(style::RED);
+                }
                 if ui.add(egui::Button::new(label).small()).on_hover_text("Developer tools (Ctrl+Shift+D)").clicked() {
-                    self.open = !self.open;
+                    self.open = true;
                 }
             });
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.tab, Tab::Http, "HTTP");
-            ui.selectable_value(&mut self.tab, Tab::WebSocket, "WebSocket");
-            ui.selectable_value(&mut self.tab, Tab::Matrix, "Todos los profiles");
-            ui.selectable_value(&mut self.tab, Tab::Profile, "Perfil / headers");
-        });
-        ui.separator();
+    fn ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, palette: &Palette) {
+        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
 
-        if self.tab != Tab::Profile {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new("Conexión:").strong());
-                ui.label(self.cfg.summary());
-                if ui.small_button("editar").clicked() {
+        StripBuilder::new(ui)
+            .clip(true)
+            .size(Size::exact(TOP_H))
+            .size(Size::remainder())
+            .size(Size::exact(FOOT_H))
+            .vertical(|mut strip| {
+                strip.cell(|ui| self.top_bar(ui, ctx, palette));
+                strip.cell(|ui| self.body(ui, ctx, palette));
+                strip.cell(|ui| self.footer(ui, palette));
+            });
+
+        if let Some(text) = self.pending_toast.take() {
+            self.toast = Some((text.to_owned(), Instant::now()));
+        }
+        let expired = self.toast.as_ref().is_some_and(|(_, since)| since.elapsed().as_secs_f32() >= TOAST_SECS);
+        if expired {
+            self.toast = None;
+        }
+        if let Some((text, _)) = &self.toast {
+            style::paint_toast(ui, palette, ui.max_rect(), text);
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
+    }
+
+    // -- Barra superior ------------------------------------------------------------
+
+    fn top_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, palette: &Palette) {
+        let rect = ui.max_rect();
+        let radius = self.corner().saturating_sub(1);
+        ui.painter().rect_filled(
+            rect,
+            egui::CornerRadius { nw: radius, ne: radius, sw: 0, se: 0 },
+            palette.panel,
+        );
+        ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, egui::Stroke::new(1.0, palette.outline));
+        let wide = rect.width() >= 980.0;
+
+        // Ventana flotante: toda la barra es el asa para moverla (doble clic la centra).
+        // Se registra antes que los botones y las pestañas, que ganan el clic.
+        if self.mode == Mode::Window {
+            let handle = ui.interact(rect, egui::Id::new("dev_top_drag"), egui::Sense::click_and_drag());
+            if handle.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                if let Some(float) = &mut self.float_rect {
+                    *float = float.translate(handle.drag_delta());
+                }
+            } else if handle.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            }
+            if handle.double_clicked() {
+                self.float_rect = None;
+            }
+        }
+
+        // Izquierda: marca, título y estado de la sesión.
+        let mut left = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("dev_top_left")
+                .max_rect(rect.shrink2(egui::vec2(14.0, 0.0)))
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        left.spacing_mut().item_spacing = egui::vec2(10.0, 0.0);
+        let (logo, _) = left.allocate_exact_size(egui::vec2(32.0, 26.0), egui::Sense::hover());
+        left.painter().rect_filled(logo, egui::CornerRadius::same(8), palette.accent);
+        left.painter().text(logo.center(), egui::Align2::CENTER_CENTER, "DEV", theme::bold(10.5), palette.on_accent);
+        if wide {
+            left.label(egui::RichText::new("Developer tools").font(theme::semibold(15.0)).color(palette.text));
+            status_chip(&mut left, palette, &self.session);
+        }
+
+        // Centro: pestañas principales.
+        let items = [
+            (MainTab::Console, "Consola"),
+            (MainTab::Network, "Red"),
+            (MainTab::Discord, "Discord"),
+            (MainTab::Traffic, "Tráfico"),
+            (MainTab::Client, "Cliente"),
+        ];
+        let width = style::segmented_width(ui, &items);
+        let mut tabs = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("dev_top_tabs")
+                .max_rect(egui::Rect::from_center_size(rect.center(), egui::vec2(width, rect.height())))
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        style::segmented(&mut tabs, palette, &mut self.main_tab, &items);
+
+        // Derecha: cerrar, modo, limpiar y copiar informe.
+        let mut right = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("dev_top_right")
+                .max_rect(rect.shrink2(egui::vec2(10.0, 0.0)))
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        );
+        right.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
+        if style::bar_icon(&mut right, palette, theme::Icon::X, "Cerrar (Ctrl+Shift+D)").clicked() {
+            self.open = false;
+        }
+        // Los dos modos a los que se puede pasar desde el actual.
+        let modes = [
+            (Mode::Detached, theme::Icon::ExternalLink, "Abrir en una ventana aparte"),
+            (Mode::Dock, theme::Icon::Shrink, "Acoplar abajo (el alto se cambia desde el borde de arriba)"),
+            (Mode::Window, theme::Icon::Maximize2, "Ventana flotante (se mueve y se redimensiona)"),
+        ];
+        let mut next_mode = None;
+        for (mode, icon, tip) in modes {
+            if mode != self.mode && style::bar_icon(&mut right, palette, icon, tip).clicked() {
+                next_mode = Some(mode);
+            }
+        }
+        if let Some(mode) = next_mode {
+            self.mode = mode;
+        }
+        if style::bar_icon(&mut right, palette, theme::Icon::Trash, "Vaciar la consola y el tráfico").clicked() {
+            capture::clear();
+            self.console.selected = None;
+            discord_client_rest::netlog::clear();
+            self.traffic.clear_selection();
+            self.pending_toast = Some("Consola y tráfico vaciados");
+        }
+        if style::bar_icon(&mut right, palette, theme::Icon::Copy, "Copiar informe de diagnóstico").clicked() {
+            ctx.copy_text(client::report(ctx, &self.session, &self.cfg.summary()));
+            self.pending_toast = Some("Informe copiado");
+        }
+    }
+
+    // -- Cuerpo: lista · centro · inspector ---------------------------------------------
+
+    fn body(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, palette: &Palette) {
+        let left = self.show_left;
+        let right = self.show_right && ui.available_width() > 880.0;
+        let mut builder = StripBuilder::new(ui).clip(true);
+        if left {
+            builder = builder.size(Size::exact(SIDEBAR_W));
+        }
+        builder = builder.size(Size::remainder().at_least(300.0));
+        if right {
+            builder = builder.size(Size::exact(INSPECTOR_W));
+        }
+        builder.horizontal(|mut strip| {
+            if left {
+                strip.cell(|ui| {
+                    let rect = ui.max_rect();
+                    ui.painter().rect_filled(rect, 0.0, palette.panel);
+                    ui.painter().vline(rect.right() - 0.5, rect.y_range(), egui::Stroke::new(1.0, palette.outline));
+                    self.sidebar(ui, palette);
+                });
+            }
+            strip.cell(|ui| self.center(ui, ctx, palette));
+            if right {
+                strip.cell(|ui| {
+                    let rect = ui.max_rect();
+                    ui.painter().rect_filled(rect, 0.0, palette.panel);
+                    ui.painter().vline(rect.left() + 0.5, rect.y_range(), egui::Stroke::new(1.0, palette.outline));
+                    self.inspector(ui, ctx, palette);
+                });
+            }
+        });
+    }
+
+    fn sidebar(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        match self.main_tab {
+            MainTab::Console => self.console.sidebar(ui, palette),
+            MainTab::Network => self.net_sidebar(ui, palette),
+            MainTab::Discord => self.discord.sidebar(ui, palette, &self.session),
+            MainTab::Traffic => self.traffic.sidebar(ui, palette),
+            MainTab::Client => self.client.sidebar(ui, palette),
+        }
+    }
+
+    fn net_sidebar(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        style::panel_title(ui, palette, "Red");
+        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+        style::side_header(ui, palette, "Pruebas");
+        for tab in [Tab::Http, Tab::WebSocket, Tab::Matrix] {
+            if style::side_item(ui, palette, tab.title(), tab.color(), self.tab == tab, None).clicked() {
+                self.tab = tab;
+            }
+        }
+        style::side_header(ui, palette, "Conexión");
+        let tab = Tab::Profile;
+        if style::side_item(ui, palette, tab.title(), tab.color(), self.tab == tab, None).clicked() {
+            self.tab = tab;
+        }
+    }
+
+    fn center(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, palette: &Palette) {
+        let dock = self.show_dock
+            && self.main_tab != MainTab::Console
+            && self.main_tab != MainTab::Traffic
+            && ui.available_height() > 380.0;
+        let mut builder = StripBuilder::new(ui).clip(true).size(Size::remainder().at_least(160.0));
+        if dock {
+            builder = builder.size(Size::exact(DOCK_H));
+        }
+        builder.vertical(|mut strip| {
+            strip.cell(|ui| self.page(ui, ctx, palette));
+            if dock {
+                strip.cell(|ui| {
+                    let rect = ui.max_rect();
+                    ui.painter().rect_filled(rect, 0.0, palette.panel);
+                    ui.painter().hline(rect.x_range(), rect.top() + 0.5, egui::Stroke::new(1.0, palette.outline));
+                    self.console.log_table(ui, palette, "dev_console_dock");
+                });
+            }
+        });
+    }
+
+    fn page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, palette: &Palette) {
+        match self.main_tab {
+            MainTab::Console => {
+                StripBuilder::new(ui).clip(true).size(Size::remainder()).size(Size::exact(46.0)).vertical(|mut strip| {
+                    strip.cell(|ui| self.console.log_table(ui, palette, "dev_console_main"));
+                    strip.cell(|ui| {
+                        if let Some(action) = self.console.input_row(ui, palette) {
+                            self.handle_console(ctx, action);
+                        }
+                    });
+                });
+            }
+            MainTab::Network => {
+                egui::Frame::new().inner_margin(egui::Margin::symmetric(18, 12)).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+                    theme::section_title(ui, palette, self.tab.title());
+                    theme::text(ui, self.tab.subtitle(), theme::regular(12.0), palette.dim);
+                    ui.add_space(4.0);
+                    match self.tab {
+                        Tab::Http => self.http_tab(ui, ctx, palette),
+                        Tab::WebSocket => self.ws_tab(ui, ctx, palette),
+                        Tab::Matrix => self.matrix_tab(ui, ctx, palette),
+                        Tab::Profile => self.profile_tab(ui),
+                    }
+                });
+            }
+            MainTab::Discord => {
+                egui::Frame::new().inner_margin(egui::Margin::symmetric(18, 12)).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+                    self.discord.page(ui, ctx, palette, &self.session);
+                });
+            }
+            MainTab::Traffic => self.traffic.page(ui, palette),
+            MainTab::Client => {
+                egui::Frame::new().inner_margin(egui::Margin::symmetric(18, 12)).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+                    let toast = self.client.page(ui, ctx, palette, &self.session, &mut self.remember_flag);
+                    if toast.is_some() {
+                        self.pending_toast = toast;
+                    }
+                });
+            }
+        }
+    }
+
+    // -- Inspector (panel derecho) ---------------------------------------------------------
+
+    fn inspector(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, palette: &Palette) {
+        let toast = match self.main_tab {
+            MainTab::Console => self.console.inspector(ui, palette),
+            MainTab::Network => {
+                self.net_inspector(ui, palette);
+                None
+            }
+            MainTab::Discord => self.discord.inspector(ui, ctx, palette),
+            MainTab::Traffic => self.traffic.inspector(ui, palette),
+            MainTab::Client => {
+                let report = client::report(ctx, &self.session, &self.cfg.summary());
+                self.client.inspector(ui, palette, &report)
+            }
+        };
+        if toast.is_some() {
+            self.pending_toast = toast;
+        }
+    }
+
+    /// Conexión emulada activa: profile, plataforma y opciones (lo que usan
+    /// todas las pruebas de Red).
+    fn net_inspector(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        style::panel_title(ui, palette, "Conexión activa");
+        egui::Frame::new().inner_margin(egui::Margin::symmetric(18, 0)).show(ui, |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+            let width = (ui.available_width() - 4.0).max(120.0);
+
+            style::field_label(ui, palette, "Profile");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.profile_filter).desired_width(width).hint_text("Filtrar profiles…"),
+            );
+            let filter = self.profile_filter.trim().to_ascii_lowercase();
+            egui::ComboBox::from_id_salt("dev_insp_profile").selected_text(self.cfg.profile.clone()).width(width).height(360.0).show_ui(
+                ui,
+                |ui| {
+                    for profile in Profile::VARIANTS {
+                        let name = profile_name(*profile);
+                        if !filter.is_empty() && !name.to_ascii_lowercase().contains(&filter) {
+                            continue;
+                        }
+                        ui.selectable_value(&mut self.cfg.profile, name.clone(), name);
+                    }
+                },
+            );
+
+            style::field_label(ui, palette, "Plataforma");
+            egui::ComboBox::from_id_salt("dev_insp_platform").selected_text(self.cfg.platform.clone()).width(width).show_ui(
+                ui,
+                |ui| {
+                    for platform in Platform::VARIANTS {
+                        let name = platform_name(*platform);
+                        ui.selectable_value(&mut self.cfg.platform, name.clone(), name);
+                    }
+                },
+            );
+
+            ui.add_space(8.0);
+            ui.checkbox(&mut self.cfg.http2, "HTTP/2 propio del profile");
+            ui.checkbox(&mut self.cfg.emu_headers, "Headers propios del profile");
+
+            style::field_label(ui, palette, "Headers propios");
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("{} activos", self.cfg.active_headers().count())).color(palette.dim),
+                );
+                if ui.small_button("Editar").clicked() {
                     self.tab = Tab::Profile;
                 }
             });
-            ui.add_space(4.0);
-        }
 
-        match self.tab {
-            Tab::Http => self.http_tab(ui, ctx),
-            Tab::WebSocket => self.ws_tab(ui, ctx),
-            Tab::Matrix => self.matrix_tab(ui, ctx),
-            Tab::Profile => self.profile_tab(ui),
+            if !self.saved_profiles.is_empty() {
+                style::field_label(ui, palette, "Perfiles guardados");
+                let mut load: Option<usize> = None;
+                egui::ComboBox::from_id_salt("dev_insp_saved").selected_text("Cargar…").width(width).show_ui(ui, |ui| {
+                    for (index, (name, _)) in self.saved_profiles.iter().enumerate() {
+                        if ui.selectable_label(false, name).clicked() {
+                            load = Some(index);
+                        }
+                    }
+                });
+                if let Some(index) = load {
+                    self.cfg = self.saved_profiles[index].1.clone();
+                    self.pending_toast = Some("Perfil cargado");
+                }
+            }
+
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new(self.cfg.summary()).small().color(palette.dim));
+        });
+    }
+
+    // -- Barra inferior ------------------------------------------------------------------------
+
+    fn footer(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        let rect = ui.max_rect();
+        let radius = self.corner().saturating_sub(1);
+        ui.painter().rect_filled(
+            rect,
+            egui::CornerRadius { nw: 0, ne: 0, sw: radius, se: radius },
+            palette.panel,
+        );
+        ui.painter().hline(rect.x_range(), rect.top() + 0.5, egui::Stroke::new(1.0, palette.outline));
+
+        let mut row = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("dev_footer_left")
+                .max_rect(rect.shrink2(egui::vec2(12.0, 0.0)))
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        row.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+        let counts = capture::counts();
+        for level in Level::ALL {
+            let index = level.index();
+            if style::count_chip(&mut row, palette, level, counts[index], self.console.levels[index]).clicked() {
+                self.console.levels[index] = !self.console.levels[index];
+            }
+        }
+        row.add_space(10.0);
+        row.add(
+            egui::TextEdit::singleline(&mut self.console.filter).hint_text("Filtrar logs…").desired_width(220.0),
+        );
+        row.add_space(10.0);
+        style::toggle_switch(&mut row, palette, &mut self.console.follow);
+        row.add_space(2.0);
+        row.label(egui::RichText::new("Seguir al final").size(12.5).color(palette.secondary));
+
+        let mut icons = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("dev_footer_right")
+                .max_rect(rect.shrink2(egui::vec2(12.0, 0.0)))
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        );
+        icons.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
+        if style::panel_toggle(&mut icons, palette, style::PanelSide::Right, self.show_right, "Panel derecho (inspector)")
+            .clicked()
+        {
+            self.show_right = !self.show_right;
+        }
+        if style::panel_toggle(&mut icons, palette, style::PanelSide::Bottom, self.show_dock, "Consola abajo").clicked() {
+            self.show_dock = !self.show_dock;
+        }
+        if style::panel_toggle(&mut icons, palette, style::PanelSide::Left, self.show_left, "Panel izquierdo (lista)")
+            .clicked()
+        {
+            self.show_left = !self.show_left;
+        }
+    }
+
+    // -- Comandos de la consola ------------------------------------------------------------------
+
+    fn handle_console(&mut self, ctx: &egui::Context, action: console::ConsoleAction) {
+        match action {
+            console::ConsoleAction::Run(line) => self.run_command(ctx, &line),
+        }
+    }
+
+    fn run_command(&mut self, ctx: &egui::Context, line: &str) {
+        capture::push(Level::Info, "consola", format!("› {line}"));
+        let (command, rest) = match line.split_once(char::is_whitespace) {
+            Some((command, rest)) => (command.to_ascii_lowercase(), rest.trim()),
+            None => (line.to_ascii_lowercase(), ""),
+        };
+        match command.as_str() {
+            "help" | "?" => {
+                for text in HELP {
+                    capture::push(Level::Info, "consola", text);
+                }
+            }
+            "clear" | "cls" => {
+                capture::clear();
+                self.console.selected = None;
+            }
+            "info" => {
+                for text in client::report(ctx, &self.session, &self.cfg.summary()).lines() {
+                    capture::push(Level::Info, "consola", text);
+                }
+            }
+            "mem" => {
+                let heap = crate::support::mem_report::heap_bytes();
+                let resident = crate::support::mem_report::process_memory().map(|memory| memory.resident);
+                let textures = crate::support::mem_report::gpu_texture_bytes(ctx);
+                capture::push(
+                    Level::Info,
+                    "consola",
+                    format!(
+                        "heap {} · RAM {} · texturas {}",
+                        crate::support::mem_report::fmt_bytes(heap),
+                        resident.map_or("—".to_owned(), crate::support::mem_report::fmt_bytes),
+                        crate::support::mem_report::fmt_bytes(textures),
+                    ),
+                );
+            }
+            "level" => match Level::parse(rest) {
+                Some(minimum) => {
+                    for level in Level::ALL {
+                        self.console.levels[level.index()] = level <= minimum;
+                    }
+                    capture::push(Level::Info, "consola", format!("Mostrando {} y más graves.", minimum.tag()));
+                }
+                None => capture::push(Level::Warn, "consola", "Uso: level error|warn|info|debug|trace"),
+            },
+            "copy" => {
+                let text = self.console.visible_text();
+                let lines = text.lines().count();
+                ctx.copy_text(text);
+                capture::push(Level::Info, "consola", format!("{lines} líneas copiadas."));
+                self.pending_toast = Some("Registro copiado");
+            }
+            "tab" => match rest.to_ascii_lowercase().as_str() {
+                "consola" | "console" => self.main_tab = MainTab::Console,
+                "red" | "net" | "network" => self.main_tab = MainTab::Network,
+                "discord" => self.main_tab = MainTab::Discord,
+                "trafico" | "tráfico" | "traffic" => self.main_tab = MainTab::Traffic,
+                "cliente" | "client" => self.main_tab = MainTab::Client,
+                _ => capture::push(Level::Warn, "consola", "Uso: tab consola|red|discord|trafico|cliente"),
+            },
+            "get" | "post" | "put" | "patch" | "delete" => {
+                let (path, body) = match rest.split_once(char::is_whitespace) {
+                    Some((path, body)) => (path, body.trim()),
+                    None => (rest, ""),
+                };
+                if path.is_empty() {
+                    capture::push(Level::Warn, "consola", format!("Uso: {command} /ruta [json]"));
+                } else {
+                    let session = self.session.clone();
+                    self.discord.quick(ctx, &session, &command, path, body);
+                }
+            }
+            "toast" => {
+                const ECORD: &str = "dev.ecord.client";
+                const POWERSHELL: &str = r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe";
+                match rest {
+                    "app" => crate::lib::notifications::send_desktop(
+                        "eCord".into(),
+                        "Prueba por el camino normal".into(),
+                    ),
+                    "ps" => crate::lib::toast_debug::run(POWERSHELL, "eCord (AUMID de PowerShell)", "Prueba de control"),
+                    "" => crate::lib::toast_debug::run(ECORD, "eCord", "Prueba directa de toast"),
+                    custom => crate::lib::toast_debug::run(custom, "eCord", "Prueba con AUMID propio"),
+                }
+            }
+            other => capture::push(Level::Warn, "consola", format!("Comando desconocido: {other}. Escribe help.")),
         }
     }
 
     // -- HTTP ---------------------------------------------------------------
 
-    fn http_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("dev_http_method").selected_text(self.method.clone()).width(90.0).show_ui(
+    fn http_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, palette: &Palette) {
+        let running = lock(&self.http_out).running;
+
+        // Barra de petición: método · URL · presets · enviar.
+        bar(ui, palette, |ui| {
+            egui::ComboBox::from_id_salt("dev_http_method").selected_text(self.method.clone()).width(72.0).show_ui(
                 ui,
                 |ui| {
                     for method in METHODS {
@@ -732,19 +1591,33 @@ impl DevTools {
             );
             ui.add(
                 egui::TextEdit::singleline(&mut self.http_url)
-                    .desired_width((ui.available_width() - 150.0).max(120.0))
+                    .frame(egui::Frame::NONE)
+                    .desired_width((ui.available_width() - 200.0).max(100.0))
                     .hint_text("https://..."),
             );
-            egui::ComboBox::from_id_salt("dev_http_preset").selected_text("Presets").width(110.0).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("dev_http_preset").selected_text("Presets").width(70.0).show_ui(ui, |ui| {
                 for (label, url) in HTTP_PRESETS {
                     if ui.selectable_label(false, label).clicked() {
                         self.http_url = url.to_owned();
                     }
                 }
             });
+            if primary_button(ui, palette, "Enviar", !running) {
+                self.send_http(ctx);
+            }
+            if running {
+                theme::spinner(ui, 16.0, palette.accent);
+            }
         });
 
-        ui.collapsing("Cuerpo", |ui| {
+        ui.horizontal(|ui| {
+            ui.toggle_value(&mut self.http_body_open, "Cuerpo");
+            ui.checkbox(&mut self.show_resp_headers, "Headers de la respuesta");
+            if !self.http_body.is_empty() {
+                ui.weak(format!("{} bytes de cuerpo (se ignora en GET y HEAD)", self.http_body.len()));
+            }
+        });
+        if self.http_body_open {
             ui.add(
                 egui::TextEdit::multiline(&mut self.http_body)
                     .desired_rows(3)
@@ -752,62 +1625,59 @@ impl DevTools {
                     .code_editor()
                     .hint_text("(vacío) — se ignora en GET y HEAD"),
             );
-        });
-
-        let running = lock(&self.http_out).running;
-        ui.horizontal(|ui| {
-            if ui.add_enabled(!running, egui::Button::new("Enviar")).clicked() {
-                self.send_http(ctx);
-            }
-            if running {
-                ui.spinner();
-            }
-            ui.checkbox(&mut self.show_resp_headers, "Mostrar headers de la respuesta");
-        });
-        ui.separator();
+        }
 
         let out = lock(&self.http_out);
         match &out.result {
             None => {
-                ui.weak("Sin respuesta todavía.");
+                ui.add_space(24.0);
+                ui.vertical_centered(|ui| {
+                    ui.weak("Sin respuesta todavía. Escribe una URL y pulsa Enviar.");
+                });
             }
             Some(Err(error)) => {
-                ui.colored_label(theme_error(), "Falló:");
-                egui::ScrollArea::vertical().id_salt("dev_http_err").max_height(f32::INFINITY).show(ui, |ui| {
-                    ui.add(egui::Label::new(egui::RichText::new(error.as_str()).monospace()).selectable(true));
+                inset_panel(ui, palette, |ui| {
+                    ui.horizontal(|ui| badge(ui, "Falló", palette.danger));
+                    egui::ScrollArea::vertical().id_salt("dev_http_err").auto_shrink([false, false]).show(ui, |ui| {
+                        ui.add(egui::Label::new(egui::RichText::new(error.as_str()).monospace()).selectable(true));
+                    });
                 });
             }
             Some(Ok(info)) => {
                 let good = info.status.starts_with('2') || info.status.starts_with('3');
-                ui.horizontal_wrapped(|ui| {
-                    ui.colored_label(
-                        if good { theme_ok() } else { theme_error() },
-                        egui::RichText::new(&info.status).strong(),
+                ui.horizontal(|ui| {
+                    badge(ui, &info.status, if good { theme_ok() } else { palette.danger });
+                    ui.label(
+                        egui::RichText::new(format!("{} · {} ms · {} bytes", info.version, info.elapsed_ms, info.body_len))
+                            .color(palette.secondary),
                     );
-                    ui.label(format!("{} · {} ms · {} bytes", info.version, info.elapsed_ms, info.body_len));
                     if info.truncated {
                         ui.weak(format!("(se muestran {} KB)", MAX_BODY_SHOWN / 1024));
                     }
-                    if ui.small_button("copiar cuerpo").clicked() {
-                        ui.ctx().copy_text(info.body.clone());
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("copiar cuerpo").clicked() {
+                            ui.ctx().copy_text(info.body.clone());
+                        }
+                    });
                 });
-                egui::ScrollArea::vertical().id_salt("dev_http_resp").auto_shrink([false, false]).show(ui, |ui| {
-                    if self.show_resp_headers {
-                        egui::CollapsingHeader::new(format!("Headers ({})", info.headers.len()))
-                            .id_salt("dev_http_resp_headers")
-                            .default_open(true)
-                            .show(ui, |ui| {
-                                egui::Grid::new("dev_http_resp_grid").striped(true).num_columns(2).show(ui, |ui| {
-                                    for (name, value) in &info.headers {
-                                        ui.label(egui::RichText::new(name).monospace().strong());
-                                        ui.add(egui::Label::new(egui::RichText::new(value).monospace()).selectable(true));
-                                        ui.end_row();
-                                    }
+                inset_panel(ui, palette, |ui| {
+                    egui::ScrollArea::vertical().id_salt("dev_http_resp").auto_shrink([false, false]).show(ui, |ui| {
+                        if self.show_resp_headers {
+                            egui::CollapsingHeader::new(format!("Headers ({})", info.headers.len()))
+                                .id_salt("dev_http_resp_headers")
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    egui::Grid::new("dev_http_resp_grid").striped(true).num_columns(2).show(ui, |ui| {
+                                        for (name, value) in &info.headers {
+                                            ui.label(egui::RichText::new(name).monospace().strong());
+                                            ui.add(egui::Label::new(egui::RichText::new(value).monospace()).selectable(true));
+                                            ui.end_row();
+                                        }
+                                    });
                                 });
-                            });
-                    }
-                    ui.add(egui::Label::new(egui::RichText::new(&info.body).monospace()).selectable(true));
+                        }
+                        ui.add(egui::Label::new(egui::RichText::new(&info.body).monospace()).selectable(true));
+                    });
                 });
             }
         }
@@ -839,21 +1709,22 @@ impl DevTools {
 
     // -- WebSocket -----------------------------------------------------------
 
-    fn ws_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn ws_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, palette: &Palette) {
         let (connecting, connected) = {
             let guard = lock(&self.ws.shared);
             (guard.connecting, guard.connected)
         };
 
-        ui.horizontal(|ui| {
+        bar(ui, palette, |ui| {
             ui.add_enabled(
                 !connecting && !connected,
                 egui::TextEdit::singleline(&mut self.ws_url)
+                    .frame(egui::Frame::NONE)
                     .desired_width((ui.available_width() - 250.0).max(120.0))
                     .hint_text("wss://..."),
             );
             ui.add_enabled_ui(!connecting && !connected, |ui| {
-                egui::ComboBox::from_id_salt("dev_ws_preset").selected_text("Presets").width(110.0).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("dev_ws_preset").selected_text("Presets").width(70.0).show_ui(ui, |ui| {
                     for (label, url) in WS_PRESETS {
                         if ui.selectable_label(false, label).clicked() {
                             self.ws_url = url.to_owned();
@@ -862,16 +1733,16 @@ impl DevTools {
                 });
             });
             if connected || connecting {
-                if ui.button("Desconectar").clicked() {
+                if theme::soft_button(ui, palette, None, "Desconectar", false).clicked() {
                     if let Some(tx) = &self.ws.tx {
                         let _ = tx.send(WsCmd::Close);
                     }
                 }
-            } else if ui.button("Conectar").clicked() {
+            } else if theme::pill_button(ui, palette, "Conectar", true).clicked() {
                 self.connect_ws(ctx);
             }
             if connecting {
-                ui.spinner();
+                theme::spinner(ui, 16.0, palette.accent);
             }
         });
 
@@ -879,7 +1750,7 @@ impl DevTools {
             let response = ui.add_enabled(
                 connected,
                 egui::TextEdit::singleline(&mut self.ws_input)
-                    .desired_width((ui.available_width() - 150.0).max(120.0))
+                    .desired_width((ui.available_width() - 190.0).max(120.0))
                     .hint_text("Texto a enviar (JSON, por ejemplo)"),
             );
             let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -892,7 +1763,7 @@ impl DevTools {
             if ui.button("Limpiar").clicked() {
                 lock(&self.ws.shared).lines.clear();
             }
-            if ui.button("Copiar registro").clicked() {
+            if ui.button("Copiar").on_hover_text("Copiar el registro").clicked() {
                 let mut text = String::new();
                 for line in &lock(&self.ws.shared).lines {
                     let _ = writeln!(text, "[{:>7} ms] {} {}", line.at_ms, line_tag(line.kind), line.text);
@@ -900,30 +1771,31 @@ impl DevTools {
                 ui.ctx().copy_text(text);
             }
         });
-        ui.separator();
 
-        let guard = lock(&self.ws.shared);
-        egui::ScrollArea::vertical().id_salt("dev_ws_log").auto_shrink([false, false]).stick_to_bottom(true).show(
-            ui,
-            |ui| {
-                if guard.lines.is_empty() {
-                    ui.weak("Sin actividad. Elegí un preset y tocá Conectar.");
-                }
-                for line in &guard.lines {
-                    let color = match line.kind {
-                        LineKind::Info => ui.visuals().weak_text_color(),
-                        LineKind::Out => theme_out(),
-                        LineKind::In => theme_ok(),
-                        LineKind::Error => theme_error(),
-                    };
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(egui::RichText::new(format!("{:>7} ms", line.at_ms)).monospace().weak());
-                        ui.label(egui::RichText::new(line_tag(line.kind)).monospace().color(color));
-                        ui.add(egui::Label::new(egui::RichText::new(&line.text).monospace()).selectable(true));
-                    });
-                }
-            },
-        );
+        inset_panel(ui, palette, |ui| {
+            let guard = lock(&self.ws.shared);
+            egui::ScrollArea::vertical().id_salt("dev_ws_log").auto_shrink([false, false]).stick_to_bottom(true).show(
+                ui,
+                |ui| {
+                    if guard.lines.is_empty() {
+                        ui.weak("Sin actividad. Elige un preset y pulsa Conectar.");
+                    }
+                    for line in &guard.lines {
+                        let color = match line.kind {
+                            LineKind::Info => palette.dim,
+                            LineKind::Out => palette.accent,
+                            LineKind::In => theme_ok(),
+                            LineKind::Error => palette.danger,
+                        };
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(egui::RichText::new(format!("{:>7} ms", line.at_ms)).monospace().color(palette.dim));
+                            ui.label(egui::RichText::new(line_tag(line.kind)).monospace().color(color));
+                            ui.add(egui::Label::new(egui::RichText::new(&line.text).monospace()).selectable(true));
+                        });
+                    }
+                },
+            );
+        });
     }
 
     fn connect_ws(&mut self, ctx: &egui::Context) {
@@ -945,27 +1817,20 @@ impl DevTools {
 
     // -- Todos los profiles ---------------------------------------------------
 
-    fn matrix_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn matrix_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, palette: &Palette) {
         let running = lock(&self.matrix).running;
 
-        ui.horizontal(|ui| {
-            ui.label("Prueba:");
+        bar(ui, palette, |ui| {
             ui.add_enabled_ui(!running, |ui| {
                 ui.selectable_value(&mut self.matrix_mode, MatrixMode::Http, "HTTP");
                 ui.selectable_value(&mut self.matrix_mode, MatrixMode::WebSocket, "WebSocket");
             });
             ui.separator();
-            ui.label("Plataforma:");
-            ui.label(egui::RichText::new(&self.cfg.platform).strong());
-            ui.weak("(se cambia en Perfil / headers)");
-        });
-
-        match self.matrix_mode {
-            MatrixMode::Http => {
-                ui.horizontal(|ui| {
+            match self.matrix_mode {
+                MatrixMode::Http => {
                     egui::ComboBox::from_id_salt("dev_matrix_method")
                         .selected_text(self.method.clone())
-                        .width(90.0)
+                        .width(72.0)
                         .show_ui(ui, |ui| {
                             for method in METHODS {
                                 ui.selectable_value(&mut self.method, method.to_owned(), method);
@@ -973,31 +1838,33 @@ impl DevTools {
                         });
                     ui.add(
                         egui::TextEdit::singleline(&mut self.http_url)
-                            .desired_width((ui.available_width() - 20.0).max(120.0)),
+                            .frame(egui::Frame::NONE)
+                            .desired_width((ui.available_width() - 10.0).max(120.0)),
                     );
-                });
+                }
+                MatrixMode::WebSocket => {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.ws_url)
+                            .frame(egui::Frame::NONE)
+                            .desired_width((ui.available_width() - 10.0).max(120.0)),
+                    );
+                }
             }
-            MatrixMode::WebSocket => {
-                ui.add(egui::TextEdit::singleline(&mut self.ws_url).desired_width(f32::INFINITY));
-            }
-        }
-        ui.weak("Usa los headers propios y las opciones de la conexión activa; el profile cambia en cada fila.");
+        });
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if running {
-                if ui.button("Cancelar").clicked() {
+                if theme::soft_button(ui, palette, None, "Cancelar", false).clicked() {
                     self.matrix_cancel.store(true, Ordering::Relaxed);
                 }
-                ui.spinner();
-            } else if ui.button("Probar los profiles").clicked() {
+                theme::spinner(ui, 16.0, palette.accent);
+            } else if theme::pill_button(ui, palette, "Probar los profiles", true).clicked() {
                 self.start_matrix(ctx);
             }
-
-            ui.separator();
             ui.label("Familia:");
             egui::ComboBox::from_id_salt("dev_matrix_family")
                 .selected_text(self.matrix_family.unwrap_or("Todas"))
-                .width(90.0)
+                .width(80.0)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.matrix_family, None, "Todas");
                     for family in FAMILIES {
@@ -1005,6 +1872,10 @@ impl DevTools {
                     }
                 });
             ui.checkbox(&mut self.matrix_only_failed, "Solo fallidos");
+            ui.label(egui::RichText::new(format!("Plataforma: {}", self.cfg.platform)).color(palette.dim)).on_hover_text(
+                "Usa los headers propios y las opciones de la conexión activa; el profile cambia en cada fila. \
+                 La plataforma se cambia en Perfil / headers.",
+            );
         });
 
         let (rows, done, total, label) = {
@@ -1015,11 +1886,11 @@ impl DevTools {
         if total > 0 {
             let ok = rows.iter().filter(|r| matches!(r.state, RowState::Ok { .. })).count();
             let fail = rows.iter().filter(|r| matches!(r.state, RowState::Fail { .. })).count();
-            ui.horizontal(|ui| {
-                ui.add(egui::ProgressBar::new(done as f32 / total as f32).desired_width(180.0).text(format!("{done}/{total}")));
-                ui.colored_label(theme_ok(), format!("{ok} OK"));
-                ui.colored_label(theme_error(), format!("{fail} fallidos"));
-                ui.weak(label);
+            ui.horizontal_wrapped(|ui| {
+                ui.add(egui::ProgressBar::new(done as f32 / total as f32).desired_width(160.0).text(format!("{done}/{total}")));
+                badge(ui, &format!("{ok} OK"), theme_ok());
+                badge(ui, &format!("{fail} fallidos"), palette.danger);
+                ui.label(egui::RichText::new(label).small().color(palette.dim));
                 if ui.small_button("copiar resultados").clicked() {
                     let mut text = String::new();
                     for row in &rows {
@@ -1035,62 +1906,63 @@ impl DevTools {
                 }
             });
         }
-        ui.separator();
 
         let mut use_profile: Option<String> = None;
-        egui::ScrollArea::vertical().id_salt("dev_matrix_rows").auto_shrink([false, false]).show(ui, |ui| {
-            egui::Grid::new("dev_matrix_grid").striped(true).num_columns(4).spacing([14.0, 4.0]).show(ui, |ui| {
-                for row in &rows {
-                    if let Some(family) = self.matrix_family {
-                        if family_of(&row.profile) != family {
+        inset_panel(ui, palette, |ui| {
+            egui::ScrollArea::vertical().id_salt("dev_matrix_rows").auto_shrink([false, false]).show(ui, |ui| {
+                egui::Grid::new("dev_matrix_grid").striped(true).num_columns(4).spacing([14.0, 5.0]).show(ui, |ui| {
+                    for row in &rows {
+                        if let Some(family) = self.matrix_family {
+                            if family_of(&row.profile) != family {
+                                continue;
+                            }
+                        }
+                        if self.matrix_only_failed && !matches!(row.state, RowState::Fail { .. }) {
                             continue;
                         }
+                        ui.label(egui::RichText::new(&row.profile).monospace());
+                        match &row.state {
+                            RowState::Pending => {
+                                ui.weak("pendiente");
+                                ui.label("");
+                                ui.label("");
+                            }
+                            RowState::Running => {
+                                ui.horizontal(|ui| {
+                                    theme::spinner(ui, 14.0, palette.accent);
+                                    ui.label("probando…");
+                                });
+                                ui.label("");
+                                ui.label("");
+                            }
+                            RowState::Ok { detail, ms } => {
+                                badge(ui, "OK", theme_ok());
+                                ui.label(format!("{ms} ms"));
+                                ui.horizontal(|ui| {
+                                    ui.label(detail);
+                                    if ui.small_button("usar").clicked() {
+                                        use_profile = Some(row.profile.clone());
+                                    }
+                                });
+                            }
+                            RowState::Fail { detail, ms } => {
+                                badge(ui, "FALLO", palette.danger);
+                                ui.label(format!("{ms} ms"));
+                                ui.horizontal(|ui| {
+                                    ui.label(detail);
+                                    if ui.small_button("usar").clicked() {
+                                        use_profile = Some(row.profile.clone());
+                                    }
+                                });
+                            }
+                        }
+                        ui.end_row();
                     }
-                    if self.matrix_only_failed && !matches!(row.state, RowState::Fail { .. }) {
-                        continue;
-                    }
-                    ui.label(egui::RichText::new(&row.profile).monospace());
-                    match &row.state {
-                        RowState::Pending => {
-                            ui.weak("pendiente");
-                            ui.label("");
-                            ui.label("");
-                        }
-                        RowState::Running => {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label("probando…");
-                            });
-                            ui.label("");
-                            ui.label("");
-                        }
-                        RowState::Ok { detail, ms } => {
-                            ui.colored_label(theme_ok(), "OK");
-                            ui.label(format!("{ms} ms"));
-                            ui.horizontal(|ui| {
-                                ui.label(detail);
-                                if ui.small_button("usar").clicked() {
-                                    use_profile = Some(row.profile.clone());
-                                }
-                            });
-                        }
-                        RowState::Fail { detail, ms } => {
-                            ui.colored_label(theme_error(), "FALLO");
-                            ui.label(format!("{ms} ms"));
-                            ui.horizontal(|ui| {
-                                ui.label(detail);
-                                if ui.small_button("usar").clicked() {
-                                    use_profile = Some(row.profile.clone());
-                                }
-                            });
-                        }
-                    }
-                    ui.end_row();
+                });
+                if rows.is_empty() {
+                    ui.weak("Todavía no se probó nada.");
                 }
             });
-            if rows.is_empty() {
-                ui.weak("Todavía no se probó nada.");
-            }
         });
         if let Some(profile) = use_profile {
             self.cfg.profile = profile;
@@ -1168,17 +2040,47 @@ impl DevTools {
     // -- Perfil / headers -------------------------------------------------------
 
     fn profile_tab(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().id_salt("dev_profile_scroll").auto_shrink([false, false]).show(ui, |ui| {
-            ui.heading("Emulación");
+        // Dos columnas en vez de una lista larga: emulación y perfiles a la
+        // izquierda, tabla de headers a la derecha.
+        StripBuilder::new(ui)
+            .size(Size::relative(0.4).at_least(280.0))
+            .size(Size::exact(10.0))
+            .size(Size::remainder().at_least(300.0))
+            .horizontal(|mut strip| {
+                strip.cell(|ui| {
+                    egui::ScrollArea::vertical().id_salt("dev_profile_left").auto_shrink([false, false]).show(ui, |ui| {
+                        self.emulation_ui(ui);
+                        ui.add_space(6.0);
+                        card(ui, "Perfiles guardados", |ui| self.saved_profiles_ui(ui));
+                        ui.add_space(6.0);
+                        if ui
+                            .checkbox(&mut self.remember_flag, "Recordar activado en próximos arranques")
+                            .on_hover_text("Guarda la opción use_developer_features.")
+                            .changed()
+                        {
+                            let _ =
+                                web_local_storage_api::set_item(STORAGE_FLAG, if self.remember_flag { "true" } else { "false" });
+                        }
+                    });
+                });
+                strip.empty();
+                strip.cell(|ui| {
+                    egui::ScrollArea::vertical().id_salt("dev_profile_right").auto_shrink([false, false]).show(ui, |ui| {
+                        card(ui, "Headers propios", |ui| self.headers_editor(ui));
+                    });
+                });
+            });
+    }
+
+    fn emulation_ui(&mut self, ui: &mut egui::Ui) {
+        card(ui, "Emulación", |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Profile:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.profile_filter).desired_width(110.0).hint_text("filtrar…"),
-                );
+                ui.add(egui::TextEdit::singleline(&mut self.profile_filter).desired_width(90.0).hint_text("filtrar…"));
                 let filter = self.profile_filter.trim().to_ascii_lowercase();
                 egui::ComboBox::from_id_salt("dev_profile_combo")
                     .selected_text(self.cfg.profile.clone())
-                    .width(190.0)
+                    .width(150.0)
                     .height(360.0)
                     .show_ui(ui, |ui| {
                         for profile in Profile::VARIANTS {
@@ -1192,7 +2094,7 @@ impl DevTools {
                 ui.label("Plataforma:");
                 egui::ComboBox::from_id_salt("dev_platform_combo")
                     .selected_text(self.cfg.platform.clone())
-                    .width(110.0)
+                    .width(100.0)
                     .show_ui(ui, |ui| {
                         for platform in Platform::VARIANTS {
                             let name = platform_name(*platform);
@@ -1200,44 +2102,26 @@ impl DevTools {
                         }
                     });
             });
-            ui.checkbox(&mut self.cfg.http2, "Usar el HTTP/2 propio del profile (SETTINGS, orden de pseudo-headers…)");
-            ui.checkbox(
-                &mut self.cfg.emu_headers,
-                "Mandar los headers propios del profile (User-Agent, sec-ch-ua, Accept…)",
+            ui.checkbox(&mut self.cfg.http2, "HTTP/2 propio del profile")
+                .on_hover_text("SETTINGS, orden de pseudo-headers…");
+            ui.checkbox(&mut self.cfg.emu_headers, "Headers propios del profile").on_hover_text(
+                "User-Agent, sec-ch-ua, Accept…\n\
+                 Apagados, salen SOLO los de la tabla. Prendidos, los de la tabla se agregan \
+                 al pedido (para reemplazar uno, apagá los del profile).",
             );
-            ui.weak(
-                "Con los headers del profile apagados salen SOLO los de la tabla. Con ellos prendidos, \
-                 los de la tabla se agregan al pedido (para reemplazar uno, apagá los del profile).",
-            );
-
-            ui.add_space(8.0);
-            ui.heading("Headers propios");
-            self.headers_editor(ui);
-
-            ui.add_space(8.0);
-            ui.heading("Perfiles guardados");
-            self.saved_profiles_ui(ui);
-
-            ui.add_space(8.0);
-            ui.separator();
-            if ui
-                .checkbox(&mut self.remember_flag, "Recordar activado (use_developer_features) para próximos arranques")
-                .changed()
-            {
-                let _ = web_local_storage_api::set_item(STORAGE_FLAG, if self.remember_flag { "true" } else { "false" });
-            }
         });
     }
 
     fn headers_editor(&mut self, ui: &mut egui::Ui) {
         let mut remove: Option<usize> = None;
+        let value_width = (ui.available_width() - 150.0 - 90.0).max(140.0);
         egui::Grid::new("dev_headers_grid").num_columns(4).spacing([6.0, 4.0]).show(ui, |ui| {
             for (index, row) in self.cfg.headers.iter_mut().enumerate() {
                 ui.checkbox(&mut row.on, "");
-                ui.add(egui::TextEdit::singleline(&mut row.name).desired_width(170.0).hint_text("Nombre").font(
+                ui.add(egui::TextEdit::singleline(&mut row.name).desired_width(150.0).hint_text("Nombre").font(
                     egui::TextStyle::Monospace,
                 ));
-                ui.add(egui::TextEdit::singleline(&mut row.value).desired_width(360.0).hint_text("Valor").font(
+                ui.add(egui::TextEdit::singleline(&mut row.value).desired_width(value_width).hint_text("Valor").font(
                     egui::TextStyle::Monospace,
                 ));
                 if ui.small_button("✕").on_hover_text("Quitar").clicked() {
@@ -1307,9 +2191,13 @@ impl DevTools {
 
     fn saved_profiles_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.new_profile_name).desired_width(200.0).hint_text("Nombre del perfil"));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.new_profile_name)
+                    .desired_width((ui.available_width() - 120.0).max(90.0))
+                    .hint_text("Nombre del perfil"),
+            );
             let name = self.new_profile_name.trim().to_owned();
-            if ui.add_enabled(!name.is_empty(), egui::Button::new("Guardar el actual")).clicked() {
+            if ui.add_enabled(!name.is_empty(), egui::Button::new("Guardar actual")).clicked() {
                 let cfg = self.cfg.clone();
                 if let Some(slot) = self.saved_profiles.iter_mut().find(|(n, _)| *n == name) {
                     slot.1 = cfg;
@@ -1324,8 +2212,7 @@ impl DevTools {
         let mut delete: Option<usize> = None;
         for (index, (name, cfg)) in self.saved_profiles.iter().enumerate() {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(name).strong());
-                ui.weak(cfg.summary());
+                ui.label(egui::RichText::new(name).strong()).on_hover_text(cfg.summary());
                 if ui.small_button("Cargar").clicked() {
                     load = Some(index);
                 }
@@ -1363,6 +2250,46 @@ impl Drop for DevTools {
 }
 
 // ---------------------------------------------------------------------------
+// Ventana flotante y ventana aparte
+// ---------------------------------------------------------------------------
+
+/// Mantiene la ventana flotante dentro de lo razonable: no más chica que el mínimo,
+/// no más grande que la pantalla y con un pedazo de la barra superior siempre a la
+/// vista (para poder agarrarla y traerla de vuelta).
+fn clamp_floating(rect: egui::Rect, screen: egui::Rect) -> egui::Rect {
+    let width = rect.width().max(MIN_W).min(screen.width().max(1.0));
+    let height = rect.height().max(MIN_H).min(screen.height().max(1.0));
+    let x = rect.min.x.max(screen.left() + 120.0 - width).min(screen.right() - 120.0);
+    let y = rect.min.y.max(screen.top()).min(screen.bottom() - TOP_H);
+    egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(width, height))
+}
+
+/// Lo que `Context::show_viewport_immediate` le entrega al callback de la ventana aparte
+/// (según la versión de egui es un `&Context` o un `&mut Ui`). Este trait deja dibujar el
+/// panel igual con cualquiera de los dos: `paint` da siempre un `Ui` que ocupa toda la
+/// ventana y su `Context`.
+trait ViewportSurface {
+    fn paint(self, add: impl FnOnce(&mut egui::Ui, &egui::Context));
+}
+
+impl ViewportSurface for &egui::Context {
+    fn paint(self, add: impl FnOnce(&mut egui::Ui, &egui::Context)) {
+        let rect = self.viewport_rect();
+        egui::Area::new(egui::Id::new("ecord_devtools_detached"))
+            .order(egui::Order::Background)
+            .fixed_pos(rect.min)
+            .show(self, |ui| add(ui, self));
+    }
+}
+
+impl ViewportSurface for &mut egui::Ui {
+    fn paint(self, add: impl FnOnce(&mut egui::Ui, &egui::Context)) {
+        let ctx = self.ctx().clone();
+        add(self, &ctx);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Colores
 // ---------------------------------------------------------------------------
 
@@ -1383,6 +2310,297 @@ fn theme_error() -> egui::Color32 {
     egui::Color32::from_rgb(0xE5, 0x5B, 0x5B)
 }
 
-fn theme_out() -> egui::Color32 {
-    egui::Color32::from_rgb(0x6C, 0xA8, 0xF0)
+fn theme_warn() -> egui::Color32 {
+    egui::Color32::from_rgb(0xE5, 0xB8, 0x4B)
 }
+
+// ---------------------------------------------------------------------------
+// Piezas de interfaz compartidas
+// ---------------------------------------------------------------------------
+
+/// Bloque con título sobre la superficie de la paleta: agrupa una sección.
+fn card<R>(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let palette = theme::current(ui.ctx());
+    egui::Frame::new()
+        .fill(palette.surface)
+        .stroke(egui::Stroke::new(1.0, palette.outline))
+        .corner_radius(egui::CornerRadius::same(theme::radius_small() + 2))
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            theme::text(ui, title, theme::semibold(12.5), palette.secondary);
+            ui.add_space(4.0);
+            add_contents(ui)
+        })
+        .inner
+}
+
+/// Barra redondeada para una fila de controles (método · URL · acciones).
+fn bar<R>(ui: &mut egui::Ui, palette: &Palette, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    egui::Frame::new()
+        .fill(palette.surface)
+        .stroke(egui::Stroke::new(1.0, palette.outline))
+        .corner_radius(egui::CornerRadius::same(theme::radius()))
+        .inner_margin(egui::Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| add_contents(ui)).inner
+        })
+        .inner
+}
+
+/// Panel hundido para respuestas, logs y resultados: ocupa el alto que sobra.
+fn inset_panel<R>(ui: &mut egui::Ui, palette: &Palette, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    egui::Frame::new()
+        .fill(theme::inset(palette))
+        .corner_radius(egui::CornerRadius::same(theme::radius_small() + 2))
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.set_min_height(ui.available_height().max(60.0));
+            add_contents(ui)
+        })
+        .inner
+}
+
+/// Etiqueta de color con fondo tenue (estado, veredicto, contadores).
+fn badge(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+    egui::Frame::new()
+        .fill(color.gamma_multiply(0.18))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(8, 2))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(text).color(color).strong().small());
+        });
+}
+
+/// Botón principal de la paleta; `true` si se pulsó (y estaba habilitado).
+fn primary_button(ui: &mut egui::Ui, palette: &Palette, label: &str, enabled: bool) -> bool {
+    ui.add_enabled_ui(enabled, |ui| theme::pill_button(ui, palette, label, true)).inner.clicked()
+}
+
+fn copy_button(ui: &mut egui::Ui, text: &str) {
+    let button = egui::Button::new("copiar").small().wrap_mode(egui::TextWrapMode::Extend);
+    if ui.add(button).on_hover_text("Copiar al portapapeles").clicked() {
+        ui.ctx().copy_text(text.to_owned());
+    }
+}
+
+/// Fila de una tabla de 3 columnas: nombre · copiar · valor. El valor va al
+/// final para poder ocupar (y partirse en) el ancho que sobra.
+fn kv_row(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
+    // Nombre y botón nunca se truncan ni se parten (el valor, a la derecha, es el que se ajusta).
+    ui.add(egui::Label::new(egui::RichText::new(label).weak()).extend());
+    match value {
+        Some(value) => {
+            copy_button(ui, value);
+            // Se parte en varias líneas solo si no entra: nunca se corta con "…".
+            ui.add(egui::Label::new(egui::RichText::new(value).monospace()).wrap().selectable(true));
+        }
+        None => {
+            ui.label("");
+            ui.colored_label(theme_warn(), "— sin valor —");
+        }
+    }
+    ui.end_row();
+}
+
+fn session_rows(ui: &mut egui::Ui, identity: &ClientIdentity) {
+    egui::Grid::new("dev_ident_session").num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
+        kv_row(ui, "Installation ID", identity.installation_id.as_deref());
+        kv_row(ui, "X-Fingerprint", identity.anonymous_fingerprint.as_deref());
+        kv_row(ui, "Build number", Some(&identity.client_build_number.to_string()));
+        kv_row(ui, "client_launch_id", Some(&identity.client_launch_id));
+        kv_row(ui, "heartbeat_session_id", Some(&identity.client_heartbeat_session_id));
+        kv_row(ui, "User-Agent", Some(&identity.user_agent));
+    });
+    ui.weak("El Installation ID viaja en el header X-Installation-ID y en el IDENTIFY del Gateway.");
+}
+
+/// Campos de `X-Super-Properties` en el orden en que se envían (un `serde_json::Value`
+/// los reordenaría alfabéticamente).
+struct OrderedFields(Vec<(String, serde_json::Value)>);
+
+impl<'de> Deserialize<'de> for OrderedFields {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct FieldsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for FieldsVisitor {
+            type Value = OrderedFields;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("un objeto JSON")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut fields = Vec::new();
+                while let Some((key, value)) = map.next_entry::<String, serde_json::Value>()? {
+                    fields.push((key, value));
+                }
+                Ok(OrderedFields(fields))
+            }
+        }
+
+        deserializer.deserialize_map(FieldsVisitor)
+    }
+}
+
+fn parse_super_properties(json: &str) -> Result<Vec<(String, serde_json::Value)>, String> {
+    serde_json::from_str::<OrderedFields>(json).map(|fields| fields.0).map_err(|error| error.to_string())
+}
+
+fn super_properties_section(
+    ui: &mut egui::Ui,
+    identity: &ClientIdentity,
+    fields: &Result<Vec<(String, serde_json::Value)>, String>,
+) {
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("Copiar base64").clicked() {
+            ui.ctx().copy_text(identity.super_properties_b64.clone());
+        }
+        if ui.button("Copiar JSON").clicked() {
+            ui.ctx().copy_text(identity.super_properties_json.clone());
+        }
+        let count = fields.as_ref().map_or(0, |fields| fields.len());
+        ui.weak(format!("{count} campos · {} bytes de JSON", identity.super_properties_json.len()));
+    });
+    ui.add_space(2.0);
+
+    match fields {
+        Err(error) => {
+            ui.colored_label(theme_error(), format!("No se pudo decodificar: {error}"));
+        }
+        Ok(fields) => {
+            egui::Grid::new("dev_ident_props").striped(true).num_columns(2).spacing([10.0, 3.0]).show(ui, |ui| {
+                for (key, value) in fields {
+                    ui.label(egui::RichText::new(key).monospace().strong());
+                    prop_value(ui, key, value);
+                    ui.end_row();
+                }
+            });
+        }
+    }
+
+    ui.add_space(2.0);
+    egui::CollapsingHeader::new("Base64 (valor del header)").id_salt("dev_ident_b64").show(ui, |ui| {
+        ui.add(egui::Label::new(egui::RichText::new(&identity.super_properties_b64).monospace()).wrap().selectable(true));
+    });
+}
+
+fn prop_value(ui: &mut egui::Ui, key: &str, value: &serde_json::Value) {
+    match value {
+        serde_json::Value::Null => {
+            ui.weak("null");
+        }
+        serde_json::Value::Bool(flag) if key == "has_client_mods" => {
+            ui.colored_label(if *flag { theme_error() } else { theme_ok() }, flag.to_string());
+        }
+        serde_json::Value::String(text) if text.is_empty() => {
+            ui.weak("\"\"");
+        }
+        serde_json::Value::String(text) => {
+            ui.add(egui::Label::new(egui::RichText::new(text).monospace()).wrap().selectable(true));
+        }
+        other => {
+            ui.add(egui::Label::new(egui::RichText::new(other.to_string()).monospace()).wrap().selectable(true));
+        }
+    }
+}
+
+fn signature_section(
+    ui: &mut egui::Ui,
+    identity: &ClientIdentity,
+    report: &Result<LaunchSignatureReport, LaunchSignatureError>,
+    declares_mods: Option<bool>,
+    other: &mut String,
+) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new("En uso:").weak());
+        ui.add(egui::Label::new(egui::RichText::new(&identity.launch_signature).monospace()).selectable(true));
+        copy_button(ui, &identity.launch_signature);
+    });
+
+    match report {
+        Err(error) => {
+            ui.colored_label(theme_error(), format!("Firma inválida: {error}"));
+        }
+        Ok(report) => {
+            report_ui(ui, report, "dev_sig_live");
+            // `has_client_mods` del super-properties tiene que coincidir con lo que dice la firma.
+            if let Some(declared) = declares_mods {
+                let consistent = declared == !report.is_clean();
+                let text = format!(
+                    "has_client_mods = {declared} · firma {} → {}",
+                    if report.is_clean() { "limpia" } else { "con mods" },
+                    if consistent { "coherente" } else { "INCOHERENTE" },
+                );
+                ui.colored_label(if consistent { theme_ok() } else { theme_error() }, text);
+            }
+        }
+    }
+
+    ui.add_space(2.0);
+    egui::CollapsingHeader::new("Analizar otra firma").id_salt("dev_sig_other").show(ui, |ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut *other)
+                .desired_width(f32::INFINITY)
+                .font(egui::TextStyle::Monospace)
+                .hint_text("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"),
+        );
+        if !other.trim().is_empty() {
+            match launch_signature::analyze(other.as_str()) {
+                Ok(report) => report_ui(ui, &report, "dev_sig_other_report"),
+                Err(error) => {
+                    ui.colored_label(theme_error(), format!("Firma inválida: {error}"));
+                }
+            }
+        }
+    });
+}
+
+/// Veredicto, mods detectados y detalle de bytes/bits de una firma ya analizada.
+fn report_ui(ui: &mut egui::Ui, report: &LaunchSignatureReport, salt: &str) {
+    if report.is_clean() {
+        badge(ui, "CLIENTE LIMPIO", theme_ok());
+    } else {
+        badge(ui, "CLIENTE CON MODS", theme_error());
+    }
+
+    if report.detected.is_empty() {
+        ui.weak("Mods detectados: ninguno");
+    } else {
+        ui.label(format!("Mods detectados ({}):", report.detected.len()));
+        for client_mod in &report.detected {
+            ui.colored_label(theme_error(), format!("✗ {} (bit {})", client_mod.name, client_mod.id));
+        }
+    }
+    if !report.reserved_set.is_empty() {
+        let ids = report.reserved_set.iter().map(u8::to_string).collect::<Vec<_>>().join(", ");
+        ui.colored_label(theme_warn(), format!("Bits reservados encendidos: {ids} (no corresponden a un cliente web limpio)"));
+    }
+
+    egui::CollapsingHeader::new(format!("Detalle ({} mods comprobados)", launch_signature::CLIENT_MODS.len()))
+        .id_salt(salt)
+        .show(ui, |ui| {
+            let mono = |text: String| egui::Label::new(egui::RichText::new(text).monospace()).wrap().selectable(true);
+            ui.add(mono(format!("Bytes:        {}", report.bytes_hex())));
+            ui.add(mono(format!("Bytes 0–7:    0x{:016x}  (u64 LE)", report.low_bitfield())));
+            ui.add(mono(format!("Bytes 8–15:   0x{:016x}  (u64 LE)", report.high_bitfield())));
+            ui.weak("Los mods con id ≥ 64 (Legcord en adelante) viven en los bytes 8–15.");
+            ui.add_space(2.0);
+            egui::Grid::new(format!("{salt}_grid")).striped(true).num_columns(3).spacing([12.0, 2.0]).show(ui, |ui| {
+                for client_mod in &launch_signature::CLIENT_MODS {
+                    let present = report.detected.contains(client_mod);
+                    ui.label(client_mod.name);
+                    ui.label(egui::RichText::new(format!("bit {}", client_mod.id)).monospace().weak());
+                    if present {
+                        ui.colored_label(theme_error(), "detectado");
+                    } else {
+                        ui.colored_label(theme_ok(), "ausente");
+                    }
+                    ui.end_row();
+                }
+            });
+        });
+}
+

@@ -3,6 +3,7 @@
 // El binario no dibuja nada acá: solo arma la ventana y delega
 // - la lógica/estado a `lib::state::App`
 // - el dibujado a los módulos de `ui`
+mod app_shell;
 mod bidi;
 mod discord;
 mod lib;
@@ -16,6 +17,9 @@ mod ui;
 mod updater;
 
 use lib::state::App;
+
+/// `ecord --start-hidden`: arranca sin ventana (en la bandeja), p. ej. al iniciar sesión.
+const START_HIDDEN_FLAG: &str = "--start-hidden";
 
 // Ver el comentario de `mimalloc` en Cargo.toml: baja el RSS tras los picos de
 // parseo del gateway porque devuelve las páginas libres al sistema. Sigue
@@ -57,7 +61,7 @@ fn main() -> eframe::Result<()> {
     if std::env::args().any(|arg| arg == discord::captcha::WINDOW_FLAG) {
         discord::captcha::run_window();
     }
-    env_logger::init();
+    logging::init();
     // Una sola ventana de ecord: si ya hay una abierta, se le pide que se
     // muestre y esta instancia se cierra (ver `single_instance`).
     if single_instance::acquire() == single_instance::Role::Secondary {
@@ -69,7 +73,42 @@ fn main() -> eframe::Result<()> {
     let opaque = std::env::var_os("ECORD_OPAQUE").is_some()
         || std::env::var_os("SOMMELIER_VERSION").is_some()
         || std::path::Path::new("/dev/.cros_milestone").exists();
-    let options = eframe::NativeOptions {
+    let start_hidden = std::env::args().any(|arg| arg == START_HIDDEN_FLAG);
+
+    // El `App` vive fuera de la ventana: el `Shell` lo presta a cada ventana
+    // que se abre y lo sigue corriendo (sin ventana) mientras eCord está en la
+    // bandeja. Hilos y bandeja despiertan a la UI con el `Waker`.
+    let waker = app_shell::waker().clone();
+    let mut app = App::default();
+    app.install_tray();
+
+    let shell = fastframe_shell::Shell::new(app, &waker).start_hidden(start_hidden);
+    // En macOS el ícono de la barra de menú solo responde mientras corre el
+    // loop de AppKit: con la ventana cerrada lo corre `idle`. En Windows y
+    // Linux el shell espera en el `Waker` y no hace falta.
+    #[cfg(target_os = "macos")]
+    let shell = shell.idle(fastframe_tray::idle);
+
+    shell.run(|lease| {
+        eframe::run_native(
+            "eCord",
+            native_options(opaque),
+            Box::new(move |cc| {
+                // Cada ventana tiene su propio contexto de egui: las fuentes
+                // (Inter + emoji) y los íconos Lucide se registran en cada una.
+                ui::theme::install(&cc.egui_ctx);
+                // `take` engancha el `Waker` a esta ventana.
+                let mut app = lease.take(&cc.egui_ctx);
+                app.attach_window();
+                Ok(Box::new(app_shell::Window::new(app)))
+            }),
+        )
+    })
+}
+
+/// Opciones de UNA ventana (se llama cada vez que el `Shell` abre una).
+fn native_options(opaque: bool) -> eframe::NativeOptions {
+    eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([900.0, 600.0])
@@ -85,18 +124,5 @@ fn main() -> eframe::Result<()> {
             // Ícono de la ventana / barra de tareas.
             .with_icon(load_icon()),
         ..Default::default()
-    };
-
-    eframe::run_native(
-        "eCord",
-        options,
-        Box::new(|cc| {
-            // Fuentes (Inter + emoji) e íconos Lucide se registran una sola
-            // vez acá, contra el contexto real de la ventana.
-            ui::theme::install(&cc.egui_ctx);
-            // Desde acá una segunda instancia puede pedirle foco a esta ventana.
-            single_instance::set_context(&cc.egui_ctx);
-            Ok(Box::new(App::default()))
-        }),
-    )
+    }
 }

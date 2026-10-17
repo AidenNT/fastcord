@@ -54,6 +54,48 @@ fn shared_fingerprint() -> Arc<ClientFingerprint> {
     Arc::new(ClientFingerprint::new(CLIENT_BUILD_NUMBER))
 }
 
+/// Foto de solo lectura de la identidad que declara este cliente (para las
+/// devtools). `None` hasta que `init_fingerprint` publique el fingerprint
+/// compartido, es decir, hasta que se inicie sesión.
+pub fn current_identity() -> Option<super::fingerprint::ClientIdentity> {
+    let guard = SHARED_FINGERPRINT.read().ok()?;
+    guard.as_ref().map(|fingerprint| fingerprint.identity())
+}
+
+/// Qué manda `RestClient::raw` además de método, ruta y cuerpo.
+#[derive(Clone, Default)]
+pub struct RawOptions {
+    /// Headers del fingerprint web (`discord_rest_headers`).
+    pub client_headers: bool,
+    /// Token de la cuenta en `Authorization`.
+    pub auth: bool,
+    /// Headers extra (nombre, valor), al final.
+    pub extra: Vec<(String, String)>,
+}
+
+/// Resultado de `RestClient::raw`.
+pub struct RawExchange {
+    /// Lo que se mandó, con `Authorization` enmascarado.
+    pub request_headers: Vec<(String, String)>,
+    pub status: u16,
+    pub reason: String,
+    pub version: String,
+    pub response_headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    pub elapsed_ms: u128,
+}
+
+/// `abcd…wxyz (72 caracteres)`: lo justo para reconocer un token sin exponerlo.
+fn mask_secret(secret: &str) -> String {
+    let chars: Vec<char> = secret.chars().collect();
+    if chars.len() <= 12 {
+        return "••••••••".to_owned();
+    }
+    let head: String = chars[..4].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{head}…{tail} ({} caracteres)", chars.len())
+}
+
 #[derive(Clone)]
 pub struct RestClient {
     http: reqwest::Client,
@@ -106,6 +148,79 @@ impl RestClient {
             // Un cliente de verdad (no un bot de la Developer Portal) manda
             // el token pelado en `Authorization`, sin el prefijo `Bot `.
             .header("Authorization", &self.token)
+    }
+
+    /// Pedido REST "crudo" para las devtools (`ui::devtools`, pestaña Discord).
+    ///
+    /// Sale por el mismo `reqwest::Client` que el resto de la app (cookies,
+    /// huella TLS), pero deja decidir qué se manda:
+    /// - `options.client_headers`: los headers del fingerprint web
+    ///   (`X-Super-Properties`, `User-Agent`, `Sec-CH-UA`...);
+    /// - `options.auth`: el token de la cuenta en `Authorization`;
+    /// - `options.extra`: headers sueltos que se agregan al final.
+    ///
+    /// `path` es SIEMPRE relativo a la API (`/users/@me`): una URL completa se
+    /// rechaza para que el token no pueda salir hacia otro dominio.
+    ///
+    /// Devuelve los headers de la petición ya construida con el token
+    /// enmascarado, para poder mostrarlos y copiarlos sin filtrar la cuenta.
+    pub async fn raw(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<String>,
+        options: RawOptions,
+    ) -> Result<RawExchange, String> {
+        if !path.starts_with('/') {
+            return Err("la ruta tiene que empezar con / (es relativa a https://discord.com/api/v10)".to_owned());
+        }
+        let mut builder = self.http.request(method, format!("{API_BASE}{path}"));
+        if options.client_headers {
+            builder = builder.headers(discord_rest_headers(&self.fingerprint));
+        }
+        if options.auth {
+            builder = builder.header("Authorization", &self.token);
+        }
+        for (name, value) in &options.extra {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+        if let Some(body) = body {
+            builder = builder.header("Content-Type", "application/json").body(body);
+        }
+        let request = builder.build().map_err(|error| format!("{error}\n{error:?}"))?;
+
+        let request_headers = request
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                let text = String::from_utf8_lossy(value.as_bytes()).into_owned();
+                if name.as_str().eq_ignore_ascii_case("authorization") {
+                    (name.to_string(), mask_secret(&text))
+                } else {
+                    (name.to_string(), text)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let started = std::time::Instant::now();
+        let response = self.http.execute(request).await.map_err(|error| format!("{error}\n{error:?}"))?;
+        let status = response.status();
+        let version = format!("{:?}", response.version());
+        let response_headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.to_string(), String::from_utf8_lossy(value.as_bytes()).into_owned()))
+            .collect::<Vec<_>>();
+        let body = response.bytes().await.map_err(|error| format!("{error}\n{error:?}"))?.to_vec();
+        Ok(RawExchange {
+            request_headers,
+            status: status.as_u16(),
+            reason: status.canonical_reason().unwrap_or("").to_owned(),
+            version,
+            response_headers,
+            body,
+            elapsed_ms: started.elapsed().as_millis(),
+        })
     }
 
     pub async fn guild_channels(&self, guild_id: &str) -> reqwest::Result<Vec<Channel>> {

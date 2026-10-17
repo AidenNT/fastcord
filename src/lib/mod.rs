@@ -5,3 +5,6 @@ pub mod last_view;
 pub mod notifications;
 pub mod permissions;
 pub mod state;
+pub mod toast_debug;
+#[cfg(windows)]
+pub mod win_toast;

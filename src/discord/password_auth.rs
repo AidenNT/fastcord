@@ -187,14 +187,11 @@ pub(super) async fn post_json(
             }
         }
 
-        let response = auth_session
-            .http()
-            .post(url)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| format!("{send_error}: {error}"))?;
+        // El cuerpo (con la contraseña) no se registra, solo el pedido.
+        let trace = crate::support::nettrace::begin("POST", url, "password_auth (login)");
+        let sent = auth_session.http().post(url).headers(headers).json(&body).send().await;
+        crate::support::nettrace::observe(&trace, &sent);
+        let response = sent.map_err(|error| format!("{send_error}: {error}"))?;
         let status = response.status();
         let text = response
             .text()

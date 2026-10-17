@@ -8,7 +8,9 @@
 //!   (`user_guild_settings`), así que se lee de ahí.
 //! - **Texto** (`preview`, `author_name`): lo que se muestra en la
 //!   notificación, con `<@id>`/`<#id>`/emojis ya convertidos a algo legible.
-//! - **Escritorio** (`send_desktop`): notificación nativa del SO.
+//! - **Escritorio** (`send_desktop`): notificación nativa del SO (con clic
+//!   para volver a la ventana): por `fastframe-notifications` en Linux y macOS,
+//!   y directo por WinRT en Windows (`lib::win_toast`).
 //!
 //! Quién llama a esto y qué hace con el resultado (contadores, toast dentro
 //! de la app, notificación de escritorio) vive en `lib::state::App`.
@@ -357,21 +359,129 @@ fn render_token(token: &str, msg: &GatewayMessage) -> Option<String> {
 // Notificación del escritorio
 // ---------------------------------------------------------------------
 
-/// Manda una notificación nativa del SO. Va en un hilo aparte porque
-/// `notify-rust` puede bloquear (D-Bus en Linux) y esto se llama desde el
-/// hilo de la UI. Si falla (sin servicio de notificaciones, etc.) solo lo
-/// deja en el log: una notificación perdida no justifica molestar al usuario.
-pub fn send_desktop(title: String, body: String) {
-    std::thread::spawn(move || {
-        let result = notify_rust::Notification::new()
-            .appname("eCord")
-            .summary(&title)
-            .body(&body)
-            .show();
-        if let Err(err) = result {
-            log::warn!("no se pudo mostrar la notificación de escritorio: {err}");
+/// Cuántas notificaciones recientes se siguen "observando" (para su clic).
+/// Soltar el handle de una antigua no la borra del centro de notificaciones;
+/// solo libera su listener (algunos escritorios guardan el historial sin avisar
+/// cuándo se descartó, así que no se acumulan indefinidamente).
+#[cfg(not(windows))]
+const KEEP_HANDLES: usize = 32;
+
+#[cfg(not(windows))]
+struct Desktop {
+    client: fastframe_notifications::Client,
+    live: std::sync::Mutex<std::collections::VecDeque<fastframe_notifications::Handle>>,
+}
+
+#[cfg(not(windows))]
+static DESKTOP: std::sync::Mutex<Option<std::sync::Arc<Desktop>>> = std::sync::Mutex::new(None);
+
+/// El servicio de notificaciones, creado en el primer uso (y vuelto a crear si
+/// su hilo se detuvo, ver `send_desktop`). `None` si el SO no lo ofrece (sin
+/// D-Bus, macOS sin bundle firmado): una notificación perdida no justifica
+/// molestar al usuario, solo queda en el log.
+#[cfg(not(windows))]
+fn desktop() -> Option<std::sync::Arc<Desktop>> {
+    let mut slot = DESKTOP.lock().unwrap_or_else(|p| p.into_inner());
+    if slot.is_none() {
+        // El id tiene que ser la identidad de la app instalada: en Windows,
+        // el AppUserModelID del acceso directo (el `identifier` de
+        // `[package.metadata.packager]`); en Linux, el .desktop `ecord`.
+        let app = fastframe_notifications::App::new("dev.ecord.client", "eCord")
+            .desktop_entry("ecord")
+            .icon("ecord");
+        match fastframe_notifications::Client::new(app) {
+            Ok(client) => {
+                *slot = Some(std::sync::Arc::new(Desktop {
+                    client,
+                    live: Default::default(),
+                }));
+            }
+            Err(err) => log::warn!("notificaciones de escritorio no disponibles: {err}"),
         }
-    });
+    }
+    slot.clone()
+}
+
+/// Descarta el servicio actual: el próximo aviso crea uno nuevo.
+#[cfg(not(windows))]
+fn reset_desktop() {
+    *DESKTOP.lock().unwrap_or_else(|p| p.into_inner()) = None;
+}
+
+/// Manda una notificación nativa del SO. No bloquea: `fastframe-notifications`
+/// entrega en su propio hilo, así que se puede llamar desde la UI. Un clic en
+/// la notificación trae la ventana al frente (o la crea, con eCord en la
+/// bandeja). Sin sonido propio del SO: eCord ya reproduce el suyo
+/// (`support::sound_alerts`) y sonarían los dos.
+///
+/// Si el hilo del servicio murió (`Error::Stopped`) se crea uno nuevo y se
+/// reintenta una vez: antes, un fallo así dejaba mudas las notificaciones
+/// hasta reiniciar eCord.
+#[cfg(not(windows))]
+pub fn send_desktop(title: String, body: String) {
+    use fastframe_notifications::{Error, Event, Notification, Sound};
+
+    // Un NUL o un título vacío invalidan la notificación entera.
+    let title = title.replace('\0', "");
+    let title = if title.trim().is_empty() { "eCord".to_string() } else { title };
+    let body = body.replace('\0', "");
+
+    for attempt in 0..2 {
+        let Some(desktop) = desktop() else { return };
+        let notification = Notification::new(title.clone()).body(body.clone()).sound(Sound::Silent);
+        let shown = desktop.client.show_with(notification, |event| match event {
+            Event::Activated => crate::app_shell::request_show(),
+            Event::Failed(err) => log::warn!("no se pudo mostrar la notificación de escritorio: {err}"),
+            _ => {}
+        });
+        match shown {
+            Ok(handle) => {
+                let mut live = desktop.live.lock().unwrap_or_else(|p| p.into_inner());
+                live.push_back(handle);
+                while live.len() > KEEP_HANDLES {
+                    live.pop_front();
+                }
+                return;
+            }
+            Err(Error::Stopped) if attempt == 0 => {
+                log::warn!("el servicio de notificaciones se detuvo: se reinicia");
+                reset_desktop();
+            }
+            Err(err) => {
+                log::warn!("no se pudo encolar la notificación de escritorio: {err}");
+                return;
+            }
+        }
+    }
+}
+
+/// Windows: toast directo con WinRT (`lib::win_toast`). No usa
+/// `fastframe-notifications`: su chequeo previo de permisos falla con
+/// 0x80070490 en una app sin instalar (`cargo run`) y cancela el aviso.
+#[cfg(windows)]
+pub fn send_desktop(title: String, body: String) {
+    send_desktop_with_avatar(title, body, None);
+}
+
+/// Igual que `send_desktop`, con la foto del usuario que escribió (URL del CDN
+/// de Discord). Sin avatar, el aviso sale sin imagen.
+#[cfg(windows)]
+pub fn send_desktop_with_avatar(title: String, body: String, avatar_url: Option<String>) {
+    let title = title.replace('\0', "");
+    let title = if title.trim().is_empty() { "eCord".to_string() } else { title };
+    let body = body.replace('\0', "");
+    if let Err(err) = crate::lib::win_toast::send(&title, &body, avatar_url.as_deref()) {
+        log::warn!(
+            "no se pudo mostrar la notificación de escritorio: {err:?} (HRESULT {:#010x})",
+            err.code().0 as u32
+        );
+    }
+}
+
+/// Fuera de Windows el aviso no lleva imagen (por ahora).
+#[cfg(not(windows))]
+pub fn send_desktop_with_avatar(title: String, body: String, _avatar_url: Option<String>) {
+    send_desktop(title, body);
 }
 
 #[cfg(test)]

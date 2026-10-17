@@ -5,6 +5,8 @@ pub mod captcha;
 pub mod clearance;
 pub mod image;
 pub mod mfa;
+pub mod netlog;
+mod nettrace;
 pub mod rate_limit;
 mod response;
 pub mod rest;

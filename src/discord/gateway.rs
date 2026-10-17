@@ -595,7 +595,9 @@ async fn connect_and_run(
     }
 
     crate::discord::step(tx, "Conectando con el gateway…");
-    let ws_stream = websocket::connect(&url).await?;
+    let ws_stream = websocket::connect(&url, websocket::NetKind::Gateway, "gateway (sesión principal de la cuenta)").await?;
+    // Id en el registro de tráfico de las devtools (0 si están apagadas).
+    let net_conn = ws_stream.conn_id();
     let (mut write, mut read) = ws_stream.split();
     let mut zlib = GatewayZlibDecoder::default();
 
@@ -710,7 +712,12 @@ async fn connect_and_run(
         let text = match msg {
             Message::Text(text) => text.to_string(),
             Message::Binary(bytes) => match zlib.decode(&bytes)? {
-                Some(text) => text,
+                Some(text) => {
+                    // En el cable es zlib-stream: el registro de tráfico guarda
+                    // el JSON ya descomprimido, que es lo legible.
+                    discord_client_rest::netlog::frame_decoded(net_conn, &text);
+                    text
+                }
                 None => continue,
             },
             Message::Close(frame) => {

@@ -28,9 +28,11 @@ use super::ids::{
 };
 
 /// Fallback used only when the live build number cannot be fetched at startup.
-pub(super) const CLIENT_BUILD_NUMBER: u64 = 580_004;
+pub(super) const CLIENT_BUILD_NUMBER: u64 = 630_444;
 pub(super) const CLIENT_BROWSER: &str = "Chrome";
-pub(super) const CLIENT_BROWSER_VERSION: &str = "150.0.0.0";
+/// Debe coincidir con la emulación TLS de `wreq` (Chrome149) que usa el REST
+/// vendorizado y los WebSockets: así todas las pilas declaran el mismo Chrome.
+pub(super) const CLIENT_BROWSER_VERSION: &str = "149.0.0.0";
 pub(super) const DISCORD_ORIGIN: &str = "https://discord.com";
 
 const DISCORD_CHANNELS_REFERER: &str = "https://discord.com/channels/@me";
@@ -86,6 +88,26 @@ impl ClientFingerprint {
             .expect("installation id lock is not poisoned") = identifiers.installation;
     }
 
+    /// Foto de solo lectura de lo que este cliente declara de sí mismo: lo que
+    /// muestran las devtools (pestaña "Identidad"). El `X-Super-Properties`
+    /// sale de la misma función que arma el header real, así que es exactamente
+    /// lo que viaja.
+    pub fn identity(&self) -> ClientIdentity {
+        let super_properties_json = super_properties_json(self);
+        let super_properties_b64 = STANDARD.encode(&super_properties_json);
+        ClientIdentity {
+            super_properties_b64,
+            super_properties_json,
+            installation_id: self.installation_id(),
+            anonymous_fingerprint: self.anonymous_fingerprint.clone(),
+            launch_signature: self.launch_signature.clone(),
+            client_launch_id: self.client_launch_id.clone(),
+            client_heartbeat_session_id: self.client_heartbeat_session_id.clone(),
+            client_build_number: self.client_build_number,
+            user_agent: self.user_agent.clone(),
+        }
+    }
+
     pub(super) fn installation_id(&self) -> Option<String> {
         self.installation_id
             .read()
@@ -102,12 +124,31 @@ impl ClientFingerprint {
     }
 }
 
+/// Identidad del cliente tal como la ve Discord (ver [`ClientFingerprint::identity`]).
+#[derive(Clone, Debug)]
+pub struct ClientIdentity {
+    /// Valor exacto del header `X-Super-Properties` (base64).
+    pub super_properties_b64: String,
+    /// El JSON dentro del base64, con el orden de claves con que se envía.
+    pub super_properties_json: String,
+    /// Header `X-Installation-ID` (también va en el `IDENTIFY` del Gateway).
+    pub installation_id: Option<String>,
+    /// Header `X-Fingerprint`.
+    pub anonymous_fingerprint: Option<String>,
+    pub launch_signature: String,
+    pub client_launch_id: String,
+    pub client_heartbeat_session_id: String,
+    pub client_build_number: u64,
+    pub user_agent: String,
+}
+
 #[derive(Serialize)]
 struct SuperProperties<'a> {
     os: &'a str,
     browser: &'static str,
     device: &'static str,
     system_locale: &'a str,
+    has_client_mods: bool,
     browser_user_agent: &'a str,
     browser_version: &'static str,
     os_version: &'a str,
@@ -118,7 +159,6 @@ struct SuperProperties<'a> {
     release_channel: &'static str,
     client_build_number: u64,
     client_event_source: Option<String>,
-    has_client_mods: bool,
     client_launch_id: &'a str,
     launch_signature: &'a str,
     client_app_state: &'static str,
@@ -519,7 +559,7 @@ pub(super) fn insert_fingerprint_header(headers: &mut HeaderMap, fingerprint: &C
 fn insert_chrome_client_hints(headers: &mut HeaderMap, os: &str) {
     headers.insert(
         "Sec-CH-UA",
-        HeaderValue::from_static("\"Not;A=Brand\";v=\"8\", \"Chromium\";v=\"150\", \"Google Chrome\";v=\"150\""),
+        HeaderValue::from_static("\"Not;A=Brand\";v=\"8\", \"Chromium\";v=\"149\", \"Google Chrome\";v=\"149\""),
     );
     headers.insert("Sec-CH-UA-Mobile", HeaderValue::from_static("?0"));
     headers.insert(
@@ -533,11 +573,16 @@ fn insert_chrome_client_hints(headers: &mut HeaderMap, os: &str) {
 }
 
 fn build_super_properties(fingerprint: &ClientFingerprint) -> String {
+    STANDARD.encode(super_properties_json(fingerprint))
+}
+
+fn super_properties_json(fingerprint: &ClientFingerprint) -> String {
     let properties = SuperProperties {
         os: fingerprint.os,
         browser: CLIENT_BROWSER,
         device: "",
         system_locale: &fingerprint.system_locale,
+        has_client_mods: false,
         browser_user_agent: &fingerprint.user_agent,
         browser_version: CLIENT_BROWSER_VERSION,
         os_version: &fingerprint.os_version,
@@ -548,32 +593,30 @@ fn build_super_properties(fingerprint: &ClientFingerprint) -> String {
         release_channel: "stable",
         client_build_number: fingerprint.client_build_number,
         client_event_source: None,
-        has_client_mods: true,
         client_launch_id: &fingerprint.client_launch_id,
         launch_signature: &fingerprint.launch_signature,
         client_app_state: "focused",
         client_heartbeat_session_id: &fingerprint.client_heartbeat_session_id,
     };
-    let raw = serde_json::to_vec(&properties).expect("super properties serialize");
-    STANDARD.encode(raw)
+    serde_json::to_string(&properties).expect("super properties serialize")
 }
 
 async fn fetch_client_build_number(client: &reqwest::Client) -> Option<u64> {
-    let app_html = client
-        .get(format!("{DISCORD_ORIGIN}/app"))
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
+    let app_url = format!("{DISCORD_ORIGIN}/app");
+    let trace = crate::support::nettrace::begin("GET", &app_url, "fingerprint (build number de Discord Web)");
+    let app_result = client.get(&app_url).timeout(Duration::from_secs(5)).send().await;
+    crate::support::nettrace::observe(&trace, &app_result);
+    let app_html = app_result
         .ok()?
         .text()
         .await
         .ok()?;
     let asset_path = find_sentry_asset_path(&app_html)?;
-    let asset = client
-        .get(format!("{DISCORD_ORIGIN}{asset_path}"))
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
+    let asset_url = format!("{DISCORD_ORIGIN}{asset_path}");
+    let trace = crate::support::nettrace::begin("GET", &asset_url, "fingerprint (build number de Discord Web)");
+    let asset_result = client.get(&asset_url).timeout(Duration::from_secs(5)).send().await;
+    crate::support::nettrace::observe(&trace, &asset_result);
+    let asset = asset_result
         .ok()?
         .text()
         .await
@@ -626,13 +669,10 @@ async fn fetch_session_identifier(
     url: &str,
     headers: HeaderMap,
 ) -> std::result::Result<SessionIdentifiers, String> {
-    let response = client
-        .get(url)
-        .headers(headers)
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-        .map_err(|error| format!("request failed: {error}"))?;
+    let trace = crate::support::nettrace::begin("GET", url, "fingerprint (identificadores de sesión)");
+    let result = client.get(url).headers(headers).timeout(Duration::from_secs(5)).send().await;
+    crate::support::nettrace::observe(&trace, &result);
+    let response = result.map_err(|error| format!("request failed: {error}"))?;
     let status = response.status();
     if !status.is_success() {
         return Err(format!("HTTP status {}", status.as_u16()));
@@ -834,5 +874,61 @@ fn operating_system_arch() -> &'static str {
         "x86_64" => "x64",
         "aarch64" => "arm64",
         arch => arch,
+    }
+}
+
+#[cfg(test)]
+mod super_properties_tests {
+    use super::*;
+
+    fn decoded(fp: &ClientFingerprint) -> (String, serde_json::Value) {
+        let raw = String::from_utf8(STANDARD.decode(build_super_properties(fp)).unwrap()).unwrap();
+        let value = serde_json::from_str(&raw).unwrap();
+        (raw, value)
+    }
+
+    #[test]
+    fn super_properties_are_web_clean() {
+        let fp = ClientFingerprint::new(CLIENT_BUILD_NUMBER);
+        let (raw, v) = decoded(&fp);
+        assert_eq!(v["has_client_mods"], false);
+        assert_eq!(v["browser"], "Chrome");
+        assert_eq!(v["browser_version"], CLIENT_BROWSER_VERSION);
+        assert!(raw.find("\"system_locale\"").unwrap() < raw.find("\"has_client_mods\"").unwrap());
+        assert!(raw.find("\"has_client_mods\"").unwrap() < raw.find("\"browser_user_agent\"").unwrap());
+    }
+
+    #[test]
+    fn generated_launch_signature_is_clean_for_the_decoder() {
+        use crate::discord::launch_signature::analyze;
+        for _ in 0..256 {
+            let report = analyze(&generate_launch_signature()).unwrap();
+            assert!(report.is_clean(), "mods detectados: {:?}", report.detected);
+            assert!(report.reserved_set.is_empty());
+        }
+    }
+
+    #[test]
+    fn identity_matches_the_header_value() {
+        let fp = ClientFingerprint::new(CLIENT_BUILD_NUMBER);
+        let identity = fp.identity();
+        assert_eq!(identity.super_properties_b64, build_super_properties(&fp));
+        let decoded = String::from_utf8(STANDARD.decode(&identity.super_properties_b64).unwrap()).unwrap();
+        assert_eq!(decoded, identity.super_properties_json);
+    }
+
+    #[test]
+    fn launch_signature_bits_are_masked() {
+        let mask = [
+            0b1111_1111u8, 0b0111_1111, 0b1110_1111, 0b1110_1111, 0b1111_0111, 0b1110_1111, 0b1111_0111,
+            0b1111_1111, 0b1101_1111, 0b0111_1110, 0b1111_1111, 0b1011_1111, 0b1111_1110, 0b1111_1111,
+            0b1111_0111, 0b1111_1111,
+        ];
+        for _ in 0..256 {
+            let sig = Uuid::parse_str(&generate_launch_signature()).unwrap();
+            for (byte, mask) in sig.as_bytes().iter().zip(mask) {
+                assert_eq!(byte & !mask, 0);
+            }
+        }
     }
 }
