@@ -2,7 +2,7 @@
 name = "ecord"
 version = "0.0.14"
 edition = "2024"
-# Hay dos ejecutables (`ecord` y `ecord-captcha`, ver src/bin): `cargo run` arranca la app.
+# Hay tres ejecutables (`ecord`, `ecord-captcha` y `ecord-updater`, ver src/bin): `cargo run` arranca la app.
 default-run = "ecord"
 # bidi.rs y system_fonts.rs usan let-chains ("if let ... && ...", estabilizado
 # en la edición 2024), así que hace falta un rustc razonablemente reciente.
@@ -212,13 +212,15 @@ rfd = "0.15"
 # Pegar una captura / imagen del portapapeles como adjunto (Ctrl+V).
 arboard = "3"
 
-# --- Actualizaciones automáticas (src/updater.rs) ---
-# De fastframe (github.com/crmne/fastframe, MIT), fijado a un commit. Busca versiones
+# --- Actualizaciones automáticas (src/updater.rs, src/bin/ecord-updater.rs) ---
+# De fastframe (github.com/crmne/fastframe, MIT), vendorizado en vendor/fastframe-update
+# con una extensión: `UpdateConfig::helper_executable`, que permite que quien instala sea
+# el ejecutable aparte `ecord-updater` en vez de una copia de `ecord` con todas sus DLL. Busca versiones
 # en los releases de GitHub, verifica la firma Ed25519 y el SHA-256, y
 # reemplaza el ejecutable con un ayudante que restaura la anterior si la
 # nueva no arranca. `reqwest` = el transporte sobre reqwest 0.12 blocking
 # (el cliente de arriba ya lo compila con rustls y proxy del sistema).
-fastframe-update = { git = "https://github.com/crmne/fastframe", rev = "3339a8bc524a51c47f87ca78c368dde3569d90f5", features = ["reqwest"] }
+fastframe-update = { path = "vendor/fastframe-update", features = ["reqwest"] }
 
 # --- Segundo plano (src/app_shell.rs, src/lib/state/resident.rs) ---
 # De fastframe, MISMO commit que fastframe-update (Cargo cuenta cada `rev`
@@ -289,6 +291,12 @@ deepfilternet-ort = ["voice-playback", "dep:deepfilter-rt"]
 # system_fonts.rs: lee el idioma de la UI de Windows para elegir la variante
 # de fuente CJK correcta.
 [target.'cfg(windows)'.dependencies]
+# gpl_pack.rs (paquete opcional FFmpeg GPL con libx264): `ring` verifica la firma
+# Ed25519 de checksums.txt (ya está en el árbol: es el proveedor de rustls) y
+# `zip` abre el paquete descargado. Tras añadirlas, corré `cargo check` una vez
+# y commiteá el Cargo.lock actualizado (el CI compila con --locked).
+ring = "0.17"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 # `Win32_Graphics_Dwm` y `Win32_System_Threading`: voice/window_list.rs (lista de
 # ventanas del selector de "Compartir pantalla": ventanas ocultas por DWM,
 # proceso dueño y nombre del ejecutable). `Win32_Graphics_Gdi` y `Win32_Storage_Xps`:
@@ -388,7 +396,16 @@ license-file = "LICENSE"
 category = "SocialNetworking"
 out-dir = "dist-installers"
 binaries-dir = "target/release"
-binaries = [{ path = "ecord", main = true }]
+# Todos los ejecutables del proyecto van en el instalador, junto a `ecord`:
+#   ecord          la aplicación.
+#   ecord-captcha  ventana del captcha (en Linux es la que lanza `ecord`; en Windows/macOS
+#                  la ventana va dentro de `ecord` y este ejecutable solo avisa y sale).
+#   ecord-updater  quien instala las actualizaciones (el actualizador lo busca junto a `ecord`).
+binaries = [
+    { path = "ecord", main = true },
+    { path = "ecord-captcha" },
+    { path = "ecord-updater" },
+]
 # cargo-packager elige el ícono que corresponde a cada sistema.
 icons = ["assets/packaging/icon.ico", "assets/packaging/icon.icns", "assets/packaging/icon.png"]
 # DLLs (Windows) o dylibs (macOS) que el CI copia aquí antes de empaquetar.

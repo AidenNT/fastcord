@@ -60,7 +60,7 @@ use microphone::*;
 #[cfg(test)]
 use runtime::{VoiceRuntimeAction, VoiceRuntimeState};
 pub(crate) use runtime::{forward_app_event, run_voice_runtime};
-pub(crate) use screen_capture::{CaptureTarget, ScreenCaptureConfig, StreamQuality};
+pub(crate) use screen_capture::{CaptureTarget, ScreenCaptureConfig, StreamQuality, x264_available};
 pub(crate) use source_thumbs::{ThumbKey, Thumbnail, spawn_source_thumbnails};
 pub use state::{CurrentVoiceConnectionState, VoiceAudioSettings, VoiceCache, VoiceParticipantState};
 pub use stream_publish::StreamPublishStatus;

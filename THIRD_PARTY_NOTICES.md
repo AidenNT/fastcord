@@ -24,6 +24,11 @@ into the executable.
 | Windows installer (`-setup.exe`) and portable `.zip` | DLLs from BtbN FFmpeg-Builds (`lgpl-shared`), installed next to `ecord.exe` | **GNU LGPL 2.1 or later** |
 | macOS `.dmg` (experimental) | Libraries from Homebrew's `ffmpeg@7`, copied into the app bundle | Treat as **GNU GPL**: Homebrew builds FFmpeg with GPL components |
 
+The Windows FFmpeg build has no libx264 (GPL). Screen sharing there uses the GPU
+encoders (NVENC, AMF, Quick Sync) and, as a software fallback, **OpenH264**
+(BSD-2-Clause, © Cisco Systems), which BtbN compiles into `avcodec`. Linux and
+macOS use libx264.
+
 The exact FFmpeg license terms of each build are in the `FFmpeg-LICENSE.txt` /
 `ffmpeg-LICENSE.txt` file shipped with the package (on Linux:
 `/usr/share/doc/ecord/ffmpeg-LICENSE.txt`).

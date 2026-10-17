@@ -1,6 +1,12 @@
 //! Actualizaciones automáticas de ecord (crate `fastframe-update`, dependencia de git
 //! fijada a un commit en `Cargo.toml`).
 //!
+//! Quién instala la actualización es `ecord-updater` (src/bin/ecord-updater.rs),
+//! un ejecutable aparte y chico que viaja junto a `ecord`; la configuración que
+//! comparten está en `src/update_config.rs`. Si falta junto al ejecutable, el
+//! traspaso cae a lo de antes: una copia de `ecord` con `--apply-update`
+//! (que sigue atendiendo [`intercept`]).
+//!
 //! Este módulo no dibuja nada y no conoce a `App`: guarda el estado en un
 //! `static` y lo expone con [`view`]. La UI (`ui::settings::updates`) lo lee
 //! cada frame y decide qué mostrar. Qué hace cada pieza:
@@ -21,6 +27,9 @@
 //!   con un aviso previo, actualiza desde una instancia elevada sin ventana y
 //!   reabre eCord sin privilegios.
 //!
+//! * Las DLL que viajan junto a `ecord` (FFmpeg, ONNX Runtime) las actualiza el
+//!   mismo ayudante: ver `UPDATES.libraries` en `update_config.rs`.
+//!
 //! Qué NO hace: actualizar copias instaladas por un gestor de paquetes (.deb,
 //! Flatpak, Homebrew, `cargo install`...) ni copias sin el archivo marcador de
 //! `packaging/` junto al ejecutable. En esos casos [`view`] devuelve
@@ -34,33 +43,10 @@ use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use fastframe_update::{
-    CHECK_INTERVAL, DownloadState, Launch, MacConfig, Receipt, Release, ReqwestTransport, UpdateConfig, Unsupported,
-    Updater,
+    CHECK_INTERVAL, DownloadState, Launch, Receipt, Release, ReqwestTransport, Unsupported, Updater,
 };
 
-/// Repositorio de GitHub (`dueño/nombre`) donde se publican las versiones.
-///
-/// TODO(antes de publicar): poné el tuyo. Mientras siga con este valor de
-/// ejemplo, las actualizaciones quedan desactivadas (ver `UpdateConfig::validate`
-/// más abajo y el test `la_configuracion_es_valida`).
-pub const REPOSITORY: &str = "AidenNT/fastcord";
-
-/// Cómo se describe ecord al updater. El nombre de comando (`ecord`) define
-/// los nombres de los archivos de cada versión (`ecord-v0.1.0-x86_64-unknown-linux-gnu.tar.gz`),
-/// el archivo marcador (`ecord-portable.txt`) y lo que imprime `--version`.
-pub const UPDATES: UpdateConfig = UpdateConfig {
-    macos: MacConfig {
-        // El mismo `identifier` de `[package.metadata.packager]` en Cargo.toml.
-        bundle_ids: &["dev.ecord.client"],
-        executable_names: &[],
-        legacy_bundle_names: &[],
-    },
-    // Clave PÚBLICA Ed25519 (64 caracteres hexadecimales). Cada versión tiene
-    // que publicar `checksums.txt` y `checksums.txt.sig` firmado con la clave
-    // privada correspondiente; sin firma válida no se descarga nada.
-    publisher_key: Some(include_str!("../assets/update-public-key.hex")),
-    ..UpdateConfig::new(REPOSITORY, "eCord", "ecord", env!("CARGO_PKG_VERSION"))
-};
+pub use crate::update_config::{REPOSITORY, UPDATES};
 
 pub use elevation::{needs_elevation, request_elevated_update, take_error as take_elevation_error};
 use elevation::{DEELEVATE_FLAG, ELEVATED_FLAG};

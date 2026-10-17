@@ -1,0 +1,573 @@
+//! Self-update from GitHub releases for fastframe apps.
+//!
+//! The app describes itself once in an [`UpdateConfig`], gives an
+//! [`Updater`] its own HTTP client as a [`Transport`], and keeps every
+//! decision about when to check, what to show and how to word it:
+//!
+//! ```no_run
+//! use fastframe_update::{Launch, UpdateConfig, Updater};
+//!
+//! const UPDATES: UpdateConfig = UpdateConfig {
+//!     legacy_names: &["fastsapp"],
+//!     // In the app: include_str!("../assets/update-public-key.hex")
+//!     publisher_key: Some("c2256da754d1d10b855348fdff0070f4e415424ef9237a39276a3c1e55bdbe35"),
+//!     ..UpdateConfig::new("crmne/zapfast", "ZapFast", "zapfast", env!("CARGO_PKG_VERSION"))
+//! };
+//!
+//! # struct MyClient;
+//! # impl fastframe_update::Transport for MyClient {
+//! #     fn get(&self, _: &fastframe_update::Request<'_>) -> anyhow::Result<fastframe_update::Response> {
+//! #         unimplemented!()
+//! #     }
+//! # }
+//! fn main() -> anyhow::Result<()> {
+//!     // First thing: run the helper when asked to, and take the update flags
+//!     // off the command line before the app parses it.
+//!     let launch: Launch = fastframe_update::intercept(&UPDATES);
+//!     // ... parse `launch.arguments`, show `launch.error` as a toast ...
+//!
+//!     // On a worker thread, when the app decides to check:
+//!     let updater = Updater::new(UPDATES, MyClient);
+//!     if let Some(release) = updater.check()? {
+//!         if updater.installation().is_ok() {
+//!             let prepared = updater.download(&release, |received, total| {
+//!                 // report progress
+//!             })?;
+//!             // After the user chooses to restart:
+//!             updater.handoff(prepared, vec!["--verbose".into()])?;
+//!             // Now quit the app; the helper waits for it to exit.
+//!         }
+//!     }
+//!
+//!     // After the first frame of a relaunched app:
+//!     if let Some(receipt) = launch.receipt {
+//!         receipt.acknowledge()?;
+//!     }
+//!     Ok(())
+//! }
+//! ```
+//!
+//! # How an update is installed
+//!
+//! 1. [`Updater::check`] reads the latest GitHub release and compares it with
+//!    the version the app passed in [`UpdateConfig::current_version`].
+//! 2. [`Updater::installation`] decides whether this copy may replace itself.
+//!    Package-manager installs (Flatpak, Snap, apt, dnf, pacman, Nix,
+//!    Homebrew, cargo) are refused with an [`Unsupported`] reason, as is any
+//!    Linux or Windows copy without a portable or installer marker file.
+//! 3. [`Updater::download`] fetches `checksums.txt`, verifies its Ed25519
+//!    signature (`checksums.txt.sig`) against the embedded publisher key,
+//!    downloads the package into a fresh staging folder beside the app and
+//!    checks its SHA-256. It then unpacks the executable and asks it for its
+//!    `--version`, or on macOS checks the disk image's bundle identity,
+//!    version and code signature.
+//! 4. [`Updater::handoff`] copies the running app into the staging folder as
+//!    a helper, writes `handoff.json`, and starts the helper with
+//!    `--apply-update`. The app then quits.
+//! 5. The helper waits for the app to exit, backs it up as `previous`,
+//!    replaces it and relaunches it with `--update-receipt`. The new app
+//!    calls [`Receipt::acknowledge`] once its window is up, which writes
+//!    `started`. If that never happens within a minute, or anything before
+//!    fails, the helper restores `previous` and restarts the old app with
+//!    `--update-error`.
+//!
+//! The helper is always a copy of the app that downloaded the update, and
+//! the relaunched app reads the receipt it wrote. The file names, flags and
+//! JSON shape are therefore a contract between versions; see the crate
+//! README and `tests/fixtures`.
+
+use std::time::Duration;
+
+mod detect;
+mod download;
+mod helper;
+mod host;
+mod libraries;
+mod macos;
+mod release;
+mod rename;
+#[cfg(feature = "reqwest")]
+mod reqwest_transport;
+mod shortcuts;
+mod signing;
+mod stage;
+mod startup;
+mod transport;
+mod updater;
+mod version;
+
+pub use detect::{Installation, Kind, PackageManager, Unsupported};
+pub use release::Release;
+#[cfg(feature = "reqwest")]
+pub use reqwest_transport::ReqwestTransport;
+pub use stage::Prepared;
+pub use startup::{Launch, Receipt, apply_if_requested, intercept};
+pub use transport::{Request, Response, Source, Transport};
+pub use updater::Updater;
+pub use version::is_newer;
+
+/// How often apps check for a newer release: once a day.
+pub const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The command-line flag that runs the helper: `app --apply-update <job>`.
+pub const APPLY_UPDATE_FLAG: &str = "--apply-update";
+/// The flag the helper passes to a successfully replaced app.
+pub const UPDATE_RECEIPT_FLAG: &str = "--update-receipt";
+/// The flag the helper passes, with a message, to a restored app.
+pub const UPDATE_ERROR_FLAG: &str = "--update-error";
+
+/// Everything the updater needs to know about the app.
+///
+/// Build it with [`UpdateConfig::new`] and override the rest with struct
+/// update syntax. Every value is `'static`, so it fits in a `const`.
+#[derive(Clone, Copy, Debug)]
+pub struct UpdateConfig {
+    /// The GitHub repository, `owner/name`, for example `crmne/zapfast`.
+    pub repository: &'static str,
+    /// The display name, for example `ZapFast`. Used in the user agent and
+    /// as the macOS bundle name (`ZapFast.app`).
+    pub app_name: &'static str,
+    /// The lowercase command name, for example `zapfast`. Release assets
+    /// (`zapfast-v1.2.3-<target>.tar.gz`), the executable inside them (unless
+    /// [`UpdateConfig::portable_executable`] names another), the staging folder (`.zapfast-update-<random>`), the marker files
+    /// (`zapfast-portable.txt`) and the expected `--version` output
+    /// (`zapfast 1.2.3`) all derive from it.
+    pub slug: &'static str,
+    /// The running app's version: pass `env!("CARGO_PKG_VERSION")` from the
+    /// app's own crate. Inside this crate that macro would name fastframe's
+    /// version instead.
+    pub current_version: &'static str,
+    /// The app's file inside a portable archive, when it is not the slug:
+    /// `<slug>-v<version>-<target>/<name>`, plus `.exe` on Windows. For
+    /// archives that ship more than one program, such as TonePush's
+    /// `tonepush` command-line tool beside its `tonepush-gui` editor. That
+    /// file is unpacked, probed and installed over the running executable,
+    /// and a portable copy updates itself only when the running executable
+    /// has this name, so a sibling program next to the same marker is never
+    /// replaced by it. The `--version` probe still expects
+    /// `<slug> <version>`. `None`, the default, means the slug. It changes
+    /// nothing for macOS bundles or the Windows installer.
+    pub portable_executable: Option<&'static str>,
+    /// A small program shipped beside the app whose only job is to install
+    /// updates, for example `ecord-updater` (plus `.exe` on Windows).
+    ///
+    /// Without it the helper is a copy of the running app, and on Windows
+    /// the app's DLLs have to be copied beside it too. With it, [`Updater::handoff`]
+    /// copies this program from the folder the app runs from into the staging
+    /// folder and runs that: no DLLs, no app start-up code, a fraction of the
+    /// size. The program calls [`apply_if_requested`] first thing in `main`
+    /// and answers `--version` with `<slug> <version>`.
+    ///
+    /// A portable archive may carry the program next to the app
+    /// (`<slug>-v<version>-<target>/<name>`). When it does, the update
+    /// unpacks it too, and once the new app has started the helper installs it
+    /// beside the app, so the next update runs the new helper. The helper that
+    /// installs an update is always the one that was already installed. If the
+    /// program is missing from the app's folder, the handoff falls back to a
+    /// copy of the running app, as with `None`, the default. It changes
+    /// nothing for macOS bundles or the Windows installer, whose package
+    /// installs every file itself.
+    pub helper_executable: Option<&'static str>,
+    /// Names the app shipped under before, for example `fastpotify`. Each
+    /// is accepted wherever the slug is: marker files, `--version` output,
+    /// staging folders and Homebrew casks.
+    pub legacy_names: &'static [&'static str],
+    /// Where the Windows installer put the app before it wrote an installer
+    /// marker, relative to `%LOCALAPPDATA%`. The default location,
+    /// `Programs/<app_name>/<slug>.exe`, is always checked.
+    pub legacy_windows_installs: &'static [&'static str],
+    /// The macOS bundle's identity.
+    pub macos: MacConfig,
+    /// The publisher's Ed25519 public key, 64 hexadecimal characters, usually
+    /// `include_str!` of a key file. With a key, a release must carry
+    /// `checksums.txt.sig`, a raw 64-byte signature over the exact bytes of
+    /// `checksums.txt`, or nothing is downloaded. `None` trusts the checksum
+    /// file as served by GitHub, which only protects against corruption.
+    pub publisher_key: Option<&'static str>,
+    /// More publisher keys a release may be signed with, for rotating keys:
+    /// ship the next key here, keep signing with `publisher_key`, then sign
+    /// with the next key once installs trust it. A signature valid under any
+    /// of these or `publisher_key` is accepted. Needs `publisher_key`.
+    pub additional_publisher_keys: &'static [&'static str],
+    /// Whether pre-releases (`0.3.0-alpha.4`) are offered. The default,
+    /// [`Prereleases::Never`], reads only GitHub's latest release, which is
+    /// never a pre-release.
+    pub prereleases: Prereleases,
+    /// Which macOS disk image a release carries. The default,
+    /// [`MacTarget::Universal`], is `<slug>-v<version>-macos-universal.dmg`.
+    pub mac_target: MacTarget,
+    /// Which program built the Windows setup (`<slug>-v<version>-<target>-setup.exe`),
+    /// because each one is silenced with different arguments. The default,
+    /// [`InstallerKind::Inno`], passes Inno Setup's `/VERYSILENT`; an NSIS
+    /// setup (what `cargo packager --formats nsis` builds) ignores that and
+    /// opens its wizard, so such an app sets [`InstallerKind::Nsis`].
+    pub installer: InstallerKind,
+    /// File extensions, without the dot and compared ignoring case, of the
+    /// libraries that travel beside the app and have to change with it, for
+    /// example `&["dll"]` for an app that ships FFmpeg's DLLs. Empty (the
+    /// default) means the update touches only the executable.
+    ///
+    /// For a portable copy, every file with one of these extensions that sits
+    /// directly in the archive's `<slug>-v<version>-<target>/` folder is
+    /// verified, unpacked and installed with the executable, and the new
+    /// executable is probed with *its* libraries beside it. For the setup
+    /// program, whose package installs its own files, the libraries in the
+    /// app's folder are only backed up. In both cases a failed or
+    /// non-starting update puts the previous libraries back with the previous
+    /// executable.
+    pub libraries: &'static [&'static str],
+}
+
+/// The program that built the Windows setup an update runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InstallerKind {
+    /// Inno Setup: `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=... /LOG=...`.
+    #[default]
+    Inno,
+    /// NSIS (`cargo packager --formats nsis`): `/S /D=<folder>`.
+    Nsis,
+}
+
+/// The macOS build a release publishes, which names its disk image.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MacTarget {
+    /// One universal disk image for Apple silicon and Intel Macs:
+    /// `<slug>-v<version>-macos-universal.dmg`.
+    #[default]
+    Universal,
+    /// Apple silicon only: `<slug>-v<version>-macos-arm64.dmg`. A copy
+    /// running as x86_64 is refused with [`Unsupported::Platform`]. That is
+    /// the architecture of the running executable: an Intel Mac, or an x86_64
+    /// build translated by Rosetta. An arm64 executable only runs on Apple
+    /// silicon, so it always receives the update.
+    Arm64Only,
+}
+
+/// Which releases an app running a pre-release may move to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Prereleases {
+    /// Only stable releases, from GitHub's latest release. A release
+    /// candidate still hears about its final release.
+    #[default]
+    Never,
+    /// When [`UpdateConfig::current_version`] is itself a pre-release,
+    /// every published, non-draft release is considered and the highest
+    /// version above the running one by semver precedence is offered,
+    /// whether a newer pre-release (`alpha.10` after `alpha.9`) or a stable
+    /// release. A stable build behaves as with [`Prereleases::Never`] and is
+    /// never offered a pre-release.
+    WhenRunningPrerelease,
+}
+
+impl UpdateConfig {
+    /// A configuration with no legacy names, no macOS identifiers and no
+    /// publisher key.
+    pub const fn new(
+        repository: &'static str,
+        app_name: &'static str,
+        slug: &'static str,
+        current_version: &'static str,
+    ) -> Self {
+        Self {
+            repository,
+            app_name,
+            slug,
+            current_version,
+            portable_executable: None,
+            helper_executable: None,
+            legacy_names: &[],
+            legacy_windows_installs: &[],
+            macos: MacConfig {
+                bundle_ids: &[],
+                executable_names: &[],
+                legacy_bundle_names: &[],
+            },
+            publisher_key: None,
+            additional_publisher_keys: &[],
+            prereleases: Prereleases::Never,
+            mac_target: MacTarget::Universal,
+            installer: InstallerKind::Inno,
+            libraries: &[],
+        }
+    }
+
+    /// Checks the values an app cannot get right by accident: the
+    /// repository shape, the slug, the version, and the publisher key. Call
+    /// it from a unit test in the app.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        use anyhow::ensure;
+        let valid_name = |name: &str| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        };
+        ensure!(
+            self.repository
+                .split_once('/')
+                .is_some_and(|(owner, name)| valid_name(owner) && valid_name(name)),
+            "The repository must be owner/name"
+        );
+        for name in self.names() {
+            ensure!(
+                valid_name(name) && name == name.to_ascii_lowercase(),
+                "Command names must be lowercase: {name}"
+            );
+        }
+        if let Some(name) = self.portable_executable {
+            ensure!(
+                valid_name(name)
+                    && !name.starts_with('.')
+                    && !name.to_ascii_lowercase().ends_with(".exe"),
+                "The portable executable must be a plain file name without .exe: {name}"
+            );
+        }
+        if let Some(name) = self.helper_executable {
+            ensure!(
+                valid_name(name)
+                    && !name.starts_with('.')
+                    && !name.to_ascii_lowercase().ends_with(".exe")
+                    && name != self.slug
+                    && Some(name) != self.portable_executable,
+                "The helper executable must be a plain file name without .exe, \
+                 different from the app's: {name}"
+            );
+        }
+        ensure!(
+            version::parse(self.current_version).is_some(),
+            "The current version must be major.minor.patch"
+        );
+        ensure!(
+            self.prereleases == Prereleases::Never
+                || version::Semver::parse(self.current_version).is_some(),
+            "With pre-releases on, the current version must be \
+             major.minor.patch[-pre.release] in semver's characters"
+        );
+        if let Some(key) = self.publisher_key {
+            signing::decode_key(key)?;
+        }
+        ensure!(
+            self.publisher_key.is_some() || self.additional_publisher_keys.is_empty(),
+            "Additional publisher keys need a publisher key"
+        );
+        for key in self.additional_publisher_keys {
+            signing::decode_key(key)?;
+        }
+        for extension in self.libraries {
+            ensure!(
+                !extension.is_empty()
+                    && extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                    && !extension.eq_ignore_ascii_case("exe"),
+                "A library extension is letters and digits, without the dot, and not exe: {extension}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The slug, then each legacy name.
+    fn names(&self) -> impl Iterator<Item = &'static str> + Clone {
+        std::iter::once(self.slug).chain(self.legacy_names.iter().copied())
+    }
+
+    /// Whether this build takes part in the pre-release channel: it asked
+    /// for it and is running a pre-release itself.
+    fn prerelease_channel(&self) -> bool {
+        self.prereleases == Prereleases::WhenRunningPrerelease
+            && version::Semver::parse(self.current_version)
+                .is_some_and(|version| version.is_prerelease())
+    }
+
+    /// Whether `version` may be downloaded, staged and installed: a plain
+    /// stable version, or on the pre-release channel any safe semantic
+    /// version (see `version::Semver::parse`).
+    fn accepts_version(&self, version: &str) -> bool {
+        version::is_plain_release(version)
+            || (self.prerelease_channel() && version::Semver::parse(version).is_some())
+    }
+
+    fn user_agent(&self) -> String {
+        format!("{}/{}", self.app_name, self.current_version)
+    }
+}
+
+/// The macOS bundle's identity, checked before an update is accepted.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MacConfig {
+    /// Accepted `CFBundleIdentifier` values, for example
+    /// `["rocks.spotifast.Spotifast", "me.paolino.fastpotify"]`. An update is
+    /// refused when the running bundle or the download has any other.
+    pub bundle_ids: &'static [&'static str],
+    /// Accepted `CFBundleExecutable` names. Empty means just the slug. A
+    /// release may rename the executable only if the running version already
+    /// lists the new name.
+    pub executable_names: &'static [&'static str],
+    /// Bundle names used before, for example `FastsApp.app`. A disk image
+    /// may carry either `<app_name>.app` or one of these.
+    pub legacy_bundle_names: &'static [&'static str],
+}
+
+/// Where an update stands, for the app's interface. The updater itself does
+/// not use it; both apps kept this same state, so it lives here.
+#[derive(Debug, Default)]
+pub enum DownloadState {
+    /// Nothing downloaded.
+    #[default]
+    Idle,
+    /// Downloading: bytes received of the published size.
+    Downloading {
+        /// Bytes received so far.
+        received: u64,
+        /// The published size, or zero before it is known.
+        total: u64,
+    },
+    /// Verified and staged, waiting for the user to restart.
+    Ready(Box<Prepared>),
+    /// The helper has been started; the app is about to quit.
+    Installing,
+    /// The download or handoff failed, with a message for the user.
+    Failed(String),
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod compat;
+#[cfg(test)]
+mod testing;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    pub(crate) const ZAPFAST: UpdateConfig = UpdateConfig {
+        legacy_names: &["fastsapp"],
+        macos: MacConfig {
+            bundle_ids: &["me.paolino.fastsapp"],
+            executable_names: &[],
+            legacy_bundle_names: &["FastsApp.app"],
+        },
+        publisher_key: Some(include_str!("../tests/fixtures/zapfast-public-key.hex")),
+        ..UpdateConfig::new("crmne/zapfast", "ZapFast", "zapfast", "0.16.3")
+    };
+
+    #[test]
+    fn a_config_checks_its_own_values() {
+        ZAPFAST.validate().unwrap();
+        for broken in [
+            UpdateConfig {
+                repository: "zapfast",
+                ..ZAPFAST
+            },
+            UpdateConfig {
+                slug: "ZapFast",
+                ..ZAPFAST
+            },
+            UpdateConfig {
+                current_version: "nightly",
+                ..ZAPFAST
+            },
+            UpdateConfig {
+                publisher_key: Some("c2256da7"),
+                ..ZAPFAST
+            },
+            UpdateConfig {
+                legacy_names: &["../escape"],
+                ..ZAPFAST
+            },
+            UpdateConfig {
+                portable_executable: Some("../escape"),
+                ..ZAPFAST
+            },
+            UpdateConfig {
+                portable_executable: Some(".."),
+                ..ZAPFAST
+            },
+            UpdateConfig {
+                portable_executable: Some("zapfast-gui.exe"),
+                ..ZAPFAST
+            },
+            UpdateConfig {
+                portable_executable: Some(""),
+                ..ZAPFAST
+            },
+        ] {
+            assert!(broken.validate().is_err(), "{broken:?}");
+        }
+    }
+
+    #[test]
+    fn the_prerelease_channel_needs_a_semantic_version() {
+        let alpha = UpdateConfig {
+            current_version: "0.3.0-alpha.4",
+            prereleases: Prereleases::WhenRunningPrerelease,
+            ..ZAPFAST
+        };
+        alpha.validate().unwrap();
+        assert!(alpha.prerelease_channel());
+        assert!(alpha.accepts_version("0.3.0-alpha.5"));
+        assert!(alpha.accepts_version("0.3.0"));
+        assert!(!alpha.accepts_version("0.3.0-alpha/../x"));
+        // Asked for, but running a stable build: stable versions only.
+        let stable = UpdateConfig {
+            current_version: "0.3.0",
+            ..alpha
+        };
+        stable.validate().unwrap();
+        assert!(!stable.prerelease_channel());
+        assert!(!stable.accepts_version("0.4.0-alpha.1"));
+        // Not asked for: a release candidate keeps today's rules.
+        let candidate = UpdateConfig {
+            current_version: "0.3.0-rc1",
+            ..ZAPFAST
+        };
+        candidate.validate().unwrap();
+        assert!(!candidate.prerelease_channel());
+        assert!(!candidate.accepts_version("0.3.0-rc2"));
+        assert!(
+            UpdateConfig {
+                current_version: "0.3.0-alpha_4",
+                ..alpha
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_helper_executable_name_is_checked() {
+        UpdateConfig {
+            helper_executable: Some("zapfast-updater"),
+            ..ZAPFAST
+        }
+        .validate()
+        .unwrap();
+        for broken in ["../escape", "", ".hidden", "zapfast-updater.exe", "zapfast"] {
+            assert!(
+                UpdateConfig {
+                    helper_executable: Some(broken),
+                    ..ZAPFAST
+                }
+                .validate()
+                .is_err(),
+                "{broken}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_portable_executable_name_is_accepted() {
+        UpdateConfig {
+            portable_executable: Some("zapfast-gui"),
+            ..ZAPFAST
+        }
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn the_user_agent_names_the_app_not_the_framework() {
+        assert_eq!(ZAPFAST.user_agent(), "ZapFast/0.16.3");
+    }
+}

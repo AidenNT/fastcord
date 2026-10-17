@@ -1,0 +1,12 @@
+Descomprimí este zip SOBRE la carpeta de ecord (reemplaza archivos).
+BORRÁ a mano: assets/icons/fast-forward.svg  (versión con contorno, ya no se usa)
+
+Logo con el glifo RELLENO (disco azul + "fast-forward" de Lucide relleno):
+  assets/icons/fast-forward-filled.svg   mismo SVG con fill blanco (Icon::FastForwardFilled)
+  src/theme.rs                           Icon::FastForwardFilled y theme::logo() (login, rail, barra superior)
+  assets/packaging/icon-256.png          ventana/bandeja/.deb (y encabezado del toast)
+  assets/packaging/icon.png              512 px
+  assets/packaging/icon.ico              Windows (16-256 px)
+  assets/packaging/icon.icns             macOS
+
+Windows puede tardar en refrescar la caché de íconos del .exe.

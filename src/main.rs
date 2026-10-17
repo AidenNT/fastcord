@@ -6,6 +6,7 @@
 mod app_shell;
 mod bidi;
 mod discord;
+mod gpl_pack;
 mod lib;
 mod logging;
 mod paths;
@@ -14,6 +15,7 @@ mod support;
 mod system_fonts;
 mod theme;
 mod ui;
+mod update_config;
 mod updater;
 
 use lib::state::App;

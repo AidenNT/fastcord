@@ -8,7 +8,7 @@
 //! dispositivo de captura (avdevice)  ->  decoder rawvideo  ->  sws (escala + barras)
 //!   gdigrab / x11grab / avfoundation                               |
 //!                                                                  v
-//!                       EncodedFrame  <-  libx264 / NVENC / AMF / QSV (YUV420P)
+//!             EncodedFrame  <-  NVENC / AMF / QSV / libopenh264 / libx264 (YUV420P)
 //! ```
 //!
 //! Excepción: una ventana en Windows no pasa por avdevice sino por Windows
@@ -21,8 +21,12 @@
 //! `AccessUnitSplitter` (que habría sumado un frame de latencia).
 //!
 //! Requisitos de las libs de ffmpeg con las que se compila/ejecuta: `avdevice`
-//! con el dispositivo de captura de la plataforma y `libx264` (o el encoder de
-//! hardware elegido con `ECORD_STREAM_ENCODER`).
+//! con el dispositivo de captura de la plataforma y al menos un codificador
+//! H.264 (ver `encoder_candidates`). El FFmpeg LGPL de Windows NO trae `libx264`
+//! (es GPL): ahí se usa NVENC / AMF / QSV y, por software, `libopenh264`. Los
+//! paquetes de Linux y macOS llevan un FFmpeg con `libx264`. En Windows la
+//! persona puede instalar aparte el paquete "FFmpeg GPL" (`crate::gpl_pack`),
+//! que sí lo trae; en cuanto está cargado, `libx264` pasa delante de OpenH264.
 //!
 //! Como el codificador vive en el proceso, se puede pedir una IDR en marcha
 //! (`KeyframeRequest`): el próximo frame que entra al codificador se marca como
@@ -312,6 +316,8 @@ impl ScreenCaptureConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Encoder {
     X264,
+    /// Software, de Cisco (BSD). Está en el FFmpeg LGPL de Windows, que no trae x264.
+    OpenH264,
     Nvenc,
     Amf,
     Qsv,
@@ -321,6 +327,7 @@ impl Encoder {
     fn name(self) -> &'static str {
         match self {
             Self::X264 => "libx264",
+            Self::OpenH264 => "libopenh264",
             Self::Nvenc => "h264_nvenc",
             Self::Amf => "h264_amf",
             Self::Qsv => "h264_qsv",
@@ -328,21 +335,51 @@ impl Encoder {
     }
 }
 
-/// Encoders a probar, en orden. Por defecto solo x264 (el único que está en
-/// todos los builds de ffmpeg y no depende de la GPU). `ECORD_STREAM_ENCODER`
-/// acepta `x264`, `nvenc`, `amf`, `qsv` o `auto` (hardware primero y, si no
-/// arranca, x264).
+/// Encoders a probar, en orden: el primero que arranque se usa.
+///
+/// * Windows: GPU primero (NVENC, AMF, QSV; si no hay esa GPU fallan al
+///   abrirse, al instante) y después software: `libx264` si el FFmpeg cargado
+///   lo trae (paquete GPL opcional o FFmpeg propio) y, si no, `libopenh264`
+///   (el FFmpeg LGPL de serie no trae x264, así que ese intento falla al
+///   instante y se pasa al siguiente).
+/// * Linux / macOS (FFmpeg con `libx264`): `libx264` y, si no está, `libopenh264`.
+///
+/// `ECORD_STREAM_ENCODER` lo fuerza: `x264`, `openh264`, `nvenc`, `amf`, `qsv` o
+/// `auto` (hardware primero y, si no arranca, software). Un encoder de
+/// hardware elegido a mano cae a software si no arranca.
 fn encoder_candidates() -> Vec<Encoder> {
     let choice = std::env::var("ECORD_STREAM_ENCODER")
         .unwrap_or_default()
         .to_ascii_lowercase();
-    match choice.as_str() {
-        "nvenc" => vec![Encoder::Nvenc, Encoder::X264],
-        "amf" => vec![Encoder::Amf, Encoder::X264],
-        "qsv" => vec![Encoder::Qsv, Encoder::X264],
-        "auto" => vec![Encoder::Nvenc, Encoder::Amf, Encoder::Qsv, Encoder::X264],
-        _ => vec![Encoder::X264],
+    let mut candidates = candidates_for(&choice, cfg!(target_os = "windows"));
+    // Sin libx264 en las libs (FFmpeg LGPL de Windows) no se gasta un intento:
+    // abrir la captura solo para descubrir que falta el codificador es tiempo
+    // perdido antes de caer a OpenH264. `ECORD_STREAM_ENCODER=x264` lo deja
+    // para que el error diga claramente qué falta.
+    if choice != "x264" && !x264_available() {
+        candidates.retain(|encoder| *encoder != Encoder::X264);
     }
+    candidates
+}
+
+fn candidates_for(choice: &str, windows: bool) -> Vec<Encoder> {
+    use Encoder::{Amf, Nvenc, OpenH264, Qsv, X264};
+    match choice {
+        "x264" => vec![X264],
+        "openh264" => vec![OpenH264],
+        "nvenc" => vec![Nvenc, X264, OpenH264],
+        "amf" => vec![Amf, X264, OpenH264],
+        "qsv" => vec![Qsv, X264, OpenH264],
+        "auto" => vec![Nvenc, Amf, Qsv, X264, OpenH264],
+        _ if windows => vec![Nvenc, Amf, Qsv, X264, OpenH264],
+        _ => vec![X264, OpenH264],
+    }
+}
+
+/// `true` si las libs de FFmpeg cargadas traen `libx264` (GPL). Decide si hay
+/// que ofrecer el paquete opcional en Windows (`crate::gpl_pack`).
+pub(crate) fn x264_available() -> bool {
+    ffmpeg::encoder::find_by_name(Encoder::X264.name()).is_some()
 }
 
 /// De dónde sale la imagen: formato de entrada de avdevice, "URL" y opciones.
@@ -461,6 +498,15 @@ fn encoder_options(config: &ScreenCaptureConfig, encoder: Encoder) -> Vec<(&'sta
             ("sc_threshold", "0"),
             ("x264-params", "aud=1:repeat-headers=1"),
         ]),
+        // libopenh264 escribe SPS/PPS en cada IDR por sí solo (no se pide
+        // `global_header`). Opciones comprobadas contra el avcodec de BtbN
+        // (FFmpeg 8.1): `profile`, `rc_mode` y `allow_skip_frames`; no hay
+        // `slice_mode` ni presets. Sin saltar frames para mantener el ritmo.
+        Encoder::OpenH264 => add(&[
+            ("profile", "constrained_baseline"),
+            ("rc_mode", "bitrate"),
+            ("allow_skip_frames", "0"),
+        ]),
         Encoder::Nvenc => add(&[
             ("preset", "p1"),
             ("tune", "ll"),
@@ -546,7 +592,8 @@ pub(crate) fn start_screen_encoder(
     preview: StreamFrameSlot,
 ) -> Result<ScreenEncoder, String> {
     let mut last_error = String::from("no hay codificadores disponibles");
-    for encoder in encoder_candidates() {
+    let mut candidates = encoder_candidates().into_iter().peekable();
+    while let Some(encoder) = candidates.next() {
         match start_with_encoder(config, encoder, frames_tx.clone(), keyframe.clone(), preview.clone()) {
             Ok(started) => {
                 logging::debug(
@@ -556,7 +603,14 @@ pub(crate) fn start_screen_encoder(
                 return Ok(started);
             }
             Err(error) => {
-                logging::error("stream", format!("screen encoder {} failed: {error}", encoder.name()));
+                // Con varias opciones, que falle una (p. ej. NVENC sin GPU NVIDIA) es lo
+                // normal y se pasa a la siguiente; solo es un error si no queda ninguna.
+                let message = format!("screen encoder {} failed: {error}", encoder.name());
+                if candidates.peek().is_some() {
+                    logging::debug("stream", message);
+                } else {
+                    logging::error("stream", message);
+                }
                 last_error = error;
             }
         }
@@ -1176,6 +1230,46 @@ mod tests {
         assert!(text.contains("bf=0"), "{text}");
         assert!(text.contains("b=2500k maxrate=2500k bufsize=1250k"), "{text}");
         assert!(text.contains("x264-params=aud=1:repeat-headers=1"), "{text}");
+    }
+
+    #[test]
+    fn openh264_options_have_short_gop_and_no_b_frames() {
+        let options = encoder_options(&ScreenCaptureConfig::default(), Encoder::OpenH264);
+        let text = joined(&options);
+        assert!(text.contains("g=30"), "{text}");
+        assert!(text.contains("bf=0"), "{text}");
+        assert!(text.contains("b=2500k"), "{text}");
+        assert!(text.contains("rc_mode=bitrate"), "{text}");
+        assert!(!text.contains("x264-params") && !text.contains("slice_mode"), "{text}");
+    }
+
+    #[test]
+    fn windows_default_is_gpu_then_x264_then_openh264() {
+        use Encoder::{Amf, Nvenc, OpenH264, Qsv, X264};
+        let order = candidates_for("", true);
+        assert_eq!(order, vec![Nvenc, Amf, Qsv, X264, OpenH264]);
+        // Un valor desconocido se comporta como el valor por defecto.
+        assert_eq!(candidates_for("nada", true), order);
+        // libx264 (paquete GPL opcional) va antes que libopenh264; sin él
+        // `encoder_candidates` lo descarta y queda OpenH264.
+        let openh264 = order.iter().position(|e| *e == OpenH264).unwrap();
+        let x264 = order.iter().position(|e| *e == X264).unwrap();
+        assert!(x264 < openh264);
+    }
+
+    #[test]
+    fn linux_and_macos_default_keeps_x264_first() {
+        use Encoder::{OpenH264, X264};
+        assert_eq!(candidates_for("", false), vec![X264, OpenH264]);
+    }
+
+    #[test]
+    fn forced_encoders_fall_back_to_software() {
+        use Encoder::{Nvenc, OpenH264, X264};
+        assert_eq!(candidates_for("x264", true), vec![X264]);
+        assert_eq!(candidates_for("openh264", false), vec![OpenH264]);
+        assert_eq!(candidates_for("nvenc", true), vec![Nvenc, X264, OpenH264]);
+        assert!(candidates_for("auto", false).ends_with(&[X264, OpenH264]));
     }
 
     #[test]

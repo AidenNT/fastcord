@@ -7390,6 +7390,63 @@ impl App {
         if self.broadcasting_stream.is_some() {
             return;
         }
+        // Windows sin libx264: antes de transmitir se ofrece el paquete GPL
+        // opcional (ver `gpl_pack`). Sea cual sea la respuesta se transmite
+        // igual: sin el paquete, por GPU o por software con OpenH264.
+        if crate::gpl_pack::should_ask() {
+            self.open_x264_gpl_dialog(target);
+            return;
+        }
+        self.start_broadcast_now(target);
+    }
+
+    /// Aviso de la licencia GPL de libx264 con la opción de bajar el paquete.
+    fn open_x264_gpl_dialog(&mut self, target: CaptureTarget) {
+        use crate::ui::shell::dialog::{ButtonStyle, CheckField, Dialog, DialogKind};
+        let dialog = Dialog::new("x264_gpl_prompt", DialogKind::Question, "Mejorar la calidad de la transmisión")
+            .width(540.0)
+            .text(
+                "Para transmitir con mejor calidad por software, eCord puede usar libx264, un codificador \
+                 de video que se distribuye bajo la licencia GPL (v2 o posterior). eCord en sí es MIT y no \
+                 lo incluye: es un paquete opcional con las DLL de FFmpeg compiladas con x264, que se baja \
+                 del release de GitHub y se instala junto a ecord.exe.",
+            )
+            .text(
+                "Si aceptas, empiezas a transmitir ya mismo con OpenH264 y x264 se usa la próxima vez que \
+                 abras eCord, y se vuelve a instalar solo después de cada actualización de eCord. Si no aceptas, \
+                 se usa la tarjeta gráfica (NVENC/AMF/QSV) o, si no hay, OpenH264 por software. Esta pregunta \
+                 se hace una sola vez.",
+            )
+            .text(format!(
+                "Licencia y código fuente: https://www.gnu.org/licenses/old-licenses/gpl-2.0.html · \
+                 https://code.videolan.org/videolan/x264 · {}",
+                crate::gpl_pack::release_page()
+            ))
+            .check(CheckField::new("agree", "Leí la licencia GPL de libx264 y acepto usar el paquete").required(true))
+            .button("software", "Transmitir sin x264", ButtonStyle::Secondary)
+            .button("accept", "Aceptar y descargar", ButtonStyle::Primary)
+            .on_result(move |app, ctx, result| {
+                if result.is("accept") {
+                    crate::gpl_pack::set_pref(crate::gpl_pack::Pref::Accepted);
+                    let ctx = ctx.clone();
+                    crate::gpl_pack::start_download(move || ctx.request_repaint());
+                    app.push_toast(
+                        ToastKind::Info,
+                        "Descargando x264",
+                        "Mientras tanto transmites con OpenH264. Se usará x264 al reiniciar eCord.".to_string(),
+                    );
+                } else if result.is("software") {
+                    crate::gpl_pack::set_pref(crate::gpl_pack::Pref::Declined);
+                }
+                app.start_broadcast_now(target);
+            });
+        self.open_dialog(dialog);
+    }
+
+    fn start_broadcast_now(&mut self, target: CaptureTarget) {
+        if self.broadcasting_stream.is_some() {
+            return;
+        }
         let Some(voice) = self.voice_target.as_ref() else {
             self.push_toast(
                 ToastKind::Info,
@@ -8070,6 +8127,23 @@ impl eframe::App for App {
         crate::ui::shell::dialog::show(self, ui);
         // Actualizaciones automáticas: arranque del updater y avisos (ver `ui::settings::updates`).
         crate::ui::settings::updates::poll(self, ui.ctx());
+        // Paquete opcional FFmpeg GPL (libx264): si ya se aceptó y una actualización repuso
+        // las DLL LGPL, lo reinstala solo; y avisa cuando termina de bajarse.
+        {
+            let ctx = ui.ctx().clone();
+            crate::gpl_pack::maintain(move || ctx.request_repaint());
+        }
+        match crate::gpl_pack::take_finished() {
+            Some(crate::gpl_pack::Status::InstalledRestartNeeded) => self.push_toast(
+                ToastKind::Success,
+                "x264 instalado",
+                "Reinicia eCord para transmitir con libx264.".to_string(),
+            ),
+            Some(crate::gpl_pack::Status::Failed(error)) => {
+                self.push_toast(ToastKind::Warning, "No se pudo instalar x264", error)
+            }
+            _ => {}
+        }
         // Visor multimedia (imágenes/GIFs a pantalla completa).
         crate::ui::chat::media_viewer::show(self, ui);
         crate::ui::chat::video_player::show_fullscreen(ui.ctx());

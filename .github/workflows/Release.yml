@@ -13,8 +13,12 @@
 #   El job "Versión" lo comprueba todo ANTES de gastar una hora compilando.
 #
 # Archivos del release (los nombres los fija el actualizador, no los cambies):
+#   Todos los paquetes con auto-actualización llevan `ecord-updater` junto a `ecord`: el ejecutable
+#   aparte que instala las actualizaciones (src/bin/ecord-updater.rs).
 #   Windows : ecord-vX-x86_64-pc-windows-msvc.zip        (portable, se actualiza solo)
 #             ecord-vX-x86_64-pc-windows-msvc-setup.exe  (instalador por usuario, se actualiza solo)
+#             ecord-vX-ffmpeg-gpl-x86_64-pc-windows-msvc.zip  (OPCIONAL: DLL de FFmpeg con libx264/GPL;
+#                                                   la app lo ofrece bajar tras aceptar la licencia GPL)
 #   Linux   : ecord-vX-x86_64-unknown-linux-gnu.tar.gz   (portable con FFmpeg, se actualiza solo)
 #             ecord-vX-linux-amd64.deb                   (FFmpeg incluido; lo actualiza apt/dpkg, no la app)
 #   macOS   : ecord-vX-macos-universal.dmg               (arm64 + x86_64, experimental)
@@ -239,6 +243,11 @@ jobs:
         run: |
           cargo build --release --locked
           if ($LASTEXITCODE -ne 0) { throw "cargo build falló" }
+          # Los tres ejecutables van en el instalador (binaries en [package.metadata.packager]).
+          # ecord-updater: quien instala las actualizaciones (src/bin/ecord-updater.rs).
+          foreach ($bin in "ecord", "ecord-captcha", "ecord-updater") {
+            if (-not (Test-Path "target\release\$bin.exe")) { throw "Falta $bin.exe" }
+          }
 
       # ---- Instaladores ----
       - name: Instalar cargo-packager
@@ -249,6 +258,8 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force packaging\bundle-libs | Out-Null
           Copy-Item "$env:FFMPEG_DIR\bin\*.dll" packaging\bundle-libs
+          # ecord-captcha.exe y ecord-updater.exe ya los instala cargo-packager como binarios
+          # (Cargo.toml): no se copian también acá, o quedarían duplicados.
           # Avisos de licencias: viajan junto al .exe (instalador y zip portable).
           New-Item -ItemType Directory -Force packaging\notices | Out-Null
           Copy-Item THIRD_PARTY_NOTICES.md packaging\notices\
@@ -290,12 +301,67 @@ jobs:
           $stage = "stage\$n"
           New-Item -ItemType Directory -Force $stage | Out-Null
           Copy-Item target\release\ecord.exe $stage
+          Copy-Item target\release\ecord-captcha.exe $stage
+          Copy-Item target\release\ecord-updater.exe $stage
           Copy-Item "$env:FFMPEG_DIR\bin\*.dll" $stage
           Copy-Item $env:ORT_DLL $stage
           Copy-Item packaging\notices\* $stage
           Copy-Item packaging\ecord-portable.txt $stage
           if (-not (Test-Path "$stage\onnxruntime.dll")) { throw "El zip portable no lleva onnxruntime.dll" }
+          # El actualizador instala estas DLL junto con el .exe (UPDATES.libraries): tienen que
+          # ir sueltas en la carpeta del zip, no en una subcarpeta.
+          if (-not (Get-ChildItem $stage -Filter "avcodec-*.dll")) { throw "El zip portable no lleva las DLL de FFmpeg" }
+          if (-not (Test-Path "$stage\ecord-updater.exe")) { throw "El zip portable no lleva ecord-updater.exe" }
           Compress-Archive -Path $stage -DestinationPath "dist\$n.zip" -Force
+          Get-ChildItem dist | Format-Table Name, Length
+
+      # ---- Paquete opcional FFmpeg GPL (libx264) ----
+      # NO va dentro del instalador ni del zip portable (eCord es MIT y su FFmpeg es LGPL).
+      # Es un archivo aparte del release que la app ofrece bajar tras mostrar el aviso de la
+      # licencia GPL (src/gpl_pack.rs). Mismas DLL y misma versión de FFmpeg que las LGPL,
+      # pero compiladas con --enable-gpl --enable-libx264, así que se pueden intercambiar.
+      # El nombre lo fija gpl_pack::asset_name(); entra solo en checksums.txt (ecord-v*),
+      # que va firmado: la app verifica firma y SHA-256 antes de instalar.
+      - name: Paquete FFmpeg GPL (libx264)
+        shell: pwsh
+        env:
+          FFMPEG_GPL_ASSET: ffmpeg-n8.1-latest-win64-gpl-shared-8.1
+        run: |
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/$env:FFMPEG_GPL_ASSET.zip"
+          $zip = Join-Path $env:RUNNER_TEMP "ffmpeg-gpl.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+          $tmp = "C:\ffmpeg_gpl_tmp"
+          Expand-Archive -Path $zip -DestinationPath $tmp -Force
+          $inner = Get-ChildItem $tmp -Directory | Select-Object -First 1
+          $bin = Join-Path $inner.FullName "bin"
+
+          # Tienen que ser LAS MISMAS DLL (nombres y versión mayor) que las LGPL con las que se
+          # compiló eCord; si no, intercambiarlas rompería el arranque.
+          $lgpl = (Get-ChildItem "$env:FFMPEG_DIR\bin" -Filter *.dll).Name | Sort-Object
+          $gpl  = (Get-ChildItem $bin -Filter *.dll).Name | Sort-Object
+          $diff = Compare-Object $lgpl $gpl
+          if ($diff) { $diff | Format-Table; throw "Las DLL GPL no coinciden con las LGPL (otra versión de FFmpeg)" }
+
+          $pack = "stage-gpl"
+          New-Item -ItemType Directory -Force $pack | Out-Null
+          Copy-Item "$bin\*.dll" $pack
+          Copy-Item (Join-Path $inner.FullName "LICENSE.txt") "$pack\FFmpeg-GPL-LICENSE.txt"
+          @"
+          eCord - paquete opcional FFmpeg GPL (libx264)
+          =============================================
+          Estas DLL son FFmpeg compilado con --enable-gpl --enable-libx264 (compilacion de BtbN).
+          Se distribuyen bajo la GNU GPL (v2 o posterior; ver FFmpeg-GPL-LICENSE.txt).
+          eCord en si es MIT y NO incluye estas DLL: se bajan aparte y solo si las aceptas.
+
+          Codigo fuente y scripts de compilacion:
+            FFmpeg : https://ffmpeg.org/download.html  (https://git.ffmpeg.org/ffmpeg.git)
+            x264   : https://code.videolan.org/videolan/x264
+            Build  : https://github.com/BtbN/FFmpeg-Builds  (compilacion: $env:FFMPEG_GPL_ASSET)
+
+          Para volver a las DLL LGPL originales, restaura los archivos *.lgpl-bak junto a ecord.exe.
+          "@ | Set-Content -Encoding utf8 "$pack\README-GPL.txt"
+
+          Compress-Archive -Path "$pack\*" -DestinationPath "dist\ecord-$env:VERSION-ffmpeg-gpl-$env:TARGET.zip" -Force
           Get-ChildItem dist | Format-Table Name, Length
 
       - uses: actions/upload-artifact@v4
@@ -320,8 +386,8 @@ jobs:
       VERSION: ${{ needs.meta.outputs.version }}
       TARGET: x86_64-unknown-linux-gnu
       DEBIAN_FRONTEND: noninteractive
-      # GPL = trae libx264 (hace falta para transmitir pantalla). Para una build
-      # LGPL, sin x264, cambiá "gpl" por "lgpl".
+      # GPL = trae libx264 (transmitir pantalla por software). Para una build
+      # LGPL, sin x264, cambiá "gpl" por "lgpl": el cliente usa entonces libopenh264.
       FFMPEG_ASSET: ffmpeg-n8.1-latest-linux64-gpl-shared-8.1
       FFMPEG_DIR: /opt/ffmpeg
       # Dónde buscará el binario las .so de FFmpeg una vez instalado el .deb.
@@ -440,6 +506,8 @@ jobs:
           cp target/release/ecord "stage/$N/ecord"
           # Ventana del captcha (necesita WebKitGTK del sistema; `ecord` arranca sin él).
           cp target/release/ecord-captcha "stage/$N/ecord-captcha"
+          # Ayudante que instala las actualizaciones (no enlaza FFmpeg; no necesita rpath).
+          cp target/release/ecord-updater "stage/$N/ecord-updater"
           patchelf --set-rpath '$ORIGIN/lib' "stage/$N/ecord"
           cp packaging/linux/ffmpeg-libs/* "stage/$N/lib/"
           cp packaging/ecord-portable.txt "stage/$N/"
