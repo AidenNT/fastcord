@@ -48,8 +48,10 @@ use fastframe_update::{
 
 pub use crate::update_config::{REPOSITORY, UPDATES};
 
-pub use elevation::{needs_elevation, request_elevated_update, take_error as take_elevation_error};
-use elevation::{DEELEVATE_FLAG, ELEVATED_FLAG};
+pub use elevation::{
+    needs_elevation, request_elevated_reinstall, request_elevated_update, take_error as take_elevation_error,
+};
+use elevation::{DEELEVATE_FLAG, ELEVATED_FLAG, FORCE_FLAG};
 
 /// Variable de entorno para apagar por completo el chequeo de versiones.
 pub const DISABLE_ENV: &str = "ECORD_DISABLE_UPDATES";
@@ -94,6 +96,9 @@ struct Shared {
     needs_elevation: bool,
     /// Pedido de "buscar ahora" que despierta al hilo antes del próximo día.
     wake: bool,
+    /// El próximo ciclo baja la última versión aunque no sea más nueva que
+    /// esta (reinstalación forzada desde las devtools).
+    force: bool,
 }
 
 static SHARED: Mutex<Shared> = Mutex::new(Shared {
@@ -105,6 +110,7 @@ static SHARED: Mutex<Shared> = Mutex::new(Shared {
     check_error: None,
     needs_elevation: false,
     wake: false,
+    force: false,
 });
 static WAKE: Condvar = Condvar::new();
 static UPDATER: OnceLock<Updater> = OnceLock::new();
@@ -169,7 +175,7 @@ fn relaunch_arguments() -> Vec<String> {
                 .iter()
                 .skip(1)
                 .map(|arg| arg.to_string_lossy().into_owned())
-                .filter(|arg| arg != ELEVATED_FLAG && arg != DEELEVATE_FLAG)
+                .filter(|arg| arg != ELEVATED_FLAG && arg != DEELEVATE_FLAG && arg != FORCE_FLAG)
                 .collect()
         })
         .unwrap_or_default();
@@ -280,6 +286,26 @@ pub fn check_now() {
     WAKE.notify_all();
 }
 
+/// Reinstalación forzada (devtools): baja la última versión publicada aunque
+/// sea la misma que esta (o más vieja) y la deja lista para instalar. Sirve
+/// para probar el actualizador, las DLL y el instalador sin esperar un release
+/// nuevo. Es la misma descarga verificada de siempre; después se instala con
+/// [`install_and_quit`]. No hace nada si ya hay una descarga o instalación en
+/// curso, o si el hilo del updater no arrancó (actualizaciones apagadas).
+pub fn force_reinstall() {
+    let mut shared = shared();
+    if matches!(
+        shared.state,
+        DownloadState::Downloading { .. } | DownloadState::Ready(_) | DownloadState::Installing
+    ) || shared.checking
+    {
+        return;
+    }
+    shared.force = true;
+    shared.wake = true;
+    WAKE.notify_all();
+}
+
 /// Pasa el relevo al ayudante y, cuando este ya vigila el proceso, llama a
 /// `quit` para cerrar la ventana. Corre en un hilo: el traspaso copia el
 /// ejecutable a la carpeta de trabajo y puede tardar un momento.
@@ -344,6 +370,7 @@ fn wait_for_next_cycle() {
 }
 
 fn run_cycle(updater: &Updater, repaint: &(dyn Fn() + Send + Sync)) {
+    let force;
     {
         let mut shared = shared();
         match shared.state {
@@ -356,10 +383,11 @@ fn run_cycle(updater: &Updater, repaint: &(dyn Fn() + Send + Sync)) {
         shared.checking = true;
         shared.check_error = None;
         shared.needs_elevation = false;
+        force = std::mem::take(&mut shared.force);
     }
     repaint();
 
-    let outcome = updater.check();
+    let outcome = if force { updater.latest() } else { updater.check() };
     match outcome {
         Err(error) => {
             log::warn!("updater: no se pudo consultar la última versión: {error:#}");
@@ -377,7 +405,11 @@ fn run_cycle(updater: &Updater, repaint: &(dyn Fn() + Send + Sync)) {
             shared.needs_elevation = false;
         }
         Ok(Some(release)) => {
-            log::info!("updater: hay una versión nueva: {}", release.version);
+            if force {
+                log::info!("updater: reinstalación forzada de {}", release.version);
+            } else {
+                log::info!("updater: hay una versión nueva: {}", release.version);
+            }
             let unsupported = updater.installation().err().map(|reason| explain(&reason));
             // La descarga crea una carpeta temporal junto al ejecutable. Si
             // está en una carpeta protegida, hacerlo desde acá falla con

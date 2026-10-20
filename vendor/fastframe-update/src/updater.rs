@@ -74,6 +74,14 @@ impl Updater {
         release::newer(&self.config, self.transport.as_ref(), &self.source)
     }
 
+    /// The newest release even when it is not newer than
+    /// [`UpdateConfig::current_version`]: what a forced reinstall downloads.
+    /// Downloading and installing do not require a newer version, so the
+    /// result goes straight to [`Updater::download`].
+    pub fn latest(&self) -> Result<Option<Release>> {
+        release::latest(&self.config, self.transport.as_ref(), &self.source)
+    }
+
     /// How this copy was installed, or why it cannot update itself. Reads
     /// files next to the executable and, on Linux, asks dpkg, rpm and pacman
     /// whether they own it.

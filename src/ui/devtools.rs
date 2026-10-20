@@ -42,7 +42,9 @@
 //!   `discord_client_rest::netlog`.
 //! - **Cliente** (`client`): resumen del proceso y del sistema, rendimiento,
 //!   memoria, identidad ante Discord (`X-Super-Properties`, `launch_signature`,
-//!   IDs), entorno, y un informe de diagnóstico listo para copiar.
+//!   IDs), transmisión (codificador, perfil de NVENC, paquete libx264),
+//!   actualizaciones (estado y reinstalación forzada), entorno, y un informe de
+//!   diagnóstico listo para copiar.
 //!
 //! Las pruebas de red corren en su propio runtime de tokio (`runtime`), aparte
 //! del hilo de Discord, y avisan a la UI con `request_repaint`. Nada de esto

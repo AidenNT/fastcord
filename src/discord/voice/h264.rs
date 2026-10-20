@@ -449,6 +449,13 @@ pub(crate) struct EncodedFrame {
     pub(crate) data: Vec<u8>,
     /// Contiene una IDR: un espectador nuevo puede empezar a decodificar acá.
     pub(crate) keyframe: bool,
+    /// Cuándo salió del codificador. El timestamp RTP se saca de acá y no de la
+    /// hora de envío: si una IDR grande demora el envío, los frames que esperan
+    /// detrás no deben salir con timestamps amontonados (microtirones).
+    pub(crate) captured: std::time::Instant,
+    /// Número de frame del codificador (unidades de 1/fps). Con él el camino WebRTC
+    /// arma timestamps RTP regulares, sin la variación de latencia del codificador.
+    pub(crate) pts: Option<i64>,
 }
 
 /// Posiciones `(inicio_del_start_code, inicio_de_la_NAL)` de cada start code
@@ -527,8 +534,107 @@ pub(super) fn packetize_h264_access_unit(access_unit: &[u8], max_payload: usize)
     payloads
 }
 
-/// Arma un paquete RTP de video con la extensión de "playout delay" que
-/// llevan los paquetes del cliente oficial (one-byte header, id 5, valor 0).
+/// Playout delay que se le pide al visor con la extensión RTP de los paquetes de
+/// video (id 5, `http://www.webrtc.org/experiments/rtp-hdrext/playout-delay`).
+///
+/// Lo elige, en este orden: las devtools (`set_playout_delay_override`), la variable
+/// `ECORD_PLAYOUT_DELAY` y `PlayoutDelay::DEFAULT` (sin extensión). Vale desde el próximo
+/// paquete que salga, sin reiniciar la transmisión. La transmisión escribe en el log qué
+/// valor está en uso al arrancar y cada vez que cambia.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlayoutDelay {
+    /// Sin extensión: el visor usa su jitter buffer adaptativo (~0-6 ms con este stream).
+    Off,
+    /// Los bytes que mandaba ecord antes (id 5, 2 bytes de datos en cero, que no es el
+    /// formato estándar). El visor mostraba Jitter Buffer y Target Delay en 0 ms.
+    Legacy,
+    /// Mínimo y máximo de retardo de reproducción, en ms. El visor elige su buffer dentro
+    /// de ese rango; un mínimo mayor que 0 lo obliga a esperar ese tiempo antes de mostrar
+    /// cada frame, lo que da margen a que llegue un paquete reenviado.
+    Range { min_ms: u32, max_ms: u32 },
+}
+
+impl PlayoutDelay {
+    /// Sin extensión: es lo único que se ha comprobado que renderiza siempre en el visor.
+    /// Con `0-100` (lo que manda la librería de Node `Discord-video-stream`, en unidades de
+    /// 10 ms: `playoutDelayMin = 0`, `playoutDelayMax = 10`) el visor llegó a no mostrar
+    /// la imagen en alguna prueba; es opcional, por las devtools o `ECORD_PLAYOUT_DELAY`.
+    pub(crate) const DEFAULT: Self = Self::Off;
+
+    /// Texto corto para las devtools y el log.
+    pub(crate) fn label(self) -> String {
+        match self {
+            Self::Off => "sin extensión".to_owned(),
+            Self::Legacy => "anterior (2 bytes en cero)".to_owned(),
+            Self::Range { min_ms, max_ms } => format!("{min_ms}-{max_ms} ms"),
+        }
+    }
+
+    /// La extensión de un byte (id 5) lista para meter tras la cabecera RTP: el
+    /// formato estándar de 3 bytes lleva 12 bits de mínimo y 12 de máximo en unidades
+    /// de 10 ms.
+    fn extension_bytes(self) -> Option<[u8; 4]> {
+        match self {
+            Self::Off => None,
+            Self::Legacy => Some([0x51, 0x00, 0x00, 0x00]),
+            Self::Range { min_ms, max_ms } => {
+                let units = |ms: u32| (ms / 10).min(0xFFF);
+                let min = units(min_ms);
+                let max = units(max_ms).max(min);
+                Some([
+                    0x52, // id 5, 3 bytes de datos
+                    (min >> 4) as u8,
+                    (((min & 0xF) << 4) | (max >> 8)) as u8,
+                    (max & 0xFF) as u8,
+                ])
+            }
+        }
+    }
+}
+
+/// Lo que eligen las devtools en esta sesión: gana sobre `ECORD_PLAYOUT_DELAY`.
+static PLAYOUT_DELAY_OVERRIDE: std::sync::Mutex<Option<PlayoutDelay>> = std::sync::Mutex::new(None);
+
+pub(crate) fn playout_delay_override() -> Option<PlayoutDelay> {
+    *PLAYOUT_DELAY_OVERRIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `None` vuelve a `ECORD_PLAYOUT_DELAY` (o al valor por defecto).
+pub(crate) fn set_playout_delay_override(value: Option<PlayoutDelay>) {
+    *PLAYOUT_DELAY_OVERRIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = value;
+}
+
+/// El playout delay en uso: devtools, luego `ECORD_PLAYOUT_DELAY`, luego el valor por defecto.
+pub(crate) fn playout_delay() -> PlayoutDelay {
+    playout_delay_override().unwrap_or_else(playout_delay_from_env)
+}
+
+/// `ECORD_PLAYOUT_DELAY`: sin definir (o `default`) = `PlayoutDelay::DEFAULT`; `off`; `legacy`;
+/// o `MIN-MAX` en ms (p. ej. `0-100` o `60-150`). Se lee una sola vez, al primer paquete.
+fn playout_delay_from_env() -> PlayoutDelay {
+    static FROM_ENV: std::sync::OnceLock<PlayoutDelay> = std::sync::OnceLock::new();
+    *FROM_ENV.get_or_init(|| parse_playout_delay_mode(std::env::var("ECORD_PLAYOUT_DELAY").ok().as_deref()))
+}
+
+fn parse_playout_delay_mode(value: Option<&str>) -> PlayoutDelay {
+    let Some(value) = value.map(|text| text.trim().to_ascii_lowercase()) else {
+        return PlayoutDelay::DEFAULT;
+    };
+    match value.as_str() {
+        "off" => PlayoutDelay::Off,
+        "legacy" => PlayoutDelay::Legacy,
+        range => range
+            .split_once('-')
+            .and_then(|(min, max)| Some((min.trim().parse::<u32>().ok()?, max.trim().parse::<u32>().ok()?)))
+            .map_or(PlayoutDelay::DEFAULT, |(min_ms, max_ms)| PlayoutDelay::Range { min_ms, max_ms }),
+    }
+}
+
+fn playout_delay_extension() -> Option<[u8; 4]> {
+    playout_delay().extension_bytes()
+}
+
+/// Arma un paquete RTP de video (ver `playout_delay_extension` para la extensión).
 ///
 /// Con los modos `*_rtpsize` la cabecera fija y la cabecera de la extensión
 /// quedan como AAD y el cuerpo de la extensión se cifra junto con el payload;
@@ -542,14 +648,29 @@ pub(super) fn build_video_rtp_packet(
     marker: bool,
     payload: &[u8],
 ) -> Vec<u8> {
+    build_video_rtp_packet_with(playout_delay_extension(), sequence, timestamp, ssrc, payload_type, marker, payload)
+}
+
+fn build_video_rtp_packet_with(
+    extension: Option<[u8; 4]>,
+    sequence: u16,
+    timestamp: u32,
+    ssrc: u32,
+    payload_type: u8,
+    marker: bool,
+    payload: &[u8],
+) -> Vec<u8> {
     let mut packet = Vec::with_capacity(12 + 8 + payload.len());
-    packet.push(0x90); // V=2, P=0, X=1, CC=0
+    // V=2, P=0, X según haya extensión, CC=0.
+    packet.push(if extension.is_some() { 0x90 } else { 0x80 });
     packet.push((u8::from(marker) << 7) | (payload_type & 0x7F));
     packet.extend_from_slice(&sequence.to_be_bytes());
     packet.extend_from_slice(&timestamp.to_be_bytes());
     packet.extend_from_slice(&ssrc.to_be_bytes());
-    packet.extend_from_slice(&[0xBE, 0xDE, 0x00, 0x01]);
-    packet.extend_from_slice(&[0x51, 0x00, 0x00, 0x00]);
+    if let Some(extension) = extension {
+        packet.extend_from_slice(&[0xBE, 0xDE, 0x00, 0x01]);
+        packet.extend_from_slice(&extension);
+    }
     packet.extend_from_slice(payload);
     packet
 }
@@ -608,6 +729,8 @@ impl AccessUnitSplitter {
                 frames.push(EncodedFrame {
                     data: std::mem::take(&mut self.pending),
                     keyframe: self.pending_keyframe,
+                    captured: std::time::Instant::now(),
+                    pts: None,
                 });
                 self.pending_has_slice = false;
                 self.pending_keyframe = false;
@@ -647,7 +770,295 @@ pub(crate) fn encoded_frame_from_access_unit(data: &[u8]) -> Option<EncodedFrame
         out.extend_from_slice(&START_CODE);
         out.extend_from_slice(nal);
     }
-    has_slice.then_some(EncodedFrame { data: out, keyframe })
+    has_slice.then_some(EncodedFrame {
+        data: out,
+        keyframe,
+        captured: std::time::Instant::now(),
+        pts: None,
+    })
+}
+
+/// Limpia un access unit en Annex B (lo devuelve con start codes de 4 bytes):
+///
+/// * `strip_sei`: quita los NAL de SEI (6) y de relleno (12). Ninguno hace
+///   falta para decodificar; NVENC en CBR mete SEI de temporización en CADA
+///   frame (dos en la IDR), algo que x264 casi no hace.
+/// * `strip_vui`: reescribe el VUI del SPS (ver [`with_low_delay_vui`]). El SPS de
+///   NVENC en CBR trae `timing_info` y parámetros HRD que ningún decodificador
+///   necesita y NO declara `bitstream_restriction`, que x264 sí declara
+///   (`max_num_reorder_frames = 0`). Sin ese bloque el estándar obliga a suponer
+///   el reordenamiento máximo del nivel (hasta 9 frames a 4.1 y 720p).
+pub(crate) fn cleaned(data: &[u8], strip_sei: bool, strip_vui: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    for nal in split_annexb_nals(data) {
+        let kind = nal[0] & 0x1F;
+        if strip_sei && matches!(kind, NAL_SEI | 12) {
+            continue;
+        }
+        out.extend_from_slice(&START_CODE);
+        match (strip_vui && kind == NAL_SPS).then(|| with_low_delay_vui(nal)).flatten() {
+            Some(sps) => out.extend_from_slice(&sps),
+            None => out.extend_from_slice(nal),
+        }
+    }
+    out
+}
+
+/// Lector de bits (MSB primero) para el SPS, ya sin emulation prevention.
+struct BitReader<'a> {
+    data: &'a [u8],
+    position: usize,
+}
+
+impl BitReader<'_> {
+    fn bit(&mut self) -> Option<u8> {
+        let byte = *self.data.get(self.position / 8)?;
+        let bit = (byte >> (7 - self.position % 8)) & 1;
+        self.position += 1;
+        Some(bit)
+    }
+
+    fn bits(&mut self, count: u32) -> Option<u32> {
+        let mut value = 0u32;
+        for _ in 0..count {
+            value = (value << 1) | u32::from(self.bit()?);
+        }
+        Some(value)
+    }
+
+    /// Exp-Golomb sin signo. Con signo ocupa los mismos bits, así que sirve
+    /// también para saltarse un `se(v)`.
+    fn ue(&mut self) -> Option<u32> {
+        let mut zeros = 0u32;
+        while self.bit()? == 0 {
+            zeros += 1;
+            if zeros > 31 {
+                return None;
+            }
+        }
+        Some((1u32 << zeros) - 1 + self.bits(zeros)?)
+    }
+}
+
+/// Quita los bytes de emulation prevention (`00 00 03` pasa a `00 00`).
+fn remove_emulation_prevention(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut zeros = 0;
+    for &byte in data {
+        if zeros >= 2 && byte == 3 {
+            zeros = 0;
+            continue;
+        }
+        out.push(byte);
+        zeros = if byte == 0 { zeros + 1 } else { 0 };
+    }
+    out
+}
+
+/// Inversa de [`remove_emulation_prevention`].
+fn add_emulation_prevention(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + 2);
+    let mut zeros = 0;
+    for &byte in data {
+        if zeros >= 2 && byte <= 3 {
+            out.push(3);
+            zeros = 0;
+        }
+        out.push(byte);
+        zeros = if byte == 0 { zeros + 1 } else { 0 };
+    }
+    out
+}
+
+/// Un SPS leído hasta el `vui_parameters_present_flag`.
+struct SpsUpToVui {
+    /// RBSP completo (sin el byte de la NAL ni los bytes de emulation prevention).
+    rbsp: Vec<u8>,
+    /// Posición, en bits, del `vui_parameters_present_flag`.
+    vui_flag_at: usize,
+    /// Valor de ese flag: ¿el SPS ya trae VUI?
+    has_vui: bool,
+    /// `max_num_ref_frames` del SPS.
+    max_num_ref_frames: u32,
+}
+
+/// Recorre el SPS hasta el flag del VUI. `None` si no es un SPS, si está cortado
+/// antes de ese punto o si usa listas de escala (perfiles altos con matrices
+/// propias), casos en los que no se toca.
+fn parse_sps_up_to_vui(nal: &[u8]) -> Option<SpsUpToVui> {
+    if nal.first()? & 0x1F != NAL_SPS {
+        return None;
+    }
+    let rbsp = remove_emulation_prevention(&nal[1..]);
+    let (vui_flag_at, has_vui, max_num_ref_frames) = {
+        let mut reader = BitReader { data: &rbsp, position: 0 };
+        let profile = reader.bits(8)?;
+        reader.bits(16)?; // constraint flags y level_idc
+        reader.ue()?; // seq_parameter_set_id
+        if matches!(profile, 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135) {
+            if reader.ue()? == 3 {
+                reader.bit()?; // separate_colour_plane_flag
+            }
+            reader.ue()?; // bit_depth_luma_minus8
+            reader.ue()?; // bit_depth_chroma_minus8
+            reader.bit()?; // qpprime_y_zero_transform_bypass_flag
+            if reader.bit()? == 1 {
+                return None; // seq_scaling_matrix_present_flag
+            }
+        }
+        reader.ue()?; // log2_max_frame_num_minus4
+        match reader.ue()? {
+            0 => {
+                reader.ue()?; // log2_max_pic_order_cnt_lsb_minus4
+            }
+            1 => {
+                reader.bit()?; // delta_pic_order_always_zero_flag
+                reader.ue()?; // offset_for_non_ref_pic
+                reader.ue()?; // offset_for_top_to_bottom_field
+                let cycle = reader.ue()?;
+                for _ in 0..cycle.min(255) {
+                    reader.ue()?; // offset_for_ref_frame
+                }
+            }
+            _ => {}
+        }
+        let max_num_ref_frames = reader.ue()?;
+        reader.bit()?; // gaps_in_frame_num_value_allowed_flag
+        reader.ue()?; // pic_width_in_mbs_minus1
+        reader.ue()?; // pic_height_in_map_units_minus1
+        if reader.bit()? == 0 {
+            reader.bit()?; // mb_adaptive_frame_field_flag
+        }
+        reader.bit()?; // direct_8x8_inference_flag
+        if reader.bit()? == 1 {
+            for _ in 0..4 {
+                reader.ue()?; // frame_crop_*_offset
+            }
+        }
+        let vui_flag_at = reader.position;
+        let has_vui = reader.bit()? == 1;
+        (vui_flag_at, has_vui, max_num_ref_frames)
+    };
+    Some(SpsUpToVui { rbsp, vui_flag_at, has_vui, max_num_ref_frames })
+}
+
+/// Escritor de bits (MSB primero), la inversa de [`BitReader`].
+#[derive(Default)]
+struct BitWriter {
+    bytes: Vec<u8>,
+    /// Bits ya escritos en el último byte (0 = el último byte está completo).
+    used: usize,
+}
+
+impl BitWriter {
+    fn bit(&mut self, value: u8) {
+        if self.used == 0 {
+            self.bytes.push(0);
+        }
+        if value != 0 {
+            let last = self.bytes.len() - 1;
+            self.bytes[last] |= 1 << (7 - self.used);
+        }
+        self.used = (self.used + 1) % 8;
+    }
+
+    /// Copia los primeros `count` bits de `data`.
+    fn copy_bits(&mut self, data: &[u8], count: usize) {
+        for index in 0..count {
+            self.bit((data[index / 8] >> (7 - index % 8)) & 1);
+        }
+    }
+
+    /// Exp-Golomb sin signo.
+    fn ue(&mut self, value: u32) {
+        let coded = u64::from(value) + 1;
+        let length = 64 - coded.leading_zeros();
+        for _ in 1..length {
+            self.bit(0);
+        }
+        for shift in (0..length).rev() {
+            self.bit(((coded >> shift) & 1) as u8);
+        }
+    }
+
+    /// Cierra con `rbsp_trailing_bits` (un 1 y ceros hasta completar el byte).
+    fn finish(mut self) -> Vec<u8> {
+        self.bit(1);
+        while self.used != 0 {
+            self.bit(0);
+        }
+        self.bytes
+    }
+}
+
+/// El mismo SPS (sin start code) con `vui_parameters_present_flag` en 0 y nada
+/// después. `None` si no es un SPS, si no trae VUI o si usa listas de escala
+/// (perfiles altos con matrices propias), casos en los que no se toca.
+///
+/// Ya no se usa al emitir: un SPS sin ningún VUI tampoco declara
+/// `bitstream_restriction`. Queda para comparar.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn without_vui(nal: &[u8]) -> Option<Vec<u8>> {
+    let sps = parse_sps_up_to_vui(nal)?;
+    if !sps.has_vui {
+        return None; // no hay VUI que quitar
+    }
+    let mut writer = BitWriter::default();
+    writer.copy_bits(&sps.rbsp, sps.vui_flag_at);
+    writer.bit(0); // vui_parameters_present_flag
+    let mut result = vec![nal[0]];
+    result.extend(add_emulation_prevention(&writer.finish()));
+    Some(result)
+}
+
+/// El mismo SPS (sin start code) con el VUI reemplazado por uno mínimo que solo
+/// lleva `bitstream_restriction`, como el de x264:
+///
+/// * sin `timing_info` ni HRD (lo que mete NVENC en CBR);
+/// * `max_num_reorder_frames = 0`: no hay B-frames, el orden de salida es el de
+///   decodificación;
+/// * `max_dec_frame_buffering = max_num_ref_frames` (mínimo 1; nunca puede ser
+///   menor que las referencias que declara el SPS).
+///
+/// Sin ese bloque, el estándar obliga al decodificador a suponer el
+/// reordenamiento máximo que permite el nivel. Funciona aunque el SPS original
+/// no tuviera VUI. `None` si no es un SPS, si está cortado antes del VUI o si usa
+/// listas de escala, casos en los que no se toca.
+pub(crate) fn with_low_delay_vui(nal: &[u8]) -> Option<Vec<u8>> {
+    let sps = parse_sps_up_to_vui(nal)?;
+    let mut writer = BitWriter::default();
+    writer.copy_bits(&sps.rbsp, sps.vui_flag_at);
+    writer.bit(1); // vui_parameters_present_flag
+    for _ in 0..4 {
+        writer.bit(0); // aspect_ratio_info, overscan_info, video_signal_type, chroma_loc_info
+    }
+    writer.bit(0); // timing_info_present_flag
+    for _ in 0..3 {
+        writer.bit(0); // nal_hrd, vcl_hrd, pic_struct_present_flag
+    }
+    writer.bit(1); // bitstream_restriction_flag
+    writer.bit(1); // motion_vectors_over_pic_boundaries_flag
+    writer.ue(0); // max_bytes_per_pic_denom
+    writer.ue(0); // max_bits_per_mb_denom
+    writer.ue(11); // log2_max_mv_length_horizontal
+    writer.ue(11); // log2_max_mv_length_vertical
+    writer.ue(0); // max_num_reorder_frames
+    writer.ue(sps.max_num_ref_frames.max(1)); // max_dec_frame_buffering
+    let mut result = vec![nal[0]];
+    result.extend(add_emulation_prevention(&writer.finish()));
+    Some(result)
+}
+
+/// Resumen legible de un SPS (sin el start code): perfil, restricciones y nivel
+/// (bytes 1 a 3 tras el header) más los primeros bytes en hexadecimal. Para el log.
+pub(crate) fn describe_sps(nal: &[u8]) -> String {
+    let hex: String = nal.iter().take(24).map(|byte| format!("{byte:02x}")).collect();
+    match nal {
+        [_, profile, constraints, level, ..] => {
+            format!("profile_idc={profile} constraints={constraints:#04x} level_idc={level} bytes={} hex={hex}", nal.len())
+        }
+        _ => format!("sps corto hex={hex}"),
+    }
 }
 
 #[cfg(test)]
@@ -687,6 +1098,102 @@ mod sender_tests {
         assert!(!p.keyframe);
         assert!(encoded_frame_from_access_unit(&[0, 0, 0, 1, 0x67, 1]).is_none());
         assert!(encoded_frame_from_access_unit(&[]).is_none());
+    }
+
+    #[test]
+    fn sei_and_filler_are_stripped_and_the_rest_is_kept() {
+        // AUD, SPS, PPS, SEI, SEI, relleno, IDR.
+        let data = annexb(&[&[0x09, 0xF0], &[0x67, 1], &[0x68, 2], &[0x06, 3], &[0x06, 4], &[0x0C, 5], &[0x65, 6]]);
+        let stripped = cleaned(&data, true, false);
+        assert_eq!(stripped, annexb(&[&[0x09, 0xF0], &[0x67, 1], &[0x68, 2], &[0x65, 6]]));
+        // Sin SEI el resultado es el mismo access unit.
+        assert_eq!(cleaned(&stripped, true, false), stripped);
+        assert!(encoded_frame_from_access_unit(&stripped).unwrap().keyframe);
+        // Sin pedir nada solo se normalizan los start codes.
+        assert_eq!(cleaned(&data, false, false), data);
+    }
+
+    /// El SPS real de NVENC (1280x720, Constrained Baseline 3.1, CBR): trae VUI
+    /// con timing_info y HRD. Los bytes son los primeros 24 de un SPS de 33.
+    const NVENC_SPS: [u8; 24] = [
+        0x67, 0x42, 0xC0, 0x1F, 0x95, 0x90, 0x05, 0x00, 0x5B, 0xB0, 0x11, 0x00, 0x00, 0x03, 0x03, 0xE8, 0x00, 0x00,
+        0xEA, 0x60, 0xE0, 0x00, 0x00, 0x02,
+    ];
+
+    #[test]
+    fn the_vui_of_an_sps_is_removed_and_nothing_else_changes() {
+        let clean = without_vui(&NVENC_SPS).unwrap();
+        assert_eq!(clean, [0x67, 0x42, 0xC0, 0x1F, 0x95, 0x90, 0x05, 0x00, 0x5B, 0x90]);
+        // Ya limpio no hay nada más que quitar.
+        assert!(without_vui(&clean).is_none());
+        assert!(without_vui(&[0x68, 1, 2]).is_none());
+        // Y `cleaned` reescribe el VUI solo en los SPS.
+        let data = annexb(&[&NVENC_SPS, &[0x68, 2], &[0x65, 6]]);
+        let rewritten = with_low_delay_vui(&NVENC_SPS).unwrap();
+        assert_eq!(cleaned(&data, false, true), annexb(&[&rewritten, &[0x68, 2], &[0x65, 6]]));
+        assert_eq!(cleaned(&data, false, false), data);
+    }
+
+    /// El SPS real de NVENC del log (1280x720, Constrained Baseline 4.1, CBR,
+    /// `max_num_ref_frames = 2`). Son los primeros 24 de sus 32 bytes: alcanza
+    /// porque solo se lee hasta el flag del VUI.
+    const NVENC_SPS_720P_L41: [u8; 24] = [
+        0x67, 0x42, 0xC0, 0x29, 0x95, 0xB0, 0x14, 0x01, 0x6E, 0xC0, 0x44, 0x00, 0x00, 0x0F, 0xA0, 0x00, 0x03, 0xA9,
+        0x83, 0x80, 0x00, 0x00, 0x98, 0x96,
+    ];
+
+    #[test]
+    fn the_vui_is_rewritten_with_a_bitstream_restriction_like_x264s() {
+        let rewritten = with_low_delay_vui(&NVENC_SPS_720P_L41).unwrap();
+        assert_eq!(
+            rewritten,
+            [0x67, 0x42, 0xC0, 0x29, 0x95, 0xB0, 0x14, 0x01, 0x6E, 0x80, 0x78, 0xC1, 0x97]
+        );
+        // Se lee de vuelta: sin timing ni HRD, sin reordenamiento y con
+        // `max_dec_frame_buffering` igual a `max_num_ref_frames` (2 en NVENC).
+        let sps = parse_sps_up_to_vui(&rewritten).unwrap();
+        assert!(sps.has_vui);
+        assert_eq!(sps.max_num_ref_frames, 2);
+        let mut reader = BitReader { data: &sps.rbsp, position: sps.vui_flag_at + 1 };
+        for _ in 0..8 {
+            assert_eq!(reader.bit(), Some(0)); // aspect..chroma_loc, timing, nal/vcl hrd, pic_struct
+        }
+        assert_eq!(reader.bit(), Some(1)); // bitstream_restriction_flag
+        assert_eq!(reader.bit(), Some(1)); // motion_vectors_over_pic_boundaries_flag
+        let fields: Vec<u32> = (0..6).map(|_| reader.ue().unwrap()).collect();
+        assert_eq!(fields, [0, 0, 11, 11, 0, 2]);
+        assert_eq!(reader.bit(), Some(1)); // bit de parada
+        // Es idempotente y no toca lo que no es un SPS.
+        assert_eq!(with_low_delay_vui(&rewritten).unwrap(), rewritten);
+        assert!(with_low_delay_vui(&[0x68, 1, 2]).is_none());
+    }
+
+    #[test]
+    fn exp_golomb_writer_matches_the_reader() {
+        for value in [0u32, 1, 2, 3, 6, 11, 79, 255, 78_124] {
+            let mut writer = BitWriter::default();
+            writer.ue(value);
+            let bytes = writer.finish();
+            let mut reader = BitReader { data: &bytes, position: 0 };
+            assert_eq!(reader.ue(), Some(value));
+            assert_eq!(reader.bit(), Some(1)); // el bit de parada de `finish`
+        }
+    }
+
+    #[test]
+    fn emulation_prevention_round_trips() {
+        let escaped = [0u8, 0, 3, 1, 9, 0, 0, 3, 0];
+        let plain = remove_emulation_prevention(&escaped);
+        assert_eq!(plain, [0, 0, 1, 9, 0, 0, 0]);
+        assert_eq!(add_emulation_prevention(&plain), escaped);
+    }
+
+    #[test]
+    fn an_sps_is_described_by_profile_and_level() {
+        let text = describe_sps(&[0x67, 66, 0xE0, 31, 0xAB]);
+        assert!(text.contains("profile_idc=66"), "{text}");
+        assert!(text.contains("level_idc=31"), "{text}");
+        assert!(text.contains("hex=67"), "{text}");
     }
 
     #[test]
@@ -758,13 +1265,64 @@ mod sender_tests {
     }
 
     #[test]
-    fn video_rtp_packet_parses_with_its_extension() {
-        let packet = build_video_rtp_packet(7, 9000, 0x01020304, 101, true, &[1, 2, 3]);
-        let header = crate::discord::voice::rtp::parse_rtp_header(&packet).unwrap();
+    fn video_rtp_packet_parses_with_and_without_extension() {
+        let with = build_video_rtp_packet_with(Some([0x52, 0, 0, 20]), 7, 9000, 0x01020304, 101, true, &[1, 2, 3]);
+        let header = crate::discord::voice::rtp::parse_rtp_header(&with).unwrap();
         assert_eq!(header.payload_type, 101);
         assert!(header.marker);
         assert_eq!(header.authenticated_header_len, 16);
         assert_eq!(header.encrypted_extension_body_len, 4);
-        assert_eq!(&packet[header.payload_offset..], &[1, 2, 3]);
+        assert_eq!(&with[header.payload_offset..], &[1, 2, 3]);
+
+        let without = build_video_rtp_packet_with(None, 7, 9000, 0x01020304, 101, true, &[1, 2, 3]);
+        let header = crate::discord::voice::rtp::parse_rtp_header(&without).unwrap();
+        assert_eq!(header.payload_type, 101);
+        assert!(header.marker);
+        assert_eq!(header.authenticated_header_len, 12);
+        assert_eq!(header.encrypted_extension_body_len, 0);
+        assert_eq!(&without[header.payload_offset..], &[1, 2, 3]);
+    }
+
+    #[test]
+    fn playout_delay_modes() {
+        // Por defecto no se manda extensión.
+        assert_eq!(PlayoutDelay::DEFAULT, PlayoutDelay::Off);
+        assert_eq!(PlayoutDelay::DEFAULT.extension_bytes(), None);
+        // 0-100 ms: 0 y 10 unidades de 10 ms.
+        assert_eq!(
+            parse_playout_delay_mode(Some("0-100")).extension_bytes(),
+            Some([0x52, 0x00, 0x00, 0x0A])
+        );
+        for text in [None, Some(""), Some("default"), Some("basura"), Some("5-")] {
+            assert_eq!(parse_playout_delay_mode(text), PlayoutDelay::DEFAULT, "{text:?}");
+        }
+        assert_eq!(parse_playout_delay_mode(Some("off")), PlayoutDelay::Off);
+        assert_eq!(PlayoutDelay::Off.extension_bytes(), None);
+        assert_eq!(parse_playout_delay_mode(Some(" LEGACY ")), PlayoutDelay::Legacy);
+        assert_eq!(PlayoutDelay::Legacy.extension_bytes(), Some([0x51, 0, 0, 0]));
+        let range = parse_playout_delay_mode(Some("0-200"));
+        assert_eq!(range, PlayoutDelay::Range { min_ms: 0, max_ms: 200 });
+        // 0-200 ms: min 0, max 20 unidades de 10 ms.
+        assert_eq!(range.extension_bytes(), Some([0x52, 0x00, 0x00, 0x14]));
+        // 100-4000 ms: min 10 (0x00A), max 400 (0x190).
+        assert_eq!(
+            PlayoutDelay::Range { min_ms: 100, max_ms: 4000 }.extension_bytes(),
+            Some([0x52, 0x00, 0xA1, 0x90])
+        );
+        // Un máximo menor que el mínimo se sube al mínimo.
+        assert_eq!(
+            PlayoutDelay::Range { min_ms: 100, max_ms: 20 }.extension_bytes(),
+            Some([0x52, 0x00, 0xA0, 0x0A])
+        );
+    }
+
+    #[test]
+    fn playout_delay_override_wins_and_can_be_cleared() {
+        let custom = PlayoutDelay::Range { min_ms: 60, max_ms: 150 };
+        set_playout_delay_override(Some(custom));
+        assert_eq!(playout_delay(), custom);
+        assert_eq!(playout_delay_override(), Some(custom));
+        set_playout_delay_override(None);
+        assert_eq!(playout_delay_override(), None);
     }
 }

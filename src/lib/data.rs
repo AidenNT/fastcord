@@ -2078,6 +2078,7 @@ impl Server {
             }
         }
         self.access_ctx.access_primed = complete;
+        /*
         if !newly_hidden.is_empty() && crate::logging::debug_logging_enabled() {
             crate::logging::debug(
                 "access",
@@ -2087,7 +2088,7 @@ impl Server {
                     newly_hidden.join(", ")
                 ),
             );
-        }
+        }*/
     }
 
     /// Guarda los roles propios (`READY.merged_members`, `GUILD_MEMBER_UPDATE`

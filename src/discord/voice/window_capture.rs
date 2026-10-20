@@ -143,7 +143,7 @@ impl WindowCapture {
     }
 
     /// Trae el cuadro nuevo, si lo hay. `Err` cuando la ventana se cerró.
-    pub(super) fn poll(&mut self) -> Result<(), String> {
+    pub(super) fn poll(&mut self) -> Result<bool, String> {
         // SAFETY: ver `new`.
         if !unsafe { IsWindow(Some(self.hwnd)) }.as_bool() {
             return Err("la ventana se cerró".to_owned());
@@ -152,17 +152,17 @@ impl WindowCapture {
         // último hasta que se restaure.
         // SAFETY: ver `new`.
         if unsafe { IsIconic(self.hwnd) }.as_bool() {
-            return Ok(());
+            return Ok(false);
         }
         // `TryGetNextFrame` falla cuando no hay nada nuevo; no es un error.
         let Ok(frame) = self.pool.TryGetNextFrame() else {
-            return Ok(());
+            return Ok(false);
         };
         let content = frame
             .ContentSize()
             .map_err(|error| wgc_error("tamaño del cuadro", error))?;
         if content.Width <= 0 || content.Height <= 0 {
-            return Ok(());
+            return Ok(false);
         }
         // La ventana cambió de tamaño: los próximos cuadros salen con el nuevo.
         if content.Width != self.pool_size.Width || content.Height != self.pool_size.Height {
@@ -189,7 +189,7 @@ impl WindowCapture {
         let height = (content.Height as u32).min(desc.Height).max(2);
         self.ensure_staging(&desc)?;
         let Some((staging, _, _)) = self.staging.as_ref() else {
-            return Ok(());
+            return Ok(false);
         };
 
         let needs_new = self
@@ -200,7 +200,7 @@ impl WindowCapture {
             self.latest = Some(Video::new(Pixel::BGRA, width, height));
         }
         let Some(video) = self.latest.as_mut() else {
-            return Ok(());
+            return Ok(false);
         };
 
         // SAFETY: `staging` y `texture` son del mismo dispositivo y tienen el
@@ -222,7 +222,7 @@ impl WindowCapture {
             }
             self.context.Unmap(staging, 0);
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Último cuadro recibido (todavía ninguno al arrancar).

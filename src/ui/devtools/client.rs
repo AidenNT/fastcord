@@ -1,7 +1,9 @@
 //! Pestaña "Cliente": qué es esta instancia de eCord y qué declara hacia
 //! afuera. Resumen del proceso y del sistema, rendimiento (tiempo de cuadro),
-//! memoria, identidad ante Discord (IDs, `X-Super-Properties`, `launch_signature`)
-//! y entorno (variables, argumentos, rutas).
+//! memoria, identidad ante Discord (IDs, `X-Super-Properties`, `launch_signature`),
+//! transmisión (codificador, perfil de NVENC, paquete opcional con libx264),
+//! actualizaciones (estado y reinstalación forzada) y
+//! entorno (variables, argumentos, rutas).
 //!
 //! También arma el "informe de diagnóstico" de texto que se muestra en el
 //! inspector y se copia con un clic. Ese informe NO incluye el token ni los
@@ -33,17 +35,21 @@ pub(super) enum Section {
     Identifiers,
     SuperProperties,
     Signature,
+    Streaming,
+    Updates,
     Environment,
 }
 
 impl Section {
-    const ALL: [Section; 7] = [
+    const ALL: [Section; 9] = [
         Section::Summary,
         Section::Performance,
         Section::Memory,
         Section::Identifiers,
         Section::SuperProperties,
         Section::Signature,
+        Section::Streaming,
+        Section::Updates,
         Section::Environment,
     ];
 
@@ -55,6 +61,8 @@ impl Section {
             Section::Identifiers => "Identificadores",
             Section::SuperProperties => "Super-Properties",
             Section::Signature => "launch_signature",
+            Section::Streaming => "Transmisión",
+            Section::Updates => "Actualizaciones",
             Section::Environment => "Entorno",
         }
     }
@@ -67,6 +75,8 @@ impl Section {
             Section::Identifiers => "Lo que este cliente declara de sí mismo: installation ID, fingerprint y build.",
             Section::SuperProperties => "El header X-Super-Properties tal como sale, en el orden en que se envía.",
             Section::Signature => "Mods de cliente detectados por bitfield y coherencia con has_client_mods.",
+            Section::Streaming => "Codificador de video, perfil de NVENC y el paquete opcional con libx264 (GPL).",
+            Section::Updates => "Estado del actualizador y reinstalación forzada de la última versión.",
             Section::Environment => "Variables de entorno, argumentos de línea de comandos y rutas de trabajo.",
         }
     }
@@ -79,6 +89,8 @@ impl Section {
             Section::Identifiers => style::PURPLE,
             Section::SuperProperties => style::PINK,
             Section::Signature => style::RED,
+            Section::Streaming => style::BLUE,
+            Section::Updates => style::GREEN,
             Section::Environment => style::TEAL,
         }
     }
@@ -211,6 +223,8 @@ impl ClientState {
                 Section::Performance => self.performance(ui, ctx, palette),
                 Section::Memory => toast = self.memory(ui, ctx),
                 Section::Identifiers | Section::SuperProperties | Section::Signature => self.identity(ui),
+                Section::Streaming => toast = self.streaming(ui, ctx),
+                Section::Updates => toast = self.updates(ui, ctx),
                 Section::Environment => self.environment(ui, remember),
             }
             ui.add_space(12.0);
@@ -360,6 +374,371 @@ impl ClientState {
         toast
     }
 
+    // -- Transmisión --------------------------------------------------------------------------------
+
+    /// Codificador de la transmisión de pantalla y paquete opcional de libx264.
+    /// Lo que se cambia acá vale hasta cerrar eCord. Con una transmisión en curso reinicia
+    /// el codificador en el acto (la imagen se corta ~1 s); sin ella, vale para la próxima.
+    fn streaming(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> Option<&'static str> {
+        use crate::discord::voice::{
+            ENCODER_CHOICES, KEYFRAME_INTERVAL_CHOICES_MS, NVENC_PROFILES, PlayoutDelay, encoder_override, keyframe_interval_ms,
+            keyframe_interval_override, last_encoder, nvenc_match_x264, nvenc_multi_slice, nvenc_profile, nvenc_profile_override, playout_delay,
+            playout_delay_override, set_encoder_override, set_keyframe_interval_override, set_nvenc_match_x264, set_nvenc_multi_slice,
+            set_nvenc_profile_override, set_playout_delay_override, set_strip_sei, set_strip_vui, strip_sei, strip_vui, x264_available,
+            StreamTransport, set_stream_transport_override, stream_transport, stream_transport_override,
+        };
+        use crate::gpl_pack::{self, Pref};
+        #[cfg(windows)]
+        use crate::gpl_pack::Status;
+
+        // Solo se usa en Windows (reinstalar el paquete GPL).
+        let _ = ctx;
+        let mut toast = None;
+
+        card(ui, "Codificador", |ui| {
+            egui::Grid::new("dev_client_stream_encoder").num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
+                kv_row(ui, "libx264 cargado", Some(if x264_available() { "sí" } else { "no" }));
+                kv_row(ui, "Último codificador usado", Some(last_encoder().unwrap_or("ninguno todavía")));
+                kv_row(ui, "Perfil de NVENC en uso", Some(&nvenc_profile()));
+            });
+            ui.add_space(6.0);
+
+            ui.horizontal(|ui| {
+                ui.label("Forzar codificador");
+                let current = encoder_override();
+                egui::ComboBox::from_id_salt("dev_stream_encoder")
+                    .selected_text(current.unwrap_or("predeterminado (entorno)"))
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(current.is_none(), "predeterminado (entorno)").clicked() {
+                            set_encoder_override(None);
+                        }
+                        for choice in ENCODER_CHOICES {
+                            if ui.selectable_label(current == Some(choice), choice).clicked() {
+                                set_encoder_override(Some(choice));
+                            }
+                        }
+                    });
+            });
+            ui.horizontal(|ui| {
+                ui.label("Perfil de NVENC");
+                let current = nvenc_profile_override();
+                egui::ComboBox::from_id_salt("dev_stream_nvenc_profile")
+                    .selected_text(current.unwrap_or("predeterminado (entorno)"))
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(current.is_none(), "predeterminado (entorno)").clicked() {
+                            set_nvenc_profile_override(None);
+                        }
+                        for profile in NVENC_PROFILES {
+                            if ui.selectable_label(current == Some(profile), profile).clicked() {
+                                set_nvenc_profile_override(Some(profile));
+                            }
+                        }
+                    });
+            });
+            let mut matched = nvenc_match_x264();
+            if ui
+                .checkbox(&mut matched, "NVENC: pedir el mismo nivel H.264 y 1 referencia que x264")
+                .on_hover_text(
+                    "x264 declara el nivel calculado (mínimo 4.1) y usa 1 referencia; NVENC por su cuenta declara 3.1 \
+                     a 720p30 y usa 3. También se apaga con ECORD_NVENC_AUTO_LEVEL=1.",
+                )
+                .changed()
+            {
+                set_nvenc_match_x264(matched);
+            }
+            let mut slices = nvenc_multi_slice();
+            if ui
+                .checkbox(&mut slices, "NVENC: partir cada frame en 6 slices (como x264)")
+                .on_hover_text(
+                    "x264 manda cada frame en 6 slices y el espectador lo decodifica; NVENC manda 1 solo. \
+                     También se apaga con ECORD_NVENC_SINGLE_SLICE=1.",
+                )
+                .changed()
+            {
+                set_nvenc_multi_slice(slices);
+            }
+            let mut strip = strip_sei();
+            if ui
+                .checkbox(&mut strip, "Quitar los SEI de NVENC antes de enviar")
+                .on_hover_text(
+                    "NVENC mete SEI de temporización en cada frame. No hacen falta para decodificar y algunos \
+                     espectadores se atragantan. También se apaga con ECORD_KEEP_SEI=1.",
+                )
+                .changed()
+            {
+                set_strip_sei(strip);
+            }
+            let mut strip = strip_vui();
+            if ui
+                .checkbox(&mut strip, "Reescribir el VUI del SPS de NVENC (como x264)")
+                .on_hover_text(
+                    "Reemplaza el VUI del SPS (NVENC en CBR mete timing_info y HRD y no declara \
+                     bitstream_restriction) por uno mínimo con bitstream_restriction: sin reordenamiento y \
+                     buffer igual a las referencias, como declara x264. Apagado, el SPS sale tal cual lo \
+                     escribe NVENC. También se apaga con ECORD_KEEP_VUI=1.",
+                )
+                .changed()
+            {
+                set_strip_vui(strip);
+            }
+            ui.add_space(4.0);
+            ui.weak(
+                "Vale hasta cerrar eCord y gana sobre las variables de entorno. Con una transmisión en curso, cada cambio \
+                 reinicia el codificador en vivo (la imagen se corta ~1 s); sin ella, vale para la próxima.",
+            );
+        });
+
+        card(ui, "Entrega a los espectadores", |ui| {
+            // Presets del playout delay (mínimo-máximo en ms que se le pide al visor).
+            const PLAYOUT_PRESETS: [PlayoutDelay; 8] = [
+                PlayoutDelay::Off,
+                PlayoutDelay::Legacy,
+                PlayoutDelay::Range { min_ms: 0, max_ms: 100 },
+                PlayoutDelay::Range { min_ms: 0, max_ms: 200 },
+                PlayoutDelay::Range { min_ms: 50, max_ms: 150 },
+                PlayoutDelay::Range { min_ms: 60, max_ms: 150 },
+                PlayoutDelay::Range { min_ms: 100, max_ms: 200 },
+                PlayoutDelay::Range { min_ms: 100, max_ms: 300 },
+            ];
+            egui::Grid::new("dev_client_stream_delivery").num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
+                kv_row(ui, "Transporte (próxima transmisión)", Some(stream_transport().label()));
+                kv_row(ui, "Playout delay en uso", Some(&playout_delay().label()));
+                kv_row(ui, "Intervalo entre IDR en uso", Some(&format!("{} ms", keyframe_interval_ms())));
+            });
+            ui.add_space(6.0);
+
+            ui.horizontal(|ui| {
+                ui.label("Transporte");
+                let current = stream_transport_override();
+                egui::ComboBox::from_id_salt("dev_stream_transport")
+                    .selected_text(current.map_or_else(|| "predeterminado (entorno)".to_owned(), |transport| transport.label().to_owned()))
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(current.is_none(), "predeterminado (entorno)").clicked() {
+                            set_stream_transport_override(None);
+                        }
+                        for transport in StreamTransport::CHOICES {
+                            if ui.selectable_label(current == Some(transport), transport.label()).clicked() {
+                                set_stream_transport_override(Some(transport));
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "UDP (AEAD) es el camino de siempre. WebRTC (DTLS-SRTP) negocia un SDP con Discord como la librería \
+                         de Node Discord-video-stream: Sender Reports, reenvíos por NACK/RTX y timestamps regulares. Solo \
+                         se aplica al iniciar una transmisión nueva (una en curso sigue con el que arrancó). También se \
+                         elige con ECORD_STREAM_TRANSPORT=webrtc.",
+                    );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Playout delay (min-max)");
+                let current = playout_delay_override();
+                egui::ComboBox::from_id_salt("dev_stream_playout_delay")
+                    .selected_text(current.map_or_else(|| "predeterminado (entorno)".to_owned(), PlayoutDelay::label))
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(current.is_none(), "predeterminado (entorno)").clicked() {
+                            set_playout_delay_override(None);
+                        }
+                        for preset in PLAYOUT_PRESETS {
+                            if ui.selectable_label(current == Some(preset), preset.label()).clicked() {
+                                set_playout_delay_override(Some(preset));
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Lo que se le pide al visor con la extensión RTP de playout delay. Con un mínimo mayor que 0 el visor \
+                         espera ese tiempo antes de mostrar cada frame y le da margen a un paquete reenviado, a costa de ese \
+                         retraso. Por defecto 0-100 ms, como la librería de Node. También se elige con \
+                         ECORD_PLAYOUT_DELAY (off, legacy o MIN-MAX en ms). Se aplica desde el próximo paquete, sin reiniciar \
+                         la transmisión.",
+                    );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Intervalo entre IDR");
+                let current = keyframe_interval_override();
+                egui::ComboBox::from_id_salt("dev_stream_keyframe_interval")
+                    .selected_text(current.map_or_else(|| "predeterminado (entorno)".to_owned(), |ms| format!("{ms} ms")))
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(current.is_none(), "predeterminado (entorno)").clicked() {
+                            set_keyframe_interval_override(None);
+                        }
+                        for ms in KEYFRAME_INTERVAL_CHOICES_MS {
+                            if ui.selectable_label(current == Some(ms), format!("{ms} ms")).clicked() {
+                                set_keyframe_interval_override(Some(ms));
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Cada cuánto se fuerza una IDR. Si el visor no recupera un paquete perdido, la imagen queda congelada \
+                         hasta la próxima IDR: un intervalo menor acorta el congelamiento, a costa de ~28 KB extra por IDR. \
+                         También se elige con ECORD_KEYFRAME_INTERVAL_MS (250 a 4000). Con una transmisión en curso reinicia \
+                         el codificador en el acto.",
+                    );
+            });
+            ui.add_space(4.0);
+            ui.weak("Gana sobre las variables de entorno. El playout delay cambia sin cortar la imagen; el intervalo de IDR reinicia el codificador (~1 s).");
+        });
+
+        card(ui, "Paquete GPL (libx264)", |ui| {
+            let pref = gpl_pack::pref();
+            egui::Grid::new("dev_client_stream_gpl").num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
+                kv_row(
+                    ui,
+                    "Respuesta guardada",
+                    Some(match pref {
+                        Pref::Ask => "sin responder",
+                        Pref::Accepted => "aceptado",
+                        Pref::Declined => "rechazado",
+                    }),
+                );
+                kv_row(ui, "Estado del paquete", Some(&format!("{:?}", gpl_pack::status())));
+                kv_row(
+                    ui,
+                    "Se preguntaría al transmitir",
+                    Some(if gpl_pack::should_ask() { "sí" } else { "no" }),
+                );
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(pref != Pref::Ask, egui::Button::new("Volver a preguntar"))
+                    .on_hover_text("Olvida la respuesta guardada: la pregunta de x264 sale en la próxima transmisión.")
+                    .clicked()
+                {
+                    gpl_pack::set_pref(Pref::Ask);
+                    toast = Some("Se volverá a preguntar por x264");
+                }
+                // Reinstalar encima de un paquete ya instalado pisaría las copias
+                // *.lgpl-bak con DLL GPL; por eso primero se vuelve a LGPL.
+                #[cfg(windows)]
+                if ui
+                    .add_enabled(
+                        pref == Pref::Accepted && matches!(gpl_pack::status(), Status::Idle | Status::Failed(_)),
+                        egui::Button::new("Reinstalar paquete GPL"),
+                    )
+                    .on_hover_text(
+                        "Vuelve a las DLL LGPL y baja e instala de nuevo el paquete de esta versión. \
+                         Hay que reiniciar eCord. Solo si ya aceptaste la licencia.",
+                    )
+                    .clicked()
+                {
+                    toast = Some(match gpl_pack::revert() {
+                        Ok(_) => {
+                            let repaint = ctx.clone();
+                            gpl_pack::start_download(move || repaint.request_repaint());
+                            "Reinstalando el paquete GPL"
+                        }
+                        Err(_) => "No se pudo preparar la reinstalación",
+                    });
+                }
+                #[cfg(windows)]
+                if ui
+                    .button("Quitar x264 (volver a LGPL)")
+                    .on_hover_text("Restaura las DLL *.lgpl-bak. Hay que reiniciar eCord.")
+                    .clicked()
+                {
+                    toast = Some(match gpl_pack::revert() {
+                        Ok(_) => "DLL LGPL restauradas: reiniciá eCord",
+                        Err(_) => "No se pudo volver a las DLL LGPL",
+                    });
+                }
+            });
+            if !x264_available() && pref == Pref::Ask {
+                ui.colored_label(theme_warn(), "x264 no está cargado y no hay respuesta: la pregunta aparece al transmitir.");
+            }
+        });
+        toast
+    }
+
+    // -- Actualizaciones ----------------------------------------------------------------------------
+
+    /// Estado del actualizador y reinstalación forzada. La reinstalación baja la
+    /// última versión publicada AUNQUE sea la que ya está instalada, con la misma
+    /// descarga verificada (SHA-256 y firma) y el mismo ayudante que una
+    /// actualización: reemplaza el `.exe` y las DLL, y con el `-setup.exe` lo
+    /// ejecuta en silencio.
+    fn updates(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> Option<&'static str> {
+        use crate::updater::{self, View};
+
+        let mut toast = None;
+        let view = updater::view();
+        let state = match &view {
+            View::Idle => "sin buscar todavía (o actualizaciones apagadas)".to_owned(),
+            View::Checking => "buscando…".to_owned(),
+            View::UpToDate => "al día".to_owned(),
+            View::CheckFailed(error) => format!("no se pudo consultar: {error}"),
+            View::NeedsElevation { version } => format!("{version} lista, pero hace falta administrador"),
+            View::Manual { version, reason, .. } => format!("{version} disponible, esta copia no se actualiza sola: {reason}"),
+            View::Downloading { version, received, total } => format!("bajando {version}: {received}/{total} bytes"),
+            View::Ready { version } => format!("{version} descargada y verificada: lista para instalar"),
+            View::Installing => "instalando: eCord se está cerrando".to_owned(),
+            View::Failed(error) => format!("falló: {error}"),
+        };
+
+        card(ui, "Estado", |ui| {
+            egui::Grid::new("dev_client_updates").num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
+                kv_row(ui, "Versión instalada", Some(updater::UPDATES.current_version));
+                kv_row(ui, "Estado", Some(&state));
+                kv_row(
+                    ui,
+                    "Carpeta protegida (pide administrador)",
+                    Some(if updater::needs_elevation() { "sí" } else { "no" }),
+                );
+                kv_row(ui, updater::DISABLE_ENV, Some(&env_value(updater::DISABLE_ENV)));
+            });
+        });
+
+        card(ui, "Acciones", |ui| {
+            let idle = matches!(view, View::Idle | View::UpToDate | View::CheckFailed(_) | View::Failed(_));
+            ui.horizontal(|ui| {
+                if ui.add_enabled(idle, egui::Button::new("Buscar actualizaciones")).clicked() {
+                    updater::check_now();
+                    toast = Some("Buscando actualizaciones");
+                }
+                if ui
+                    .add_enabled(idle, egui::Button::new("Forzar reinstalación"))
+                    .on_hover_text("Baja la última versión publicada aunque sea la misma que tenés.")
+                    .clicked()
+                {
+                    updater::force_reinstall();
+                    toast = Some("Bajando la última versión para reinstalar");
+                }
+            });
+            match &view {
+                View::Ready { .. } => {
+                    if ui.button("Instalar y reiniciar ahora").clicked() {
+                        let repaint = ctx.clone();
+                        let quit = ctx.clone();
+                        updater::install_and_quit(
+                            move || repaint.request_repaint(),
+                            move || crate::ui::settings::updates::quit_now(&quit),
+                        );
+                    }
+                }
+                View::NeedsElevation { .. } => {
+                    if ui.button("Reinstalar como administrador").clicked() {
+                        let repaint = ctx.clone();
+                        let quit = ctx.clone();
+                        updater::request_elevated_reinstall(
+                            move || repaint.request_repaint(),
+                            move || crate::ui::settings::updates::quit_now(&quit),
+                        );
+                    }
+                }
+                _ => {}
+            }
+            ui.add_space(4.0);
+            ui.weak(
+                "Forzar reinstalación baja la última versión publicada, la verifica (SHA-256 y firma) y deja \
+                 \"Instalar y reiniciar ahora\" listo. Reemplaza el .exe y las DLL; con el instalador \
+                 (-setup.exe) lo ejecuta en silencio.",
+            );
+        });
+        toast
+    }
+
     // -- Identidad ----------------------------------------------------------------------------------
 
     fn identity(&mut self, ui: &mut egui::Ui) {
@@ -402,6 +781,12 @@ impl ClientState {
                     "ECORD_USE_DEVELOPER_FEATURES",
                     "ECORD_INSECURE_TLS",
                     "ECORD_OPAQUE",
+                    "ECORD_STREAM_ENCODER",
+                    "ECORD_NVENC_PROFILE",
+                    "ECORD_KEEP_SEI",
+                    "ECORD_KEEP_VUI",
+                    "ECORD_NVENC_AUTO_LEVEL",
+                    "ECORD_NVENC_SINGLE_SLICE",
                     "RUST_LOG",
                 ] {
                     kv_row(ui, name, Some(&env_value(name)));

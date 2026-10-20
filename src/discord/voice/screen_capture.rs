@@ -37,8 +37,8 @@
 
 use std::ffi::CString;
 use std::ptr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -49,14 +49,67 @@ use ffmpeg::picture;
 use ffmpeg::software::scaling::{context::Context as ScalerContext, flag::Flags};
 use ffmpeg::{Dictionary, Error as FfmpegError, Packet, frame::Video};
 
-use super::h264::{EncodedFrame, encoded_frame_from_access_unit};
+use super::h264::{EncodedFrame, cleaned, describe_sps, encoded_frame_from_access_unit, split_annexb_nals, with_low_delay_vui};
 use super::stream_watch::{StreamFrame, StreamFrameSlot};
 #[cfg(target_os = "windows")]
 use super::window_capture;
 use crate::logging;
 
-/// Cada cuántos segundos se fuerza una IDR.
+/// Cada cuántos segundos se fuerza una IDR como red de seguridad. Con ~100 KB
+/// por IDR, 1 s hacía que la imagen "latiera"; pero con 2 s, un solo paquete
+/// perdido dejaba al espectador congelado hasta ~2 s (el visor oficial casi no
+/// manda PLI y los NACK no siempre llegan). Ahora que la IDR se reparte en
+/// ~70 ms y pesa menos (`bufsize` de 4 frames), 1 s es un buen compromiso. Si la
+/// imagen vuelve a "latir", probar 2.
 const KEYFRAME_INTERVAL_SECS: u32 = 1;
+
+/// Se sube cada vez que las devtools cambian algo que se lee al arrancar el codificador
+/// (codificador, perfil, slices, SEI/VUI, intervalo de IDR). La transmisión en curso lo
+/// vigila (`encoder_settings_generation`) y reinicia el codificador para aplicarlo.
+static ENCODER_SETTINGS_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Número de versión de los ajustes del codificador: cambia con cada cambio de las devtools.
+pub(crate) fn encoder_settings_generation() -> u64 {
+    ENCODER_SETTINGS_GENERATION.load(Ordering::Relaxed)
+}
+
+fn encoder_settings_changed() {
+    ENCODER_SETTINGS_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Opciones de intervalo entre IDR (ms) que ofrecen las devtools.
+pub(crate) const KEYFRAME_INTERVAL_CHOICES_MS: [u32; 7] = [250, 500, 750, 1000, 1500, 2000, 4000];
+
+/// Intervalo entre IDR elegido en las devtools (0 = sin elegir): gana sobre la variable
+/// de entorno y se aplica la PRÓXIMA vez que arranca el codificador.
+static KEYFRAME_INTERVAL_OVERRIDE_MS: AtomicU32 = AtomicU32::new(0);
+
+pub(crate) fn keyframe_interval_override() -> Option<u32> {
+    match KEYFRAME_INTERVAL_OVERRIDE_MS.load(Ordering::Relaxed) {
+        0 => None,
+        ms => Some(ms),
+    }
+}
+
+/// `None` vuelve a `ECORD_KEYFRAME_INTERVAL_MS` (o al intervalo por defecto).
+pub(crate) fn set_keyframe_interval_override(ms: Option<u32>) {
+    KEYFRAME_INTERVAL_OVERRIDE_MS.store(ms.map_or(0, |ms| ms.clamp(250, 4000)), Ordering::Relaxed);
+    encoder_settings_changed();
+}
+
+/// Intervalo entre IDR en milisegundos: devtools, luego `ECORD_KEYFRAME_INTERVAL_MS`
+/// (250 a 4000), luego `KEYFRAME_INTERVAL_SECS`. Si el visor no logra recuperar un
+/// paquete perdido, la imagen queda congelada hasta la próxima IDR, así que bajarlo acorta
+/// los congelamientos, a costa de ~28 KB extra por IDR.
+pub(crate) fn keyframe_interval_ms() -> u32 {
+    keyframe_interval_override().unwrap_or_else(|| {
+        std::env::var("ECORD_KEYFRAME_INTERVAL_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .map_or(KEYFRAME_INTERVAL_SECS * 1000, |ms| ms.clamp(250, 4000))
+    })
+}
+
 /// Cuánto se espera al primer frame antes de dar el codificador por colgado.
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(8);
 /// Separación mínima entre dos IDR forzadas. Una IDR pesa varias veces lo que
@@ -335,6 +388,140 @@ impl Encoder {
     }
 }
 
+/// Valores que acepta `ECORD_STREAM_ENCODER` (y el selector de las devtools).
+pub(crate) const ENCODER_CHOICES: [&str; 6] = ["auto", "x264", "openh264", "nvenc", "amf", "qsv"];
+/// Perfiles H.264 que acepta `ECORD_NVENC_PROFILE` (y el selector de las devtools).
+pub(crate) const NVENC_PROFILES: [&str; 3] = ["baseline", "main", "high"];
+
+/// Lo que eligen las devtools en esta sesión: gana sobre las variables de
+/// entorno y se aplica a la PRÓXIMA transmisión.
+static ENCODER_OVERRIDE: Mutex<Option<&'static str>> = Mutex::new(None);
+static NVENC_PROFILE_OVERRIDE: Mutex<Option<&'static str>> = Mutex::new(None);
+/// Último codificador que arrancó (para mostrarlo en las devtools).
+static LAST_ENCODER: Mutex<Option<&'static str>> = Mutex::new(None);
+/// Quitar los SEI de lo que saca NVENC antes de mandarlo (ver `cleaned`).
+/// Por omisión sí; `ECORD_KEEP_SEI=1` o las devtools lo apagan.
+static STRIP_SEI: AtomicBool = AtomicBool::new(true);
+
+/// ¿Se quitan los SEI de NVENC en la próxima transmisión?
+pub(crate) fn strip_sei() -> bool {
+    STRIP_SEI.load(Ordering::Relaxed) && std::env::var_os("ECORD_KEEP_SEI").is_none_or(|value| value.is_empty() || value == "0")
+}
+
+pub(crate) fn set_strip_sei(strip: bool) {
+    STRIP_SEI.store(strip, Ordering::Relaxed);
+    encoder_settings_changed();
+}
+
+/// Slices por frame que se le piden a NVENC (los mismos que x264 usa en la
+/// práctica con `zerolatency`).
+const NVENC_SLICES: &str = "6";
+
+/// Partir cada frame de NVENC en varios slices, como x264. Por omisión sí;
+/// `ECORD_NVENC_SINGLE_SLICE=1` o las devtools lo apagan.
+static NVENC_MULTI_SLICE: AtomicBool = AtomicBool::new(true);
+
+/// ¿Se le piden varios slices por frame a NVENC en la próxima transmisión?
+pub(crate) fn nvenc_multi_slice() -> bool {
+    NVENC_MULTI_SLICE.load(Ordering::Relaxed)
+        && std::env::var_os("ECORD_NVENC_SINGLE_SLICE").is_none_or(|value| value.is_empty() || value == "0")
+}
+
+pub(crate) fn set_nvenc_multi_slice(enabled: bool) {
+    NVENC_MULTI_SLICE.store(enabled, Ordering::Relaxed);
+    encoder_settings_changed();
+}
+
+/// Pedirle a NVENC el mismo nivel y número de referencias que a x264. Por
+/// omisión sí; `ECORD_NVENC_AUTO_LEVEL=1` o las devtools lo apagan.
+static NVENC_MATCH_X264: AtomicBool = AtomicBool::new(true);
+
+/// ¿Se le fuerza a NVENC el nivel y 1 referencia en la próxima transmisión?
+pub(crate) fn nvenc_match_x264() -> bool {
+    NVENC_MATCH_X264.load(Ordering::Relaxed)
+        && std::env::var_os("ECORD_NVENC_AUTO_LEVEL").is_none_or(|value| value.is_empty() || value == "0")
+}
+
+pub(crate) fn set_nvenc_match_x264(enabled: bool) {
+    NVENC_MATCH_X264.store(enabled, Ordering::Relaxed);
+    encoder_settings_changed();
+}
+
+/// Reescribir el VUI del SPS de NVENC: sin timing ni HRD y con `bitstream_restriction`
+/// (sin reordenamiento), como el de x264. Por omisión sí; `ECORD_KEEP_VUI=1` o las
+/// devtools lo apagan y el SPS sale tal cual lo escribe NVENC.
+static STRIP_VUI: AtomicBool = AtomicBool::new(true);
+
+/// ¿Se reescribe el VUI del SPS de NVENC en la próxima transmisión?
+pub(crate) fn strip_vui() -> bool {
+    STRIP_VUI.load(Ordering::Relaxed) && std::env::var_os("ECORD_KEEP_VUI").is_none_or(|value| value.is_empty() || value == "0")
+}
+
+pub(crate) fn set_strip_vui(strip: bool) {
+    STRIP_VUI.store(strip, Ordering::Relaxed);
+    encoder_settings_changed();
+}
+
+fn read_slot(slot: &Mutex<Option<&'static str>>) -> Option<&'static str> {
+    *slot.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn write_slot(slot: &Mutex<Option<&'static str>>, value: Option<&'static str>) {
+    *slot.lock().unwrap_or_else(PoisonError::into_inner) = value;
+}
+
+/// Codificador forzado desde las devtools, si lo hay.
+pub(crate) fn encoder_override() -> Option<&'static str> {
+    read_slot(&ENCODER_OVERRIDE)
+}
+
+/// `None` vuelve a lo que diga `ECORD_STREAM_ENCODER` (o al orden por omisión).
+pub(crate) fn set_encoder_override(choice: Option<&'static str>) {
+    write_slot(&ENCODER_OVERRIDE, choice);
+    encoder_settings_changed();
+}
+
+/// Perfil de NVENC forzado desde las devtools, si lo hay.
+pub(crate) fn nvenc_profile_override() -> Option<&'static str> {
+    read_slot(&NVENC_PROFILE_OVERRIDE)
+}
+
+pub(crate) fn set_nvenc_profile_override(profile: Option<&'static str>) {
+    write_slot(&NVENC_PROFILE_OVERRIDE, profile);
+    encoder_settings_changed();
+}
+
+/// Nombre del último codificador que arrancó, si ya hubo una transmisión.
+pub(crate) fn last_encoder() -> Option<&'static str> {
+    read_slot(&LAST_ENCODER)
+}
+
+/// Qué codificador se pide: devtools, luego `ECORD_STREAM_ENCODER`; vacío si ninguno.
+fn encoder_choice() -> String {
+    encoder_override().map_or_else(
+        || {
+            std::env::var("ECORD_STREAM_ENCODER")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+        },
+        str::to_owned,
+    )
+}
+
+/// Perfil con el que se abre NVENC: devtools, luego `ECORD_NVENC_PROFILE`, luego `baseline`.
+pub(crate) fn nvenc_profile() -> String {
+    nvenc_profile_override().map_or_else(
+        || {
+            std::env::var("ECORD_NVENC_PROFILE")
+                .ok()
+                .map(|value| value.to_ascii_lowercase())
+                .filter(|value| NVENC_PROFILES.contains(&value.as_str()))
+                .unwrap_or_else(|| "baseline".to_owned())
+        },
+        str::to_owned,
+    )
+}
+
 /// Encoders a probar, en orden: el primero que arranque se usa.
 ///
 /// * Windows: GPU primero (NVENC, AMF, QSV; si no hay esa GPU fallan al
@@ -348,9 +535,7 @@ impl Encoder {
 /// `auto` (hardware primero y, si no arranca, software). Un encoder de
 /// hardware elegido a mano cae a software si no arranca.
 fn encoder_candidates() -> Vec<Encoder> {
-    let choice = std::env::var("ECORD_STREAM_ENCODER")
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let choice = encoder_choice();
     let mut candidates = candidates_for(&choice, cfg!(target_os = "windows"));
     // Sin libx264 en las libs (FFmpeg LGPL de Windows) no se gasta un intento:
     // abrir la captura solo para descubrir que falta el codificador es tiempo
@@ -476,12 +661,16 @@ fn h264_level(size: (u32, u32), fps: u32) -> &'static str {
 fn encoder_options(config: &ScreenCaptureConfig, encoder: Encoder) -> Vec<(&'static str, String)> {
     let fps = config.fps.max(1);
     let level = h264_level(config.even_size(), fps);
-    let gop = (fps * KEYFRAME_INTERVAL_SECS).to_string();
+    let gop = (fps * keyframe_interval_ms() / 1000).max(1).to_string();
     let bitrate = config.bitrate_kbps.max(100);
     let mut options: Vec<(&'static str, String)> = vec![
         ("b", format!("{bitrate}k")),
         ("maxrate", format!("{bitrate}k")),
-        ("bufsize", format!("{}k", bitrate.max(2) / 2)),
+        // Buffer de rate control de ~4 frames. Con el de 0,5 s de antes una IDR
+        // podía pesar ~105 KB (94 paquetes en ráfaga); el visor mostraba saltos
+        // de ~40 paquetes perdidos de golpe y cada pérdida congelaba la imagen
+        // hasta la próxima IDR. Con 4 frames la IDR sale en ~35 paquetes.
+        ("bufsize", format!("{}k", (bitrate / fps).max(1) * 4)),
         ("g", gop.clone()),
         ("bf", "0".to_owned()),
     ];
@@ -490,7 +679,7 @@ fn encoder_options(config: &ScreenCaptureConfig, encoder: Encoder) -> Vec<(&'sta
     };
     match encoder {
         Encoder::X264 => add(&[
-            ("preset", "veryfast"),
+            ("preset", "veryfast"), //veryfast
             ("tune", "zerolatency"),
             ("profile", "baseline"),
             ("level", level),
@@ -507,15 +696,34 @@ fn encoder_options(config: &ScreenCaptureConfig, encoder: Encoder) -> Vec<(&'sta
             ("rc_mode", "bitrate"),
             ("allow_skip_frames", "0"),
         ]),
-        Encoder::Nvenc => add(&[
-            ("preset", "p1"),
-            ("tune", "ll"),
-            ("rc", "cbr"),
-            ("zerolatency", "1"),
-            ("profile", "baseline"),
-            ("forced-idr", "1"),
-            ("aud", "1"),
-        ]),
+        Encoder::Nvenc => {
+            // `ECORD_NVENC_PROFILE` o las devtools (baseline, main o high) para probar
+            // otro perfil sin recompilar: NVENC no es un codificador baseline "de verdad" y
+            // algunos decodificadores de los espectadores lo rechazan.
+            let profile = nvenc_profile();
+            add(&[
+                ("preset", "p1"),
+                ("tune", "ll"),
+                ("rc", "cbr"),
+                ("zerolatency", "1"),
+                ("profile", profile.as_str()),
+                ("forced-idr", "1"),
+                ("aud", "1"),
+            ]);
+            // x264 declara el nivel que calcula `h264_level` (mínimo 4.1) y usa una
+            // sola referencia. NVENC, por su cuenta, declara 3.1 a 720p30 y abre 3
+            // referencias: con x264 el espectador decodifica y con NVENC no, y esa
+            // es la diferencia de SPS/PPS que queda una vez quitados SEI y VUI.
+            if nvenc_match_x264() {
+                add(&[("level", level), ("refs", "1")]);
+            }
+            // x264 con `zerolatency` parte cada frame en 6 slices (uno por hilo) y el
+            // espectador lo decodifica; NVENC manda 1 solo slice de 40 a 110 KB y no.
+            // Es la diferencia estructural que queda entre los dos flujos.
+            if nvenc_multi_slice() {
+                add(&[("slices", NVENC_SLICES)]);
+            }
+        }
         Encoder::Amf => add(&[
             ("usage", "ultralowlatency"),
             ("rc", "cbr"),
@@ -596,6 +804,7 @@ pub(crate) fn start_screen_encoder(
     while let Some(encoder) = candidates.next() {
         match start_with_encoder(config, encoder, frames_tx.clone(), keyframe.clone(), preview.clone()) {
             Ok(started) => {
+                write_slot(&LAST_ENCODER, Some(encoder.name()));
                 logging::debug(
                     "stream",
                     format!("screen encoder started: {} ({})", encoder.name(), config.target.label()),
@@ -636,7 +845,10 @@ fn start_with_encoder(
         let stop = Arc::clone(&stop);
         std::thread::Builder::new()
             .name("stream-encoder".to_owned())
-            .spawn(move || run_capture(&config, encoder, frames_tx, keyframe, preview, &stop, ready_tx))
+            .spawn(move || {
+                super::stream_publish::win_perf::boost_current_thread();
+                run_capture(&config, encoder, frames_tx, keyframe, preview, &stop, ready_tx)
+            })
             .map_err(|error| format!("no se pudo iniciar el hilo del codificador: {error}"))?
     };
 
@@ -680,6 +892,9 @@ fn run_capture(
         ready_tx: Some(ready_tx),
         waiting_for_keyframe: false,
         dropped: 0,
+        logged_packets: 0,
+        strip_sei: encoder == Encoder::Nvenc && strip_sei(),
+        strip_vui: encoder == Encoder::Nvenc && strip_vui(),
     };
     if let Err(error) = capture_loop(config, encoder, &keyframe, preview, stop, &mut sink) {
         match sink.ready_tx.take() {
@@ -703,14 +918,86 @@ struct FrameSink {
     /// Tras descartar un frame hay que esperar a una IDR para seguir.
     waiting_for_keyframe: bool,
     dropped: u64,
+    /// Paquetes del codificador ya registrados en el log (solo los primeros).
+    logged_packets: u32,
+    /// Quitar los SEI de cada frame antes de encolarlo (NVENC).
+    strip_sei: bool,
+    /// Reescribir el VUI del SPS (con `bitstream_restriction`) antes de encolar la IDR (NVENC).
+    strip_vui: bool,
 }
 
 impl FrameSink {
     /// `false` si el receptor ya no existe (la sesión terminó).
     fn push(&mut self, packet: &Packet) -> bool {
-        let Some(frame) = packet.data().and_then(encoded_frame_from_access_unit) else {
+        // Diagnóstico: qué NAL trae cada uno de los primeros paquetes (7 = SPS,
+        // 8 = PPS, 5 = IDR, 1 = P, 9 = AUD, 6 = SEI). Si un codificador (p. ej.
+        // NVENC) nunca saca una IDR (5), el emisor descarta todo en silencio
+        // esperándola y el espectador solo pide keyframes.
+        if self.logged_packets < 5 {
+            self.logged_packets += 1;
+            let nals: Vec<u8> = packet
+                .data()
+                .map(|data| split_annexb_nals(data).iter().map(|nal| nal[0] & 0x1F).collect())
+                .unwrap_or_default();
+            logging::debug(
+                "stream",
+                format!(
+                    "encoder packet #{}: bytes={} key={} nal_types={nals:?}",
+                    self.logged_packets,
+                    packet.size(),
+                    packet.is_key(),
+                ),
+            );
+            // El SPS y el PPS de la primera IDR: perfil, nivel y bytes crudos,
+            // para ver qué le llega de verdad al espectador.
+            if let Some(data) = packet.data() {
+                for nal in split_annexb_nals(data) {
+                    match nal[0] & 0x1F {
+                        7 => {
+                            logging::debug("stream", format!("sps: {}", describe_sps(nal)));
+                            if self.strip_vui {
+                                match with_low_delay_vui(nal) {
+                                    Some(rewritten) => {
+                                        logging::debug(
+                                            "stream",
+                                            format!("sps reescrito (VUI con bitstream_restriction): {}", describe_sps(&rewritten)),
+                                        );
+                                    }
+                                    None => logging::debug("stream", "sps: no se pudo reescribir el VUI (se envía igual)".to_owned()),
+                                }
+                            }
+                        }
+                        8 => logging::debug(
+                            "stream",
+                            format!(
+                                "pps: bytes={} hex={}",
+                                nal.len(),
+                                nal.iter().take(16).map(|byte| format!("{byte:02x}")).collect::<String>()
+                            ),
+                        ),
+                        // Cabecera de slice (1 = P, 5 = IDR): nal_ref_idc, first_mb, slice_type,
+                        // pps_id, frame_num, idr_pic_id... para comparar NVENC con x264.
+                        1 | 5 => logging::debug(
+                            "stream",
+                            format!(
+                                "slice: nal_type={} bytes={} head={}",
+                                nal[0] & 0x1F,
+                                nal.len(),
+                                nal.iter().take(12).map(|byte| format!("{byte:02x}")).collect::<String>()
+                            ),
+                        ),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let Some(mut frame) = packet.data().and_then(encoded_frame_from_access_unit) else {
             return true;
         };
+        if self.strip_sei || self.strip_vui {
+            frame.data = cleaned(&frame.data, self.strip_sei, self.strip_vui);
+        }
+        frame.pts = packet.pts();
         if let Some(ready_tx) = self.ready_tx.take() {
             let _ = ready_tx.send(Ok(()));
         }
@@ -817,6 +1104,54 @@ struct Pipeline {
     keyframe: KeyframeRequest,
     last_forced: Option<Instant>,
     preview: PreviewRenderer,
+    stats: EncodeStats,
+    fps: u32,
+}
+
+/// Cada 5 s deja en el log cuántos frames salen de verdad y cuánto tarda cada
+/// uno (escalar + codificar): si el promedio supera 1000/fps ms el emisor no
+/// llega a los fps anunciados y el visor muestra el error `stream-view-low-fps`.
+struct EncodeStats {
+    since: Instant,
+    frames: u32,
+    total: Duration,
+    max: Duration,
+}
+
+impl EncodeStats {
+    fn new() -> Self {
+        Self {
+            since: Instant::now(),
+            frames: 0,
+            total: Duration::ZERO,
+            max: Duration::ZERO,
+        }
+    }
+
+    fn record(&mut self, took: Duration, source: (u32, u32), output: (u32, u32), fps: u32) {
+        self.frames += 1;
+        self.total += took;
+        self.max = self.max.max(took);
+        let elapsed = self.since.elapsed();
+        if elapsed < Duration::from_secs(5) {
+            return;
+        }
+        let seconds = elapsed.as_secs_f64();
+        logging::debug(
+            "stream",
+            format!(
+                "encode stats: {:.1} fps (pedido {fps}), por frame avg={:.1} ms max={} ms, captura {}x{} -> {}x{}",
+                f64::from(self.frames) / seconds,
+                self.total.as_secs_f64() * 1000.0 / f64::from(self.frames.max(1)),
+                self.max.as_millis(),
+                source.0,
+                source.1,
+                output.0,
+                output.1,
+            ),
+        );
+        *self = Self::new();
+    }
 }
 
 impl Pipeline {
@@ -832,12 +1167,27 @@ impl Pipeline {
             keyframe,
             last_forced: None,
             preview: PreviewRenderer::new(preview),
+            stats: EncodeStats::new(),
+            fps: config.fps.max(1),
         })
     }
 
     /// Codifica `source` como el frame número `pts` (en unidades de 1/fps).
     /// `false` si hay que parar (la sesión terminó).
     fn encode(&mut self, source: &Video, pts: i64, sink: &mut FrameSink) -> Result<bool, String> {
+        let started = Instant::now();
+        let result = self.encode_inner(source, pts, sink);
+        let output = self.converter.output;
+        self.stats.record(
+            started.elapsed(),
+            (source.width(), source.height()),
+            output,
+            self.fps,
+        );
+        result
+    }
+
+    fn encode_inner(&mut self, source: &Video, pts: i64, sink: &mut FrameSink) -> Result<bool, String> {
         // Vista previa para la UI (a pocos fps y solo con la ventana al frente).
         self.preview.render(source);
         let frame = self.converter.convert(source)?;
@@ -960,8 +1310,25 @@ fn window_capture_loop(
     let mut next_tick = started;
     let mut last_pts: i64 = -1;
 
+    let mut last_fresh = Instant::now();
     while !stop.load(Ordering::Relaxed) {
-        capture.poll()?;
+        // Si WGC deja de entregar cuadros durante más de 1 s, el visor ve la
+        // imagen congelada aunque el codificador siga a 30 fps (reenvía el
+        // último cuadro). Esto lo deja en el log para distinguirlo de la red.
+        if capture.poll()? {
+            let gap = last_fresh.elapsed();
+            if gap >= Duration::from_secs(1) {
+                logging::debug(
+                    "stream",
+                    format!(
+                        "captura: la ventana no entregó cuadros nuevos durante {} ms \
+                         (quieta, minimizada o sin actualizar)",
+                        gap.as_millis()
+                    ),
+                );
+            }
+            last_fresh = Instant::now();
+        }
         // Hasta que no llegue el primer cuadro no hay nada que codificar (si
         // tarda demasiado, `start_with_encoder` da el intento por fallido).
         if let Some(frame) = capture.latest() {
@@ -1055,7 +1422,11 @@ impl FrameConverter {
                 Pixel::YUV420P,
                 fit.0,
                 fit.1,
-                Flags::FAST_BILINEAR,
+                // FAST_BILINEAR al reducir (1440p/4K -> 720p) toma muy pocas
+                // muestras por píxel de salida: el texto sale dentado y
+                // tembloroso con cualquier codificador. AREA promedia todos los
+                // píxeles de origen (filtro de caja), nítido y barato.
+                Flags::AREA,
             )
             .map_err(|error| ffmpeg_error("no se pudo crear el escalador", error))?;
             self.scaled = (fit != self.output).then(|| Video::new(Pixel::YUV420P, fit.0, fit.1));
@@ -1228,8 +1599,21 @@ mod tests {
         assert!(text.contains("g=30"), "{text}");
         assert!(text.contains("keyint_min=30"), "{text}");
         assert!(text.contains("bf=0"), "{text}");
-        assert!(text.contains("b=2500k maxrate=2500k bufsize=1250k"), "{text}");
+        assert!(text.contains("b=2500k maxrate=2500k bufsize=332k"), "{text}");
         assert!(text.contains("x264-params=aud=1:repeat-headers=1"), "{text}");
+    }
+
+    #[test]
+    fn nvenc_declares_the_same_level_and_references_as_x264() {
+        let config = ScreenCaptureConfig::default();
+        let text = joined(&encoder_options(&config, Encoder::Nvenc));
+        let x264 = joined(&encoder_options(&config, Encoder::X264));
+        let level = h264_level(config.even_size(), config.fps.max(1));
+        assert!(text.contains(&format!("level={level}")), "{text}");
+        assert!(x264.contains(&format!("level={level}")), "{x264}");
+        assert!(text.contains("refs=1"), "{text}");
+        assert!(text.contains("slices=6"), "{text}");
+        assert!(text.contains("forced-idr=1") && text.contains("aud=1"), "{text}");
     }
 
     #[test]

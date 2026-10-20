@@ -220,7 +220,7 @@ pub fn section(ui: &mut egui::Ui, palette: &Palette) -> Option<UiAction> {
 
 /// Cierra eCord de verdad: la actualización reemplaza el ejecutable, así que
 /// cerrar la ventana no puede mandarlo a la bandeja.
-fn quit_now(ctx: &egui::Context) {
+pub(crate) fn quit_now(ctx: &egui::Context) {
     crate::app_shell::request_quit();
     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
 }

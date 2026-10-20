@@ -35,6 +35,7 @@ mod video_decode;
 // Transmitir la propia pantalla (Go Live): captura + H.264 con ffmpeg-the-third y la
 // sesión de media que lo manda. Ver `stream_publish.rs`.
 mod screen_capture;
+mod loss_control;
 mod source_thumbs;
 mod stream_publish;
 #[cfg(windows)]
@@ -60,11 +61,20 @@ use microphone::*;
 #[cfg(test)]
 use runtime::{VoiceRuntimeAction, VoiceRuntimeState};
 pub(crate) use runtime::{forward_app_event, run_voice_runtime};
-pub(crate) use screen_capture::{CaptureTarget, ScreenCaptureConfig, StreamQuality, x264_available};
+pub(crate) use h264::{PlayoutDelay, playout_delay, playout_delay_override, set_playout_delay_override};
+pub(crate) use screen_capture::{
+    CaptureTarget, ENCODER_CHOICES, KEYFRAME_INTERVAL_CHOICES_MS, NVENC_PROFILES, ScreenCaptureConfig, StreamQuality, encoder_override,
+    keyframe_interval_ms, keyframe_interval_override, last_encoder, nvenc_match_x264, nvenc_multi_slice, nvenc_profile,
+    nvenc_profile_override, set_encoder_override, set_keyframe_interval_override, set_nvenc_profile_override, set_nvenc_match_x264,
+    set_nvenc_multi_slice, set_strip_sei, set_strip_vui, strip_sei, strip_vui, x264_available,
+};
 pub(crate) use source_thumbs::{ThumbKey, Thumbnail, spawn_source_thumbnails};
 pub use state::{CurrentVoiceConnectionState, VoiceAudioSettings, VoiceCache, VoiceParticipantState};
 pub use stream_publish::StreamPublishStatus;
-pub(crate) use stream_publish::{StreamPublishHandle, StreamPublishParams, spawn_stream_publish};
+pub(crate) use stream_publish::{
+    StreamPublishHandle, StreamPublishParams, StreamTransport, set_stream_transport_override, spawn_stream_publish, stream_transport,
+    stream_transport_override,
+};
 pub use stream_watch::{StreamFrame, StreamFrameSlot, StreamWatchStatus};
 pub(crate) use stream_watch::{StreamWatchHandle, StreamWatchParams, spawn_stream_watch};
 pub(crate) use window_list::{

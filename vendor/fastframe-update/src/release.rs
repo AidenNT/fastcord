@@ -56,8 +56,33 @@ pub(crate) fn newer(
     source: &Source,
 ) -> Result<Option<Release>> {
     if config.prerelease_channel() {
-        return newest_listed(config, transport, source);
+        return newest_listed(config, transport, source, false);
     }
+    let release = fetch_latest(config, transport, source)?;
+    Ok(version::is_newer(&release.version, config.current_version).then_some(release))
+}
+
+/// The newest release even when it is not newer than the running app (the
+/// same version, or older): what a forced reinstall installs. On the
+/// pre-release channel `None` still means nothing is published at or above
+/// the running version.
+pub(crate) fn latest(
+    config: &UpdateConfig,
+    transport: &dyn Transport,
+    source: &Source,
+) -> Result<Option<Release>> {
+    if config.prerelease_channel() {
+        return newest_listed(config, transport, source, true);
+    }
+    fetch_latest(config, transport, source).map(Some)
+}
+
+/// The release GitHub (or the source) calls the latest, whatever its version.
+fn fetch_latest(
+    config: &UpdateConfig,
+    transport: &dyn Transport,
+    source: &Source,
+) -> Result<Release> {
     let mut body = Vec::new();
     fetch(transport, source, config, &source.latest(config), JSON)?
         .take(MANIFEST_LIMIT + 1)
@@ -68,22 +93,21 @@ pub(crate) fn newer(
         "The release listing is too large"
     );
     let latest: Latest = serde_json::from_slice(&body).context("Unexpected release listing")?;
-    let version = latest.tag_name.trim_start_matches('v').to_owned();
-    Ok(
-        version::is_newer(&version, config.current_version).then_some(Release {
-            version,
-            url: latest.html_url,
-        }),
-    )
+    Ok(Release {
+        version: latest.tag_name.trim_start_matches('v').to_owned(),
+        url: latest.html_url,
+    })
 }
 
 /// The pre-release channel: the highest published version above the
 /// running pre-release, stable or not, from the release list. Drafts and
-/// tags that are not `v` and a safe semantic version are skipped.
+/// tags that are not `v` and a safe semantic version are skipped. With
+/// `include_current` the running version itself also qualifies (a reinstall).
 fn newest_listed(
     config: &UpdateConfig,
     transport: &dyn Transport,
     source: &Source,
+    include_current: bool,
 ) -> Result<Option<Release>> {
     let current = version::Semver::parse(config.current_version)
         .context("The current version is not a semantic version")?;
@@ -114,7 +138,7 @@ fn newest_listed(
                 .as_ref()
                 .and_then(|(version, _)| version::Semver::parse(version));
             if !release.draft
-                && candidate > current
+                && (candidate > current || (include_current && candidate == current))
                 && best_so_far.is_none_or(|best| candidate > best)
             {
                 best = Some((tag.to_owned(), release.html_url.clone()));
@@ -328,6 +352,17 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn a_forced_reinstall_takes_the_latest_release_even_if_it_is_not_newer() {
+        for (tag, version) in [("v0.16.3", "0.16.3"), ("v0.16.0", "0.16.0"), ("v0.17.0", "0.17.0")] {
+            let transport = FakeTransport::default().serve(LATEST, listing(tag).as_bytes());
+            let release = latest(&ZAPFAST, &transport, &Source::github())
+                .unwrap()
+                .unwrap();
+            assert_eq!(release.version, version, "{tag}");
+        }
     }
 
     const LIST: &str = "https://api.github.com/repos/crmne/zapfast/releases?per_page=100&page=";

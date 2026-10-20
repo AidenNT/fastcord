@@ -33,6 +33,9 @@ pub const ELEVATED_FLAG: &str = "--elevated-update";
 /// Bandera con la que el ayudante reabre eCord tras una actualización
 /// elevada: la copia que la recibe se relanza sin privilegios y sale.
 pub const DEELEVATE_FLAG: &str = "--deelevate";
+/// Bandera extra de la instancia elevada: baja la última versión aunque no
+/// sea más nueva que esta (reinstalación forzada desde las devtools).
+pub const FORCE_FLAG: &str = "--force-reinstall";
 
 /// Error de un intento de elevar (UAC cancelado, `ShellExecuteW` falló...)
 /// que la UI muestra como aviso en el próximo frame.
@@ -92,9 +95,19 @@ pub fn needs_elevation() -> bool {
 /// para [`take_error`] y llama a `repaint`. La actualización descargada sigue
 /// lista: se puede volver a intentar.
 pub fn request_elevated_update(repaint: impl Fn() + Send + 'static, quit: impl FnOnce() + Send + 'static) {
+    request_elevated(false, repaint, quit);
+}
+
+/// Como [`request_elevated_update`], pero la instancia elevada reinstala la
+/// última versión publicada aunque no sea más nueva que esta.
+pub fn request_elevated_reinstall(repaint: impl Fn() + Send + 'static, quit: impl FnOnce() + Send + 'static) {
+    request_elevated(true, repaint, quit);
+}
+
+fn request_elevated(force: bool, repaint: impl Fn() + Send + 'static, quit: impl FnOnce() + Send + 'static) {
     let spawned = std::thread::Builder::new()
         .name("ecord-update-elevate".into())
-        .spawn(move || match launch_elevated() {
+        .spawn(move || match launch_elevated(force) {
             Ok(()) => quit(),
             Err(message) => {
                 log::warn!("updater: no se pudo elevar: {message}");
@@ -109,7 +122,7 @@ pub fn request_elevated_update(repaint: impl Fn() + Send + 'static, quit: impl F
 }
 
 #[cfg(windows)]
-fn launch_elevated() -> Result<(), String> {
+fn launch_elevated(force: bool) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
 
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
@@ -123,6 +136,7 @@ fn launch_elevated() -> Result<(), String> {
     // Primero la bandera; después, los argumentos con los que había que
     // reabrir eCord (sin las banderas del updater).
     let parameters = std::iter::once(ELEVATED_FLAG.to_owned())
+        .chain(force.then(|| FORCE_FLAG.to_owned()))
         .chain(relaunch_arguments())
         .map(|arg| quote_argument(&arg))
         .collect::<Vec<_>>()
@@ -157,7 +171,7 @@ fn launch_elevated() -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-fn launch_elevated() -> Result<(), String> {
+fn launch_elevated(_force: bool) -> Result<(), String> {
     Err("Elevar permisos solo hace falta en Windows.".into())
 }
 
@@ -208,8 +222,9 @@ fn run_elevated_update() -> Result<(), String> {
     let transport = ReqwestTransport::new(reqwest::blocking::Client::builder())
         .map_err(|error| format!("no se pudo crear el cliente HTTP: {error:#}"))?;
     let updater = Updater::new(UPDATES, transport);
-    let release = updater
-        .check()
+    // Con `--force-reinstall` se baja la última versión aunque sea la misma.
+    let outcome = if has_flag(FORCE_FLAG) { updater.latest() } else { updater.check() };
+    let release = outcome
         .map_err(|error| format!("no se pudo consultar la última versión: {error:#}"))?
         .ok_or_else(|| "Ya tenés la última versión.".to_owned())?;
     let prepared = updater
