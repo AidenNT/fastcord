@@ -558,12 +558,12 @@ pub(super) fn insert_fingerprint_header(headers: &mut HeaderMap, fingerprint: &C
 
 fn insert_chrome_client_hints(headers: &mut HeaderMap, os: &str) {
     headers.insert(
-        "Sec-CH-UA",
+        "sec-ch-ua",
         HeaderValue::from_static("\"Not;A=Brand\";v=\"8\", \"Chromium\";v=\"149\", \"Google Chrome\";v=\"149\""),
     );
-    headers.insert("Sec-CH-UA-Mobile", HeaderValue::from_static("?0"));
+    headers.insert("sec-ch-ua-mobile", HeaderValue::from_static("?0"));
     headers.insert(
-        "Sec-CH-UA-Platform",
+        "sec-ch-ua-platform",
         HeaderValue::from_static(match os {
             "Mac OS X" => "\"macOS\"",
             "Windows" => "\"Windows\"",

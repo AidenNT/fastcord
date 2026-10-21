@@ -600,7 +600,7 @@ fn card_bg(ui: &egui::Ui, palette: &Palette, rect: Rect) {
     let radius = CornerRadius::same(theme::CARD_RADIUS);
     ui.painter().rect_filled(rect, radius, palette.panel);
     ui.painter()
-        .rect_stroke(rect, radius, Stroke::new(1.0, palette.outline), StrokeKind::Inside);
+        .rect_stroke(rect, radius, theme::card_stroke(palette), StrokeKind::Inside);
 }
 
 fn modern_central(app: &mut App, ui: &mut egui::Ui) {
@@ -1225,7 +1225,7 @@ fn friend_tile(
         },
         palette.accent,
     );
-    painter.rect_stroke(rect, radius, Stroke::new(1.0, palette.outline), StrokeKind::Inside);
+    painter.rect_stroke(rect, radius, theme::card_stroke(palette), StrokeKind::Inside);
 
     // Avatar grande pisando el banner, con un aro del color del cuerpo.
     let av_r = 34.0;
@@ -1771,7 +1771,7 @@ fn channels_section(app: &App, ui: &mut egui::Ui, rect: Rect, action: &mut Optio
         ui.painter().rect_stroke(
             card,
             CornerRadius::same(theme::CARD_RADIUS),
-            Stroke::new(1.0, palette.outline),
+            theme::card_stroke(palette),
             StrokeKind::Inside,
         );
 
@@ -2227,7 +2227,7 @@ fn dash_header(
     ui.painter().rect_stroke(
         rect,
         CornerRadius::same(theme::CARD_RADIUS),
-        Stroke::new(1.0, palette.outline),
+        theme::card_stroke(palette),
         StrokeKind::Inside,
     );
 

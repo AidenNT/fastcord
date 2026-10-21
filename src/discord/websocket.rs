@@ -7,9 +7,10 @@
 //! Con `ECORD_INSECURE_TLS=1` también se omite la verificación del
 //! certificado en estos sockets (ver `client`), igual que en el REST.
 //!
-//! # El handshake NO lleva headers propios
+//! # Headers propios en el handshake
 //!
-//! Es a propósito. Contra `gateway.discord.gg` se probó, y el resultado fue:
+//! `connect` no manda headers propios; `connect_with_headers` sí (el Gateway
+//! principal manda `Origin: https://discord.com`). Historial: contra `gateway.discord.gg` se probó, y el resultado fue:
 //!
 //! - Emulación sola (sus headers, nada propio): el upgrade pasa. Es también lo
 //!   que hace la crate de referencia `discord_client_gateway`.
@@ -242,7 +243,27 @@ impl Sink<Message> for WebSocket {
 /// `kind` y `who` son para el registro de tráfico de las devtools: qué clase
 /// de conexión es y qué parte de la app la abre.
 pub(crate) async fn connect(url: &str, kind: NetKind, who: &str) -> Result<WebSocket, wreq::Error> {
-    let result = match client()?.websocket(url).orig_headers(browser_ws_header_case()).send().await {
+    connect_with_headers(url, kind, who, &[]).await
+}
+
+/// Igual que `connect`, pero con `headers` propios en el handshake (por
+/// ejemplo `Origin` para el Gateway). Se escriben con la grafía y el orden de
+/// Chrome (`browser_ws_header_case`).
+///
+/// Ojo: la nota del módulo documenta que `Origin` daba `403` en el Gateway
+/// cuando los headers salían en minúscula; ahora que la grafía está
+/// corregida hay que verificarlo contra el Gateway real.
+pub(crate) async fn connect_with_headers(
+    url: &str,
+    kind: NetKind,
+    who: &str,
+    headers: &[(&'static str, String)],
+) -> Result<WebSocket, wreq::Error> {
+    let mut request = client()?.websocket(url).orig_headers(browser_ws_header_case());
+    for (name, value) in headers {
+        request = request.header(*name, value.as_str());
+    }
+    let result = match request.send().await {
         Ok(response) => response.into_websocket().await,
         Err(error) => Err(error),
     };

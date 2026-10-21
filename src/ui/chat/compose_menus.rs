@@ -1943,6 +1943,27 @@ fn gif_grid(ui: &mut Ui, ctx: &Context, palette: &Palette, entries: &[GifEntry])
     picked
 }
 
+/// Cuántas celdas de la grilla se animan solas a la vez.
+const GRID_AUTO_ANIMATED: u32 = 16;
+
+/// ¿Todavía entra otra celda animada en este frame? Cuenta por frame, de arriba hacia abajo.
+fn take_grid_animation_slot(ctx: &Context) -> bool {
+    let pass = ctx.cumulative_pass_nr();
+    let id = Id::new("gif_grid_auto_slots");
+    ctx.data_mut(|d| {
+        let entry = d.get_temp_mut_or_insert_with::<(u64, u32)>(id, || (pass, 0));
+        if entry.0 != pass {
+            *entry = (pass, 0);
+        }
+        if entry.1 < GRID_AUTO_ANIMATED {
+            entry.1 += 1;
+            true
+        } else {
+            false
+        }
+    })
+}
+
 /// Un GIF de la grilla: la imagen quieta (liviana) y, solo mientras el mouse
 /// está encima, el GIF animado (o, si solo hay video, el video). Arriba a la
 /// derecha, la estrella de favorito. Devuelve la celda y si se clickeó la
@@ -1998,6 +2019,21 @@ fn gif_tile(ui: &mut Ui, ctx: &Context, palette: &Palette, gif: &GifEntry, size:
                 }
                 Thumb::Pending => {}
                 Thumb::Failed => theme::paint_icon(ui, Icon::CirclePlay, rect, 28.0, palette.dim),
+            }
+        }
+        // Las celdas a la vista se animan solas (hasta `GRID_AUTO_ANIMATED` por frame, para
+        // acotar la RAM y la CPU); el resto queda con la imagen quieta y se anima al pasar
+        // el mouse. Mientras la animación no está lista se ve la miniatura.
+        if !hovered && !gif.gif.is_empty() && !is_video_url(&gif.gif) && take_grid_animation_slot(ctx) {
+            let source = crate::ui::chat::anim::source_grid(ctx, &gif.gif, thumb_px);
+            if matches!(source, egui::ImageSource::Texture(_)) {
+                egui::Image::new(source)
+                    .fit_to_exact_size(size)
+                    .corner_radius(CornerRadius::same(8))
+                    .show_loading_spinner(false)
+                    .paint_at(ui, rect);
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(80));
             }
         }
         if hovered {

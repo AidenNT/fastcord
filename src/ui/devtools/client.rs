@@ -409,7 +409,7 @@ impl ClientState {
                 egui::ComboBox::from_id_salt("dev_stream_encoder")
                     .selected_text(current.unwrap_or("predeterminado (entorno)"))
                     .show_ui(ui, |ui| {
-                        if ui.selectable_label(current.is_none(), "predeterminado (entorno)").clicked() {
+                        if ui.selectable_label(current.is_none(), "predeterminado (WebRTC)").clicked() {
                             set_encoder_override(None);
                         }
                         for choice in ENCODER_CHOICES {
@@ -511,7 +511,7 @@ impl ClientState {
                 ui.label("Transporte");
                 let current = stream_transport_override();
                 egui::ComboBox::from_id_salt("dev_stream_transport")
-                    .selected_text(current.map_or_else(|| "predeterminado (entorno)".to_owned(), |transport| transport.label().to_owned()))
+                    .selected_text(current.map_or_else(|| "predeterminado (WebRTC)".to_owned(), |transport| transport.label().to_owned()))
                     .show_ui(ui, |ui| {
                         if ui.selectable_label(current.is_none(), "predeterminado (entorno)").clicked() {
                             set_stream_transport_override(None);
@@ -524,10 +524,10 @@ impl ClientState {
                     })
                     .response
                     .on_hover_text(
-                        "UDP (AEAD) es el camino de siempre. WebRTC (DTLS-SRTP) negocia un SDP con Discord como la librería \
+                        "WebRTC (DTLS-SRTP) es el predeterminado: negocia un SDP con Discord como la librería \
                          de Node Discord-video-stream: Sender Reports, reenvíos por NACK/RTX y timestamps regulares. Solo \
                          se aplica al iniciar una transmisión nueva (una en curso sigue con el que arrancó). También se \
-                         elige con ECORD_STREAM_TRANSPORT=webrtc.",
+                         elige con ECORD_STREAM_TRANSPORT=udp (camino UDP clásico).",
                     );
             });
             ui.horizontal(|ui| {

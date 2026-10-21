@@ -1,6 +1,6 @@
-//! Transporte WebRTC (DTLS-SRTP) para transmitir nuestra pantalla. Es opt-in: se elige en
-//! las devtools (Transmisión → Transporte) o con `ECORD_STREAM_TRANSPORT=webrtc`. Sin eso
-//! se usa el camino UDP de siempre.
+//! Transporte WebRTC (DTLS-SRTP) para transmitir nuestra pantalla. Es el transporte
+//! predeterminado. Para usar el camino UDP clásico: devtools (Transmisión → Transporte) o
+//! `ECORD_STREAM_TRANSPORT=udp`.
 //!
 //! Replica lo que hace el módulo de Node `Discord-video-stream` (libdatachannel):
 //!
@@ -284,9 +284,9 @@ impl FrameClock {
 // (SRTP), reenvía por NACK (RTX), manda Sender Reports y maneja ICE/DTLS. Ecord ya
 // trae su propio paquetizador H.264, así que le pasa paquetes RTP hechos.
 use str0m::config::Fingerprint;
-use str0m::format::Codec;
+use str0m::format::{Codec, FormatParams};
 use str0m::ice::IceCreds;
-use str0m::media::{MediaKind, MediaTime, Mid, Pt};
+use str0m::media::{Frequency, MediaKind, MediaTime, Mid, Pt};
 use str0m::net::{Protocol, Receive};
 use str0m::rtp::{Extension, ExtensionValues, RtpWrite, Ssrc};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
@@ -330,11 +330,21 @@ struct RtpOut {
     wallclock: Instant,
 }
 
+/// Un paquete RTP de audio (Opus, 20 ms) para la tarea del transporte. El audio no pasa
+/// por el pacer: son ~160 bytes cada 20 ms.
+struct AudioOut {
+    sequence: u64,
+    timestamp: u32,
+    payload: Vec<u8>,
+}
+
 /// Lo que ya está listo antes de saber a dónde conectar: credenciales locales
 /// para armar el SDP de `SELECT_PROTOCOL`.
 pub(super) struct PreparedTransport {
     rtc: Rtc,
     pt: Pt,
+    audio_pt: Pt,
+    audio_ssrc: u32,
     video_ssrc: u32,
     rtx_ssrc: u32,
     creds: LocalCreds,
@@ -342,12 +352,15 @@ pub(super) struct PreparedTransport {
 }
 
 impl PreparedTransport {
-    pub(super) fn new(video_ssrc: u32, rtx_ssrc: u32, keyframe: KeyframeRequest) -> Result<Self, String> {
+    pub(super) fn new(audio_ssrc: u32, video_ssrc: u32, rtx_ssrc: u32, keyframe: KeyframeRequest) -> Result<Self, String> {
         let ice_creds = IceCreds::new();
         // Si `build` se queja de que no hay proveedor criptográfico, instalar el de los
         // features (`str0m::crypto::from_feature_flags()`) antes de construir.
         let mut config = RtcConfig::new()
             .set_rtp_mode(true)
+            // Un IDR a 60 fps son cientos de paquetes de golpe; el buffer por defecto (1000)
+            // también sirve de historial para los reenvíos, así que se agranda.
+            .set_send_buffer_video(4096)
             .set_local_ice_credentials(ice_creds.clone())
             .clear_codecs()
             // Mismo id que usa Discord para el playout delay.
@@ -358,6 +371,15 @@ impl PreparedTransport {
             true,
             0x0042_E01F,
         );
+        // Opus estéreo a 48 kHz con el mismo payload type que anuncia el SDP.
+        config.codec_config().add_config(
+            Pt::new_with_value(PUBLISH_OPUS_PAYLOAD_TYPE),
+            None,
+            Codec::Opus,
+            Frequency::FORTY_EIGHT_KHZ,
+            Some(2),
+            FormatParams { min_p_time: Some(10), use_inband_fec: Some(true), ..Default::default() },
+        );
         let mut rtc = config.build(Instant::now());
 
         let fingerprint = rtc.direct_api().local_dtls_fingerprint().to_string();
@@ -366,17 +388,35 @@ impl PreparedTransport {
             .find(|params| params.spec().codec == Codec::H264)
             .map(|params| params.pt())
             .ok_or_else(|| "webrtc: str0m no tiene H264 configurado".to_owned())?;
+        let audio_pt = rtc
+            .codec_config()
+            .find(|params| params.spec().codec == Codec::Opus)
+            .map(|params| params.pt())
+            .ok_or_else(|| "webrtc: str0m no tiene Opus configurado".to_owned())?;
 
         // Mid 1 = video (el 0 es el audio, que no se transmite todavía).
         let mid: Mid = "1".into();
+        let audio_mid: Mid = "0".into();
         {
             let mut api = rtc.direct_api();
+            // Audio (mid 0): sin RTX, el audio no se reenvía.
+            api.declare_media(audio_mid, MediaKind::Audio);
+            api.declare_stream_tx(Ssrc::from(audio_ssrc), None, audio_mid, None);
             api.declare_media(mid, MediaKind::Video);
             api.declare_stream_tx(Ssrc::from(video_ssrc), Some(Ssrc::from(rtx_ssrc)), mid, None);
+            // Por defecto str0m usa 1024 paquetes / 3 s y un tope de RTX del 15 % (si los
+            // reenvíos pasan de esa proporción respecto al tráfico normal, VACÍA la cola de
+            // reenvíos). A 30/60 fps con ráfagas grandes de NACK se pasa del tope y los
+            // reenvíos se descartan; a 15 fps no. Sin tope: Discord ya limita con sus NACK.
+            if let Some(stream) = api.stream_tx(&Ssrc::from(video_ssrc)) {
+                stream.set_rtx_cache(4096, Duration::from_secs(3), None);
+            }
         }
         Ok(Self {
             rtc,
             pt,
+            audio_pt,
+            audio_ssrc,
             video_ssrc,
             rtx_ssrc,
             creds: LocalCreds { ufrag: ice_creds.ufrag, pwd: ice_creds.pass, fingerprint },
@@ -432,6 +472,7 @@ impl PreparedTransport {
             .map_err(|error| format!("webrtc: error al arrancar: {error:?}"))?;
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<RtpOut>();
+        let (audio_tx, audio_rx) = mpsc::unbounded_channel::<AudioOut>();
         let pacer_rate = Arc::new(std::sync::atomic::AtomicU64::new(PACER_INITIAL_BYTES_PER_SEC));
         let (connected_tx, connected_rx) = watch::channel(false);
         logging::debug(
@@ -447,19 +488,24 @@ impl PreparedTransport {
             local_addr,
             remote.address,
             cmd_rx,
+            audio_rx,
             connected_tx,
             self.keyframe,
             Ssrc::from(self.video_ssrc),
             self.pt,
+            Ssrc::from(self.audio_ssrc),
+            self.audio_pt,
             Arc::clone(&pacer_rate),
         )));
-        Ok(WebRtcHandle { cmd_tx, connected_rx, pacer_rate })
+        Ok(WebRtcHandle { cmd_tx, audio_tx, connected_rx, pacer_rate })
     }
 }
 
 /// Lo que usa el emisor de video para hablar con la tarea del transporte.
+#[derive(Clone)]
 pub(super) struct WebRtcHandle {
     cmd_tx: mpsc::UnboundedSender<RtpOut>,
+    audio_tx: mpsc::UnboundedSender<AudioOut>,
     connected_rx: watch::Receiver<bool>,
     /// Velocidad del pacer en bytes/s (la fija el emisor antes de cada frame).
     pacer_rate: Arc<std::sync::atomic::AtomicU64>,
@@ -481,6 +527,12 @@ impl WebRtcHandle {
         .map_err(|_| "webrtc: no se conectó en 20 s (ICE/DTLS)".to_owned())?
     }
 
+    fn send_audio(&self, packet: AudioOut) -> Result<(), String> {
+        self.audio_tx
+            .send(packet)
+            .map_err(|_| "webrtc: el transporte terminó".to_owned())
+    }
+
     fn set_pacer_rate(&self, bytes_per_sec: u64) {
         self.pacer_rate.store(bytes_per_sec, std::sync::atomic::Ordering::Relaxed);
     }
@@ -499,10 +551,13 @@ async fn run_transport(
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
     mut cmd_rx: mpsc::UnboundedReceiver<RtpOut>,
+    mut audio_rx: mpsc::UnboundedReceiver<AudioOut>,
     connected_tx: watch::Sender<bool>,
     keyframe: KeyframeRequest,
     video_ssrc: Ssrc,
     pt: Pt,
+    audio_ssrc: Ssrc,
+    audio_pt: Pt,
     pacer_rate: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let mut buffer = vec![0u8; 2048];
@@ -513,6 +568,7 @@ async fn run_transport(
     let mut overflows: u64 = 0;
     let mut last_log = Instant::now();
     let mut wire = WireStats::default();
+    let mut audio_open = true;
     loop {
         // 1) Vaciar todo lo que la biblioteca quiere hacer ahora.
         let deadline = loop {
@@ -536,6 +592,8 @@ async fn run_transport(
                     }
                     // Un espectador (o el servidor) pide una IDR (PLI / FIR).
                     Event::KeyframeRequest(_) => keyframe.request(),
+                    // Los NACK no llegan como evento: str0m los atiende solo (RTX) porque el
+                    // stream se declaró con `rtx_ssrc` y el media es `nackable(true)`.
                     _ => {}
                 },
                 Err(error) => {
@@ -582,6 +640,12 @@ async fn run_transport(
                 if let Err(error) = rtc.handle_input(Input::Receive(Instant::now(), receive)) {
                     logging::debug("stream", format!("webrtc: error al procesar un datagrama: {error:?}"));
                     return;
+                }
+            }
+            audio = audio_rx.recv(), if audio_open => {
+                match audio {
+                    Some(packet) => write_audio(&mut rtc, audio_ssrc, audio_pt, packet),
+                    None => audio_open = false,
                 }
             }
             command = cmd_rx.recv() => {
@@ -683,19 +747,31 @@ impl WireStats {
     /// En SRTCP solo los 8 primeros bytes van en claro: se ve el tipo del primer paquete
     /// de cada datagrama (un NACK detrás de un RR no se vería).
     fn count_in(&mut self, data: &[u8]) {
-        if data.len() < 8 || data[0] >> 6 != 2 || !(192..=223).contains(&data[1]) {
-            return;
-        }
-        self.rtcp_in += 1;
-        let fmt = data[0] & 0x1f;
-        match (data[1], fmt) {
-            (200, _) => self.sr_in += 1,
-            (201, _) => self.rr_in += 1,
-            (205, 1) => self.nack_in += 1,
-            (205, 15) => self.twcc_in += 1,
-            (206, 1) => self.pli_in += 1,
-            (206, 4) => self.fir_in += 1,
-            _ => self.other_in += 1,
+        // Discord manda RTCP compuesto: `[RR, SDES, NACK, NACK, …]`. Antes
+        // se miraba sólo el primer paquete; los NACKs van detrás del RR,
+        // así que `nack_in` siempre quedaba en 0 aunque el receptor emitiera
+        // miles. Recorremos todo el compuesto.
+        let mut rest = data;
+        while rest.len() >= 4 {
+            if rest[0] >> 6 != 2 || !(192..=223).contains(&rest[1]) {
+                break;
+            }
+            let length = (usize::from(u16::from_be_bytes([rest[2], rest[3]])) + 1) * 4;
+            if length > rest.len() {
+                break;
+            }
+            self.rtcp_in += 1;
+            let fmt = rest[0] & 0x1f;
+            match (rest[1], fmt) {
+                (200, _) => self.sr_in += 1,
+                (201, _) => self.rr_in += 1,
+                (205, 1) => self.nack_in += 1,
+                (205, 15) => self.twcc_in += 1,
+                (206, 1) => self.pli_in += 1,
+                (206, 4) => self.fir_in += 1,
+                _ => self.other_in += 1,
+            }
+            rest = &rest[length..];
         }
     }
 }
@@ -721,6 +797,15 @@ fn run_pacer(
         *budget -= (packet.payload.len() + 12) as f64;
         write_rtp(rtc, ssrc, pt, packet);
     }
+}
+
+fn write_audio(rtc: &mut Rtc, ssrc: Ssrc, pt: Pt, packet: AudioOut) {
+    let mut api = rtc.direct_api();
+    let Some(stream) = api.stream_tx(&ssrc) else {
+        return;
+    };
+    let write = RtpWrite::new(pt, packet.sequence.into(), packet.timestamp, Instant::now(), packet.payload);
+    let _ = stream.write_rtp(write);
 }
 
 fn write_rtp(rtc: &mut Rtc, ssrc: Ssrc, pt: Pt, packet: RtpOut) {
@@ -765,6 +850,76 @@ pub(super) async fn run_video_send(mut sender: WebRtcVideoSender) {
         Err(error) => error,
     };
     let _ = sender.fatal_tx.send(message);
+}
+
+/// Lo que necesita el emisor de audio de la transmisión.
+pub(super) struct WebRtcAudioSender {
+    pub(super) transport: WebRtcHandle,
+    pub(super) dave_state: Arc<Mutex<VoiceDaveState>>,
+    pub(super) target: super::super::screen_capture::CaptureTarget,
+}
+
+/// El audio es opcional: si no se puede capturar o codificar, la transmisión sigue solo
+/// con video (no se avisa como error fatal).
+pub(super) async fn run_audio_send(mut sender: WebRtcAudioSender) {
+    if let Err(error) = send_audio(&mut sender).await {
+        logging::debug("stream", format!("webrtc: transmisión sin audio: {error}"));
+    }
+}
+
+async fn send_audio(sender: &mut WebRtcAudioSender) -> Result<(), String> {
+    sender.transport.wait_connected().await?;
+    let mut capture = super::super::stream_audio::start(&sender.target)?;
+    let mut encoder = super::super::opus::VoiceOpusEncode::new_system_audio()?;
+    logging::debug("stream", "webrtc: capturando el audio de la transmisión");
+
+    // 20 ms a 48 kHz.
+    const TICKS_PER_FRAME: u32 = 960;
+    let mut sequence: u64 = u64::from(rand::random::<u16>());
+    let base_timestamp: u32 = rand::random();
+    let mut ticks: u32 = 0;
+    let mut last_frame: Option<Instant> = None;
+    let (mut frames_sent, mut frames_blocked) = (0u64, 0u64);
+
+    while let Some(pcm) = capture.frames_rx.recv().await {
+        let now = Instant::now();
+        // Sin sonido, WASAPI no entrega nada: el reloj RTP sigue la hora real para que el
+        // espectador no acumule desfase.
+        if let Some(previous) = last_frame {
+            let gap_frames = (now.saturating_duration_since(previous).as_millis() / 20) as u32;
+            if gap_frames > 3 {
+                ticks = ticks.wrapping_add((gap_frames - 1).saturating_mul(TICKS_PER_FRAME));
+            }
+        }
+        last_frame = Some(now);
+        let timestamp = base_timestamp.wrapping_add(ticks);
+        ticks = ticks.wrapping_add(TICKS_PER_FRAME);
+
+        let opus = match encoder.encode_20ms_i16(&pcm) {
+            Ok(opus) => opus,
+            Err(error) => {
+                logging::debug("stream", format!("webrtc: Opus del audio falló: {error}"));
+                continue;
+            }
+        };
+        let payload = match sender.dave_state.lock().await.prepare_outbound_opus(&opus) {
+            VoiceDaveOutboundPayload::Plain(data) | VoiceDaveOutboundPayload::Encrypted(data) => data,
+            VoiceDaveOutboundPayload::Blocked(reason) => {
+                frames_blocked = frames_blocked.saturating_add(1);
+                if frames_blocked == 1 || frames_blocked % 500 == 0 {
+                    logging::debug("stream", format!("webrtc: audio bloqueado ({frames_blocked}): {reason:?}"));
+                }
+                continue;
+            }
+        };
+        sender.transport.send_audio(AudioOut { sequence, timestamp, payload })?;
+        sequence = sequence.wrapping_add(1);
+        frames_sent = frames_sent.saturating_add(1);
+        if frames_sent == 1 {
+            logging::debug("stream", "webrtc: primer paquete de audio enviado");
+        }
+    }
+    Ok(())
 }
 
 /// Igual que `send_frames` del camino UDP (DAVE antes de paquetizar, pacing por

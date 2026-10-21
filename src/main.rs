@@ -43,7 +43,18 @@ fn load_icon() -> egui::IconData {
     }
 }
 
+/// mimalloc: devolver al sistema las páginas libres apenas quedan libres (por omisión las
+/// retiene unos ms y, con la UI decodificando y soltando imágenes sin parar, buena parte
+/// queda comprometida). Esa memoria no la cuenta el heap de Rust, así que en Ajustes →
+/// Memoria aparece como «Heap nativo y fragmentación».
+fn tune_allocator() {
+    unsafe {
+           libmimalloc_sys::mi_option_set(15, 0); // purge_delay / reset_delay
+    }
+}
+
 fn main() -> eframe::Result<()> {
+    tune_allocator();
     // Lo PRIMERO, antes del captcha, del logger y de la instancia única:
     // si este proceso es el ayudante de una actualización (`--apply-update`)
     // instala y sale sin abrir ventana; si no, quita las banderas del updater.
@@ -110,10 +121,19 @@ fn main() -> eframe::Result<()> {
 
 /// Opciones de UNA ventana (se llama cada vez que el `Shell` abre una).
 fn native_options(opaque: bool) -> eframe::NativeOptions {
+    // Tamaño, posición y maximizado de la última vez (ver `app_shell::WindowGeometry`).
+    let saved = app_shell::WindowGeometry::load();
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size(saved.map_or([1280.0, 800.0], |geometry| [geometry.w, geometry.h]))
+        .with_min_inner_size([900.0, 600.0]);
+    if let Some(geometry) = saved {
+        viewport = viewport.with_position([geometry.x, geometry.y]).with_maximized(geometry.maximized);
+    }
     eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([900.0, 600.0])
+        // La geometría la guarda `app_shell`, no eframe: este a veces guardaba el
+        // tamaño del ícono minimizado y la ventana volvía diminuta.
+        persist_window: false,
+        viewport: viewport
             // Sin decoraciones nativas: `ui::shell::topbar` dibuja su propia barra
             // (arrastre + minimizar/maximizar/cerrar), al estilo Fastpotify.
             .with_decorations(false)

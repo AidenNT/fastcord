@@ -54,13 +54,46 @@ use log::{error, warn};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use wreq::header::HeaderMap;
 use wreq::{Client, Method, Response};
 
 const API_BASE: &str = "https://discord.com/api/";
+
+/// Nombre del header con el id de instalación del cliente.
+pub const INSTALLATION_ID_HEADER: &str = "X-Installation-Id";
+
+/// Quien sabe cuál es el installation id vigente. Lo implementa el programa
+/// que usa esta crate (en esta app, `discord/fingerprint.rs` es el que lo
+/// genera, lo guarda y lo refresca); acá solo se consulta en cada request,
+/// así que si cambia a mitad de sesión el siguiente pedido ya sale con el nuevo.
+pub type InstallationIdProvider = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+static INSTALLATION_ID_PROVIDER: OnceLock<InstallationIdProvider> = OnceLock::new();
+
+/// Registra el proveedor del installation id (solo se puede una vez; las
+/// siguientes llamadas se ignoran). Debe llamarse antes de `connect` para
+/// que también las requests de arranque lo lleven.
+pub fn set_installation_id_provider(provider: InstallationIdProvider) {
+    let _ = INSTALLATION_ID_PROVIDER.set(provider);
+}
+
+/// El installation id vigente, si hay proveedor y ya tiene uno.
+pub(crate) fn installation_id() -> Option<String> {
+    INSTALLATION_ID_PROVIDER
+        .get()
+        .and_then(|provider| provider())
+        .filter(|id| !id.is_empty())
+}
+
+/// Agrega `X-Installation-Id` a `headers` si hay un id disponible.
+pub(crate) fn insert_installation_id(headers: &mut HeaderMap) {
+    if let Some(value) = installation_id().and_then(|id| id.parse().ok()) {
+        headers.insert(INSTALLATION_ID_HEADER, value);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Authentication {
@@ -227,9 +260,13 @@ impl RestClient {
                 API_BASE, api_version
             );
             let trace = nettrace::begin("GET", &experiments_url, "vendor::RestClient::connect (arranque)");
+            let mut experiments_headers = HeaderMap::new();
+            insert_installation_id(&mut experiments_headers);
             let resp = client
                 .get(experiments_url)
                 .header("Authorization", authorization.clone())
+                .headers(experiments_headers)
+                .orig_headers(crate::header_case::chrome_header_case())
                 .send()
                 .await;
             nettrace::observe(&trace, &resp);
@@ -251,6 +288,7 @@ impl RestClient {
             let resp = client
                 .get(bot_url)
                 .header("Authorization", authorization.clone())
+                .orig_headers(crate::header_case::chrome_header_case())
                 .send()
                 .await;
             nettrace::observe(&trace, &resp);
@@ -280,16 +318,20 @@ impl RestClient {
                     API_BASE, api_version
                 );
                 let trace = nettrace::begin("GET", &index_url, "vendor::RestClient::connect (arranque)");
+                let mut index_headers = HeaderMap::new();
+                insert_installation_id(&mut index_headers);
                 let resp = client
                     .get(index_url)
                     .header("Authorization", authorization.clone())
-                    .header("x-debug-options", "bugReporterEnabled")
-                    .header("x-discord-locale", locale.clone())
-                    .header("x-discord-timezone", timezone.clone())
+                    .header("X-Debug-Options", "bugReporterEnabled")
+                    .header("X-Discord-Locale", locale.clone())
+                    .header("X-Discord-Timezone", timezone.clone())
                     .header(
-                        "x-super-properties",
+                        "X-Super-Properties",
                         build_super_props(build_numbers.clone(), client_session.clone()),
                     )
+                    .headers(index_headers)
+                    .orig_headers(crate::header_case::chrome_header_case())
                     .send()
                     .await;
                 nettrace::observe(&trace, &resp);
@@ -660,7 +702,11 @@ impl RestClient {
             netlog::HttpTrace::none()
         };
 
-        let mut request = self.client.request(method, &full_url).headers(headers);
+        let mut request = self
+            .client
+            .request(method, &full_url)
+            .headers(headers)
+            .orig_headers(crate::header_case::chrome_header_case());
 
         if let Some(body_data) = body {
             request = request
@@ -809,6 +855,8 @@ impl RestClient {
                 .parse()
                 .map_err(|e| Box::new(e) as BoxedError)?,
         );
+
+        insert_installation_id(&mut headers);
 
         if let Some(req_properties) = req_properties {
             if let Some(referer) = req_properties.referer {

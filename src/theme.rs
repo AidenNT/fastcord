@@ -143,16 +143,16 @@ pub fn radius_small() -> u8 {
 }
 
 /// Radio de las tarjetas flotantes de la interfaz nueva.
-pub const CARD_RADIUS: u8 = 18;
+pub const CARD_RADIUS: u8 = 12;
 
 /// Hueco entre tarjetas/píldoras de la interfaz nueva.
-pub const GAP: i8 = 16;
+pub const GAP: i8 = 8;
 
 /// Alto de las píldoras flotantes de arriba (buscador, pestañas, íconos).
-pub const PILL_H: f32 = 46.0;
+pub const PILL_H: f32 = 38.0;
 
 /// Radio de esas píldoras.
-pub const PILL_RADIUS: u8 = 18;
+pub const PILL_RADIUS: u8 = 12;
 
 /// Color "hundido" para campos de búsqueda dentro de una tarjeta (#212327
 /// con la paleta CreArts).
@@ -187,7 +187,7 @@ pub fn card_frame(palette: &Palette, classic: Frame, inner: i8, left: i8, right:
     let _ = (left, right);
     Frame::new()
         .fill(palette.panel)
-        .stroke(Stroke::new(1.0, palette.outline))
+        .stroke(card_stroke(palette))
         .corner_radius(CornerRadius::same(CARD_RADIUS))
         .outer_margin(Margin {
             left: GAP / 2,
@@ -196,6 +196,22 @@ pub fn card_frame(palette: &Palette, classic: Frame, inner: i8, left: i8, right:
             bottom: GAP,
         })
         .inner_margin(Margin::same(inner))
+}
+
+/// Borde de las tarjetas y píldoras flotantes de la interfaz nueva: ninguno.
+/// Las zonas se distinguen por el relleno y el hueco entre ellas (como en el
+/// cliente oficial); el borde de 1px solo ensuciaba la interfaz.
+pub fn card_stroke<P>(_palette: P) -> Stroke {
+    Stroke::NONE
+}
+
+/// Borde de campos (caja de mensaje): la interfaz nueva no lo lleva.
+pub fn field_stroke(palette: &Palette) -> Stroke {
+    if is_modern() {
+        Stroke::NONE
+    } else {
+        Stroke::new(1.0, palette.outline)
+    }
 }
 
 /// Fondo de una fila de lista sin seleccionar ni hover: el de la ventana en

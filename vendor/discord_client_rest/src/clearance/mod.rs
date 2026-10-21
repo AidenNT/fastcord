@@ -21,7 +21,11 @@ pub(crate) struct Invisible {
 pub(crate) async fn get_invisible(client: &Client) -> BoxedResult<Invisible> {
     let script_url = "https://discord.com/cdn-cgi/challenge-platform/scripts/jsd/main.js";
     let trace = crate::nettrace::begin("GET", script_url, "vendor::clearance (desafío de Cloudflare)");
-    let response = client.get(script_url).send().await;
+    let response = client
+        .get(script_url)
+        .orig_headers(crate::header_case::chrome_header_case())
+        .send()
+        .await;
     crate::nettrace::observe(&trace, &response);
     let response = response?;
 
@@ -84,6 +88,7 @@ pub(crate) async fn get_clearance_cookie(
         .post(&url)
         .header("Content-Type", "text/plain;charset=UTF-8")
         .body(payload)
+        .orig_headers(crate::header_case::chrome_header_case())
         .send()
         .await;
     crate::nettrace::observe(&trace, &response);

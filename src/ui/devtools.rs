@@ -698,6 +698,32 @@ enum Mode {
     Detached,
 }
 
+fn detached_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("ecord_devtools_window")
+}
+
+/// Las devtools que guarda la app. Es un `Arc<Mutex<..>>` porque la ventana aparte es un
+/// viewport diferido, cuyo callback vive fuera del frame de la ventana principal.
+#[derive(Clone, Default)]
+pub struct DevToolsHandle(Arc<Mutex<DevTools>>);
+
+impl DevToolsHandle {
+    /// ¿Está el panel abierto? La app arma el [`SessionInfo`] solo en ese caso.
+    pub fn is_open(&self) -> bool {
+        lock(&self.0).is_open()
+    }
+
+    pub fn set_session(&self, session: SessionInfo) {
+        lock(&self.0).set_session(session);
+    }
+
+    /// Se llama una vez por frame. No hace nada si las herramientas no están
+    /// habilitadas (ver [`enabled`]).
+    pub fn show(&self, ctx: &egui::Context) {
+        lock(&self.0).show(ctx, &self.0);
+    }
+}
+
 pub struct DevTools {
     open: bool,
     mode: Mode,
@@ -842,7 +868,7 @@ impl DevTools {
 
     /// Se llama una vez por frame. No hace nada si las herramientas no están
     /// habilitadas (ver [`enabled`]).
-    pub fn show(&mut self, ctx: &egui::Context) {
+    fn show(&mut self, ctx: &egui::Context, handle: &Arc<Mutex<DevTools>>) {
         if !enabled() {
             return;
         }
@@ -861,10 +887,14 @@ impl DevTools {
         self.client.sample_frame(ctx.input(|i| i.unstable_dt));
         match self.mode {
             Mode::Window | Mode::Dock => self.show_overlay(ctx, &palette),
-            Mode::Detached => self.show_detached(ctx, &palette),
+            Mode::Detached => self.show_detached(ctx, handle),
         }
+        self.request_repaints(ctx);
+    }
 
-        // Mientras algo está corriendo, refrescar para mostrar el avance.
+    /// Mientras algo está corriendo, refrescar para mostrar el avance. Se llama desde
+    /// la ventana principal y, en modo ventana aparte, desde la propia ventana.
+    fn request_repaints(&self, ctx: &egui::Context) {
         let busy = lock(&self.http_out).running
             || lock(&self.ws.shared).connecting
             || lock(&self.ws.shared).connected
@@ -892,27 +922,53 @@ impl DevTools {
             });
     }
 
-    /// Ventana propia del sistema operativo. El viewport es "inmediato": se dibuja
-    /// dentro de esta misma llamada, así que puede usar `self` sin compartirlo.
-    fn show_detached(&mut self, ctx: &egui::Context, palette: &Palette) {
-        let id = egui::ViewportId::from_hash_of("ecord_devtools_window");
+    /// Ventana propia del sistema operativo. El viewport es "diferido": egui lo dibuja en
+    /// su propio frame, sin colgarlo del de la ventana principal. Con uno "inmediato" cada
+    /// frame de eCord esperaba además al `swap_buffers` (vsync) de esta ventana, y los fps
+    /// de la app caían en picada mientras estaba abierta. Como el callback tiene que ser
+    /// `Send + Sync + 'static`, el estado de las devtools va detrás de `handle`.
+    fn show_detached(&mut self, ctx: &egui::Context, handle: &Arc<Mutex<DevTools>>) {
+        let id = detached_viewport_id();
         let builder = egui::ViewportBuilder::default()
             .with_title("eCord · Developer tools")
             .with_inner_size([1180.0, 760.0])
             .with_min_inner_size([MIN_W, MIN_H]);
-        let shortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::D);
-        let mut close = false;
-        ctx.show_viewport_immediate(id, builder, |surface, _class| {
+        let handle = Arc::clone(handle);
+        ctx.show_viewport_deferred(id, builder, move |surface, _class| {
             surface.paint(|ui, vctx| {
-                if vctx.input(|i| i.viewport().close_requested()) || vctx.input_mut(|i| i.consume_shortcut(&shortcut)) {
-                    close = true;
+                // `try_lock`: si el estado está tomado (p. ej. por el frame de la ventana
+                // principal) no se espera —un `lock` anidado en el mismo hilo cuelga la app—,
+                // se reintenta enseguida.
+                match handle.try_lock() {
+                    Ok(mut devtools) => devtools.paint_detached(ui, vctx),
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                        poisoned.into_inner().paint_detached(ui, vctx);
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        vctx.request_repaint_after(Duration::from_millis(16));
+                    }
                 }
-                let rect = vctx.viewport_rect();
-                self.panel_in(ui, vctx, palette, rect, false);
             });
         });
-        if close {
+        // Los hilos de fondo despiertan a la ventana principal, no a esta: se repinta
+        // tras ella, pero a lo sumo ~30 veces por segundo. Pedirle un frame por cada frame
+        // de la principal (140/s) hacía esperar el vsync de esta ventana en cada uno.
+        ctx.request_repaint_after_for(Duration::from_millis(33), id);
+    }
+
+    /// Contenido de la ventana aparte (corre en el frame de su propio viewport).
+    fn paint_detached(&mut self, ui: &mut egui::Ui, vctx: &egui::Context) {
+        let shortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::D);
+        if vctx.input(|i| i.viewport().close_requested()) || vctx.input_mut(|i| i.consume_shortcut(&shortcut)) {
             self.open = false;
+        }
+        let palette = theme::current(vctx);
+        let rect = vctx.viewport_rect();
+        self.panel_in(ui, vctx, &palette, rect, false);
+        self.request_repaints(vctx);
+        if !self.open || self.mode != Mode::Detached {
+            // La ventana principal es la que deja de pedir este viewport: que lo note ya.
+            vctx.request_repaint_of(egui::ViewportId::ROOT);
         }
     }
 
@@ -2266,7 +2322,7 @@ fn clamp_floating(rect: egui::Rect, screen: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(width, height))
 }
 
-/// Lo que `Context::show_viewport_immediate` le entrega al callback de la ventana aparte
+/// Lo que `Context::show_viewport_deferred` le entrega al callback de la ventana aparte
 /// (según la versión de egui es un `&Context` o un `&mut Ui`). Este trait deja dibujar el
 /// panel igual con cualquiera de los dos: `paint` da siempre un `Ui` que ocupa toda la
 /// ventana y su `Context`.

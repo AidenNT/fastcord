@@ -13,7 +13,7 @@
 //! sin ventana si no.
 
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use fastframe_shell::{Held, StallWatch, Waker};
@@ -118,6 +118,12 @@ pub struct Window {
     app: Held<App>,
     stalls: StallWatch,
     recovery_checked: bool,
+    /// Veces que se corrigió una ventana que apareció con un tamaño diminuto.
+    size_fixes: u8,
+    /// Última geometría buena vista y la que ya está en disco.
+    geometry: Option<WindowGeometry>,
+    persisted_geometry: Option<WindowGeometry>,
+    last_geometry_write: Instant,
 }
 
 impl Window {
@@ -126,6 +132,141 @@ impl Window {
             app,
             stalls: StallWatch::default(),
             recovery_checked: false,
+            size_fixes: 0,
+            geometry: None,
+            persisted_geometry: WindowGeometry::load(),
+            last_geometry_write: Instant::now(),
+        }
+    }
+}
+
+/// Geometría de la ventana principal que se recuerda entre ejecuciones. Se guarda aparte
+/// de la persistencia de eframe (desactivada en `main::native_options`) para poder
+/// ignorar los estados raros: minimizada (en Windows mide ~160x28 y está en -32000,
+/// -32000), en pantalla completa, o de un tamaño absurdo.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WindowGeometry {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub maximized: bool,
+}
+
+impl WindowGeometry {
+    /// La geometría guardada, si existe y es razonable.
+    pub fn load() -> Option<Self> {
+        let path = crate::paths::window_state_file()?;
+        let geometry: Self = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        geometry.is_sane().then_some(geometry)
+    }
+
+    fn save(&self) {
+        let Some(path) = crate::paths::window_state_file() else { return };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_vec(self) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+
+    fn is_sane(&self) -> bool {
+        [self.x, self.y, self.w, self.h].iter().all(|value| value.is_finite())
+            && self.w >= MIN_SANE_WINDOW_SIZE.x
+            && self.h >= MIN_SANE_WINDOW_SIZE.y
+            && self.w <= 16_000.0
+            && self.h <= 16_000.0
+            && self.x > -10_000.0
+            && self.y > -10_000.0
+    }
+}
+
+/// Tamaño con el que se abre la ventana (el de `main::native_options`).
+const DEFAULT_WINDOW_SIZE: egui::Vec2 = egui::vec2(1280.0, 800.0);
+/// Debajo de esto la ventana se considera rota (el mínimo real es 900x600).
+const MIN_SANE_WINDOW_SIZE: egui::Vec2 = egui::vec2(600.0, 400.0);
+
+impl Window {
+    /// Anota la geometría de la ventana mientras es buena (no minimizada, no en pantalla
+    /// completa, a la vista) y la escribe a disco como mucho una vez por segundo. Así,
+    /// cerrar la ventana minimizada no guarda nunca el rectángulo del ícono.
+    fn track_geometry(&mut self, ctx: &egui::Context) {
+        let (inner, outer, minimized, fullscreen, maximized) = ctx.input(|input| {
+            let viewport = input.viewport();
+            (
+                viewport.inner_rect,
+                viewport.outer_rect,
+                viewport.minimized.unwrap_or(false),
+                viewport.fullscreen.unwrap_or(false),
+                viewport.maximized.unwrap_or(false),
+            )
+        });
+        if minimized || fullscreen {
+            return;
+        }
+        let (Some(inner), Some(outer)) = (inner, outer) else { return };
+        let size = inner.size();
+        let mut geometry = self.geometry.or(self.persisted_geometry).unwrap_or(WindowGeometry {
+            x: outer.min.x,
+            y: outer.min.y,
+            w: size.x,
+            h: size.y,
+            maximized,
+        });
+        geometry.maximized = maximized;
+        // Maximizada se conserva el último tamaño normal: al restaurar vuelve a ese.
+        if !maximized {
+            geometry.x = outer.min.x;
+            geometry.y = outer.min.y;
+            geometry.w = size.x;
+            geometry.h = size.y;
+        }
+        if !geometry.is_sane() {
+            return;
+        }
+        self.geometry = Some(geometry);
+        if self.last_geometry_write.elapsed() >= Duration::from_secs(1) {
+            self.flush_geometry();
+        }
+    }
+
+    fn flush_geometry(&mut self) {
+        if let Some(geometry) = self.geometry
+            && self.persisted_geometry != Some(geometry)
+        {
+            geometry.save();
+            self.persisted_geometry = Some(geometry);
+        }
+        self.last_geometry_write = Instant::now();
+    }
+
+    /// Al cerrar y abrir el cliente (sobre todo si se cerró minimizado), a veces la
+    /// ventana vuelve con el tamaño del ícono minimizado (~160x28) y se queda así,
+    /// con la interfaz apretada en un rectángulo diminuto. Si pasa, se le devuelve el
+    /// tamaño normal y se centra. Máximo 3 intentos por ventana.
+    fn fix_tiny_window(&mut self, ctx: &egui::Context) {
+        if self.size_fixes >= 3 {
+            return;
+        }
+        let (inner, minimized, fullscreen) = ctx.input(|input| {
+            let viewport = input.viewport();
+            (viewport.inner_rect, viewport.minimized.unwrap_or(false), viewport.fullscreen.unwrap_or(false))
+        });
+        let Some(inner) = inner else { return };
+        let size = inner.size();
+        // Tamaño 0 = ventana oculta o recién creada: todavía no hay nada que juzgar.
+        if minimized || fullscreen || size.x < 1.0 || size.y < 1.0 {
+            return;
+        }
+        if size.x < MIN_SANE_WINDOW_SIZE.x || size.y < MIN_SANE_WINDOW_SIZE.y {
+            self.size_fixes += 1;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(DEFAULT_WINDOW_SIZE));
+            if let Some(center) = egui::ViewportCommand::center_on_screen(ctx) {
+                ctx.send_viewport_cmd(center);
+            }
+            ctx.request_repaint();
         }
     }
 }
@@ -137,6 +278,8 @@ impl eframe::App for Window {
         if !std::mem::replace(&mut self.recovery_checked, true) {
             fastframe_shell::window::recover_offscreen(ctx, frame);
         }
+        self.fix_tiny_window(ctx);
+        self.track_geometry(ctx);
         self.stalls.logic(|| self.app.window_logic(ctx));
     }
 
@@ -145,6 +288,7 @@ impl eframe::App for Window {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.flush_geometry();
         eframe::App::save(&mut *self.app, storage);
     }
 

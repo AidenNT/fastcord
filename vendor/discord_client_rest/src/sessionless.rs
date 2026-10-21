@@ -4,7 +4,7 @@ use crate::bootstrap::{DEFAULT_API_VERSION, build_emulated_client, solve_cloudfl
 use crate::captcha::CaptchaRequiredError;
 use crate::rate_limit::{RateLimitError, RateLimiter};
 use crate::response::{parse_error_body, rate_limit_from_body};
-use crate::rest::{RequestProperties, read_traced};
+use crate::rest::{RequestProperties, insert_installation_id, read_traced};
 use crate::structs::context::ContextHeader;
 use crate::structs::referer::RefererHeader;
 use crate::super_prop::build_super_props;
@@ -234,7 +234,11 @@ impl SessionlessClient {
             crate::netlog::HttpTrace::none()
         };
 
-        let mut request = self.client.request(method, &full_url).headers(headers);
+        let mut request = self
+            .client
+            .request(method, &full_url)
+            .headers(headers)
+            .orig_headers(crate::header_case::chrome_header_case());
 
         if let Some(body_data) = body {
             request = request
@@ -342,6 +346,8 @@ impl SessionlessClient {
                 .parse()
                 .map_err(|e| Box::new(e) as BoxedError)?,
         );
+
+        insert_installation_id(&mut headers);
 
         if let Some(fingerprint) = self.fingerprint().await {
             headers.insert(

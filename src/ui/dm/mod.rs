@@ -23,7 +23,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     // Rail de servidores + panel de amigos/DMs + barra de usuario
     // combinada; ver `ui::shell::nav`.
     nav::show(app, ui);
-    profile_panel(app, ui, index);
+    if app.members_panel_open {
+        profile_panel(app, ui, index);
+    }
     central_panel(app, ui, index);
 }
 
@@ -261,6 +263,52 @@ fn simple_profile(app: &App, ui: &mut egui::Ui, index: usize) {
     });
 }
 
+/// Botón de llamar del DM: corta la llamada si ya estás en ella; si no, la
+/// inicia. Lo usan el encabezado clásico y la píldora de la interfaz nueva.
+pub(crate) fn toggle_dm_call(app: &mut App, index: usize) {
+    let Some(friend) = app.friends.get(index) else { return };
+    let channel_id = friend.dm_channel_id.clone();
+    let already_connected = channel_id.as_deref().is_some_and(|id| app.is_connected_to_voice_dm_str(id));
+    if already_connected {
+        app.leave_voice();
+    } else {
+        match channel_id {
+            Some(channel_id) => app.start_dm_call(&channel_id),
+            // Todavía no se abrió el canal de DM de verdad (por REST) — pasa
+            // con amigos con los que nunca hablaste en esta sesión; `open_dm`
+            // ya lo está pidiendo en segundo plano apenas se entra.
+            None => app.push_toast(
+                crate::lib::state::ToastKind::Info,
+                "Todavía estamos abriendo esta conversación",
+                "Probá de nuevo en un segundo.",
+            ),
+        }
+    }
+}
+
+/// Texto de estado de la píldora de arriba (interfaz nueva): en un grupo, la
+/// cantidad de miembros; en un 1:1, la actividad o el estado.
+pub(crate) fn header_status_text(app: &App, index: usize) -> String {
+    let Some(f) = app.friends.get(index) else { return String::new() };
+    let raw = if f.is_group {
+        let n = app
+            .dms
+            .iter()
+            .find(|d| Some(d.id.as_str()) == f.dm_channel_id.as_deref())
+            .map(|d| d.recipients.len() + 1)
+            .unwrap_or(1);
+        format!("{n} miembros")
+    } else {
+        f.subtitle.clone().unwrap_or_else(|| f.status.label().to_string())
+    };
+    let flat = crate::discord::models::one_line(&raw);
+    if flat.chars().count() > 70 {
+        flat.chars().take(69).chain(std::iter::once('…')).collect()
+    } else {
+        flat.to_string()
+    }
+}
+
 fn central_panel(app: &mut App, ui: &mut egui::Ui, index: usize) {
     let palette = app.palette;
     egui::CentralPanel::default()
@@ -269,7 +317,8 @@ fn central_panel(app: &mut App, ui: &mut egui::Ui, index: usize) {
             Frame::new().fill(palette.window).inner_margin(Margin::same(0)),
             6,
             5,
-            5,
+            // Sin panel a la derecha, el borde de la ventana queda a 10.
+            if app.members_panel_open { 5 } else { 10 },
         ))
         .show(ui, |ui| {
             let already_connected = app
@@ -290,35 +339,27 @@ fn central_panel(app: &mut App, ui: &mut egui::Ui, index: usize) {
                     format!("{n} miembros")
                 })
             };
-            let call_clicked = {
-                let friend = &app.friends[index];
-                dm_top_bar(
-                    ui,
-                    &palette,
-                    &friend.name,
-                    friend.avatar_url.as_deref(),
-                    friend.avatar_color,
-                    &friend.initial(),
-                    friend.status,
-                    group_subtitle.as_deref().or(friend.subtitle.as_deref()),
-                    already_connected,
-                    friend.is_group,
-                )
-            };
-            if call_clicked && already_connected {
-                app.leave_voice();
-            } else if call_clicked {
-                match app.friends[index].dm_channel_id.clone() {
-                    Some(channel_id) => app.start_dm_call(&channel_id),
-                    // Todavía no se abrió el canal de DM de verdad (por
-                    // REST) — pasa con amigos con los que nunca hablaste
-                    // en esta sesión; `open_dm` ya lo está pidiendo en
-                    // segundo plano apenas se entra a la conversación.
-                    None => app.push_toast(
-                        crate::lib::state::ToastKind::Info,
-                        "Todavía estamos abriendo esta conversación",
-                        "Probá de nuevo en un segundo.",
-                    ),
+            // Interfaz nueva: igual que en los servers, el título (y la llamada)
+            // viven en la píldora de arriba (`shell::topbar::show_row`), así que
+            // acá no se repite el encabezado.
+            if !theme::is_modern() {
+                let call_clicked = {
+                    let friend = &app.friends[index];
+                    dm_top_bar(
+                        ui,
+                        &palette,
+                        &friend.name,
+                        friend.avatar_url.as_deref(),
+                        friend.avatar_color,
+                        &friend.initial(),
+                        friend.status,
+                        group_subtitle.as_deref().or(friend.subtitle.as_deref()),
+                        already_connected,
+                        friend.is_group,
+                    )
+                };
+                if call_clicked {
+                    toggle_dm_call(app, index);
                 }
             }
 

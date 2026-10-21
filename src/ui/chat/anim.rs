@@ -428,6 +428,29 @@ pub fn source_hover(ctx: &Context, url: &str, max_side: u32) -> ImageSource<'sta
     )
 }
 
+/// GIF de la grilla del selector que se anima solo (sin pasar el mouse): aún más
+/// chico que el de `source_hover` porque hay varios a la vez. Comparte caché y
+/// vencimiento (`HOVER_TTL`) con `source_hover`: al salir de la vista se sueltan a
+/// los pocos segundos y `release_hover` los borra al cerrar el selector.
+pub fn source_grid(ctx: &Context, url: &str, max_side: u32) -> ImageSource<'static> {
+    if image_mode() != ImageMode::Normal || !is_gif_url(url) {
+        return plain(url);
+    }
+    let max_side = max_side.clamp(96, 360);
+    source_impl(
+        ctx,
+        url,
+        Mode {
+            apng: false,
+            max_side,
+            max_frames: 60,
+            budget: 2_500_000,
+            ttl: HOVER_TTL,
+        },
+        None,
+    )
+}
+
 /// Suelta ya las animaciones del selector de GIFs (las de `source_hover`), con
 /// sus texturas y los bytes que `egui` guardó. Se llama al cerrar el selector.
 pub fn release_hover(ctx: &Context) {

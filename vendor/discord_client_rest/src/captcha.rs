@@ -61,16 +61,16 @@ impl SolvedCaptcha {
 
     pub fn add_headers(&self, headers: &mut HeaderMap) {
         if let Ok(value) = self.key.parse() {
-            headers.insert("x-captcha-key", value);
+            headers.insert("X-Captcha-Key", value);
         }
         if !self.session_id.is_empty() {
             if let Ok(value) = self.session_id.parse() {
-                headers.insert("x-captcha-session-id", value);
+                headers.insert("X-Captcha-Session-Id", value);
             }
         }
         if !self.rqtoken.is_empty() {
             if let Ok(value) = self.rqtoken.parse() {
-                headers.insert("x-captcha-rqtoken", value);
+                headers.insert("X-Captcha-Rqtoken", value);
             }
         }
     }

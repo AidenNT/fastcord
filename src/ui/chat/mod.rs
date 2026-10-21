@@ -270,7 +270,7 @@ fn restriction_bar(ui: &mut egui::Ui, palette: &Palette, text: &str, tone: Color
         ui.add_space(16.0);
         Frame::new()
             .fill(palette.surface)
-            .stroke(Stroke::new(1.0, palette.outline))
+            .stroke(theme::field_stroke(&palette))
             .corner_radius(CornerRadius::same(theme::radius() + 6))
             .inner_margin(Margin::symmetric(14, 12))
             .show(ui, |ui| {
@@ -2291,7 +2291,15 @@ fn message_row(
         if let Some(line) = &msg.interaction {
             interaction_row(ui, palette, line);
         }
+        // `horizontal` fuerza un alto mínimo de `interact_size.y` (32px): en un
+        // mensaje agrupado de una sola línea eso lo dejaba mucho más alto
+        // que el texto. Se baja a 0 para que la fila mida lo que mide su
+        // contenido, y adentro se restaura el valor original para que los
+        // botones/embeds del cuerpo no cambien de tamaño.
+        let prev_interact_y = ui.spacing().interact_size.y;
+        ui.spacing_mut().interact_size.y = 0.0;
         ui.horizontal(|ui| {
+            ui.spacing_mut().interact_size.y = prev_interact_y;
             // Fuerza a que la fila ocupe todo el ancho disponible (no solo
             // lo que mide el texto), para que la barra flotante se pueda
             // anclar contra el borde derecho de verdad y para que el mouse
@@ -2339,7 +2347,11 @@ fn message_row(
                 ui.vertical(|ui| {
                     ui.set_max_width((ui.available_width() - MESSAGE_RIGHT_GUTTER).max(120.0));
                     ui.spacing_mut().item_spacing.y = 2.0;
+                    // Mismo problema que arriba: la fila del nombre/hora medía 32px.
+                    let header_prev_y = ui.spacing().interact_size.y;
+                    ui.spacing_mut().interact_size.y = 18.0;
                     ui.horizontal(|ui| {
+                        ui.spacing_mut().interact_size.y = header_prev_y;
                         // Como en Discord: el nombre lleva el color del rol
                         // más alto del autor en este server. Sin rol con
                         // color (o en DMs) queda el color de siempre.
@@ -2367,6 +2379,7 @@ fn message_row(
                         }
                         theme::text(ui, &msg.time, theme::regular(10.5), palette.dim);
                     });
+                    ui.spacing_mut().interact_size.y = header_prev_y;
                     message_body(ui, palette, msg, channels, index, toggled_reaction, actions);
                 });
             }
@@ -4412,7 +4425,7 @@ fn composer(
         ui.add_space(16.0);
         let framed = Frame::new()
             .fill(palette.surface)
-            .stroke(Stroke::new(1.0, palette.outline))
+            .stroke(theme::field_stroke(&palette))
             .corner_radius(CornerRadius::same(theme::radius() + 6))
             .inner_margin(Margin::symmetric(12, 10))
             .show(ui, |ui| {

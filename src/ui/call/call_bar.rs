@@ -326,7 +326,7 @@ pub fn show_bottom(app: &mut App, ui: &mut egui::Ui) {
     if fully_connected && !settled {
         ctx.request_repaint_after(std::time::Duration::from_secs_f64((hold_until - now).max(0.0) + 0.02));
     }
-    let shown = !settled || !in_call_view;
+    let shown = !app.call_bar_hidden && (!settled || !in_call_view);
     ctx.data_mut(|d| d.insert_temp(vis_id, shown));
     let t = ui.ctx().animate_bool_with_time_and_easing(
         egui::Id::new("call_bar_bottom_slide"),
@@ -335,6 +335,9 @@ pub fn show_bottom(app: &mut App, ui: &mut egui::Ui) {
         egui::emath::easing::cubic_out,
     );
     if t < 0.005 {
+        if app.call_bar_hidden {
+            restore_tab(app, &ctx);
+        }
         return;
     }
     let palette = app.palette;
@@ -360,6 +363,7 @@ pub fn show_bottom(app: &mut App, ui: &mut egui::Ui) {
     );
     let mut leave_clicked = false;
     let mut settings_clicked = false;
+    let mut hide_clicked = false;
     let mut goto_clicked = false;
     let mut share_clicked = false;
     let mut soundboard_click: Option<egui::Rect> = None;
@@ -468,15 +472,37 @@ pub fn show_bottom(app: &mut App, ui: &mut egui::Ui) {
                         {
                             settings_clicked = true;
                         }
+
                     });
                 });
             });
         });
 
+    // Pestaña para ocultar la barra: centrada sobre el borde de arriba de la píldora.
+    {
+        let panel_top = ctx.viewport_rect().bottom() - panel_height * t;
+        let edge = panel_top + if modern { 8.0 } else { 0.0 };
+        egui::Area::new(egui::Id::new("call_bar_hide_tab"))
+            .order(egui::Order::Foreground)
+            .pivot(Align2::CENTER_CENTER)
+            .fixed_pos(egui::pos2(ctx.viewport_rect().center().x, edge))
+            .show(&ctx, |ui| {
+                ui.set_opacity(t);
+                if tab_button(ui, &palette, Icon::ChevronDown, "Ocultar la barra de llamada").clicked() {
+                    hide_clicked = true;
+                }
+            });
+    }
+
     // Un solo clic a la vez, aplicado después de dibujar (mismo patrón que
     // `show`): arriba `palette`/`channel` salieron de `app`.
     if let Some(rect) = soundboard_click {
         app.toggle_soundboard(rect);
+    }
+    if hide_clicked {
+        app.call_bar_hidden = true;
+        // Primera vez: un aviso explica adónde fue el botón de colgar.
+        app.call_bar_tip_open = !app.call_bar_tip_seen;
     }
     if leave_clicked {
         app.leave_voice();
@@ -652,4 +678,67 @@ fn disconnect_button(ui: &mut egui::Ui, palette: &crate::ui::theme::Palette) -> 
 fn vertical_separator(ui: &mut egui::Ui, palette: &crate::ui::theme::Palette) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(1.0, 22.0), Sense::hover());
     ui.painter().rect_filled(rect, 0.0, palette.outline);
+}
+
+/// Pestañita redonda con una flecha, para ocultar / volver a subir la barra de llamada.
+fn tab_button(ui: &mut egui::Ui, palette: &crate::ui::theme::Palette, icon: Icon, tooltip: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(44.0, 20.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let fill = if response.hovered() {
+            extra::blend(palette.surface_hover, palette.accent, 0.15)
+        } else {
+            extra::blend(palette.surface, palette.accent, 0.08)
+        };
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(10),
+            fill,
+            Stroke::new(1.0, extra::blend(palette.outline, palette.accent, 0.35)),
+            egui::StrokeKind::Inside,
+        );
+        theme::paint_icon(ui, icon, rect, 14.0, palette.text);
+    }
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(tooltip)
+}
+
+/// Con la barra oculta a mano: al pasar el puntero por donde estaría la barra (borde
+/// inferior, centro) aparece una pestaña ▲ para volver a subirla. El botón de colgar
+/// del rail sigue disponible aparte.
+fn restore_tab(app: &mut App, ctx: &egui::Context) {
+    let palette = app.palette;
+    let screen = ctx.viewport_rect();
+    let zone = egui::Rect::from_min_max(
+        egui::pos2(screen.left(), screen.bottom() - (BOTTOM_HEIGHT + 16.0)),
+        screen.max,
+    );
+    let hover = ctx.pointer_hover_pos().is_some_and(|p| zone.contains(p));
+    let fade = ctx.animate_bool_with_time(egui::Id::new("call_bar_restore_tab_fade"), hover, 0.18);
+    if fade < 0.02 {
+        return;
+    }
+    let mut clicked = false;
+    egui::Area::new(egui::Id::new("call_bar_restore_tab"))
+        .order(egui::Order::Foreground)
+        .pivot(Align2::CENTER_BOTTOM)
+        .fixed_pos(egui::pos2(screen.center().x, screen.bottom() - 10.0))
+        .show(ctx, |ui| {
+            ui.set_opacity(fade);
+            clicked = tab_button(ui, &palette, Icon::ChevronUp, "Mostrar la barra de llamada").clicked();
+        });
+    if clicked {
+        show_again(app, ctx);
+    }
+}
+
+/// Vuelve a subir la barra oculta a mano. Dentro de la vista de la llamada la barra se
+/// auto-oculta apenas pasa su tiempo de gracia, así que se renueva ese tiempo: sin esto
+/// "se mostraba" y bajaba en el mismo frame, y parecía que el botón no hacía nada.
+pub fn show_again(app: &mut App, ctx: &egui::Context) {
+    app.call_bar_hidden = false;
+    app.call_bar_tip_open = false;
+    let now = ctx.input(|i| i.time);
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("call_bar_hold_until"), now + AUTO_HIDE_SECS));
+    ctx.request_repaint();
 }

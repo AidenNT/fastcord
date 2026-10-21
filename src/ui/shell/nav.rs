@@ -9,7 +9,7 @@
 //! barra de usuario queda una sola vez, abajo de las dos, ocupando TODO el
 //! ancho combinado (rail + panel) — el pedido explícito de la consigna.
 
-use egui::{Align, CornerRadius, Frame, Layout, Margin, Rect, Stroke, StrokeKind, UiBuilder, Vec2};
+use egui::{Align, CornerRadius, Frame, Layout, Margin, Rect, StrokeKind, UiBuilder, Vec2};
 
 use crate::lib::state::{App, Screen};
 use crate::ui::{call::call_bar, dm::friends_panel, server, shell::rail};
@@ -177,7 +177,7 @@ fn show_modern(app: &mut App, ui: &mut egui::Ui) {
                 ui.painter().rect_stroke(
                     search_rect,
                     CornerRadius::same(PILL_RADIUS),
-                    Stroke::new(1.0, palette.outline),
+                    theme::card_stroke(&palette),
                     StrokeKind::Inside,
                 );
                 ui.scope_builder(
@@ -200,7 +200,7 @@ fn show_modern(app: &mut App, ui: &mut egui::Ui) {
 
             // Tarjeta de abajo: actividad propia (opcional) + usuario.
             let has_activity = app.own_activity().is_some();
-            let bottom_h = 12.0 * 2.0 + 56.0 + if has_activity { 58.0 + 8.0 } else { 0.0 };
+            let bottom_h = 8.0 * 2.0 + 44.0 + if has_activity { 58.0 + 6.0 } else { 0.0 };
             let bottom_rect =
                 Rect::from_min_size(egui::pos2(col_x, full.max.y - bottom_h), Vec2::new(card_w, bottom_h));
 
@@ -220,11 +220,10 @@ fn show_modern(app: &mut App, ui: &mut egui::Ui) {
                     .max_rect(list_rect)
                     .layout(Layout::top_down(Align::Min)),
                 |ui| {
-                    // El borde de 1px suma 2px al marco: se restan.
-                    let inner = list_rect.size() - Vec2::splat(2.0);
+                    let inner = list_rect.size();
                     Frame::new()
                         .fill(palette.panel)
-                        .stroke(Stroke::new(1.0, palette.outline))
+                        .stroke(theme::card_stroke(&palette))
                         .corner_radius(CornerRadius::same(theme::CARD_RADIUS))
                         .show(ui, |ui| {
                             ui.set_min_size(inner);
@@ -255,18 +254,18 @@ fn show_modern(app: &mut App, ui: &mut egui::Ui) {
                     .max_rect(bottom_rect)
                     .layout(Layout::top_down(Align::Min)),
                 |ui| {
-                    let inner = bottom_rect.size() - Vec2::splat(2.0 + 24.0);
+                    let inner = bottom_rect.size() - Vec2::splat(16.0);
                     Frame::new()
                         .fill(palette.panel)
-                        .stroke(Stroke::new(1.0, palette.outline))
+                        .stroke(theme::card_stroke(&palette))
                         .corner_radius(CornerRadius::same(theme::CARD_RADIUS))
-                        .inner_margin(Margin::same(12))
+                        .inner_margin(Margin::same(8))
                         .show(ui, |ui| {
                             ui.set_min_size(inner);
                             ui.set_max_size(inner);
                             ui.spacing_mut().item_spacing = Vec2::ZERO;
                             if friends_panel::now_playing_card(ui, app) {
-                                ui.add_space(8.0);
+                                ui.add_space(6.0);
                             }
                             friends_panel::user_card(ui, app);
                         });

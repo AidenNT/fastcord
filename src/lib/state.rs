@@ -612,7 +612,7 @@ pub struct App {
     pub join_form: Option<JoinFormModal>,
     /// Ventana flotante de herramientas de desarrollo (`ui::devtools`); solo
     /// existe si se activó `use_developer_features`.
-    pub devtools: crate::ui::devtools::DevTools,
+    pub devtools: crate::ui::devtools::DevToolsHandle,
     /// Soundboard de la llamada: el popup está abierto.
     pub soundboard_open: bool,
     /// Botón de la barra de llamada que lo abrió (el popup se ubica encima y
@@ -735,6 +735,10 @@ pub struct App {
     /// Perfil que se muestra de forma permanente en el panel derecho de un DM
     /// (`ui::profile_popup::show_panel`). Mismo formato que `profile_popup`.
     pub dm_profile: Option<ProfilePopup>,
+    /// Panel derecho del chat (miembros del server / perfil o miembros del DM)
+    /// visible u oculto; lo conmuta el botón de la píldora de arriba
+    /// (`ui::shell::topbar::show_row`).
+    pub members_panel_open: bool,
     /// Modal de "Ver perfil completo", si está abierto.
     pub profile_full: Option<FullProfile>,
     /// Modo de tema activo (oscuro / claro / según el wallpaper / uno de
@@ -762,6 +766,14 @@ pub struct App {
     /// de la tarjeta chica del panel izquierdo. Se persiste solo; ver
     /// `set_new_call_ui`.
     pub new_call_ui: bool,
+    /// La persona ocultó a mano la barra de llamada de abajo (`call_bar::show_bottom`):
+    /// "Colgar" pasa a la píldora de abajo del rail, junto a Ajustes. Se limpia
+    /// sola cuando termina la llamada.
+    pub call_bar_hidden: bool,
+    /// Muestra el aviso (tutorial) de la barra oculta, pegado al rail.
+    pub call_bar_tip_open: bool,
+    /// El aviso ya se mostró una vez: no vuelve a salir. Se persiste.
+    pub call_bar_tip_seen: bool,
     /// Pantalla de bienvenida de la primera vez (elegir interfaz clásica o
     /// nueva). Se muestra justo después de iniciar sesión, solo a quien abre la
     /// app por primera vez; ver `App::choose_interface` y `ui::auth::welcome`.
@@ -1009,7 +1021,7 @@ impl Default for App {
             last_history_trim: 0.0,
             component_modal: None,
             join_form: None,
-            devtools: crate::ui::devtools::DevTools::default(),
+            devtools: crate::ui::devtools::DevToolsHandle::default(),
             soundboard_open: false,
             soundboard_button: None,
             soundboard_loading: false,
@@ -1055,6 +1067,7 @@ impl Default for App {
             profile_popup: None,
             role_popup: None,
             dm_profile: None,
+            members_panel_open: true,
             profile_full: None,
             theme_mode: theme_mode.clone(),
             custom_themes,
@@ -1099,6 +1112,9 @@ impl Default for App {
             video_paused: false,
             shell: resident::ShellState::default(),
             new_call_ui,
+            call_bar_hidden: false,
+            call_bar_tip_open: false,
+            call_bar_tip_seen: matches!(web_local_storage_api::get_item("call_bar_tip_seen"), Ok(Some(_))),
             show_welcome: false,
             ui_scale,
             ui_scale_applied: f32::NAN,
@@ -8092,6 +8108,10 @@ impl eframe::App for App {
         // laterales y el central se repartan lo que queda.
         if self.new_call_ui && self.voice_target.is_some() && !matches!(self.screen, Screen::Login) {
             crate::ui::call::call_bar::show_bottom(self, ui);
+        } else {
+            // Sin llamada no hay barra que mantener oculta.
+            self.call_bar_hidden = false;
+            self.call_bar_tip_open = false;
         }
 
         match self.screen {

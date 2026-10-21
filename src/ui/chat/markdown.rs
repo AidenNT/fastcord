@@ -159,6 +159,8 @@ pub fn show(ui: &mut Ui, palette: &Palette, text: &str, size: f32, color: Color3
                 render_paragraph(ui, palette, &text, (size - 2.5).max(10.0), palette.dim, false, ctx)
             }
             Block::List(items) => {
+                let prev_interact_y = ui.spacing().interact_size.y;
+                ui.spacing_mut().interact_size.y = (size * LINE_HEIGHT_FACTOR).round();
                 for item in items {
                     ui.horizontal(|ui| {
                         ui.add_space(4.0);
@@ -167,6 +169,7 @@ pub fn show(ui: &mut Ui, palette: &Palette, text: &str, size: f32, color: Color3
                         ui.vertical(|ui| render_paragraph(ui, palette, &item, size, color, false, ctx));
                     });
                 }
+                ui.spacing_mut().interact_size.y = prev_interact_y;
             }
             Block::Paragraph(text) => render_paragraph(ui, palette, &text, size, color, false, ctx),
         }
@@ -366,6 +369,13 @@ type Run = (RunContent, InlineStyle);
 /// Delimitadores reconocidos, del más largo al más corto: hay que probar
 /// `***` antes que `**`/`*` en la misma posición o nunca se arma la
 /// combinación negrita+cursiva.
+/// Alto de línea del texto de los mensajes, como múltiplo del tamaño de
+/// fuente (13.5 * 1.7 ≈ 23px). Antes cada línea ocupaba el mínimo de egui
+/// (`interact_size.y` = 32px), y por eso los mensajes se veían muy
+/// separados entre sí comparado con Discord. Subí/bajá este valor para
+/// hacer la lista más compacta o más aireada.
+const LINE_HEIGHT_FACTOR: f32 = 1.7;
+
 const DELIMS: &[(&str, fn(InlineStyle) -> InlineStyle)] = &[
     ("***", |s| InlineStyle {
         bold: true,
@@ -681,16 +691,29 @@ fn render_paragraph(
     heading: bool,
     ctx: &MentionCtx,
 ) {
+    // Alto de línea fijo estilo Discord. `horizontal_wrapped` toma como alto
+    // mínimo de fila `interact_size.y` (32px en el tema moderno), así que se
+    // baja a `line_height` solo mientras se dibujan las líneas del párrafo.
+    // El espacio entre filas de una línea que se parte en varias (wrap) se
+    // calcula para que midan lo mismo que la primera fila.
+    let line_height = (size * LINE_HEIGHT_FACTOR).round();
+    let wrap_gap = (line_height - size * 1.25).max(0.0);
+    let prev_interact_y = ui.spacing().interact_size.y;
+    let prev_item_y = ui.spacing().item_spacing.y;
+    ui.spacing_mut().interact_size.y = line_height;
+    ui.spacing_mut().item_spacing.y = 0.0;
     for line in text.split('\n') {
         let mut runs = Vec::new();
         parse_inline(line, InlineStyle::default(), None, &mut runs);
         ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, wrap_gap);
             for (content, style) in &runs {
                 render_run(ui, palette, content, *style, size, color, heading, ctx);
             }
         });
     }
+    ui.spacing_mut().interact_size.y = prev_interact_y;
+    ui.spacing_mut().item_spacing.y = prev_item_y;
 }
 
 fn render_run(

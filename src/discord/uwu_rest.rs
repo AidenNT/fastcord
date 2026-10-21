@@ -65,6 +65,19 @@ pub(super) fn set_shared_fingerprint(fingerprint: Arc<ClientFingerprint>) {
     }
 }
 
+/// Le dice al cliente vendorizado de dónde sacar el `X-Installation-Id`:
+/// siempre del fingerprint compartido (`fingerprint.rs` lo genera, lo guarda
+/// y lo refresca). Se consulta en cada request, así que si Discord lo cambia
+/// a mitad de sesión el siguiente pedido ya sale con el nuevo.
+fn register_installation_id_provider() {
+    discord_client_rest::rest::set_installation_id_provider(Arc::new(|| {
+        SHARED_FINGERPRINT
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().and_then(|fingerprint| fingerprint.installation_id()))
+    }));
+}
+
 fn shared_fingerprint() -> Arc<ClientFingerprint> {
     if let Ok(guard) = SHARED_FINGERPRINT.read() {
         if let Some(fingerprint) = guard.as_ref() {
@@ -97,6 +110,9 @@ async fn connected_client(token: &str) -> anyhow::Result<Arc<UwuInner>> {
             return Ok(Arc::clone(client));
         }
     }
+
+    // Antes del `connect`, para que las requests de arranque también lo lleven.
+    register_installation_id_provider();
 
     let fingerprint = shared_fingerprint();
     let build_numbers = BuildNumbers::new(fingerprint.client_build_number as u32, None);
@@ -1202,6 +1218,7 @@ impl UwuRest {
                     .header("Content-Type", file.mime.as_str())
                     .header("Origin", "https://discord.com")
                     .header("Referer", "https://discord.com/")
+                    .orig_headers(discord_client_rest::header_case::chrome_header_case())
                     .body(bytes)
                     .send()
                     .await;

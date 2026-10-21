@@ -84,6 +84,13 @@ pub fn accounts_file() -> Option<PathBuf> {
     state_dir().map(|dir| dir.join("accounts.json"))
 }
 
+/// Tamaño, posición y estado maximizado de la ventana principal (JSON, ver
+/// `app_shell::WindowGeometry`). Reemplaza la persistencia de ventana de eframe, que a
+/// veces guardaba el tamaño del ícono minimizado.
+pub fn window_state_file() -> Option<PathBuf> {
+    state_dir().map(|dir| dir.join("window_state.json"))
+}
+
 /// Último canal abierto de cada server y posición del scroll de cada canal
 /// (JSON, ver `lib::last_view`).
 pub fn last_view_file() -> Option<PathBuf> {

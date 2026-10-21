@@ -37,6 +37,7 @@ mod video_decode;
 mod screen_capture;
 mod loss_control;
 mod source_thumbs;
+mod stream_audio;
 mod stream_publish;
 #[cfg(windows)]
 mod window_capture;

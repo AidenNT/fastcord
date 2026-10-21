@@ -35,7 +35,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let in_voice_channel = app.servers[index].channel(cat, chan).is_some_and(|c| c.is_voice);
     if app.thread_panel.is_some() {
         thread_side_panel(app, ui, index);
-    } else if !in_voice_channel {
+    } else if !in_voice_channel && app.members_panel_open {
         member_list_panel(app, ui, index);
     }
     central_panel(app, ui, index);
@@ -153,7 +153,7 @@ fn thread_side_panel(app: &mut App, ui: &mut egui::Ui, server_index: usize) {
             ui.painter().hline(
                 ui.max_rect().x_range(),
                 ui.cursor().top(),
-                Stroke::new(1.0, palette.outline),
+                theme::header_stroke(&palette),
             );
 
             Frame::new()
@@ -246,9 +246,9 @@ pub fn channel_list_content(app: &mut App, ui: &mut egui::Ui, server_index: usiz
 }
 
 /// Alto del banner del server (interfaz nueva) cuando el server tiene uno.
-pub const BANNER_HEIGHT: f32 = 150.0;
+pub const BANNER_HEIGHT: f32 = 128.0;
 /// Alto del encabezado con solo el nombre, para servers sin banner.
-pub const NAME_HEADER_HEIGHT: f32 = 56.0;
+pub const NAME_HEADER_HEIGHT: f32 = 48.0;
 
 /// Igual que [`channel_list_content`]. Con `header_pad = Some(alto)` el
 /// encabezado (nombre del server) NO se dibuja acá: lo pinta quien llama
@@ -374,7 +374,7 @@ pub fn paint_server_banner(ui: &mut egui::Ui, palette: &Palette, server: &Server
     ui.painter().rect_stroke(
         rect,
         radius,
-        Stroke::new(1.0, palette.outline),
+        theme::card_stroke(palette),
         egui::StrokeKind::Inside,
     );
 
@@ -707,7 +707,7 @@ fn central_panel(app: &mut App, ui: &mut egui::Ui, server_index: usize) {
     let in_voice = app.servers[server_index]
         .channel(cat0, chan0)
         .is_some_and(|c| c.is_voice);
-    let right_gap = if app.thread_panel.is_some() || !in_voice { 5 } else { 10 };
+    let right_gap = if app.thread_panel.is_some() || (!in_voice && app.members_panel_open) { 5 } else { 10 };
     egui::CentralPanel::default()
         .frame(theme::card_frame(
             &palette,
@@ -966,7 +966,7 @@ fn voice_channel_view(
             .show(ui, |ui| {
                 let rect = ui.max_rect();
                 ui.painter()
-                    .vline(rect.left(), rect.y_range(), Stroke::new(1.0, palette.outline));
+                    .vline(rect.left(), rect.y_range(), theme::header_stroke(&palette));
                 Frame::new().inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         theme::text(ui, "Chat de voz", theme::semibold(14.0), palette.text);
@@ -982,7 +982,7 @@ fn voice_channel_view(
                 ui.painter().hline(
                     ui.max_rect().x_range(),
                     ui.cursor().top(),
-                    Stroke::new(1.0, palette.outline),
+                    theme::header_stroke(&palette),
                 );
                 channel_chat(app, ui, palette, server_index, cat, chan, channel_name);
             });

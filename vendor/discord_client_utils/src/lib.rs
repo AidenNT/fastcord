@@ -1,5 +1,7 @@
 use discord_client_structs::structs::client::BuildNumbers;
 use std::error::Error;
+pub mod header_case;
+
 use wreq::{Client, redirect};
 use wreq_util::{Emulation, Platform, Profile};
 
@@ -24,6 +26,7 @@ pub async fn find_build_numbers() -> BoxedResult<BuildNumbers> {
 
     let res = client
         .get("https://discord.com/app")
+        .orig_headers(header_case::chrome_header_case())
         .send()
         .await?
         .text()

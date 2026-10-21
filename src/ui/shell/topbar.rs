@@ -8,7 +8,7 @@
 //! botones de minimizar/maximizar/cerrar.
 
 use egui::{
-    Align, CornerRadius, Frame, Layout, Margin, Rect, Sense, Stroke, StrokeKind, UiBuilder, Vec2, ViewportCommand,
+    Align, CornerRadius, Frame, Layout, Margin, Rect, Sense, StrokeKind, UiBuilder, Vec2, ViewportCommand,
 };
 
 use crate::lib::state::{App, Screen, ToastKind};
@@ -361,7 +361,20 @@ pub fn show_row(app: &mut App, ui: &mut egui::Ui) {
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
             let full = ui.available_rect_before_wrap();
-            let right_w = 116.0;
+            // Al entrar a un chat la píldora de la derecha cambia de herramientas
+            // (actualizaciones + notificaciones → buscar, fijados, hilos,
+            // miembros) con una animación: crece un poco y se desvanecen unos
+            // íconos mientras entran los otros.
+            let in_chat = matches!(app.screen, Screen::Dm(_) | Screen::Server(_));
+            let chat_tools = chat_tools_count(app);
+            let t = ui.ctx().animate_bool_with_time_and_easing(
+                egui::Id::new("app_row_chat_mode"),
+                in_chat,
+                0.24,
+                egui::emath::easing::cubic_out,
+            );
+            let chat_w = 24.0 + chat_tools as f32 * 27.0;
+            let right_w = 116.0 + (chat_w - 116.0) * t;
             let left_w = (full.width() - right_w - gap as f32).max(120.0);
             let left_rect = Rect::from_min_size(full.min, Vec2::new(left_w, pill_h));
             let right_rect =
@@ -373,7 +386,7 @@ pub fn show_row(app: &mut App, ui: &mut egui::Ui) {
                 ui.painter().rect_stroke(
                     rect,
                     CornerRadius::same(theme::PILL_RADIUS),
-                    Stroke::new(1.0, palette.outline),
+                    theme::card_stroke(&palette),
                     StrokeKind::Inside,
                 );
             }
@@ -392,6 +405,12 @@ pub fn show_row(app: &mut App, ui: &mut egui::Ui) {
                             theme::icon(ui, Icon::MessageCircle, 18.0, palette.secondary);
                             ui.add_space(8.0);
                             theme::text(ui, name, theme::bold(16.0), palette.text);
+                            // Como el tópico del canal en un server.
+                            let status = crate::ui::dm::header_status_text(app, i);
+                            if !status.trim().is_empty() {
+                                ui.add_space(12.0);
+                                theme::text(ui, status, theme::regular(12.5), palette.dim);
+                            }
                         }
                         Screen::Server(i) => {
                             // Como en la referencia: el canal abierto (# o
@@ -431,39 +450,162 @@ pub fn show_row(app: &mut App, ui: &mut egui::Ui) {
                 },
             );
 
-            // Derecha: actualizaciones + notificaciones.
-            ui.scope_builder(
-                UiBuilder::new()
-                    .max_rect(right_rect.shrink2(Vec2::new(10.0, 0.0)))
-                    .layout(Layout::right_to_left(Align::Center)),
-                |ui| {
-                    ui.spacing_mut().item_spacing = Vec2::ZERO;
-                    // Notificaciones: campana con el contador de pendientes; el
-                    // panel se dibuja abajo, ya fuera de la fila.
-                    bell_rect = Some(crate::ui::dm::inbox::bell_button(ui, app));
-                    ui.add_space(4.0);
-                    if theme::icon_button(
-                        ui,
-                        Icon::Refresh,
-                        15.0,
-                        palette.dim,
-                        palette.text,
-                        "Buscar actualizaciones",
-                    )
-                    .clicked()
-                    {
-                        app.push_toast(
-                            ToastKind::Info,
-                            "Buscando actualizaciones",
-                            "eCord ya está en la última versión.",
-                        );
-                    }
-                },
-            );
+            // En un DM, llamar vive en el extremo derecho de la píldora larga (el
+            // encabezado propio del chat ya no se dibuja, igual que en un server).
+            if let Screen::Dm(i) = app.screen {
+                let in_call = app
+                    .friends
+                    .get(i)
+                    .and_then(|f| f.dm_channel_id.clone())
+                    .is_some_and(|id| app.is_connected_to_voice_dm_str(&id));
+                let mut call_clicked = false;
+                ui.scope_builder(
+                    UiBuilder::new()
+                        .max_rect(left_rect.shrink2(Vec2::new(10.0, 0.0)))
+                        .layout(Layout::right_to_left(Align::Center)),
+                    |ui| {
+                        ui.spacing_mut().item_spacing = Vec2::ZERO;
+                        let (icon, color, tooltip) = if in_call {
+                            (Icon::PhoneOff, palette.danger, "En llamada — cortar")
+                        } else {
+                            (Icon::Phone, palette.dim, "Llamar")
+                        };
+                        call_clicked = theme::icon_button(ui, icon, 15.0, color, palette.text, tooltip).clicked();
+                    },
+                );
+                if call_clicked {
+                    crate::ui::dm::toggle_dm_call(app, i);
+                }
+            }
+
+            // Derecha: dos juegos de íconos superpuestos con fundido cruzado.
+            //   t = 0 → actualizaciones + notificaciones
+            //   t = 1 → herramientas del chat (buscar, fijados, hilos, miembros)
+            let slide = 10.0;
+            if t < 0.999 {
+                let rect = right_rect.translate(Vec2::new(-slide * t, 0.0));
+                ui.scope_builder(
+                    UiBuilder::new()
+                        .max_rect(rect.shrink2(Vec2::new(10.0, 0.0)))
+                        .layout(Layout::right_to_left(Align::Center)),
+                    |ui| {
+                        ui.set_opacity(1.0 - t);
+                        if t >= 0.5 {
+                            ui.disable();
+                        }
+                        ui.spacing_mut().item_spacing = Vec2::ZERO;
+                        // Notificaciones: campana con el contador de pendientes; el
+                        // panel se dibuja abajo, ya fuera de la fila.
+                        let bell = crate::ui::dm::inbox::bell_button(ui, app);
+                        if t < 0.5 {
+                            bell_rect = Some(bell);
+                        }
+                        ui.add_space(4.0);
+                        if theme::icon_button(
+                            ui,
+                            Icon::Refresh,
+                            15.0,
+                            palette.dim,
+                            palette.text,
+                            "Buscar actualizaciones",
+                        )
+                        .clicked()
+                        {
+                            app.push_toast(
+                                ToastKind::Info,
+                                "Buscando actualizaciones",
+                                "eCord ya está en la última versión.",
+                            );
+                        }
+                    },
+                );
+            }
+            if t > 0.001 {
+                let rect = right_rect.translate(Vec2::new(slide * (1.0 - t), 0.0));
+                let mut action: Option<ChatTool> = None;
+                ui.scope_builder(
+                    UiBuilder::new()
+                        .max_rect(rect.shrink2(Vec2::new(10.0, 0.0)))
+                        .layout(Layout::right_to_left(Align::Center)),
+                    |ui| {
+                        ui.set_opacity(t);
+                        if t <= 0.5 {
+                            ui.disable();
+                        }
+                        ui.spacing_mut().item_spacing = Vec2::ZERO;
+                        // De derecha a izquierda: miembros, hilos (solo servers),
+                        // fijados, buscar.
+                        let members_color = if app.members_panel_open { palette.text } else { palette.dim };
+                        let members_tip = if app.members_panel_open {
+                            "Ocultar lista de miembros"
+                        } else {
+                            "Mostrar lista de miembros"
+                        };
+                        if theme::icon_button(ui, Icon::Users, 15.0, members_color, palette.text, members_tip)
+                            .clicked()
+                        {
+                            action = Some(ChatTool::Members);
+                        }
+                        if matches!(app.screen, Screen::Server(_))
+                            && theme::icon_button(ui, Icon::ListPlus, 15.0, palette.dim, palette.text, "Hilos")
+                                .clicked()
+                        {
+                            action = Some(ChatTool::Threads);
+                        }
+                        if theme::icon_button(ui, Icon::Pin, 15.0, palette.dim, palette.text, "Mensajes fijados")
+                            .clicked()
+                        {
+                            action = Some(ChatTool::Pins);
+                        }
+                        if theme::icon_button(ui, Icon::Search, 15.0, palette.dim, palette.text, "Buscar")
+                            .clicked()
+                        {
+                            action = Some(ChatTool::Search);
+                        }
+                    },
+                );
+                match action {
+                    Some(ChatTool::Members) => app.members_panel_open = !app.members_panel_open,
+                    Some(ChatTool::Threads) => app.push_toast(
+                        ToastKind::Info,
+                        "Hilos",
+                        "La lista de hilos todavía no está disponible en esta versión.",
+                    ),
+                    Some(ChatTool::Pins) => app.push_toast(
+                        ToastKind::Info,
+                        "Mensajes fijados",
+                        "Todavía no está disponible en esta versión.",
+                    ),
+                    Some(ChatTool::Search) => app.push_toast(
+                        ToastKind::Info,
+                        "Buscar",
+                        "Todavía no está disponible en esta versión.",
+                    ),
+                    None => {}
+                }
+            }
         });
 
     if let Some(rect) = bell_rect {
         crate::ui::dm::inbox::show_panel(app, ui.ctx(), rect);
+    }
+}
+
+/// Herramientas de la píldora derecha cuando hay un chat abierto.
+#[derive(Clone, Copy)]
+enum ChatTool {
+    Search,
+    Pins,
+    Threads,
+    Members,
+}
+
+/// Cuántos botones lleva esa píldora: en un server son cuatro (con hilos); en
+/// un DM, tres.
+fn chat_tools_count(app: &App) -> usize {
+    match app.screen {
+        Screen::Server(_) => 4,
+        _ => 3,
     }
 }
 

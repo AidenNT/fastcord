@@ -19,7 +19,8 @@
 //! Como el visor, NO pasa por la máquina de estados de `runtime.rs`: corre en
 //! su propio hilo con su propio runtime de tokio.
 //!
-//! Todavía no transmite audio del sistema (solo video).
+//! El audio de la ventana/pantalla solo se transmite por WebRTC (`stream_audio.rs`,
+//! Windows); el camino UDP clásico sigue siendo solo video.
 
 use super::dave::{VoiceDaveOutboundPayload, handles_gateway_json_op};
 use super::gateway::{
@@ -42,9 +43,9 @@ mod webrtc;
 /// Cómo viaja el video de la transmisión propia.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StreamTransport {
-    /// UDP con cifrado AEAD (el camino de siempre).
+    /// UDP con cifrado AEAD (el camino clásico; `ECORD_STREAM_TRANSPORT=udp`).
     Udp,
-    /// WebRTC (DTLS-SRTP), como la librería de Node `Discord-video-stream`.
+    /// WebRTC (DTLS-SRTP), el predeterminado; como la librería de Node `Discord-video-stream`.
     WebRtc,
 }
 
@@ -66,7 +67,7 @@ pub(crate) fn stream_transport_override() -> Option<StreamTransport> {
     *STREAM_TRANSPORT_OVERRIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// `None` vuelve a `ECORD_STREAM_TRANSPORT` (o a UDP).
+/// `None` vuelve a `ECORD_STREAM_TRANSPORT` (o a WebRTC).
 pub(crate) fn set_stream_transport_override(value: Option<StreamTransport>) {
     *STREAM_TRANSPORT_OVERRIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = value;
 }
@@ -75,10 +76,11 @@ pub(crate) fn set_stream_transport_override(value: Option<StreamTransport>) {
 /// una sola vez al empezar: cambiarlo con una transmisión en curso no la toca.
 pub(crate) fn stream_transport() -> StreamTransport {
     stream_transport_override().unwrap_or_else(|| {
-        if std::env::var("ECORD_STREAM_TRANSPORT").is_ok_and(|value| value.trim().eq_ignore_ascii_case("webrtc")) {
-            StreamTransport::WebRtc
-        } else {
+        // WebRTC es el predeterminado; `ECORD_STREAM_TRANSPORT=udp` vuelve al camino clásico.
+        if std::env::var("ECORD_STREAM_TRANSPORT").is_ok_and(|value| value.trim().eq_ignore_ascii_case("udp")) {
             StreamTransport::Udp
+        } else {
+            StreamTransport::WebRtc
         }
     })
 }
@@ -449,21 +451,66 @@ fn publish_status(
     });
 }
 
+/// Tiempo máximo que se sigue reintentando después de perder la conexión (corte de
+/// internet, cambio de red, el servidor de media que cierra) antes de dar la
+/// transmisión por fallida.
+const RECONNECT_GIVE_UP: Duration = Duration::from_secs(5 * 60);
+/// Espera entre reintentos: 1 s, 2 s, 4 s… hasta este máximo.
+const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(8);
+/// Una sesión que llegó a durar esto estaba funcionando: el plazo de reintentos
+/// empieza de cero.
+const RECONNECT_HEALTHY_AFTER: Duration = Duration::from_secs(15);
+
 async fn run_stream_publish(
     params: StreamPublishParams,
     events: std::sync::mpsc::Sender<AppEvent>,
-    stop_rx: watch::Receiver<bool>,
+    mut stop_rx: watch::Receiver<bool>,
 ) {
     logging::debug("stream", format!("stream publish starting: {params:?}"));
     publish_status(&events, &params.stream_key, StreamPublishStatus::Connecting, None);
-    match publish_stream_session(&params, &events, stop_rx).await {
-        Ok(()) => {
-            logging::debug("stream", "stream publish ended");
-            publish_status(&events, &params.stream_key, StreamPublishStatus::Ended, None);
-        }
-        Err(error) => {
-            logging::error("stream", &error);
-            publish_status(&events, &params.stream_key, StreamPublishStatus::Failed, Some(error));
+    // Desde cuándo se está fallando sin parar (None = la última sesión funcionó).
+    let mut failing_since: Option<Instant> = None;
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        let started = Instant::now();
+        match publish_stream_session(&params, &events, stop_rx.clone()).await {
+            Ok(()) => {
+                logging::debug("stream", "stream publish ended");
+                publish_status(&events, &params.stream_key, StreamPublishStatus::Ended, None);
+                return;
+            }
+            Err(error) => {
+                if *stop_rx.borrow() {
+                    publish_status(&events, &params.stream_key, StreamPublishStatus::Ended, None);
+                    return;
+                }
+                if started.elapsed() >= RECONNECT_HEALTHY_AFTER {
+                    failing_since = None;
+                    backoff = Duration::from_secs(1);
+                }
+                let since = *failing_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= RECONNECT_GIVE_UP {
+                    logging::error("stream", format!("{error} (se dejó de reintentar tras {RECONNECT_GIVE_UP:?})"));
+                    publish_status(&events, &params.stream_key, StreamPublishStatus::Failed, Some(error));
+                    return;
+                }
+                logging::error("stream", format!("{error}: reintentando en {backoff:?}"));
+                publish_status(
+                    &events,
+                    &params.stream_key,
+                    StreamPublishStatus::Connecting,
+                    Some(format!("Reconectando… ({error})")),
+                );
+                // El sleep se corta si se pide parar la transmisión.
+                tokio::select! {
+                    () = tokio::time::sleep(backoff) => {}
+                    _ = stop_rx.changed() => {
+                        publish_status(&events, &params.stream_key, StreamPublishStatus::Ended, None);
+                        return;
+                    }
+                }
+                backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF);
+            }
         }
     }
 }
@@ -702,7 +749,7 @@ async fn publish_stream_session(
                         if use_webrtc {
                             // WebRTC: sin descubrimiento de IP ni modo de cifrado. Se manda
                             // un SDP local y Discord contesta con el suyo.
-                            let prepared = webrtc::PreparedTransport::new(video_ssrc, rtx_ssrc, keyframe_request.clone())?;
+                            let prepared = webrtc::PreparedTransport::new(ready.ssrc, video_ssrc, rtx_ssrc, keyframe_request.clone())?;
                             let offer = webrtc::build_offer_sdp(prepared.creds(), ready.ssrc, video_ssrc, rtx_ssrc);
                             logging::debug("stream", format!("webrtc: oferta SDP local:\n{offer}"));
                             send_voice_text(
@@ -747,6 +794,12 @@ async fn publish_stream_session(
                         let Some(frames_rx) = frames_rx.take() else {
                             return Err("stream frame queue already taken".to_owned());
                         };
+                        // Audio de la ventana/pantalla (opcional: si falla, sigue solo el video).
+                        tasks.push(tokio::spawn(webrtc::run_audio_send(webrtc::WebRtcAudioSender {
+                            transport: transport.clone(),
+                            dave_state: Arc::clone(&dave_state),
+                            target: params.capture.target.clone(),
+                        })));
                         tasks.push(tokio::spawn(webrtc::run_video_send(webrtc::WebRtcVideoSender {
                             transport,
                             dave_state: Arc::clone(&dave_state),

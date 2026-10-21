@@ -9,7 +9,7 @@ use crate::ui::theme::{self, Icon};
 pub const WIDTH: f32 = 72.0;
 
 /// Ancho del rail de la interfaz nueva (`content_modern`).
-pub const MODERN_WIDTH: f32 = 76.0;
+pub const MODERN_WIDTH: f32 = 60.0;
 
 /// Mismo tamaño de "casillero" para un server suelto o una carpeta
 /// colapsada — así la barra no salta de ancho/alineación entre entradas.
@@ -261,13 +261,13 @@ pub fn content(app: &mut App, ui: &mut egui::Ui) {
 // ---------------------------------------------------------------------
 
 /// Lado de los íconos cuadrados redondeados de las píldoras.
-const M_ICON: f32 = 50.0;
+const M_ICON: f32 = 40.0;
 /// Separación vertical entre íconos.
-const M_STEP: f32 = 10.0;
+const M_STEP: f32 = 6.0;
 /// Margen interno (arriba y abajo) de cada píldora.
-const M_PAD: f32 = 14.0;
+const M_PAD: f32 = 10.0;
 /// Radio de las esquinas de los íconos.
-const M_CORNER: f32 = 16.0;
+const M_CORNER: f32 = 12.0;
 
 /// Alto de una píldora con `n` íconos.
 fn pill_height(n: usize) -> f32 {
@@ -276,10 +276,10 @@ fn pill_height(n: usize) -> f32 {
 
 /// Fondo de una píldora del rail.
 fn paint_pill(ui: &egui::Ui, rect: Rect, palette: &theme::Palette) {
-    let radius = CornerRadius::same(theme::CARD_RADIUS + 4);
+    let radius = CornerRadius::same(theme::CARD_RADIUS + 2);
     ui.painter().rect_filled(rect, radius, palette.panel);
     ui.painter()
-        .rect_stroke(rect, radius, Stroke::new(1.0, palette.outline), StrokeKind::Inside);
+        .rect_stroke(rect, radius, theme::card_stroke(palette), StrokeKind::Inside);
 }
 
 /// Barra blanca pegada al borde izquierdo de la píldora: marca el servidor
@@ -304,9 +304,57 @@ fn square_button(
     let resp = ui.interact(rect, ui.id().with(("rail_square", id)), Sense::click());
     let bg = if resp.hovered() { fill_hover } else { fill };
     ui.painter().rect_filled(rect, CornerRadius::same(M_CORNER as u8), bg);
-    theme::paint_icon(ui, icon, rect, 22.0, icon_color);
+    theme::paint_icon(ui, icon, rect, 20.0, icon_color);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
         .on_hover_text(tooltip)
+}
+
+/// Tutorial de una sola vez: explica adónde fue el botón de colgar al ocultar la
+/// barra de llamada. Se dibuja pegado a la derecha de la píldora de abajo.
+fn call_hidden_tip(app: &mut App, ctx: &egui::Context, pill: Rect, t: f32) {
+    let palette = app.palette;
+    let mut dismiss = false;
+    egui::Area::new(egui::Id::new("call_bar_hidden_tip"))
+        .order(egui::Order::Foreground)
+        .pivot(egui::Align2::LEFT_BOTTOM)
+        .fixed_pos(egui::pos2(pill.right() + 12.0 - 10.0 * (1.0 - t), pill.bottom()))
+        .show(ctx, |ui| {
+            ui.set_opacity(t);
+            Frame::new()
+                .fill(palette.surface)
+                .stroke(Stroke::new(1.0, palette.accent))
+                .corner_radius(CornerRadius::same(theme::radius() + 4))
+                .inner_margin(Margin::same(14))
+                .show(ui, |ui| {
+                    ui.set_width(250.0);
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    theme::text(ui, "Barra de llamada oculta", theme::semibold(13.0), palette.text);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(
+                                "El botón de colgar ahora está junto a Ajustes. Pasa el cursor por esta \
+                                 píldora para desplegarla; con la flecha de arriba vuelves a mostrar la barra.",
+                            )
+                            .font(theme::regular(12.0))
+                            .color(palette.dim),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(4.0);
+                    let button = egui::Button::new(
+                        egui::RichText::new("Entendido").font(theme::semibold(12.0)).color(palette.on_accent),
+                    )
+                    .fill(palette.accent);
+                    if ui.add(button).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        dismiss = true;
+                    }
+                });
+        });
+    if dismiss {
+        app.call_bar_tip_open = false;
+        app.call_bar_tip_seen = true;
+        let _ = web_local_storage_api::set_item("call_bar_tip_seen", "1");
+    }
 }
 
 /// Contenido del rail en la interfaz nueva: tres píldoras flotantes. Arriba
@@ -334,7 +382,39 @@ pub fn content_modern(app: &mut App, ui: &mut egui::Ui) {
         egui::emath::easing::cubic_out(ctx.animate_bool_with_time(id.with("t"), hover, 0.22))
     };
     let top_h = collapsed_h + (full_h - collapsed_h) * expand;
-    let bottom_h = pill_height(3);
+    // Píldora de abajo: silenciar, ensordecer y ajustes. Con la barra de llamada
+    // oculta a mano suma "mostrar barra" y "colgar" y se pliega igual que la de
+    // arriba: en reposo solo se ve Ajustes y al pasar el cursor se despliega hacia
+    // arriba. `bottom_expand` va de 0.0 (plegada) a 1.0 (desplegada).
+    let call_hidden = app.call_bar_hidden && app.voice_target.is_some() && app.new_call_ui;
+    // 0.0 = píldora normal (3 botones), 1.0 = barra oculta (plegable, 5 botones). Se anima
+    // para que al ocultar / mostrar la barra la píldora no salte de golpe.
+    let hid = egui::emath::easing::cubic_out(ui.ctx().animate_bool_with_time(
+        egui::Id::new("rail_bottom_hidden_t"),
+        call_hidden,
+        0.28,
+    ));
+    let hidden_layout = hid > 0.002;
+    let bottom_n: usize = 5;
+    let bottom_expand = if hidden_layout {
+        let ctx = ui.ctx().clone();
+        let id = egui::Id::new("rail_bottom_expand");
+        let was: bool = ctx.data(|d| d.get_temp(id)).unwrap_or(false);
+        let test_h = if was { pill_height(bottom_n) } else { pill_height(1) };
+        let test_rect = Rect::from_min_max(
+            egui::pos2(full.min.x, full.max.y - test_h),
+            egui::pos2(full.min.x + width, full.max.y),
+        );
+        // Mientras el aviso está abierto se mantiene desplegada para mostrar dónde quedó "Colgar".
+        let hover = (call_hidden && app.call_bar_tip_open)
+            || ctx.pointer_hover_pos().is_some_and(|p| test_rect.contains(p));
+        ctx.data_mut(|d| d.insert_temp(id, hover));
+        egui::emath::easing::cubic_out(ctx.animate_bool_with_time(id.with("t"), hover, 0.22))
+    } else {
+        1.0
+    };
+    let hidden_h = pill_height(1) + (pill_height(bottom_n) - pill_height(1)) * bottom_expand;
+    let bottom_h = pill_height(3) + (hidden_h - pill_height(3)) * hid;
     let top_rect = Rect::from_min_size(full.min, Vec2::new(width, top_h));
     let bottom_rect = Rect::from_min_size(
         egui::pos2(full.min.x, full.max.y - bottom_h),
@@ -439,66 +519,113 @@ pub fn content_modern(app: &mut App, ui: &mut egui::Ui) {
         }
     }
 
-    // --- Píldora de abajo: silenciar, ensordecer, ajustes ----------------
+    // --- Píldora de abajo: silenciar, ensordecer, ajustes (y colgar) -----
     {
         let self_mute = app.voice_target.as_ref().map_or(app.self_mute, |t| t.self_mute);
         let self_deaf = app.voice_target.as_ref().map_or(app.self_deaf, |t| t.self_deaf);
         let cx = bottom_rect.center().x;
-        let y0 = bottom_rect.min.y + M_PAD + M_ICON / 2.0;
-        let y1 = y0 + M_ICON + M_STEP;
-        let y2 = y1 + M_ICON + M_STEP;
+        let step = M_ICON + M_STEP;
+        // Ajustes no se mueve: los demás salen de detrás suyo, hacia arriba.
+        let settings_y = bottom_rect.max.y - M_PAD - M_ICON / 2.0;
+        let lerp = |a: f32, b: f32| a + (b - a) * hid;
+        // Posiciones: normal (silenciar, ensordecer, ajustes) y con la barra oculta.
+        let mute_y = lerp(settings_y - 2.0 * step, settings_y - 3.0 * step * bottom_expand);
+        let deaf_y = lerp(settings_y - step, settings_y - 2.0 * step * bottom_expand);
+        let hang_y = settings_y - step * bottom_expand;
+        let show_y = settings_y - 4.0 * step * bottom_expand;
+        // Silenciar y ensordecer siempre están; solo se atenúan al plegarse.
+        let fade = 1.0 + (bottom_expand - 1.0) * hid;
+        let ready = fade > 0.6;
+        // Colgar y mostrar la barra aparecen con la ocultación.
+        let extra_fade = bottom_expand * hid;
+        let extra_ready = extra_fade > 0.6;
         let danger_fill = extra::blend(palette.panel, palette.danger, 0.35);
         let danger_hover = extra::blend(palette.panel, palette.danger, 0.5);
 
-        let (mute_icon, mute_fill, mute_hover, mute_color) = if self_mute {
-            (Icon::MicOff, danger_fill, danger_hover, palette.danger)
-        } else {
-            (Icon::Mic, palette.surface, palette.surface_hover, palette.secondary)
-        };
-        if square_button(
-            ui,
-            "mute",
-            egui::pos2(cx, y0),
-            mute_fill,
-            mute_hover,
-            mute_icon,
-            mute_color,
-            if self_mute { "Dejar de silenciar" } else { "Silenciar" },
-        )
-        .clicked()
-        {
-            app.toggle_self_mute();
+        if hidden_layout && extra_fade > 0.02 {
+            if square_button(
+                ui,
+                "show_call_bar",
+                egui::pos2(cx, show_y),
+                palette.surface.gamma_multiply(extra_fade),
+                palette.surface_hover.gamma_multiply(extra_fade),
+                Icon::ChevronUp,
+                palette.secondary.gamma_multiply(extra_fade),
+                "Mostrar la barra de llamada",
+            )
+            .clicked()
+                && extra_ready
+            {
+                crate::ui::call::call_bar::show_again(app, ui.ctx());
+            }
         }
 
-        let (deaf_icon, deaf_fill, deaf_hover, deaf_color) = if self_deaf {
-            (Icon::VolumeX, danger_fill, danger_hover, palette.danger)
-        } else {
-            (
-                Icon::Headphones,
-                palette.surface,
-                palette.surface_hover,
-                palette.secondary,
+        if fade > 0.02 {
+            let (mute_icon, mute_fill, mute_hover, mute_color) = if self_mute {
+                (Icon::MicOff, danger_fill, danger_hover, palette.danger)
+            } else {
+                (Icon::Mic, palette.surface, palette.surface_hover, palette.secondary)
+            };
+            if square_button(
+                ui,
+                "mute",
+                egui::pos2(cx, mute_y),
+                mute_fill.gamma_multiply(fade),
+                mute_hover.gamma_multiply(fade),
+                mute_icon,
+                mute_color.gamma_multiply(fade),
+                if self_mute { "Dejar de silenciar" } else { "Silenciar" },
             )
-        };
-        if square_button(
-            ui,
-            "deafen",
-            egui::pos2(cx, y1),
-            deaf_fill,
-            deaf_hover,
-            deaf_icon,
-            deaf_color,
-            if self_deaf { "Dejar de ensordecer" } else { "Ensordecer" },
-        )
-        .clicked()
+            .clicked()
+                && ready
+            {
+                app.toggle_self_mute();
+            }
+
+            let (deaf_icon, deaf_fill, deaf_hover, deaf_color) = if self_deaf {
+                (Icon::VolumeX, danger_fill, danger_hover, palette.danger)
+            } else {
+                (Icon::Headphones, palette.surface, palette.surface_hover, palette.secondary)
+            };
+            if square_button(
+                ui,
+                "deafen",
+                egui::pos2(cx, deaf_y),
+                deaf_fill.gamma_multiply(fade),
+                deaf_hover.gamma_multiply(fade),
+                deaf_icon,
+                deaf_color.gamma_multiply(fade),
+                if self_deaf { "Dejar de ensordecer" } else { "Ensordecer" },
+            )
+            .clicked()
+                && ready
+            {
+                app.toggle_self_deafen();
+            }
+        }
+
+        if hidden_layout
+            && extra_fade > 0.02
+            && square_button(
+                ui,
+                "hang_up",
+                egui::pos2(cx, hang_y),
+                palette.danger.gamma_multiply(extra_fade),
+                extra::blend(palette.danger, Color32::WHITE, 0.12).gamma_multiply(extra_fade),
+                Icon::PhoneOff,
+                Color32::WHITE.gamma_multiply(extra_fade),
+                "Colgar la llamada",
+            )
+            .clicked()
+            && extra_ready
         {
-            app.toggle_self_deafen();
+            app.leave_voice();
         }
 
         if square_button(
             ui,
             "settings",
-            egui::pos2(cx, y2),
+            egui::pos2(cx, settings_y),
             palette.surface,
             palette.surface_hover,
             Icon::Settings,
@@ -509,6 +636,16 @@ pub fn content_modern(app: &mut App, ui: &mut egui::Ui) {
         {
             app.settings_open = true;
         }
+    }
+
+    // Aviso de la primera vez que se oculta la barra de llamada.
+    let tip_t = egui::emath::easing::cubic_out(ui.ctx().animate_bool_with_time(
+        egui::Id::new("call_bar_hidden_tip_t"),
+        call_hidden && app.call_bar_tip_open,
+        0.25,
+    ));
+    if tip_t > 0.02 {
+        call_hidden_tip(app, ui.ctx(), bottom_rect, tip_t);
     }
 
     // --- Píldora del medio: servidores y carpetas ------------------------

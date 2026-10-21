@@ -10,7 +10,7 @@ use crate::ui::theme::{self, Icon, Palette};
 pub const WIDTH: f32 = 260.0;
 
 /// Ancho de la columna de DMs en la interfaz nueva (ver `ui::shell::nav::show_modern`).
-pub const MODERN_WIDTH: f32 = 288.0;
+pub const MODERN_WIDTH: f32 = 264.0;
 
 /// Contenido del panel de amigos/DMs: buscador + navegación + lista de
 /// conversaciones. Antes era un `egui::Panel::left` propio con su propia
@@ -172,9 +172,9 @@ fn dm_row_compact(
     in_call: bool,
 ) -> bool {
     let modern = theme::is_modern();
-    let desired = Vec2::new(ui.available_width() - 12.0, if modern { 52.0 } else { 46.0 });
+    let desired = Vec2::new(ui.available_width() - 12.0, if modern { 44.0 } else { 46.0 });
     let (av_x, av_r, text_x, name_y, sub_y) = if modern {
-        (24.0, 18.0, 54.0, 11.0, 30.0)
+        (20.0, 16.0, 46.0, 6.0, 24.0)
     } else {
         (18.0, 16.0, 44.0, 10.0, 26.0)
     };
@@ -451,13 +451,13 @@ pub(crate) fn user_card(ui: &mut egui::Ui, app: &App) {
     let palette = app.palette;
     Frame::new()
         .fill(palette.surface)
-        .corner_radius(CornerRadius::same(14))
-        .inner_margin(Margin::symmetric(10, 8))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(8, 6))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing = Vec2::ZERO;
             ui.horizontal(|ui| {
-                let (rect, _) = ui.allocate_exact_size(Vec2::splat(38.0), egui::Sense::hover());
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(32.0), egui::Sense::hover());
                 let (me_name, me_avatar_url) = match app.me.as_ref() {
                     Some(me) => (me.display_name().to_string(), me.avatar_url()),
                     None => ("Aiden".to_string(), None),
@@ -465,7 +465,7 @@ pub(crate) fn user_card(ui: &mut egui::Ui, app: &App) {
                 extra::avatar(
                     ui,
                     rect.center(),
-                    19.0,
+                    16.0,
                     me_avatar_url.as_deref(),
                     palette.accent,
                     "A",
@@ -474,13 +474,13 @@ pub(crate) fn user_card(ui: &mut egui::Ui, app: &App) {
                 extra::status_dot(
                     ui,
                     rect.center(),
-                    19.0,
+                    16.0,
                     extra::status_color(Status::Online, &palette),
                     palette.surface,
                 );
                 ui.add_space(10.0);
                 ui.vertical(|ui| {
-                    ui.add_space(3.0);
+                    ui.add_space(0.0);
                     theme::text(ui, &me_name, theme::semibold(14.0), palette.text);
                     ui.add_space(1.0);
                     theme::text(ui, "En línea", theme::regular(11.5), palette.dim);

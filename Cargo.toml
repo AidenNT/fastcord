@@ -104,8 +104,8 @@ flate2 = "1"
 rsa = "0.9"
 sha2 = "0.10"
 rand = "0.8"
-# Transporte WebRTC (DTLS-SRTP) del Go Live propio, opt-in desde las devtools o con
-# `ECORD_STREAM_TRANSPORT=webrtc` (ver `stream_publish/webrtc.rs`). str0m es "sans-IO":
+# Transporte WebRTC (DTLS-SRTP) del Go Live propio, predeterminado (UDP con las devtools o
+# `ECORD_STREAM_TRANSPORT=udp`) (ver `stream_publish/webrtc.rs`). str0m es "sans-IO":
 # ecord le pasa los datagramas UDP y le fija los SSRC que asigna Discord.
 # Backend criptográfico `rust-crypto` (DTLS con dimpl + RustCrypto, Rust puro, todas las
 # plataformas): el de OpenSSL choca con BoringSSL (btls-sys, ver arriba). Las versiones 0.9
@@ -298,6 +298,8 @@ deepfilternet-ort = ["voice-playback", "dep:deepfilter-rt"]
 # system_fonts.rs: lee el idioma de la UI de Windows para elegir la variante
 # de fuente CJK correcta.
 [target.'cfg(windows)'.dependencies]
+# voice/stream_audio.rs: loopback de audio por proceso (WASAPI) para el sonido del Go Live propio.
+wasapi = "0.26"
 # gpl_pack.rs (paquete opcional FFmpeg GPL con libx264): `ring` verifica la firma
 # Ed25519 de checksums.txt (ya está en el árbol: es el proveedor de rustls) y
 # `zip` abre el paquete descargado. Tras añadirlas, corré `cargo check` una vez
@@ -310,7 +312,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # voice/source_thumbs.rs (miniaturas con PrintWindow/StretchBlt) y la lista de
 # pantallas (EnumDisplayMonitors). `Win32_System_Console`: logging.rs
 # (AttachConsole, para mostrar los logs en la terminal desde la que se lanzó).
-windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Media", "Win32_Storage_Xps", "Win32_System_Console", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Media", "Win32_Storage_Xps", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 # voice/window_capture.rs: captura de una ventana con Windows Graphics Capture
 # (WGC) + Direct3D 11 para leer los cuadros. Reemplaza al `gdigrab title=...`.
 windows = { version = "0.61", features = [

@@ -164,6 +164,26 @@ pub fn release_free_memory_periodic() {
         LAST_SECS.store(now, Ordering::Relaxed);
         release_free_memory();
         compact_native_heaps();
+        trim_if_retained(now);
+    }
+}
+
+/// Si la RAM que ve el sistema (working set) pasa por mucho a la que usa de verdad el
+/// heap de Rust, lo que sobra es memoria que ya se soltó pero Windows sigue contando.
+/// Antes solo se recortaba al cambiar de chat o cerrar el selector de GIFs, así que tras un
+/// pico (entrar a muchos servidores, recibir media, transmitir) la cifra no bajaba hasta
+/// entrar a un chat. Ahora se recorta sola, como mucho una vez por minuto.
+fn trim_if_retained(now_secs: isize) {
+    const RETAINED_MIN: usize = 128 * 1024 * 1024;
+    const EVERY_SECS: isize = 60;
+    static LAST_TRIM: AtomicIsize = AtomicIsize::new(-1000);
+    if now_secs - LAST_TRIM.load(Ordering::Relaxed) < EVERY_SECS {
+        return;
+    }
+    let Some(memory) = process_memory() else { return };
+    if memory.resident.saturating_sub(heap_bytes()) >= RETAINED_MIN {
+        LAST_TRIM.store(now_secs, Ordering::Relaxed);
+        trim_native_later();
     }
 }
 
