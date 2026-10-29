@@ -7,7 +7,7 @@
 #       - sin "tag" -> solo compila y deja los archivos como artefactos.
 #
 # Requisitos para publicar (ver packaging/ACTUALIZACIONES.md):
-#   1. REPOSITORY en src/updater.rs = este repo (dueño/nombre).
+#   1. REPOSITORY en src/update_config.rs = este repo (dueño/nombre).
 #   2. assets/update-public-key.hex = clave pública Ed25519 (64 hex).
 #   3. Secreto del repo ECORD_UPDATE_KEY = clave privada PEM correspondiente.
 #   El job "Versión" lo comprueba todo ANTES de gastar una hora compilando.
@@ -97,9 +97,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          repo=$(grep -m1 'pub const REPOSITORY' src/updater.rs | cut -d'"' -f2)
+          # La constante vive en src/update_config.rs (updater.rs solo la reexporta).
+          # Se busca en todo src/ para que siga funcionando si vuelve a moverse.
+          repo_line=$(grep -rhE 'pub const REPOSITORY' src | head -n1 || true)
+          repo=$(printf '%s' "$repo_line" | cut -d'"' -f2)
+          if [ -z "$repo" ]; then
+            echo "::error file=src/update_config.rs::No se encontró 'pub const REPOSITORY' en src/. Sin eso no se puede comprobar a qué repo apuntan las copias instaladas."
+            exit 1
+          fi
           if [ "${repo,,}" != "${GITHUB_REPOSITORY,,}" ]; then
-            echo "::error file=src/updater.rs::REPOSITORY = \"$repo\", pero el release se publica en \"$GITHUB_REPOSITORY\". Las copias instaladas buscarían actualizaciones en otro repo."
+            echo "::error file=src/update_config.rs::REPOSITORY = \"$repo\", pero el release se publica en \"$GITHUB_REPOSITORY\". Las copias instaladas buscarían actualizaciones en otro repo."
             exit 1
           fi
 
