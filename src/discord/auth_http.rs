@@ -6,6 +6,7 @@ use super::fingerprint::{
 };
 
 pub(super) const DISCORD_LOGIN_REFERER: &str = "https://discord.com/login";
+pub(super) const DISCORD_REGISTER_REFERER: &str = "https://discord.com/register";
 
 #[derive(Clone)]
 pub(crate) struct DiscordAuthSession {
@@ -37,9 +38,26 @@ impl DiscordAuthSession {
 }
 
 pub(super) fn discord_login_headers(fingerprint: &ClientFingerprint) -> reqwest::header::HeaderMap {
+    discord_auth_headers(fingerprint, DISCORD_LOGIN_REFERER)
+}
+
+/// Headers de `POST /auth/register`: los mismos que el login (locale,
+/// timezone, super-properties, installation-id, fingerprint...) pero con el
+/// referer de `/register` y el `X-Debug-Options` que manda la página de
+/// Discord en esa pantalla.
+pub(super) fn discord_register_headers(fingerprint: &ClientFingerprint) -> reqwest::header::HeaderMap {
+    let mut headers = discord_auth_headers(fingerprint, DISCORD_REGISTER_REFERER);
+    headers.insert(
+        "X-Debug-Options",
+        reqwest::header::HeaderValue::from_static("bugReporterEnabled"),
+    );
+    headers
+}
+
+fn discord_auth_headers(fingerprint: &ClientFingerprint, referer: &'static str) -> reqwest::header::HeaderMap {
     use reqwest::header::{CACHE_CONTROL, HeaderValue, ORIGIN, PRAGMA};
 
-    let mut headers = discord_api_request_headers(fingerprint, DISCORD_LOGIN_REFERER);
+    let mut headers = discord_api_request_headers(fingerprint, referer);
     headers.insert(ORIGIN, HeaderValue::from_static(DISCORD_ORIGIN));
     headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     headers.insert(PRAGMA, HeaderValue::from_static("no-cache"));
@@ -85,5 +103,25 @@ mod tests {
             login.get(PRAGMA).and_then(|value| value.to_str().ok()),
             Some("no-cache")
         );
+    }
+
+    #[test]
+    fn register_headers_extend_login_headers_with_register_referer_and_debug_options() {
+        let fingerprint = ClientFingerprint::new(CLIENT_BUILD_NUMBER);
+        let login = discord_login_headers(&fingerprint);
+        let register = discord_register_headers(&fingerprint);
+
+        for name in ["X-Discord-Locale", "X-Discord-Timezone", "X-Super-Properties", "user-agent"] {
+            assert_eq!(login.get(name), register.get(name));
+        }
+        assert_eq!(
+            register.get(REFERER).and_then(|value| value.to_str().ok()),
+            Some(DISCORD_REGISTER_REFERER)
+        );
+        assert_eq!(
+            register.get("X-Debug-Options").and_then(|value| value.to_str().ok()),
+            Some("bugReporterEnabled")
+        );
+        assert!(login.get("X-Debug-Options").is_none());
     }
 }

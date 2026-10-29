@@ -161,12 +161,35 @@ pub(super) async fn post_json(
     body: Value,
     send_error: &str,
 ) -> Result<(reqwest::StatusCode, String), String> {
+    post_json_with_headers(
+        auth_session,
+        url,
+        body,
+        send_error,
+        "password_auth (login)",
+        discord_login_headers,
+    )
+    .await
+}
+
+/// Lo mismo que [`post_json`] pero con los headers base y la etiqueta del
+/// registro de red a elección de quien llama (`discord::register` usa
+/// los de `/register`). El manejo del captcha es idéntico: lo resuelve la
+/// persona en la ventana de hCaptcha, nunca se automatiza.
+pub(super) async fn post_json_with_headers(
+    auth_session: &DiscordAuthSession,
+    url: &str,
+    body: Value,
+    send_error: &str,
+    via: &str,
+    base_headers: fn(&crate::discord::fingerprint::ClientFingerprint) -> reqwest::header::HeaderMap,
+) -> Result<(reqwest::StatusCode, String), String> {
     use reqwest::header::{HeaderName, HeaderValue};
 
     let mut solved: Option<captcha::CaptchaSolution> = None;
     let mut solves = 0;
     loop {
-        let mut headers = discord_login_headers(auth_session.fingerprint());
+        let mut headers = base_headers(auth_session.fingerprint());
         if let Some(solution) = solved.take() {
             if let Ok(value) = HeaderValue::from_str(&solution.token) {
                 headers.insert(HeaderName::from_static("x-captcha-key"), value);
@@ -188,7 +211,7 @@ pub(super) async fn post_json(
         }
 
         // El cuerpo (con la contraseña) no se registra, solo el pedido.
-        let trace = crate::support::nettrace::begin("POST", url, "password_auth (login)");
+        let trace = crate::support::nettrace::begin("POST", url, via);
         let sent = auth_session.http().post(url).headers(headers).json(&body).send().await;
         crate::support::nettrace::observe(&trace, &sent);
         let response = sent.map_err(|error| format!("{send_error}: {error}"))?;

@@ -305,17 +305,29 @@ pub(crate) fn user_bar(ui: &mut egui::Ui, app: &mut App) {
     } else {
         bar_frame
     };
+    let own_status = app.own_status();
+    let (me_name, me_username, me_avatar_url) = match app.me.as_ref() {
+        Some(me) => (me.display_name().to_string(), me.username.clone(), me.avatar_url()),
+        None => ("Aiden".to_string(), String::new(), None),
+    };
+    // Subtítulo: el usuario (@) como en Discord; sin él, el estado.
+    let subtitle = if me_username.is_empty() {
+        own_status.label().to_string()
+    } else {
+        me_username.clone()
+    };
+    let mut hover_bg = None;
+    let mut profile_rect: Option<egui::Rect> = None;
     bar_frame.show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             // `nav::show` pone `item_spacing = ZERO` para todo su
             // contenido: sin esto el nombre queda pegado al avatar.
             ui.spacing_mut().item_spacing.x = 10.0;
+            // Fondo de "hover" de tu perfil: se reserva ahora (queda DETRÁS del
+            // avatar y el nombre) y se rellena al final, cuando ya se sabe el área.
+            hover_bg = Some(ui.painter().add(egui::Shape::Noop));
             let (rect, _) = ui.allocate_exact_size(Vec2::splat(32.0), egui::Sense::hover());
-            let (me_name, me_avatar_url) = match app.me.as_ref() {
-                Some(me) => (me.display_name().to_string(), me.avatar_url()),
-                None => ("Aiden".to_string(), None),
-            };
             extra::avatar(
                 ui,
                 rect.center(),
@@ -325,11 +337,21 @@ pub(crate) fn user_bar(ui: &mut egui::Ui, app: &mut App) {
                 "A",
                 &palette,
             );
+            let ring = Color32::from_rgb(palette.surface.r(), palette.surface.g(), palette.surface.b());
+            crate::ui::shell::menus::paint_status_badge(
+                ui,
+                rect.center() + Vec2::new(12.0, 12.0),
+                5.0,
+                own_status,
+                Some(ring),
+                &palette,
+            );
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 1.0;
                 theme::text(ui, &me_name, theme::semibold(12.5), palette.text);
-                theme::text(ui, "En línea", theme::regular(10.5), palette.dim);
+                theme::text(ui, &subtitle, theme::regular(10.5), palette.dim);
             });
+            let mut mute_left = None;
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // El panel de nav pone `item_spacing = ZERO` para el
                 // resto de su contenido (ver `ui::shell::nav::show`); sin
@@ -351,12 +373,39 @@ pub(crate) fn user_bar(ui: &mut egui::Ui, app: &mut App) {
                 let mute_icon = if self_mute { Icon::MicOff } else { Icon::Mic };
                 let mute_color = if self_mute { palette.danger } else { palette.dim };
                 let mute_tooltip = if self_mute { "Dejar de silenciar" } else { "Silenciar" };
-                if theme::icon_button(ui, mute_icon, 14.0, mute_color, palette.text, mute_tooltip).clicked() {
+                let mute_resp = theme::icon_button(ui, mute_icon, 14.0, mute_color, palette.text, mute_tooltip);
+                mute_left = Some(mute_resp.rect.left());
+                if mute_resp.clicked() {
                     mute_clicked = true;
                 }
             });
+            // Zona clicable de tu perfil: del avatar hasta el primer botón.
+            let right = mute_left.unwrap_or(rect.right() + 120.0) - 6.0;
+            profile_rect = Some(egui::Rect::from_min_max(
+                egui::Pos2::new(rect.left() - 4.0, rect.top() - 4.0),
+                egui::Pos2::new(right.max(rect.right() + 8.0), rect.bottom() + 4.0),
+            ));
         });
     });
+
+    // Clic en tu perfil → tarjeta flotante (`ui::shell::menus`), que se abre
+    // hacia arriba desde esta barra.
+    if let Some(pr) = profile_rect {
+        let resp = ui
+            .interact(pr, ui.id().with("me_profile_click"), egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if resp.hovered() {
+            if let Some(idx) = hover_bg {
+                ui.painter().set(
+                    idx,
+                    egui::Shape::rect_filled(pr, CornerRadius::same(10), palette.surface_hover),
+                );
+            }
+        }
+        if resp.clicked() {
+            crate::ui::shell::menus::toggle_me_menu(ui.ctx(), pr);
+        }
+    }
 
     // Mismo patrón que `ui::call::call_bar`: aplicar después de dibujar, ya que
     // arriba tomamos `palette`/`self_mute`/`self_deaf` prestados de `app`.
@@ -449,7 +498,8 @@ pub(crate) fn now_playing_card(ui: &mut egui::Ui, app: &App) -> bool {
 /// ahora en el rail (`ui::shell::rail::content_modern`).
 pub(crate) fn user_card(ui: &mut egui::Ui, app: &App) {
     let palette = app.palette;
-    Frame::new()
+    let own_status = app.own_status();
+    let outer = Frame::new()
         .fill(palette.surface)
         .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin::symmetric(8, 6))
@@ -471,22 +521,32 @@ pub(crate) fn user_card(ui: &mut egui::Ui, app: &App) {
                     "A",
                     &palette,
                 );
-                extra::status_dot(
+                let ring = Color32::from_rgb(palette.surface.r(), palette.surface.g(), palette.surface.b());
+                crate::ui::shell::menus::paint_status_badge(
                     ui,
-                    rect.center(),
-                    16.0,
-                    extra::status_color(Status::Online, &palette),
-                    palette.surface,
+                    rect.center() + Vec2::new(12.0, 12.0),
+                    5.0,
+                    own_status,
+                    Some(ring),
+                    &palette,
                 );
                 ui.add_space(10.0);
                 ui.vertical(|ui| {
                     ui.add_space(0.0);
                     theme::text(ui, &me_name, theme::semibold(14.0), palette.text);
                     ui.add_space(1.0);
-                    theme::text(ui, "En línea", theme::regular(11.5), palette.dim);
+                    theme::text(ui, own_status.label(), theme::regular(11.5), palette.dim);
                 });
             });
         });
+    // Clic en la tarjeta → tarjeta flotante de tu perfil (`ui::shell::menus`).
+    let rect = outer.response.rect;
+    let resp = ui
+        .interact(rect, ui.id().with("me_card_click"), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if resp.clicked() {
+        crate::ui::shell::menus::toggle_me_menu(ui.ctx(), rect);
+    }
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {

@@ -11,15 +11,15 @@
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use egui::{CornerRadius, Sense, Stroke, pos2, vec2};
 
 use super::{
-    SessionInfo, STORAGE_FLAG, card, kv_row, parse_super_properties, session_rows, signature_section,
-    super_properties_section, style, theme_error, theme_ok, theme_warn,
+    SessionInfo, STORAGE_FLAG, badge, card, copy_button, kv_row, opcodes, parse_super_properties, session_rows,
+    signature_section, super_properties_section, style, theme_error, theme_ok, theme_warn,
 };
-use crate::discord::{launch_signature, rest};
+use crate::discord::{gateway, gateway_tracking, launch_signature, rest};
 use crate::logging::capture;
 use crate::support::mem_report;
 use crate::theme::{self, Palette};
@@ -32,6 +32,8 @@ pub(super) enum Section {
     Summary,
     Performance,
     Memory,
+    Tracking,
+    Opcodes,
     Identifiers,
     SuperProperties,
     Signature,
@@ -41,10 +43,12 @@ pub(super) enum Section {
 }
 
 impl Section {
-    const ALL: [Section; 9] = [
+    const ALL: [Section; 11] = [
         Section::Summary,
         Section::Performance,
         Section::Memory,
+        Section::Tracking,
+        Section::Opcodes,
         Section::Identifiers,
         Section::SuperProperties,
         Section::Signature,
@@ -58,6 +62,8 @@ impl Section {
             Section::Summary => "Resumen",
             Section::Performance => "Rendimiento",
             Section::Memory => "Memoria",
+            Section::Tracking => "Seguimiento",
+            Section::Opcodes => "Opcodes",
             Section::Identifiers => "Identificadores",
             Section::SuperProperties => "Super-Properties",
             Section::Signature => "launch_signature",
@@ -72,6 +78,8 @@ impl Section {
             Section::Summary => "Esta instancia de eCord, el sistema donde corre y la sesión de Discord.",
             Section::Performance => "Tiempo de cada cuadro de la interfaz mientras esta pestaña está abierta.",
             Section::Memory => "RAM del proceso, texturas de la GPU y cachés en disco.",
+            Section::Tracking => "Cuenta regresiva del opcode 41, latidos del Gateway y estado de la conexión.",
+            Section::Opcodes => "Todos los opcodes del Gateway y de voz, cuáles usa eCord y plantillas para probarlos.",
             Section::Identifiers => "Lo que este cliente declara de sí mismo: installation ID, fingerprint y build.",
             Section::SuperProperties => "El header X-Super-Properties tal como sale, en el orden en que se envía.",
             Section::Signature => "Mods de cliente detectados por bitfield y coherencia con has_client_mods.",
@@ -86,6 +94,8 @@ impl Section {
             Section::Summary => style::BLUE,
             Section::Performance => style::GREEN,
             Section::Memory => style::ORANGE,
+            Section::Tracking => style::YELLOW,
+            Section::Opcodes => style::TEAL,
             Section::Identifiers => style::PURPLE,
             Section::SuperProperties => style::PINK,
             Section::Signature => style::RED,
@@ -100,15 +110,28 @@ pub(super) struct ClientState {
     pub section: Section,
     frame_ms: VecDeque<f32>,
     sig_input: String,
+    /// Búsqueda de la sección Opcodes (número o parte del nombre).
+    op_filter: String,
+    /// Opcodes del Gateway de voz en vez de los del Gateway principal.
+    op_voice: bool,
+    /// Solo los opcodes que eCord todavía no implementa.
+    op_only_missing: bool,
 }
 
 impl Default for ClientState {
     fn default() -> Self {
-        Self { section: Section::Summary, frame_ms: VecDeque::new(), sig_input: String::new() }
+        Self {
+            section: Section::Summary,
+            frame_ms: VecDeque::new(),
+            sig_input: String::new(),
+            op_filter: String::new(),
+            op_voice: false,
+            op_only_missing: false,
+        }
     }
 }
 
-fn fmt_duration(duration: Duration) -> String {
+pub(super) fn fmt_duration(duration: Duration) -> String {
     let secs = duration.as_secs();
     let (hours, minutes, seconds) = (secs / 3600, (secs / 60) % 60, secs % 60);
     if hours > 0 {
@@ -118,6 +141,41 @@ fn fmt_duration(duration: Duration) -> String {
     } else {
         format!("{seconds} s")
     }
+}
+
+/// "hace" entre dos instantes, p. ej. `2 min 05 s`.
+fn fmt_ago(now: Instant, at: Instant) -> String {
+    fmt_duration(now.saturating_duration_since(at))
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "sí" } else { "no" }
+}
+
+/// Fila de dos columnas (nombre · valor) para las tablas de seguimiento.
+fn track_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.add(egui::Label::new(egui::RichText::new(label).weak()).extend());
+    ui.add(egui::Label::new(egui::RichText::new(value).monospace()).wrap().selectable(true));
+    ui.end_row();
+}
+
+/// Una línea con el estado del Gateway y la cuenta regresiva del opcode 41.
+fn tracking_summary() -> String {
+    let snap = gateway_tracking::snapshot();
+    if !snap.connected {
+        return "desconectado".to_owned();
+    }
+    let now = Instant::now();
+    let op41 = match snap.time_spent_next_at {
+        Some(next) => format!("opcode 41 en {}", fmt_duration(next.saturating_duration_since(now))),
+        None => "opcode 41 sin programar".to_owned(),
+    };
+    format!(
+        "{} · {op41} · {} enviados, {} omitidos",
+        if snap.established { "sesión establecida" } else { "conectando" },
+        snap.time_spent_sent,
+        snap.time_spent_skipped,
+    )
 }
 
 fn env_value(name: &str) -> String {
@@ -167,6 +225,7 @@ pub(super) fn report(ctx: &egui::Context, session: &SessionInfo, connection: &st
         mem_report::fmt_bytes(mem_report::gpu_texture_bytes(ctx)),
     );
     let _ = writeln!(out, "Conexión emulada: {connection}");
+    let _ = writeln!(out, "Gateway: {}", tracking_summary());
     let counts = capture::counts();
     let _ = writeln!(
         out,
@@ -222,6 +281,8 @@ impl ClientState {
                 Section::Summary => self.summary(ui, ctx, session),
                 Section::Performance => self.performance(ui, ctx, palette),
                 Section::Memory => toast = self.memory(ui, ctx),
+                Section::Tracking => self.tracking(ui, ctx, palette),
+                Section::Opcodes => self.opcodes(ui),
                 Section::Identifiers | Section::SuperProperties | Section::Signature => self.identity(ui),
                 Section::Streaming => toast = self.streaming(ui, ctx),
                 Section::Updates => toast = self.updates(ui, ctx),
@@ -737,6 +798,235 @@ impl ClientState {
             );
         });
         toast
+    }
+
+    // -- Seguimiento ------------------------------------------------------------------------------
+
+    fn tracking(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, palette: &Palette) {
+        // La cuenta regresiva se mueve sola: repintar ~4 veces por segundo.
+        ctx.request_repaint_after(Duration::from_millis(250));
+        let snap = gateway_tracking::snapshot();
+        let now = Instant::now();
+        let interval = gateway::time_spent_interval();
+
+        // -- Opcode 41 --
+        card(ui, "Opcode 41 · Update Time Spent Session ID", |ui| {
+            match (snap.connected, snap.time_spent_next_at) {
+                (true, Some(next)) => {
+                    let remaining = next.saturating_duration_since(now);
+                    let done = 1.0 - (remaining.as_secs_f32() / interval.as_secs_f32()).clamp(0.0, 1.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(fmt_duration(remaining)).monospace().size(22.0).color(palette.accent),
+                        );
+                        ui.label(egui::RichText::new("para el próximo tick").color(palette.dim));
+                    });
+                    ui.add(
+                        egui::ProgressBar::new(done)
+                            .desired_height(10.0)
+                            .corner_radius(CornerRadius::same(5))
+                            .fill(style::YELLOW),
+                    );
+                    ui.add_space(2.0);
+                    match gateway::time_spent_skip_reason(snap.established) {
+                        None => ui.horizontal_wrapped(|ui| {
+                            badge(ui, "se mandaría ahora", style::GREEN);
+                            ui.weak("Si el tick venciera en este momento, el opcode 41 saldría junto con un QoS heartbeat.");
+                        }),
+                        Some(reason) => ui.horizontal_wrapped(|ui| {
+                            badge(ui, "se omitiría ahora", style::ORANGE);
+                            ui.weak(format!("Motivo: {}.", reason.label()));
+                        }),
+                    };
+                }
+                _ => {
+                    ui.horizontal_wrapped(|ui| {
+                        badge(ui, "sin conexión", style::RED);
+                        ui.weak("La cuenta regresiva arranca al conectar con el Gateway.");
+                    });
+                }
+            }
+            ui.add_space(6.0);
+            egui::Grid::new("dev_track_op41").num_columns(2).spacing([14.0, 4.0]).show(ui, |ui| {
+                track_row(ui, "Intervalo", &fmt_duration(interval));
+                track_row(
+                    ui,
+                    "Último envío",
+                    &match (snap.time_spent_last_sent_at, snap.time_spent_last_reason) {
+                        (Some(at), Some(reason)) => format!("hace {} · {}", fmt_ago(now, at), reason.label()),
+                        _ => "todavía no se mandó".to_owned(),
+                    },
+                );
+                track_row(ui, "Enviados (desde que abrió eCord)", &snap.time_spent_sent.to_string());
+                track_row(ui, "Ticks omitidos", &snap.time_spent_skipped.to_string());
+                track_row(
+                    ui,
+                    "Último tick omitido",
+                    &match snap.time_spent_last_skip {
+                        Some((at, reason)) => format!("hace {} · {}", fmt_ago(now, at), reason.label()),
+                        None => "ninguno".to_owned(),
+                    },
+                );
+                let (focused, in_voice) = gateway::qos_state();
+                track_row(ui, "Ventana con foco", yes_no(focused));
+                track_row(ui, "En llamada de voz", yes_no(in_voice));
+            });
+            ui.add_space(4.0);
+            ui.weak(
+                "Sale al conectar (READY/RESUMED) y cada 30 min si la ventana tiene foco o hay llamada. \
+                 Si el tick vence sin foco ni llamada se omite y el siguiente intento es 30 min después.",
+            );
+        });
+
+        // -- Latidos --
+        card(ui, &format!("Latidos · opcode {} (con ACK en el 11)", gateway::heartbeat_opcode()), |ui| {
+            if !snap.connected {
+                ui.weak("Sin conexión con el Gateway.");
+                return;
+            }
+            ui.horizontal_wrapped(|ui| {
+                if snap.awaiting_ack {
+                    badge(ui, "esperando ACK", style::ORANGE);
+                } else {
+                    badge(ui, "ACK al día", style::GREEN);
+                }
+            });
+            ui.add_space(4.0);
+            egui::Grid::new("dev_track_hb").num_columns(2).spacing([14.0, 4.0]).show(ui, |ui| {
+                track_row(
+                    ui,
+                    "Intervalo de Discord",
+                    &snap.heartbeat_interval.map_or("— (falta el HELLO)".to_owned(), |d| format!("{:.2} s", d.as_secs_f32())),
+                );
+                track_row(
+                    ui,
+                    "Próximo latido en",
+                    &snap
+                        .next_heartbeat_at
+                        .map_or("—".to_owned(), |at| fmt_duration(at.saturating_duration_since(now))),
+                );
+                track_row(
+                    ui,
+                    "Último latido",
+                    &snap.last_heartbeat_at.map_or("todavía no se mandó".to_owned(), |at| format!("hace {}", fmt_ago(now, at))),
+                );
+                track_row(
+                    ui,
+                    "Último ACK",
+                    &snap.last_ack_at.map_or("todavía no llegó".to_owned(), |at| format!("hace {}", fmt_ago(now, at))),
+                );
+                track_row(
+                    ui,
+                    "Ida y vuelta",
+                    &snap.last_rtt.map_or("—".to_owned(), |rtt| format!("{} ms", rtt.as_millis())),
+                );
+                track_row(ui, "Latidos mandados / ACKs", &format!("{} / {}", snap.heartbeats_sent, snap.acks_received));
+                let reasons = gateway::current_qos_reasons();
+                track_row(
+                    ui,
+                    "Motivos QoS ahora",
+                    &if reasons.is_empty() { "ninguno (active: false)".to_owned() } else { reasons.join(", ") },
+                );
+            });
+        });
+
+        // -- Conexión --
+        card(ui, "Conexión con el Gateway", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                match (snap.connected, snap.established) {
+                    (true, true) => badge(ui, "sesión establecida", style::GREEN),
+                    (true, false) => badge(ui, "conectando", style::ORANGE),
+                    _ => badge(ui, "desconectado", style::RED),
+                };
+            });
+            ui.add_space(4.0);
+            egui::Grid::new("dev_track_conn").num_columns(2).spacing([14.0, 4.0]).show(ui, |ui| {
+                track_row(
+                    ui,
+                    "Conectado hace",
+                    &match (snap.connected, snap.connected_at) {
+                        (true, Some(at)) => fmt_ago(now, at),
+                        _ => "—".to_owned(),
+                    },
+                );
+                track_row(ui, "Conexiones abiertas", &snap.connections.to_string());
+                track_row(ui, "Última secuencia (s)", &snap.sequence.map_or("—".to_owned(), |s| s.to_string()));
+            });
+        });
+    }
+
+    // -- Opcodes --------------------------------------------------------------------------------------
+
+    fn opcodes(&mut self, ui: &mut egui::Ui) {
+        let list: &[opcodes::Op] = if self.op_voice { &opcodes::VOICE[..] } else { &opcodes::GATEWAY[..] };
+
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut self.op_voice, false, "Gateway");
+            ui.selectable_value(&mut self.op_voice, true, "Voz");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.op_filter)
+                    .desired_width(180.0)
+                    .hint_text("Buscar por número o nombre"),
+            );
+            ui.checkbox(&mut self.op_only_missing, "Solo los que faltan");
+        });
+        let missing = opcodes::missing(list);
+        ui.horizontal_wrapped(|ui| {
+            badge(ui, &format!("{} implementados", list.len() - missing), style::GREEN);
+            badge(ui, &format!("{missing} sin implementar"), style::ORANGE);
+            ui.weak("Verde: eCord lo usa · naranja: falta en eCord · ↑ lo manda el cliente · ↓ lo recibe · ↕ ambos");
+        });
+        ui.add_space(4.0);
+
+        let needle = self.op_filter.trim().to_lowercase();
+        let voice = self.op_voice;
+        let mut shown = 0;
+        for (index, op) in list.iter().enumerate() {
+            if self.op_only_missing && op.ecord.is_some() {
+                continue;
+            }
+            if !needle.is_empty() && !op.code.to_string().starts_with(&needle) && !op.name.to_lowercase().contains(&needle)
+            {
+                continue;
+            }
+            shown += 1;
+            let color = if op.ecord.is_some() { style::GREEN } else { style::ORANGE };
+            let title = format!(
+                "{:>2}  {}  {}{}",
+                op.code,
+                op.dir.arrow(),
+                op.name,
+                if op.deprecated { "  (obsoleto)" } else { "" }
+            );
+            egui::CollapsingHeader::new(egui::RichText::new(title).monospace().color(color))
+                .id_salt(("dev_op", voice, index))
+                .show(ui, |ui| {
+                    egui::Grid::new(("dev_op_grid", voice, index)).num_columns(2).spacing([14.0, 4.0]).show(ui, |ui| {
+                        track_row(ui, "Dirección", op.dir.label());
+                        track_row(ui, "En eCord", op.ecord.unwrap_or("todavía no implementado"));
+                        if !op.note.is_empty() {
+                            track_row(ui, "Nota", op.note);
+                        }
+                    });
+                    if let Some(template) = op.template {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.weak("Plantilla");
+                            copy_button(ui, template);
+                        });
+                        let pretty = serde_json::from_str::<serde_json::Value>(template)
+                            .ok()
+                            .and_then(|value| serde_json::to_string_pretty(&value).ok())
+                            .unwrap_or_else(|| template.to_owned());
+                        ui.add(egui::Label::new(egui::RichText::new(pretty).monospace().size(12.0)).wrap().selectable(true));
+                        ui.weak("Se puede cargar en Red → WebSocket con el selector \"Opcodes\".");
+                    }
+                });
+        }
+        if shown == 0 {
+            ui.add_space(6.0);
+            ui.weak("Ningún opcode coincide con el filtro.");
+        }
     }
 
     // -- Identidad ----------------------------------------------------------------------------------

@@ -5,9 +5,10 @@
 //! Deliberadamente NO usamos los structs tipados de `discord_client_structs`
 //! (`Channel`, `Message`, `User` de esa crate) para las respuestas: son un
 //! sistema de tipos aparte del nuestro (`crate::discord::models`), y
-//! reconstruir a mano su `MessageBuilder`/`MessageReferenceBuilder` sin
-//! poder compilar acá mismo para probarlo es la parte con más chance de
-//! quedar rota. En cambio pedimos las respuestas como JSON crudo
+//! reconstruir a mano sus builders sin poder compilar acá mismo para
+//! probarlo es la parte con más chance de quedar rota. (Tampoco se usa su
+//! `MessageBuilder` para *enviar*: serializa el `Message` entero y manda
+//! decenas de `null` que el cliente oficial no manda; ver `message_body`.) En cambio pedimos las respuestas como JSON crudo
 //! (`serde_json::Value`) y las parseamos con `crate::discord::models`, que
 //! es exactamente lo que hacía `rest.rs` con `reqwest` -- mismos paths,
 //! mismos bodies, mismos modelos. Lo que cambia es el transporte: en vez de
@@ -30,9 +31,10 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use discord_client_rest::captcha::{CaptchaRequiredError, SolvedCaptcha};
 use discord_client_rest::rest::{BadRequestError, RequestProperties, RequestPropertiesBuilder, RestClient as UwuInner};
+use discord_client_rest::structs::context::Context;
 use discord_client_rest::structs::referer::{DmChannelReferer, GuildChannelReferer, Referer};
 use discord_client_structs::structs::client::BuildNumbers;
-use discord_client_structs::structs::message::{Message, MessageBuilder, MessageReferenceBuilder};
+use discord_client_structs::structs::message::Message;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio::sync::Mutex as AsyncMutex;
@@ -184,6 +186,59 @@ fn dump_json_if_requested(tag: &str, id: &str, value: &Value) {
 
 fn err(e: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!("{e}")
+}
+
+/// Traduce los errores de los pedidos de cuenta (cambiar usuario, correo,
+/// contraseña, perfil, sesiones) a un texto en español para mostrar tal cual.
+/// Discord contesta casi todo con `50035 Invalid Form Body`, que por sí solo no
+/// dice nada, así que se mira también el texto crudo (`PASSWORD_DOES_NOT_MATCH`,
+/// `USERNAME_RATE_LIMIT`...). Lo que no se reconoce pasa con el mensaje de
+/// Discord; el captcha cancelado y la sesión inválida conservan su tipo.
+fn account_error(error: BoxError) -> anyhow::Error {
+    let raw = error.to_string();
+    let upper = raw.to_uppercase();
+    if upper.contains("PASSWORD_DOES_NOT_MATCH") {
+        return anyhow::anyhow!("La contraseña actual no es correcta.");
+    }
+    if upper.contains("USERNAME_RATE_LIMIT") || upper.contains("CHANGING YOUR USERNAME TOO FAST") {
+        return anyhow::anyhow!("Cambiaste el nombre de usuario demasiadas veces seguidas. Prueba más tarde.");
+    }
+    if upper.contains("USERNAME_ALREADY_TAKEN") || upper.contains("USERNAME_TOO_MANY_USERS") {
+        return anyhow::anyhow!("Ese nombre de usuario ya está en uso.");
+    }
+    if upper.contains("EMAIL_ALREADY_REGISTERED") {
+        return anyhow::anyhow!("Ese correo ya está registrado en otra cuenta.");
+    }
+    if upper.contains("PREMIUM") && upper.contains("REQUIRED") {
+        return anyhow::anyhow!("Eso necesita Nitro.");
+    }
+    if let Some(bad_request) = error.downcast_ref::<BadRequestError>() {
+        match bad_request.code {
+            // Pide el código de la app de verificación en dos pasos.
+            Some(60003) => {
+                return anyhow::anyhow!(
+                    "Tu cuenta tiene verificación en dos pasos y Discord pide el código para este cambio. \
+                     Hazlo desde el cliente oficial."
+                );
+            }
+            Some(50035) => {
+                return anyhow::anyhow!(
+                    "Discord rechazó los datos. Revisa la contraseña actual y que los valores sean válidos."
+                );
+            }
+            _ => {}
+        }
+        if let Some(message) = bad_request.message.as_deref().filter(|m| !m.is_empty()) {
+            return anyhow::anyhow!("{message}");
+        }
+    }
+    if error.downcast_ref::<CaptchaCancelled>().is_some() {
+        return anyhow::anyhow!("Cancelaste el captcha, así que el cambio no se hizo.");
+    }
+    if error.downcast_ref::<super::InvalidSession>().is_some() {
+        return anyhow::Error::new(super::InvalidSession);
+    }
+    anyhow::anyhow!("{raw}")
 }
 
 /// Código de error de Discord (HTTP 400) al aceptar una solicitud de amistad
@@ -493,6 +548,98 @@ impl UwuRest {
         })
     }
 
+    /// Mensajes fijados de un canal o DM (`GET /channels/{id}/messages/pins`).
+    /// Discord devolvía antes un arreglo de mensajes y ahora `{ items: [{
+    /// pinned_at, message }] }`; se aceptan los dos. Cada mensaje se parsea
+    /// por separado, así uno raro no tira abajo la lista.
+    pub async fn pinned_messages(&self, channel_id: &str) -> anyhow::Result<Vec<GatewayMessage>> {
+        let mut query = HashMap::new();
+        query.insert("limit".to_string(), "50".to_string());
+        let path = format!("channels/{channel_id}/messages/pins");
+        let value: Value = self
+            .client
+            .get(&path, Some(query), Some(Self::home()))
+            .await
+            .map_err(err)?;
+        let items: Vec<Value> = match value.as_array() {
+            Some(list) => list.clone(),
+            None => value.get("items").and_then(Value::as_array).cloned().unwrap_or_default(),
+        };
+        Ok(items
+            .into_iter()
+            .filter_map(|item| {
+                let message = item.get("message").cloned().unwrap_or(item);
+                serde_json::from_value::<GatewayMessage>(message).ok()
+            })
+            .collect())
+    }
+
+    /// Busca mensajes por texto: en un server (`GET /guilds/{id}/messages/search`)
+    /// o, en un DM, dentro del propio canal (`GET /channels/{id}/messages/search`).
+    /// Devuelve (total de resultados, mensajes de esta página). Discord agrupa
+    /// cada resultado con mensajes de contexto; solo se queda con el que
+    /// coincide (`hit`).
+    pub async fn search_messages(
+        &self,
+        guild_id: Option<&str>,
+        channel_id: &str,
+        text: &str,
+        offset: u32,
+    ) -> anyhow::Result<(u32, Vec<GatewayMessage>)> {
+        let mut query = HashMap::new();
+        query.insert("content".to_string(), text.to_string());
+        query.insert("offset".to_string(), offset.to_string());
+        let path = match guild_id {
+            Some(guild) => format!("guilds/{guild}/messages/search"),
+            None => format!("channels/{channel_id}/messages/search"),
+        };
+        let value: Value = self
+            .client
+            .get(&path, Some(query), Some(Self::home()))
+            .await
+            .map_err(err)?;
+        let total = value.get("total_results").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let groups = value.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
+        let messages = groups
+            .into_iter()
+            .filter_map(|group| {
+                let list = group.as_array()?;
+                let hit = list
+                    .iter()
+                    .find(|m| m.get("hit").and_then(Value::as_bool).unwrap_or(false))
+                    .or_else(|| list.first())?;
+                serde_json::from_value::<GatewayMessage>(hit.clone()).ok()
+            })
+            .collect();
+        Ok((total, messages))
+    }
+
+    /// Hilos de un canal de texto (`GET /channels/{id}/threads/search`, el
+    /// mismo endpoint que usa el cliente oficial en su lista de hilos).
+    /// `archived` pide los archivados en vez de los activos.
+    pub async fn channel_threads(&self, channel_id: &str, archived: bool) -> anyhow::Result<Vec<ThreadChannel>> {
+        let mut query = HashMap::new();
+        query.insert("archived".to_string(), archived.to_string());
+        query.insert("sort_by".to_string(), "last_message_time".to_string());
+        query.insert("sort_order".to_string(), "desc".to_string());
+        query.insert("limit".to_string(), "25".to_string());
+        query.insert("tag_setting".to_string(), "match_some".to_string());
+        let path = format!("channels/{channel_id}/threads/search");
+        let value: Value = self
+            .client
+            .get(&path, Some(query), Some(Self::home()))
+            .await
+            .map_err(err)?;
+        Ok(value
+            .get("threads")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|t| serde_json::from_value(t).ok())
+            .collect())
+    }
+
     /// Crea un post en un foro (`POST /channels/{id}/threads`). Devuelve el
     /// hilo creado.
     pub async fn create_forum_post(
@@ -701,7 +848,8 @@ impl UwuRest {
         let body = json!({ "recipient_id": user_id });
         let value: Value = self
             .client
-            .post("users/@me/channels", Some(body), Some(Self::home()))
+            // El cliente oficial manda el contexto vacío (`{}`) al abrir un DM.
+            .post("users/@me/channels", Some(body), Some(Self::home().with_context(Context::NoContext)))
             .await
             .map_err(err)?;
         value
@@ -749,9 +897,16 @@ impl UwuRest {
             Some(confirm) => json!({ "confirm_stranger_request": confirm }),
             None => json!({}),
         };
+        // Aceptar una solicitud (`Some`) se hace desde la pestaña de amigos;
+        // mandarla (`None`), desde el perfil de la persona.
+        let context = if confirm_stranger.is_some() {
+            Context::FRIENDS
+        } else {
+            Context::USER_PROFILE
+        };
         let _: Value = self
             .client
-            .put(&path, Some(body), Some(Self::home()))
+            .put(&path, Some(body), Some(Self::home().with_context(context)))
             .await
             .map_err(|e| {
                 // Solo al aceptar sin confirmar (`false`): el 80013 se
@@ -779,7 +934,7 @@ impl UwuRest {
         let body = json!({ "username": name, "discriminator": discriminator });
         let _: Value = self
             .client
-            .post("users/@me/relationships", Some(body), Some(Self::home()))
+            .post("users/@me/relationships", Some(body), Some(Self::home().with_context(Context::ADD_FRIEND)))
             .await
             .map_err(|e| {
                 if let Some(bad_request) = e.downcast_ref::<BadRequestError>() {
@@ -803,7 +958,11 @@ impl UwuRest {
         let path = format!("users/@me/relationships/{user_id}");
         let _: Value = self
             .client
-            .put(&path, Some(json!({ "type": 2 })), Some(Self::home()))
+            .put(
+                &path,
+                Some(json!({ "type": 2 })),
+                Some(Self::home().with_context(Context::CONTEXT_MENU)),
+            )
             .await
             .map_err(err)?;
         Ok(())
@@ -815,7 +974,7 @@ impl UwuRest {
         let path = format!("users/@me/relationships/{user_id}");
         let _: Value = self
             .client
-            .delete(&path, None::<()>, Some(Self::home()))
+            .delete(&path, None::<()>, Some(Self::home().with_context(Context::FRIENDS)))
             .await
             .map_err(err)?;
         Ok(())
@@ -875,7 +1034,7 @@ impl UwuRest {
         channel_id: u64,
         channel_type: u8,
     ) -> anyhow::Result<Value> {
-        use discord_client_rest::structs::context::{Context, InviteContext};
+        use discord_client_rest::structs::context::InviteContext;
         let path = format!("invites/{code}");
         let props = Self::home().with_context(Context::InviteContext(InviteContext {
             location_guild_id: guild_id,
@@ -994,8 +1153,39 @@ impl UwuRest {
             .ok_or_else(|| anyhow::anyhow!("Discord no devolvió el código de la invitación"))
     }
 
-    /// `POST /channels/{id}/messages` armando el cuerpo con `MessageBuilder`
-    /// (y `MessageReferenceBuilder` para las respuestas) y mandando el
+    /// Cuerpo de un mensaje como lo arma el cliente oficial: solo los campos
+    /// que tienen valor (`content`, `nonce`, `tts`, `flags`,
+    /// `mobile_network_type` y, si responde a otro mensaje,
+    /// `message_reference`). Nada de `poll: null` ni del resto del struct
+    /// `Message`. `guild_id` solo va en la referencia dentro de un server.
+    fn message_body(
+        channel_id: &str,
+        guild_id: Option<&str>,
+        content: &str,
+        reply_to: Option<&str>,
+    ) -> Value {
+        let mut body = json!({
+            "mobile_network_type": "unknown",
+            "content": content,
+            "nonce": Self::interaction_nonce(),
+            "tts": false,
+            "flags": 0,
+        });
+        if let Some(message_id) = reply_to {
+            let mut reference = json!({
+                "message_id": message_id,
+                "channel_id": channel_id,
+            });
+            if let Some(guild_id) = guild_id.filter(|g| !g.is_empty()) {
+                reference["guild_id"] = json!(guild_id);
+            }
+            body["message_reference"] = reference;
+        }
+        body
+    }
+
+    /// `POST /channels/{id}/messages` con el cuerpo de `message_body`, el
+    /// contexto `chat_input` y mandando el
     /// `Referer` del canal desde el que se escribe, como el cliente oficial:
     /// `/channels/{guild}/{canal}` en un server, `/channels/@me/{canal}` en un
     /// DM (`guild_id` = `None`). Devuelve el mensaje que creó Discord.
@@ -1030,28 +1220,17 @@ impl UwuRest {
 
         let props = RequestPropertiesBuilder::default()
             .referer::<Referer>(referer)
-            // .context(...)
+            .context::<Context>(Context::CHAT_INPUT)
             // El captcha no se pasa acá: `CaptchaClient` lo agrega solo al
             // reintentar cuando Discord lo pide.
             .build()
             .map_err(err)?;
 
-        let mut builder = MessageBuilder::default();
-        builder.content(content).nonce(Self::interaction_nonce());
-        if let Some(message_id) = reply_to {
-            let reference = MessageReferenceBuilder::default()
-                .message_id(message_id.parse::<u64>().map_err(err)?)
-                .channel_id(channel_id_num)
-                .guild_id(guild_id_num)
-                .build()
-                .map_err(err)?;
-            builder.message_reference(reference);
-        }
-        let message = builder.build().map_err(err)?;
+        let body = Self::message_body(channel_id, guild_id, content, reply_to);
 
         let resp: Message = self
             .client
-            .post::<Message, Message>(&path, Some(message), Some(props))
+            .post::<Message, Value>(&path, Some(body), Some(props))
             .await
             .map_err(err)?;
         Ok(resp)
@@ -1091,21 +1270,12 @@ impl UwuRest {
 
         let props = RequestPropertiesBuilder::default()
             .referer::<Referer>(referer)
+            .context::<Context>(Context::CHAT_INPUT)
             .build()
             .map_err(err)?;
 
-        let mut body = json!({
-            "content": "",
-            "sticker_ids": [sticker_id],
-            "nonce": Self::interaction_nonce(),
-            "flags": 0,
-        });
-        if let Some(message_id) = reply_to {
-            body["message_reference"] = json!({
-                "message_id": message_id,
-                "channel_id": channel_id,
-            });
-        }
+        let mut body = Self::message_body(channel_id, guild_id, "", reply_to);
+        body["sticker_ids"] = json!([sticker_id]);
 
         let _: Value = self
             .client
@@ -1254,24 +1424,20 @@ impl UwuRest {
         }
 
         // 3) El mensaje.
-        let mut body = json!({
-            "content": content,
-            "attachments": message_attachments,
-            "nonce": Self::interaction_nonce(),
-            "channel_id": channel_id,
-            "type": 0,
-            "sticker_ids": [],
-            "flags": 0,
-        });
-        if let Some(message_id) = reply_to {
-            body["message_reference"] = json!({
-                "message_id": message_id,
-                "channel_id": channel_id,
-            });
-        }
+        let mut body = Self::message_body(channel_id, guild_id, content, reply_to);
+        body["attachments"] = json!(message_attachments);
+        body["channel_id"] = json!(channel_id);
+        body["type"] = json!(0);
+        body["sticker_ids"] = json!([]);
+        // Los destinos de subida (paso 1) se piden sin contexto; solo el
+        // mensaje final sale desde la caja de texto del chat.
         let _: Value = self
             .client
-            .post::<Value, Value>(&format!("channels/{channel_id}/messages"), Some(body), Some(props))
+            .post::<Value, Value>(
+                &format!("channels/{channel_id}/messages"),
+                Some(body),
+                Some(props.with_context(Context::CHAT_INPUT)),
+            )
             .await
             .map_err(err)?;
         Ok(())
@@ -1337,6 +1503,46 @@ impl UwuRest {
             .patch("users/@me/settings-proto/1", Some(body), Some(Self::home()))
             .await
             .map_err(err)?;
+        Ok(())
+    }
+
+    /// `PATCH /users/@me`: nombre visible, usuario, correo, contraseña y
+    /// avatar. Cambiar usuario, correo o contraseña necesita `password` (la
+    /// actual) en el cuerpo. Devuelve el usuario ya actualizado; si se cambió
+    /// la contraseña trae además un `token` NUEVO (el anterior deja de valer).
+    pub async fn patch_me(&self, body: Value) -> anyhow::Result<Value> {
+        self.client
+            .patch("users/@me", Some(body), Some(Self::home()))
+            .await
+            .map_err(account_error)
+    }
+
+    /// `PATCH /users/@me/profile`: "Sobre mí", pronombres, color del banner y
+    /// banner (imagen en data URI; `null` la quita).
+    pub async fn patch_my_profile(&self, body: Value) -> anyhow::Result<Value> {
+        self.client
+            .patch("users/@me/profile", Some(body), Some(Self::home()))
+            .await
+            .map_err(account_error)
+    }
+
+    /// `GET /auth/sessions`: los dispositivos con sesión abierta en la cuenta.
+    pub async fn get_auth_sessions(&self) -> anyhow::Result<Value> {
+        self.client
+            .get("auth/sessions", None, Some(Self::home()))
+            .await
+            .map_err(account_error)
+    }
+
+    /// `POST /auth/sessions/logout`: cierra la sesión de los dispositivos con
+    /// esos `id_hash` (los de `get_auth_sessions`).
+    pub async fn logout_auth_sessions(&self, id_hashes: &[String]) -> anyhow::Result<()> {
+        let body = json!({ "session_id_hashes": id_hashes });
+        let _: Value = self
+            .client
+            .post("auth/sessions/logout", Some(body), Some(Self::home()))
+            .await
+            .map_err(account_error)?;
         Ok(())
     }
 
@@ -1449,6 +1655,20 @@ impl UwuRest {
             .await
             .map_err(err)?;
         dump_json_if_requested("product_dump", sku_id, &value);
+        Ok(value)
+    }
+
+    /// `GET /applications/public?application_ids=…`: datos públicos de una
+    /// aplicación/juego (`name`, `icon`…). Se usa para los íconos de la
+    /// colección de juegos del perfil. Devuelve el JSON crudo (un arreglo).
+    pub async fn application_public(&self, application_id: &str) -> anyhow::Result<Value> {
+        let mut query = HashMap::new();
+        query.insert("application_ids".to_string(), application_id.to_string());
+        let value: Value = self
+            .client
+            .get("applications/public", Some(query), Some(Self::home()))
+            .await
+            .map_err(err)?;
         Ok(value)
     }
 
@@ -1604,5 +1824,38 @@ impl UwuRest {
     /// `vendor/discord_client_rest/src/api/*.rs`, por ejemplo).
     pub fn get_http_client(&self) -> &wreq::Client {
         self.client.inner.get_http_client()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_message_body_has_only_the_official_fields() {
+        let body = UwuRest::message_body("111", Some("222"), "hola", None);
+        let object = body.as_object().unwrap();
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["content", "flags", "mobile_network_type", "nonce", "tts"]);
+        assert_eq!(body["content"], "hola");
+        assert_eq!(body["mobile_network_type"], "unknown");
+        assert_eq!(body["tts"], false);
+        assert_eq!(body["flags"], 0);
+        assert!(object.values().all(|value| !value.is_null()), "no debe haber nulls");
+        assert!(body["nonce"].as_str().unwrap().parse::<u64>().is_ok());
+    }
+
+    #[test]
+    fn reply_reference_carries_guild_only_inside_a_server() {
+        let in_server = UwuRest::message_body("111", Some("222"), "r", Some("333"));
+        assert_eq!(
+            in_server["message_reference"],
+            json!({ "message_id": "333", "channel_id": "111", "guild_id": "222" })
+        );
+        for guild in [None, Some("")] {
+            let in_dm = UwuRest::message_body("111", guild, "r", Some("333"));
+            assert_eq!(in_dm["message_reference"], json!({ "message_id": "333", "channel_id": "111" }));
+        }
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "ecord"
-version = "0.0.14"
+version = "0.0.15"
 edition = "2024"
 # Hay tres ejecutables (`ecord`, `ecord-captcha` y `ecord-updater`, ver src/bin): `cargo run` arranca la app.
 default-run = "ecord"

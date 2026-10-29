@@ -6,6 +6,7 @@
 //! eventos; `App` los va sacando del receiver una vez por frame
 //! (`App::poll_discord_events`, en `lib/state.rs`) y actualiza su estado.
 
+pub mod account_edit;
 pub mod activity;
 pub mod affinities;
 mod auth_http;
@@ -14,11 +15,13 @@ pub mod clean_mic;
 pub mod fingerprint;
 pub mod frecency;
 pub mod gateway;
+pub mod gateway_tracking;
 pub mod invites;
 pub mod join_form;
 pub mod launch_signature;
 pub mod models;
 pub mod password_auth;
+pub mod register;
 pub mod remote_auth;
 pub mod rest;
 pub mod slash;
@@ -72,6 +75,7 @@ fn connection_failure_event(context: &str, error: &anyhow::Error) -> AppEvent {
 }
 pub(crate) mod ids;
 
+pub use account_edit::{AccountEdit, AccountEditOutcome, AccountEditTarget, AuthSession};
 pub use models::{
     Channel, Emoji, ForumPage, GatewayMessage, MemberListMember, MemberListUpdate, MessageUpdate, PresenceEvent,
     ReadyPayload, Role, ThreadChannel, User, UserProfileResponse, VoiceState,
@@ -167,6 +171,21 @@ pub enum AppEvent {
         settings: Box<user_settings::PreloadedUserSettings>,
         partial: bool,
     },
+    /// Discord contestó a un cambio de cuenta hecho desde Ajustes (nombre,
+    /// usuario, correo, contraseña, avatar, perfil). `done` es el aviso de
+    /// éxito; en el error va el texto ya traducido para mostrar.
+    AccountEditResult {
+        done: &'static str,
+        result: Result<AccountEditOutcome, String>,
+    },
+    /// El selector de archivos del avatar/banner terminó: el cambio ya armado
+    /// (imagen en data URI) o el motivo por el que no se pudo (`Err("")` = la
+    /// persona cerró el selector sin elegir nada).
+    AccountEditPicked(Result<AccountEdit, String>),
+    /// Los dispositivos con sesión abierta (Ajustes → Dispositivos).
+    AuthSessions(Result<Vec<AuthSession>, String>),
+    /// Resultado de cerrar la sesión de un dispositivo.
+    AuthSessionClosed { id_hash: String, result: Result<(), String> },
     /// `FrecencyUserSettings` de la cuenta (GIFs/stickers/emojis favoritos y
     /// frecency), traído de `GET /users/@me/settings-proto/2` después de
     /// loguearse. Ver `discord::frecency`.
@@ -422,6 +441,10 @@ pub enum AppEvent {
     /// de `Error` porque hay que volver a mostrar el formulario de
     /// contraseña con el error, no la pantalla de login entera.
     PasswordLoginFailed(String),
+    /// El registro de una cuenta nueva (`register::spawn`) falló, con el
+    /// mensaje ya listo para mostrar. Si salió bien llega
+    /// `PasswordLoginToken`, igual que un login por contraseña.
+    RegisterFailed(String),
     /// Estado de la conexión de voz propia (`voice::VoiceStatusPublisher`):
     /// conectando/conectado/caído. `scope` es el guild id o, en una
     /// llamada de DM/grupo, el channel id (ver `VoiceScope::server_id_string`).
@@ -492,6 +515,15 @@ pub enum AppEvent {
     ForumPostCreated { forum_id: String, thread: ThreadChannel },
     /// Falló la publicación de un post (se reactiva el formulario).
     ForumPostCreateFailed { forum_id: String },
+    /// Mensajes fijados del canal (`spawn_fetch_pins`). `request` descarta
+    /// respuestas de un pedido viejo del panel de herramientas.
+    SidePins { request: u64, messages: Vec<GatewayMessage> },
+    /// Resultados de una búsqueda de mensajes (`spawn_search_messages`).
+    SideSearch { request: u64, total: u32, messages: Vec<GatewayMessage> },
+    /// Hilos del canal (`spawn_fetch_channel_threads`).
+    SideThreads { request: u64, threads: Vec<ThreadChannel> },
+    /// Falló el pedido del panel de herramientas (se saca el "cargando").
+    SideFailed { request: u64 },
     /// `THREAD_CREATE` / `THREAD_UPDATE`: post de foro nuevo o modificado
     /// (título, etiquetas, fijado...).
     ThreadUpsert(ThreadChannel),
@@ -753,6 +785,98 @@ pub fn spawn_fetch_forum_posts(
                     let _ = tx.send(AppEvent::Error(format!(
                         "No se pudieron traer las publicaciones del foro: {e}"
                     )));
+                }
+            }
+        });
+    });
+}
+
+/// Pide los mensajes fijados de un canal. Llega como `AppEvent::SidePins`.
+pub fn spawn_fetch_pins(token: String, channel_id: String, request: u64, tx: std::sync::mpsc::Sender<AppEvent>) {
+    std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("fetch_pins");
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            let _ = tx.send(AppEvent::SideFailed { request });
+            return;
+        };
+        rt.block_on(async move {
+            let result = match uwu_rest::UwuRest::for_token(token).await {
+                Ok(rest) => rest.pinned_messages(&channel_id).await,
+                Err(e) => Err(e),
+            };
+            match result {
+                Ok(messages) => {
+                    let _ = tx.send(AppEvent::SidePins { request, messages });
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::SideFailed { request });
+                    let _ = tx.send(AppEvent::Error(format!("No se pudieron traer los mensajes fijados: {e}")));
+                }
+            }
+        });
+    });
+}
+
+/// Busca mensajes por texto (en el server si `guild_id` viene, si no en el
+/// canal/DM). Llega como `AppEvent::SideSearch`.
+pub fn spawn_search_messages(
+    token: String,
+    guild_id: Option<String>,
+    channel_id: String,
+    text: String,
+    request: u64,
+    tx: std::sync::mpsc::Sender<AppEvent>,
+) {
+    std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("search_messages");
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            let _ = tx.send(AppEvent::SideFailed { request });
+            return;
+        };
+        rt.block_on(async move {
+            let result = match uwu_rest::UwuRest::for_token(token).await {
+                Ok(rest) => rest.search_messages(guild_id.as_deref(), &channel_id, &text, 0).await,
+                Err(e) => Err(e),
+            };
+            match result {
+                Ok((total, messages)) => {
+                    let _ = tx.send(AppEvent::SideSearch { request, total, messages });
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::SideFailed { request });
+                    let _ = tx.send(AppEvent::Error(format!("No se pudo buscar: {e}")));
+                }
+            }
+        });
+    });
+}
+
+/// Pide los hilos activos de un canal de texto. Llega como
+/// `AppEvent::SideThreads`.
+pub fn spawn_fetch_channel_threads(
+    token: String,
+    channel_id: String,
+    request: u64,
+    tx: std::sync::mpsc::Sender<AppEvent>,
+) {
+    std::thread::spawn(move || {
+        let _who = discord_client_rest::netlog::origin("fetch_channel_threads");
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            let _ = tx.send(AppEvent::SideFailed { request });
+            return;
+        };
+        rt.block_on(async move {
+            let result = match uwu_rest::UwuRest::for_token(token).await {
+                Ok(rest) => rest.channel_threads(&channel_id, false).await,
+                Err(e) => Err(e),
+            };
+            match result {
+                Ok(threads) => {
+                    let _ = tx.send(AppEvent::SideThreads { request, threads });
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::SideFailed { request });
+                    let _ = tx.send(AppEvent::Error(format!("No se pudieron traer los hilos: {e}")));
                 }
             }
         });
@@ -1261,6 +1385,53 @@ async fn fetch_profile_frame(rest: &uwu_rest::UwuRest, sku_id: &str) -> Option<m
     frame
 }
 
+/// Caché de nombre/ícono de juegos (por id de aplicación), para no repetir el
+/// pedido cada vez que se vuelve a bajar un perfil.
+fn game_info_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, models::ProfileGame>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, models::ProfileGame>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Completa nombre e ícono de los primeros juegos de la colección (el menú de
+/// perfil muestra 3). Si un pedido falla, ese juego queda sin ícono y la UI
+/// dibuja un cuadrito con un gamepad.
+async fn resolve_profile_games(rest: &uwu_rest::UwuRest, games: &mut [models::ProfileGame]) {
+    for game in games.iter_mut().take(3) {
+        let cached = game_info_cache()
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&game.application_id).cloned());
+        if let Some(hit) = cached {
+            *game = hit;
+            continue;
+        }
+        let value = match rest.application_public(&game.application_id).await {
+            Ok(value) => value,
+            Err(e) => {
+                log::debug!("juego {}: no se pudo resolver ({e})", game.application_id);
+                continue;
+            }
+        };
+        let entry = value.as_array().and_then(|a| a.first()).unwrap_or(&value);
+        let name = entry.get("name").and_then(|x| x.as_str()).map(str::to_owned);
+        let icon = entry
+            .get("icon")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|hash| format!("https://cdn.discordapp.com/app-icons/{}/{hash}.png?size=128", game.application_id));
+        if name.is_some() {
+            game.name = name;
+        }
+        if icon.is_some() {
+            game.icon_url = icon;
+        }
+        if let Ok(mut cache) = game_info_cache().lock() {
+            cache.insert(game.application_id.clone(), game.clone());
+        }
+    }
+}
+
 /// Trae el perfil completo de `user_id` (bio, banner, servers/amigos en
 /// común, roles en `guild_id` si se pasa uno) para la tarjeta que se abre
 /// al clickearlo. Se llama desde `App::open_user_profile`; el resultado
@@ -1324,6 +1495,10 @@ pub fn spawn_fetch_user_profile(
                     if let Some(sku) = profile.profile_frame_sku() {
                         profile.frame = fetch_profile_frame(&rest, &sku).await;
                     }
+                    // Colección de juegos: el perfil solo trae los `game_id`.
+                    let mut games = profile.widget_games();
+                    resolve_profile_games(&rest, &mut games).await;
+                    profile.games = games;
                     profile_cache_put(&user_id, guild_id.as_deref(), &profile);
                     let _ = tx.send(AppEvent::UserProfileFetched { user_id, profile });
                 }

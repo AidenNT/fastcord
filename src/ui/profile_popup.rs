@@ -38,7 +38,11 @@ use crate::ui::{chat::anim, shell::extra};
 mod full;
 pub use full::show_full;
 
-const CARD_WIDTH: f32 = 360.0;
+/// Ancho de la tarjeta: el MISMO que el del menú de tu propio perfil
+/// (`ui::shell::menus::POP_W`), así los dos popups se ven del mismo tamaño.
+const CARD_WIDTH: f32 = crate::ui::shell::menus::POP_W;
+/// Alto máximo de la tarjeta: igual que el tope del menú de tu perfil.
+const CARD_MAX_HEIGHT: f32 = 760.0;
 const BANNER_HEIGHT: f32 = 112.0;
 const AVATAR_RADIUS: f32 = 40.0;
 /// La decoración se dibuja más grande que el avatar (como en Discord).
@@ -53,8 +57,16 @@ const EFFECT_REF_WIDTH: f32 = 450.0;
 /// Alto (en px del arte original) de las esquinas del borde que NO se estiran
 /// cuando la tarjeta es más alta o baja que el arte.
 const FRAME_CORNER_ART_PX: f32 = 120.0;
+/// Qué tanto del borde que sobresale por arriba y por abajo de la tarjeta se
+/// conserva (0.0 = las líneas laterales terminan justo en las esquinas de la
+/// tarjeta; 1.0 = el arte completo, como lo manda Discord). El tramo se
+/// encoge verticalmente; las capas de adorno (luna, arcos) no se tocan.
+const FRAME_SIDE_OVERFLOW_KEEP: f32 = 0.12;
 /// Bio más larga que esto se recorta con "Ver biografía completa".
-const BIO_PREVIEW: usize = 220;
+pub(crate) const BIO_PREVIEW: usize = 220;
+/// Largo (en caracteres) del resumen de la bio en la tarjeta, como el popout
+/// de Discord: unas tres líneas y "Ver biografía completa".
+const BIO_CARD_PREVIEW: usize = 110;
 
 const STATUS_ONLINE: Color32 = Color32::from_rgb(0x23, 0xa5, 0x5a);
 const STATUS_IDLE: Color32 = Color32::from_rgb(0xf0, 0xb2, 0x32);
@@ -142,9 +154,9 @@ enum Action {
 // Datos ya masticados para dibujar
 // ---------------------------------------------------------------------
 
-struct BadgeView {
-    icon_url: String,
-    description: String,
+pub(crate) struct BadgeView {
+    pub(crate) icon_url: String,
+    pub(crate) description: String,
 }
 
 struct ConnectionView {
@@ -341,19 +353,19 @@ impl View {
 /// Colores de la tarjeta según el tema del perfil (o la paleta de la app si
 /// la persona no configuró colores).
 #[derive(Clone, Copy)]
-struct Tone {
+pub(crate) struct Tone {
     /// Fondo arriba (justo debajo del banner) y abajo del degradado.
-    top: Color32,
-    bottom: Color32,
-    text: Color32,
-    dim: Color32,
+    pub(crate) top: Color32,
+    pub(crate) bottom: Color32,
+    pub(crate) text: Color32,
+    pub(crate) dim: Color32,
     /// Fondo de las secciones, chips y de la cajita de mensaje.
-    panel: Color32,
-    stroke: Color32,
+    pub(crate) panel: Color32,
+    pub(crate) stroke: Color32,
     /// Borde de la tarjeta entera (con tema de perfil: el color primario).
-    border: Color32,
-    accent: Color32,
-    on_accent: Color32,
+    pub(crate) border: Color32,
+    pub(crate) accent: Color32,
+    pub(crate) on_accent: Color32,
 }
 
 /// Discord no pinta los colores del perfil "a pelo": les pone encima una capa
@@ -366,7 +378,14 @@ const PROFILE_VEIL_LIGHT: f32 = 0.78;
 
 impl Tone {
     fn for_view(view: &View, palette: &Palette) -> Self {
-        match view.theme {
+        Self::from_theme(view.theme, palette)
+    }
+
+    /// Colores de una tarjeta a partir de los `theme_colors` del perfil (o de
+    /// la paleta de la app si no hay). Lo usa también el menú de tu propio
+    /// perfil (`ui::shell::menus`) para verse igual que esta tarjeta.
+    pub(crate) fn from_theme(theme: Option<(Color32, Color32)>, palette: &Palette) -> Self {
+        match theme {
             Some((primary, secondary)) => {
                 // Capa translúcida sobre el degradado (ver PROFILE_VEIL_*).
                 let (veil, amount) = if palette.dark {
@@ -464,7 +483,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         screen.max - vec2(pad_side, pad_bottom),
     );
     let card_w = target_w.min(usable.width() - SCREEN_MARGIN * 2.0).max(120.0);
-    let max_h = (usable.height() - SCREEN_MARGIN * 2.0).max(240.0);
+    let max_h = (usable.height() - SCREEN_MARGIN * 2.0).max(240.0).min(CARD_MAX_HEIGHT);
     // El alto real recién se conoce después de dibujar: se recuerda el del
     // frame anterior para ubicar la tarjeta sin que se salga de la pantalla.
     let height_id = Id::new("profile_popout_height");
@@ -491,7 +510,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 screen,
             )
         });
-    let card_rect = inner.response.rect;
+    // Rect de la tarjeta (ancho fijo), no el del Area: este último crece si
+    // algo del contenido se pasa.
+    let card_rect = inner.inner;
 
     if (card_rect.height() - last_h).abs() > 1.0 {
         ctx.memory_mut(|m| m.data.insert_temp(height_id, card_rect.height()));
@@ -543,7 +564,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             );
         }
         Some(Action::EditProfile) => {
-            app.settings_tab = crate::ui::settings::SettingsTab::Account;
+            app.settings_tab = crate::ui::settings::SettingsTab::Profile;
             app.settings_open = true;
             app.close_profile_popup();
         }
@@ -595,14 +616,15 @@ pub fn show_panel(app: &mut App, ui: &mut egui::Ui) {
     let mut action: Option<Action> = None;
     let mut quick_message = String::new();
 
-    // Margen alrededor de la tarjeta: lo que sobresale el frame (si hay).
-    let base = 12.0;
+    // La tarjeta ocupa todo el panel: sin margen propio. Solo se deja el hueco
+    // que necesita el profile frame (si tiene) para no recortarse.
+    let base = 0.0;
     let pad = |w: f32| match &view.frame {
         Some(f) => frame_padding(f, w),
         None => (0.0, 0.0, 0.0),
     };
     let (_, _, side0) = pad(avail.width() - base * 2.0);
-    let margin = base.max(side0 + 6.0);
+    let margin = if view.frame.is_some() { base.max(side0 + 6.0) } else { base };
     let card_w = (avail.width() - margin * 2.0).max(120.0);
     let (pad_top, pad_bottom, _) = pad(card_w);
     let top = base + pad_top;
@@ -640,7 +662,7 @@ pub fn show_panel(app: &mut App, ui: &mut egui::Ui) {
         }
         Some(Action::OpenFull) => app.open_full_profile(view.user_id.clone()),
         Some(Action::EditProfile) => {
-            app.settings_tab = crate::ui::settings::SettingsTab::Account;
+            app.settings_tab = crate::ui::settings::SettingsTab::Profile;
             app.settings_open = true;
         }
         Some(Action::CopyId) => ctx.copy_text(view.user_id.clone()),
@@ -671,6 +693,28 @@ fn card_position(anchor: Option<Pos2>, screen: Rect, w: f32, h: f32) -> Pos2 {
 // La tarjeta
 // ---------------------------------------------------------------------
 
+/// Avisa en el log si algo de la tarjeta se pasó del ancho previsto (eso es lo
+/// que la "estira"): dice en qué parte pasó, para encontrar al culpable.
+fn warn_if_overflow(ui: &egui::Ui, card_w: f32, user_id: &str, part: &str) {
+    let width = ui.min_rect().width();
+    // Una sola línea por cambio (esto corre en cada frame).
+    let id = Id::new(("profile_overflow_seen", user_id, part));
+    let key = if width > card_w + 1.0 { width.round() as i32 } else { 0 };
+    let previous = ui.ctx().data_mut(|d| d.get_temp::<i32>(id).unwrap_or(0));
+    if key != previous {
+        ui.ctx().data_mut(|d| d.insert_temp(id, key));
+        if key != 0 {
+            crate::logging::debug(
+                "profile",
+                format!("la tarjeta de {user_id} se estiró: {width:.0}px > {card_w:.0}px (después de: {part})"),
+            );
+        }
+    }
+}
+
+/// Radio de esquina del perfil incrustado en el DM (0 = totalmente cuadrado).
+const PANEL_RADIUS: u8 = 3;
+
 #[allow(clippy::too_many_arguments)]
 fn draw_card(
     ui: &mut egui::Ui,
@@ -683,25 +727,22 @@ fn draw_card(
     action: &mut Option<Action>,
     panel: bool,
 ) -> Rect {
-    let radius: u8 = theme::radius() + 6;
+    // El panel del DM va casi cuadrado; la tarjeta flotante conserva su redondeo.
+    let radius: u8 = if panel { PANEL_RADIUS } else { theme::radius() + 6 };
     // Ids distintos para la tarjeta del panel y la flotante: pueden estar
     // abiertas a la vez.
     let sfx = if panel { "panel" } else { "popup" };
 
-    Frame::new()
-        .fill(tone.bottom)
-        .stroke(Stroke::new(1.5, tone.border))
+    // El fondo, el borde y la sombra se pintan a mano con el ancho EXACTO de la
+    // tarjeta (ver más abajo): si algo del contenido se pasa de `card_w`, el
+    // `Frame` crece pero la tarjeta (y el profile frame, que se calcula a
+    // partir de ella) no se estiran. El trazo transparente solo reserva el
+    // mismo espacio de 1.5 px que antes.
+    const BORDER: f32 = 1.5;
+    let card_bg_idx = ui.painter().add(Shape::Noop);
+    let frame_response = Frame::new()
+        .stroke(Stroke::new(BORDER, Color32::TRANSPARENT))
         .corner_radius(CornerRadius::same(radius))
-        .shadow(if panel {
-            egui::epaint::Shadow::NONE
-        } else {
-            egui::epaint::Shadow {
-                offset: [0, 16],
-                blur: 40,
-                spread: 0,
-                color: palette.shadow,
-            }
-        })
         .show(ui, |ui| {
             ui.set_width(card_w);
             // El header se posiciona a mano: sin separación automática.
@@ -793,7 +834,10 @@ fn draw_card(
                 theme::text(ui, &view.display_name, theme::bold(20.0), name_color);
                 if view.username_line.is_some() || view.pronouns.is_some() {
                     ui.add_space(2.0);
-                    ui.horizontal(|ui| {
+                    // `horizontal_wrapped`: con usuario + pronombres largos baja
+                    // de línea en vez de estirar la tarjeta.
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
                         if let Some(username) = &view.username_line {
                             theme::text(ui, username, theme::regular(13.0), tone.dim);
                         }
@@ -817,6 +861,7 @@ fn draw_card(
                 }
             });
             ui.add_space(12.0);
+            warn_if_overflow(ui, card_w, &view.user_id, "cabecera (nombre, usuario, pronombres, insignias)");
 
             // -- Cuerpo scrolleable --
             let header_h = ui.cursor().min.y - card_top;
@@ -824,11 +869,15 @@ fn draw_card(
             egui::ScrollArea::vertical()
                 .id_salt(("profile_popout_body", sfx))
                 .max_height(scroll_max)
+                // En el panel del DM el cuerpo se estira para que el botón
+                // "Ver perfil completo" quede abajo y la tarjeta llene el alto.
+                .min_scrolled_height(if panel { scroll_max } else { 0.0 })
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
-                    draw_body(ui, view, tone, palette, action);
+                    draw_body(ui, view, tone, palette, action, panel);
                 });
+            warn_if_overflow(ui, card_w, &view.user_id, "cuerpo (zona con scroll)");
 
             // -- Pie: editar perfil / mensaje rápido --
             ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
@@ -843,6 +892,7 @@ fn draw_card(
                 }
             });
             ui.add_space(PAD);
+            warn_if_overflow(ui, card_w, &view.user_id, "pie (mensaje rápido / botón)");
 
             // Ahora que se sabe cuánto mide todo, se pinta el degradado en el
             // lugar reservado. Las últimas `radius` px quedan del color liso
@@ -858,11 +908,50 @@ fn draw_card(
             ui.painter()
                 .set(gradient_idx, gradient_mesh(gradient, tone.top, tone.bottom));
         })
-        .response
-        .rect
+        .response;
+
+    // Rectángulo real de la tarjeta: ancho fijo, alto del contenido.
+    let card = Rect::from_min_size(
+        frame_response.rect.min,
+        vec2(card_w + BORDER * 2.0, frame_response.rect.height()),
+    );
+    let shadow = if panel {
+        egui::epaint::Shadow::NONE
+    } else {
+        egui::epaint::Shadow {
+            offset: [0, 16],
+            blur: 40,
+            spread: 0,
+            color: palette.shadow,
+        }
+    };
+    let corner = CornerRadius::same(radius);
+    ui.painter().set(
+        card_bg_idx,
+        Shape::Vec(vec![
+            shadow.as_shape(card, corner).into(),
+            egui::epaint::RectShape::new(
+                card,
+                corner,
+                tone.bottom,
+                Stroke::new(BORDER, tone.border),
+                egui::StrokeKind::Inside,
+            )
+            .into(),
+        ]),
+    );
+    card
 }
 
-fn draw_body(ui: &mut egui::Ui, view: &View, tone: &Tone, palette: &Palette, action: &mut Option<Action>) {
+fn draw_body(
+    ui: &mut egui::Ui,
+    view: &View,
+    tone: &Tone,
+    palette: &Palette,
+    action: &mut Option<Action>,
+    square: bool,
+) {
+    let section_r: u8 = if square { PANEL_RADIUS } else { 10 };
     if view.loading {
         padded(ui, |ui| {
             ui.horizontal(|ui| {
@@ -884,81 +973,7 @@ fn draw_body(ui: &mut egui::Ui, view: &View, tone: &Tone, palette: &Palette, act
         ui.add_space(6.0);
     }
 
-    // -- Sobre mí + miembro desde --
-    if view.bio.is_some() || view.member_since.is_some() {
-        padded(ui, |ui| {
-            panel(ui, tone, |ui| {
-                if let Some(bio) = &view.bio {
-                    let long = bio.chars().count() > BIO_PREVIEW;
-                    let shown = if view.bio_expanded || !long {
-                        bio.clone()
-                    } else {
-                        format!("{}...", bio.chars().take(BIO_PREVIEW).collect::<String>())
-                    };
-                    markdown::show(ui, palette, &shown, 13.5, tone.text, &MentionCtx::none());
-                    if long && !view.bio_expanded {
-                        ui.add_space(4.0);
-                        if theme::link(ui, "Ver biografía completa", theme::medium(12.5), tone.text).clicked() {
-                            *action = Some(Action::ToggleBio);
-                        }
-                    }
-                }
-                if let Some(since) = &view.member_since {
-                    if view.bio.is_some() {
-                        ui.add_space(8.0);
-                    }
-                    theme::text(ui, "MIEMBRO DE DISCORD DESDE", theme::semibold(10.5), tone.dim);
-                    ui.add_space(2.0);
-                    theme::text(ui, since, theme::regular(13.0), tone.text);
-                }
-            });
-        });
-        ui.add_space(8.0);
-    }
-
-    // -- Jugando / escuchando --
-    for activity in &view.activities {
-        padded(ui, |ui| {
-            panel(ui, tone, |ui| activity_block(ui, tone, activity));
-        });
-        ui.add_space(8.0);
-    }
-
-    // -- Roles --
-    if !view.roles.is_empty() {
-        padded(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
-                for role in &view.roles {
-                    role_chip(ui, tone, role);
-                }
-            });
-        });
-        ui.add_space(8.0);
-    }
-
-    // -- Conexiones --
-    if !view.connections.is_empty() {
-        padded(ui, |ui| {
-            panel(ui, tone, |ui| {
-                theme::text(ui, "CONEXIONES", theme::semibold(10.5), tone.dim);
-                ui.add_space(4.0);
-                for connection in &view.connections {
-                    ui.horizontal(|ui| {
-                        theme::icon(ui, Icon::Globe, 14.0, tone.dim);
-                        theme::text(ui, connection.name.clone(), theme::medium(13.0), tone.text);
-                        theme::text(ui, format!("· {}", connection.kind), theme::regular(12.0), tone.dim);
-                        if connection.verified {
-                            theme::icon(ui, Icon::BadgeCheck, 13.0, STATUS_ONLINE);
-                        }
-                    });
-                }
-            });
-        });
-        ui.add_space(8.0);
-    }
-
-    // -- En común --
+    // -- En común (amigos / servidores), justo bajo la cabecera como en Discord --
     let friends = view.mutual_friends.filter(|n| *n > 0);
     let guilds = view.mutual_guilds.filter(|n| *n > 0);
     if friends.is_some() || guilds.is_some() {
@@ -989,6 +1004,83 @@ fn draw_body(ui: &mut egui::Ui, view: &View, tone: &Tone, palette: &Palette, act
         });
         ui.add_space(8.0);
     }
+
+    // -- Sobre mí: texto plano, sin panel, y resumido a unas pocas líneas --
+    if let Some(bio) = &view.bio {
+        padded(ui, |ui| {
+            let long = bio.chars().count() > BIO_CARD_PREVIEW;
+            let shown = if view.bio_expanded || !long {
+                bio.clone()
+            } else {
+                // Resumen en un solo párrafo (los saltos de línea se aplanan).
+                let head: String = bio.chars().take(BIO_CARD_PREVIEW).collect();
+                format!("{} …", head.split_whitespace().collect::<Vec<_>>().join(" "))
+            };
+            markdown::show(ui, palette, &shown, 13.5, tone.text, &MentionCtx::none());
+            if long && !view.bio_expanded {
+                ui.add_space(6.0);
+                if theme::link(ui, "Ver biografía completa", theme::medium(12.5), tone.text).clicked() {
+                    *action = Some(Action::ToggleBio);
+                }
+            }
+        });
+        ui.add_space(10.0);
+    }
+
+    // -- Miembro desde --
+    if let Some(since) = &view.member_since {
+        padded(ui, |ui| {
+            panel_r(ui, tone, section_r, |ui| {
+                theme::text(ui, "MIEMBRO DE DISCORD DESDE", theme::semibold(10.5), tone.dim);
+                ui.add_space(2.0);
+                theme::text(ui, since, theme::regular(13.0), tone.text);
+            });
+        });
+        ui.add_space(8.0);
+    }
+
+    // -- Jugando / escuchando --
+    for activity in &view.activities {
+        padded(ui, |ui| {
+            panel_r(ui, tone, section_r, |ui| activity_block(ui, tone, activity));
+        });
+        ui.add_space(8.0);
+    }
+
+    // -- Roles --
+    if !view.roles.is_empty() {
+        padded(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                for role in &view.roles {
+                    role_chip(ui, tone, role);
+                }
+            });
+        });
+        ui.add_space(8.0);
+    }
+
+    // -- Conexiones --
+    if !view.connections.is_empty() {
+        padded(ui, |ui| {
+            panel_r(ui, tone, section_r, |ui| {
+                theme::text(ui, "CONEXIONES", theme::semibold(10.5), tone.dim);
+                ui.add_space(4.0);
+                for connection in &view.connections {
+                    ui.horizontal(|ui| {
+                        theme::icon(ui, Icon::Globe, 14.0, tone.dim);
+                        theme::text(ui, connection.name.clone(), theme::medium(13.0), tone.text);
+                        theme::text(ui, format!("· {}", connection.kind), theme::regular(12.0), tone.dim);
+                        if connection.verified {
+                            theme::icon(ui, Icon::BadgeCheck, 13.0, STATUS_ONLINE);
+                        }
+                    });
+                }
+            });
+        });
+        ui.add_space(8.0);
+    }
+
 }
 
 // ---------------------------------------------------------------------
@@ -1004,11 +1096,16 @@ fn padded<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
 }
 
 /// Sección con fondo translúcido (bio, actividad, conexiones).
-fn panel<R>(ui: &mut egui::Ui, tone: &Tone, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+pub(crate) fn panel<R>(ui: &mut egui::Ui, tone: &Tone, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    panel_r(ui, tone, 10, add)
+}
+
+/// Igual que `panel`, con el radio de esquina elegido.
+fn panel_r<R>(ui: &mut egui::Ui, tone: &Tone, radius: u8, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let width = ui.available_width();
     Frame::new()
         .fill(tone.panel)
-        .corner_radius(CornerRadius::same(10))
+        .corner_radius(CornerRadius::same(radius))
         .inner_margin(Margin::symmetric(12, 10))
         .show(ui, |ui| {
             ui.set_width((width - 24.0).max(40.0));
@@ -1054,7 +1151,7 @@ fn paint_banner(ui: &mut egui::Ui, view: &View, palette: &Palette, rect: Rect, r
 
 /// Región (en UV) de una textura de tamaño `tex` que hay que mostrar para que
 /// llene `target` sin deformarse, recortando parejo de los lados que sobran.
-fn cover_uv(tex: Vec2, target: Vec2) -> Rect {
+pub(crate) fn cover_uv(tex: Vec2, target: Vec2) -> Rect {
     let full = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
     if tex.x <= 0.0 || tex.y <= 0.0 || target.x <= 0.0 || target.y <= 0.0 {
         return full;
@@ -1145,7 +1242,7 @@ fn paint_status_bubble(ui: &mut egui::Ui, tone: &Tone, banner: Rect, avatar_cent
 }
 
 /// Etiqueta de servidor (`[icono] NULL`).
-fn clan_chip(ui: &mut egui::Ui, tone: &Tone, clan: &ClanTag) {
+pub(crate) fn clan_chip(ui: &mut egui::Ui, tone: &Tone, clan: &ClanTag) {
     let galley = ui
         .painter()
         .layout_no_wrap(clan.tag.clone(), theme::bold(12.0), tone.text);
@@ -1167,10 +1264,13 @@ fn clan_chip(ui: &mut egui::Ui, tone: &Tone, clan: &ClanTag) {
 }
 
 /// Insignias en una pastilla, con su descripción al pasar el mouse.
-fn badges_pill(ui: &mut egui::Ui, tone: &Tone, badges: &[BadgeView]) {
+pub(crate) fn badges_pill(ui: &mut egui::Ui, tone: &Tone, badges: &[BadgeView]) {
     let icon = 18.0;
     let gap = 4.0;
     let pad = 7.0;
+    // Nunca más ancha que la fila: con muchas insignias entran las que caben.
+    let fit = ((ui.available_width() - pad * 2.0 + gap) / (icon + gap)).floor().max(1.0) as usize;
+    let badges = &badges[..badges.len().min(fit)];
     let count = badges.len() as f32;
     let width = pad * 2.0 + count * icon + (count - 1.0).max(0.0) * gap;
     let (rect, _) = ui.allocate_exact_size(vec2(width, 24.0), Sense::hover());
@@ -1276,7 +1376,7 @@ fn view_full_profile_button(ui: &mut egui::Ui, tone: &Tone, action: &mut Option<
     } else {
         extra::blend(tone.text, tone.bottom, 0.90)
     };
-    ui.painter().rect_filled(rect, 8.0, fill);
+    ui.painter().rect_filled(rect, f32::from(PANEL_RADIUS), fill);
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
@@ -1338,7 +1438,31 @@ fn quick_message_box(
         .inner_margin(Margin::symmetric(12, 9))
         .show(ui, |ui| {
             ui.set_width((width - 24.0).max(40.0));
-            let hint = egui::RichText::new(format!("Enviar mensaje a @{}", view.display_name)).color(tone.dim);
+            // El hint no puede ser más ancho que la caja: con un nombre largo
+            // (o de glifos anchos) ensanchaba la tarjeta. Se recorta con "…".
+            let hint_text = {
+                let full = format!("Enviar mensaje a @{}", view.display_name);
+                let font = egui::FontId::proportional(14.0);
+                let max_w = ui.available_width();
+                let fits = |t: &str| {
+                    ui.painter()
+                        .layout_no_wrap(t.to_owned(), font.clone(), Color32::WHITE)
+                        .size()
+                        .x
+                        <= max_w
+                };
+                if fits(&full) {
+                    full
+                } else {
+                    let chars: Vec<char> = full.chars().collect();
+                    let mut keep = chars.len();
+                    while keep > 1 && !fits(&format!("{}…", chars[..keep].iter().collect::<String>())) {
+                        keep -= 1;
+                    }
+                    format!("{}…", chars[..keep].iter().collect::<String>())
+                }
+            };
+            let hint = egui::RichText::new(hint_text).color(tone.dim);
             let response = ui.add(
                 egui::TextEdit::singleline(&mut *quick_message)
                     .hint_text(hint)
@@ -1359,7 +1483,7 @@ fn quick_message_box(
 // Efecto de perfil
 // ---------------------------------------------------------------------
 
-fn effect_start_id(user_id: &str) -> Id {
+pub(crate) fn effect_start_id(user_id: &str) -> Id {
     Id::new(("profile_popout_effect_start", user_id))
 }
 
@@ -1368,7 +1492,7 @@ fn effect_start_id(user_id: &str) -> Id {
 /// la tarjeta y las de bucle se repiten. Si todavía se están bajando o
 /// decodificando, esa capa simplemente no se ve (nunca un cuadro estático
 /// suelto).
-fn draw_effect(
+pub(crate) fn draw_effect(
     ctx: &egui::Context,
     layer: egui::LayerId,
     card: Rect,
@@ -1425,9 +1549,6 @@ fn frame_scale(frame: &ProfileFrame, card_w: f32) -> f32 {
         1.0
     }
 }
-
-/// Cuánto sobresale el frame de la tarjeta, en px de pantalla:
-/// `(arriba, abajo, cada lado)`.
 fn frame_padding(frame: &ProfileFrame, card_w: f32) -> (f32, f32, f32) {
     let s = frame_scale(frame, card_w);
     (
@@ -1515,6 +1636,9 @@ fn frame_shapes(ctx: &egui::Context, frame: &ProfileFrame, card: Rect) -> (Vec<S
                 px,
                 (frame.overflow_top + FRAME_CORNER_ART_PX) * src_per_art,
                 (frame.overflow_bottom + FRAME_CORNER_ART_PX) * src_per_art,
+                frame.overflow_top * src_per_art,
+                frame.overflow_bottom * src_per_art,
+                FRAME_SIDE_OVERFLOW_KEEP,
             );
         } else {
             // `responsive`: se estira al ancho del lienzo manteniendo la proporción.
@@ -1626,6 +1750,7 @@ fn full_uv() -> Rect {
 /// arte, se estira SOLO la franja del medio (3 cortes verticales) para no
 /// deformar las esquinas ni los adornos de arriba y abajo.
 /// `top_cut` / `bottom_cut`: alto en px de la imagen de las franjas fijas.
+#[allow(clippy::too_many_arguments)]
 fn border_slices(
     out: &mut Vec<Shape>,
     id: TextureId,
@@ -1634,20 +1759,26 @@ fn border_slices(
     px: f32,
     top_cut: f32,
     bottom_cut: f32,
+    // Parte del corte de arriba / abajo que es solo "sobresale" (sin las
+    // esquinas de la tarjeta), en px de la imagen.
+    top_over: f32,
+    bottom_over: f32,
+    // 0.0..=1.0: cuánto de ese tramo se conserva (se encoge en vertical).
+    keep: f32,
 ) {
     let natural_h = size.y * px;
     let top_cut = top_cut.min(size.y / 2.0);
     let bottom_cut = bottom_cut.min(size.y / 2.0);
+    let top_over = top_over.min(top_cut);
+    let bottom_over = bottom_over.min(bottom_cut);
+    let keep = keep.clamp(0.0, 1.0);
     let (top_h, bottom_h) = (top_cut * px, bottom_cut * px);
     let fits = (natural_h - canvas.height()).abs() < 1.0;
-    if fits || top_h + bottom_h >= canvas.height() {
-        // Mismo alto (o tarjeta demasiado baja para cortar): una sola imagen.
+    if top_h + bottom_h >= canvas.height() || (fits && keep >= 1.0) {
+        // Tarjeta demasiado baja para cortar (o nada que encoger): una sola imagen.
         out.push(Shape::image(id, canvas, full_uv(), Color32::WHITE));
         return;
     }
-    let (v1, v2) = (top_cut / size.y, 1.0 - bottom_cut / size.y);
-    let y1 = canvas.top() + top_h;
-    let y2 = canvas.bottom() - bottom_h;
     let strip = |top: f32, bottom: f32, v_top: f32, v_bottom: f32| {
         Shape::image(
             id,
@@ -1656,9 +1787,27 @@ fn border_slices(
             Color32::WHITE,
         )
     };
-    out.push(strip(canvas.top(), y1, 0.0, v1));
-    out.push(strip(y1, y2, v1, v2));
-    out.push(strip(y2, canvas.bottom(), v2, 1.0));
+    // Alturas (px de pantalla) de cada tramo.
+    let (over_t, over_b) = (top_over * px, bottom_over * px);
+    let y_card_top = canvas.top() + over_t; // donde empieza la tarjeta
+    let y1 = canvas.top() + top_h; // fin de la esquina de arriba
+    let y2 = canvas.bottom() - bottom_h; // inicio de la esquina de abajo
+    let y_card_bottom = canvas.bottom() - over_b; // donde termina la tarjeta
+    let (v_ot, v_c1) = (top_over / size.y, top_cut / size.y);
+    let (v_c2, v_ob) = (1.0 - bottom_cut / size.y, 1.0 - bottom_over / size.y);
+
+    // Arriba: tramo que sobresale (encogido, pegado a la tarjeta) + esquina.
+    if keep > 0.0 && top_over > 0.0 {
+        out.push(strip(y_card_top - over_t * keep, y_card_top, 0.0, v_ot));
+    }
+    out.push(strip(y_card_top, y1, v_ot, v_c1));
+    // Medio: se estira con la altura de la tarjeta.
+    out.push(strip(y1, y2, v_c1, v_c2));
+    // Abajo: esquina + tramo que sobresale (encogido).
+    out.push(strip(y2, y_card_bottom, v_c2, v_ob));
+    if keep > 0.0 && bottom_over > 0.0 {
+        out.push(strip(y_card_bottom, y_card_bottom + over_b * keep, v_ob, 1.0));
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1666,7 +1815,7 @@ fn border_slices(
 // ---------------------------------------------------------------------
 
 /// Degradado vertical como malla (barato: dos triángulos).
-fn gradient_mesh(rect: Rect, top: Color32, bottom: Color32) -> Shape {
+pub(crate) fn gradient_mesh(rect: Rect, top: Color32, bottom: Color32) -> Shape {
     let mut mesh = egui::Mesh::default();
     mesh.colored_vertex(rect.left_top(), top);
     mesh.colored_vertex(rect.right_top(), top);
@@ -1677,7 +1826,7 @@ fn gradient_mesh(rect: Rect, top: Color32, bottom: Color32) -> Shape {
     Shape::mesh(mesh)
 }
 
-fn rgb(c: u32) -> Color32 {
+pub(crate) fn rgb(c: u32) -> Color32 {
     Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
 }
 
@@ -1723,7 +1872,7 @@ fn luma(c: Color32) -> f32 {
 }
 
 /// `[primario, secundario]` de los colores del tema de un perfil.
-fn theme_pair(meta: Option<&crate::discord::models::UserProfileMeta>) -> Option<(Color32, Color32)> {
+pub(crate) fn theme_pair(meta: Option<&crate::discord::models::UserProfileMeta>) -> Option<(Color32, Color32)> {
     let colors = meta?.theme_colors.as_ref()?;
     let first = *colors.first()?;
     let second = colors.get(1).copied().unwrap_or(first);

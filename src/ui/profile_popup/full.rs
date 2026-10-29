@@ -241,7 +241,7 @@ pub fn show_full(app: &mut App, ui: &mut egui::Ui) {
         }
         Some(FullAction::CopyId) => ctx.copy_text(user_id.clone()),
         Some(FullAction::EditProfile) => {
-            app.settings_tab = crate::ui::settings::SettingsTab::Account;
+            app.settings_tab = crate::ui::settings::SettingsTab::Profile;
             app.settings_open = true;
             close_full(app);
         }

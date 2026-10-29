@@ -72,6 +72,7 @@ use web_local_storage_api;
 
 // Informe de memoria (Ajustes → Memoria): hijo de este módulo para poder leer
 // los campos privados de `App`. Ver `lib/state/memory.rs`.
+pub mod account_edit;
 pub mod dm_calls;
 pub mod memory;
 mod resident;
@@ -121,6 +122,13 @@ pub enum AuthStatus {
     PasswordMfaRequired,
     /// Mandando el código de 2FA.
     PasswordMfaSubmitting,
+    /// Formulario para crear una cuenta nueva sin salir del cliente
+    /// (`App::register_*`; el error del intento anterior va en
+    /// `App::register_error`).
+    RegisterForm,
+    /// Mandando `POST /auth/register` (o esperando que la persona resuelva
+    /// el captcha que Discord pidió).
+    RegisterSubmitting,
 }
 
 /// De qué tipo es un [`Toast`]; solo cambia el color del punto de acento.
@@ -220,6 +228,82 @@ pub struct ThreadPanel {
     pub compose_text: String,
     pub reply_target: Option<crate::lib::data::ReplyTarget>,
     pub scroll_anchor: Option<String>,
+}
+
+/// Herramientas de la píldora superior derecha que abren un panel lateral.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SideTool {
+    Search,
+    Pins,
+    Threads,
+}
+
+/// Un mensaje de los resultados de búsqueda o de los fijados.
+pub struct SideHit {
+    pub channel_id: String,
+    pub message_id: String,
+    pub author: String,
+    pub avatar_url: Option<String>,
+    pub content: String,
+    pub time: String,
+}
+
+/// Un hilo de la lista de hilos del canal.
+pub struct SideThread {
+    pub id: String,
+    pub name: String,
+    pub owner_id: Option<String>,
+    pub replies: u32,
+}
+
+/// Estado del panel lateral de buscar / fijados / hilos. Ocupa el lugar de la
+/// lista de miembros (ver `ui::shell::side_tools`).
+pub struct SideToolPanel {
+    pub tool: SideTool,
+    /// Canal (o DM) donde se abrió; si se cambia de canal se vuelve a pedir.
+    pub channel_id: String,
+    /// Server donde se abrió (`None` en un DM). La búsqueda abarca todo el
+    /// server; fijados e hilos, solo el canal.
+    pub guild_id: Option<String>,
+    /// Texto del campo de búsqueda.
+    pub query: String,
+    /// Lo último que se buscó (para el \"sin resultados para …\").
+    pub submitted: String,
+    pub loading: bool,
+    pub failed: bool,
+    pub total: u32,
+    pub hits: Vec<SideHit>,
+    pub threads: Vec<SideThread>,
+    /// Número del último pedido: las respuestas con otro número se descartan.
+    pub request: u64,
+    /// Pedir el foco del campo de búsqueda en el próximo frame.
+    pub focus_search: bool,
+}
+
+fn side_hit(m: &crate::discord::models::GatewayMessage) -> SideHit {
+    // `<@id>` crudo no le dice nada a nadie: se muestra como @nombre.
+    let mut content = m.content.clone();
+    for user in &m.mentions {
+        let name = format!("@{}", user.display_name());
+        content = content
+            .replace(&format!("<@{}>", user.id), &name)
+            .replace(&format!("<@!{}>", user.id), &name);
+    }
+    if content.trim().is_empty() {
+        content = if m.attachments.is_empty() {
+            "(mensaje sin texto)".to_string()
+        } else {
+            "(archivo adjunto)".to_string()
+        };
+    }
+    SideHit {
+        channel_id: m.channel_id.clone(),
+        message_id: m.id.clone(),
+        author: m.author.display_name().to_string(),
+        avatar_url: m.author.avatar_url(),
+        content,
+        time: crate::lib::data::format_timestamp(&m.timestamp),
+    }
 }
 
 /// Un campo de texto de un [`ComponentModal`].
@@ -468,6 +552,9 @@ pub struct App {
     /// adelante otros campos (status, notificaciones, privacidad...) sin
     /// tener que pedirlo de nuevo.
     pub discord_settings: Option<crate::discord::user_settings::PreloadedUserSettings>,
+    /// Estado de las páginas de Ajustes que editan la cuenta (cambios en vuelo,
+    /// dispositivos con sesión abierta). Ver `lib::state::account_edit`.
+    pub account_ui: account_edit::AccountUi,
     /// Llamadas de DM/grupo en curso, por id de canal (`CALL_CREATE` /
     /// `CALL_UPDATE` / `CALL_DELETE`). Ver `lib::state::dm_calls`.
     pub dm_calls: std::collections::HashMap<String, dm_calls::DmCallInfo>,
@@ -603,6 +690,10 @@ pub struct App {
     newer_retry_after: Option<Instant>,
     /// Hilo abierto en el panel lateral del server, si hay alguno.
     pub thread_panel: Option<ThreadPanel>,
+    /// Panel lateral de buscar / fijados / hilos (ver `SideToolPanel`).
+    pub side_tool: Option<SideToolPanel>,
+    /// Contador de pedidos del panel de herramientas.
+    pub side_request: u64,
     /// Último momento (reloj de la UI, segundos) en que se recortó el
     /// historial de los chats inactivos (`App::trim_inactive_history`).
     pub last_history_trim: f64,
@@ -641,6 +732,12 @@ pub struct App {
     /// `session_id` del Gateway (del `READY`): las interacciones con
     /// botones de bots lo piden.
     pub gateway_session_id: String,
+    /// Último valor de "ausente" con el que se mandó la presencia (opcode 3).
+    /// `None` = todavía no se mandó ninguna.
+    presence_idle_sent: Option<bool>,
+    /// Desde cuándo la ventana está sin foco (`None` = tiene foco). Pasado
+    /// `PRESENCE_IDLE_AFTER` sin recuperarlo, la cuenta pasa a ausente.
+    unfocused_since: Option<std::time::Instant>,
     /// Catálogos de slash commands ya pedidos, por server (o por canal en un
     /// DM). Ver `ui::chat::slash` y `discord::slash`.
     pub slash_catalogs: std::collections::HashMap<String, crate::discord::slash::CachedCatalog>,
@@ -730,6 +827,12 @@ pub struct App {
     /// Tarjeta de perfil de usuario actualmente abierta, si hay alguna
     /// (ver `App::open_user_profile` / `ui::profile_popup`).
     pub profile_popup: Option<ProfilePopup>,
+    /// Tu propio perfil completo (colores del tema, efecto, decoración…), para
+    /// pintar el menú de tu perfil de la barra de usuario igual que lo ven los
+    /// demás (`ui::shell::menus`). Se pide al abrir ese menú.
+    pub me_profile: Option<UserProfileResponse>,
+    /// `true` mientras `me_profile` ya se pidió en esta apertura del menú.
+    pub me_profile_requested: bool,
     /// Miembros de un rol (clic en una mención `@rol`), si está abierto.
     pub role_popup: Option<RolePopup>,
     /// Perfil que se muestra de forma permanente en el panel derecho de un DM
@@ -812,6 +915,20 @@ pub struct App {
     pub login_email: String,
     pub login_password: String,
     pub login_mfa_code: String,
+    /// Formulario de registro (`AuthStatus::RegisterForm`). La fecha de
+    /// nacimiento se escribe en tres campos de texto (día / mes / año).
+    pub register_email: String,
+    pub register_username: String,
+    pub register_display_name: String,
+    pub register_password: String,
+    pub register_birth_day: String,
+    pub register_birth_month: String,
+    pub register_birth_year: String,
+    /// Acepta los Términos de servicio y la Política de privacidad. Parte
+    /// desmarcado: solo se manda `consent: true` si la persona lo marca.
+    pub register_consent: bool,
+    pub register_promo_emails: bool,
+    pub register_error: Option<String>,
     /// Si ya se pidió el SMS de 2FA en este desafío (para no dejar
     /// mandarlo de nuevo con cada repintado, y para cambiar el texto del
     /// botón a "Reenviar").
@@ -978,6 +1095,7 @@ impl Default for App {
             accounts,
             discord_token: None,
             discord_settings: None,
+            account_ui: account_edit::AccountUi::default(),
             participant_playback: std::collections::HashMap::new(),
             participant_audio_dirty: std::collections::HashSet::new(),
             participant_audio_dirty_at: None,
@@ -1018,6 +1136,8 @@ impl Default for App {
             inbox_open: false,
             newer_retry_after: None,
             thread_panel: None,
+            side_tool: None,
+            side_request: 0,
             last_history_trim: 0.0,
             component_modal: None,
             join_form: None,
@@ -1032,6 +1152,8 @@ impl Default for App {
             slash_succeeded: false,
             gateway_disconnected: false,
             gateway_session_id: String::new(),
+            presence_idle_sent: None,
+            unfocused_since: None,
             slash_catalogs: std::collections::HashMap::new(),
             slash_pending: std::collections::HashSet::new(),
             top_search: String::new(),
@@ -1065,6 +1187,8 @@ impl Default for App {
             dialogs: std::collections::VecDeque::new(),
             pending_resume_token: None,
             profile_popup: None,
+            me_profile: None,
+            me_profile_requested: false,
             role_popup: None,
             dm_profile: None,
             members_panel_open: true,
@@ -1085,6 +1209,16 @@ impl Default for App {
             login_email: String::new(),
             login_password: String::new(),
             login_mfa_code: String::new(),
+            register_email: String::new(),
+            register_username: String::new(),
+            register_display_name: String::new(),
+            register_password: String::new(),
+            register_birth_day: String::new(),
+            register_birth_month: String::new(),
+            register_birth_year: String::new(),
+            register_consent: false,
+            register_promo_emails: false,
+            register_error: None,
             login_sms_sent: false,
             login_error: None,
             connection_steps: Vec::new(),
@@ -1166,6 +1300,10 @@ impl Default for App {
         app
     }
 }
+
+/// Cuánto tiene que estar la ventana sin foco para que la cuenta pase a
+/// ausente (idle + afk). El cliente oficial usa 10 minutos.
+const PRESENCE_IDLE_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 impl App {
     /// Arranca el login por QR: abre un canal nuevo hacia un hilo de fondo
@@ -1425,6 +1563,7 @@ impl App {
         self.discord_token = None;
         self.me = None;
         self.discord_settings = None;
+        self.account_ui = account_edit::AccountUi::default();
         self.open_guild_folders.clear();
         self.friends.clear();
         self.dms.clear();
@@ -1463,6 +1602,8 @@ impl App {
         self.shown_title_count = None;
         self.modal = None;
         self.profile_popup = None;
+        self.me_profile = None;
+        self.me_profile_requested = false;
         self.role_popup = None;
         self.dm_profile = None;
         self.profile_full = None;
@@ -1504,6 +1645,8 @@ impl App {
         self.pending_member_subscription = None;
         self.hover_peeks.clear();
         self.gateway_session_id.clear();
+        self.presence_idle_sent = None;
+        self.unfocused_since = None;
         self.slash_catalogs.clear();
         self.slash_pending.clear();
         self.connection_steps.clear();
@@ -1575,6 +1718,87 @@ impl App {
         self.event_tx = Some(tx.clone());
         self.event_rx = Some(rx);
         crate::discord::password_auth::spawn(self.login_email.clone(), self.login_password.clone(), tx);
+    }
+
+    /// Abre el formulario de registro (link "Regístrate" del login).
+    pub fn start_register(&mut self) {
+        self.captcha.cancel_all();
+        self.register_error = None;
+        // Se suelta el canal del QR que ya estaba generándose (como hace
+        // `cancel_sign_in`): si no, un `QrReady`/`Confirming` tardío lo
+        // sacaría del formulario mientras se escribe.
+        self.event_rx = None;
+        self.event_tx = None;
+        self.auth = AuthStatus::RegisterForm;
+    }
+
+    /// Vuelve del registro al login (QR + contraseña) y borra lo tipeado.
+    pub fn cancel_register(&mut self) {
+        self.captcha.cancel_all();
+        self.clear_register_form();
+        self.switch_to_qr_form();
+    }
+
+    fn clear_register_form(&mut self) {
+        self.register_email.clear();
+        self.register_username.clear();
+        self.register_display_name.clear();
+        self.register_password.clear();
+        self.register_birth_day.clear();
+        self.register_birth_month.clear();
+        self.register_birth_year.clear();
+        self.register_consent = false;
+        self.register_promo_emails = false;
+        self.register_error = None;
+    }
+
+    /// Valida el formulario y manda el registro. Discord valida el resto
+    /// (formato del mail, largo y seguridad de la contraseña, nombre de
+    /// usuario libre...) y sus mensajes se muestran tal cual; acá solo
+    /// se comprueba lo que se puede decir sin red: campos obligatorios,
+    /// fecha de nacimiento real (y edad mínima) y la aceptación de los
+    /// Términos.
+    pub fn submit_register(&mut self) {
+        let email = self.register_email.trim().to_owned();
+        let username = self.register_username.trim().to_lowercase();
+        if email.is_empty() || username.is_empty() || self.register_password.is_empty() {
+            self.register_error = Some("Completá correo, nombre de usuario y contraseña".to_owned());
+            return;
+        }
+        let date_of_birth = match crate::discord::register::validate_birth_date(
+            &self.register_birth_day,
+            &self.register_birth_month,
+            &self.register_birth_year,
+            chrono::Local::now().date_naive(),
+        ) {
+            Ok(date) => date,
+            Err(message) => {
+                self.register_error = Some(message);
+                return;
+            }
+        };
+        if !self.register_consent {
+            self.register_error =
+                Some("Tenés que aceptar los Términos de servicio y la Política de privacidad".to_owned());
+            return;
+        }
+        self.register_error = None;
+        self.auth = AuthStatus::RegisterSubmitting;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.event_tx = Some(tx.clone());
+        self.event_rx = Some(rx);
+        crate::discord::register::spawn(
+            crate::discord::register::RegisterRequest {
+                email,
+                username,
+                global_name: self.register_display_name.trim().to_owned(),
+                password: self.register_password.clone(),
+                date_of_birth,
+                consent: self.register_consent,
+                promotional_email_opt_in: self.register_promo_emails,
+            },
+            tx,
+        );
     }
 
     /// Manda el código de 2FA que se acaba de tipear (`App::login_mfa_code`)
@@ -2157,6 +2381,157 @@ impl App {
 
     /// Si el canal abierto es un foro y todavía no se pidieron sus posts, los
     /// pide (llegan como `AppEvent::ForumPosts`).
+    /// Dónde está parado el panel de herramientas: (canal o DM, server).
+    fn side_tool_scope(&self) -> Option<(String, Option<String>)> {
+        let channel_id = self.viewed_channel_id()?;
+        let guild_id = match self.screen {
+            Screen::Server(i) => self.servers.get(i).map(|s| s.guild_id.clone()).filter(|g| !g.is_empty()),
+            _ => None,
+        };
+        Some((channel_id, guild_id))
+    }
+
+    /// Botón de la píldora: abre la herramienta, o la cierra si ya era la
+    /// que estaba abierta.
+    pub fn toggle_side_tool(&mut self, tool: SideTool) {
+        if self.side_tool.as_ref().is_some_and(|p| p.tool == tool) {
+            self.side_tool = None;
+            return;
+        }
+        // Comparten el lugar de la derecha: el hilo abierto se cierra.
+        self.thread_panel = None;
+        self.open_side_tool(tool, String::new());
+        if let Some(panel) = self.side_tool.as_mut() {
+            panel.focus_search = tool == SideTool::Search;
+        }
+    }
+
+    pub fn close_side_tool(&mut self) {
+        self.side_tool = None;
+    }
+
+    fn open_side_tool(&mut self, tool: SideTool, query: String) {
+        let Some((channel_id, guild_id)) = self.side_tool_scope() else {
+            self.side_tool = None;
+            return;
+        };
+        self.side_request += 1;
+        let request = self.side_request;
+        let mut panel = SideToolPanel {
+            tool,
+            channel_id: channel_id.clone(),
+            guild_id: guild_id.clone(),
+            query,
+            submitted: String::new(),
+            loading: false,
+            failed: false,
+            total: 0,
+            hits: Vec::new(),
+            threads: Vec::new(),
+            request,
+            focus_search: false,
+        };
+        if let Some((token, tx)) = self.discord_token.clone().zip(self.event_tx.clone()) {
+            match tool {
+                SideTool::Pins => {
+                    panel.loading = true;
+                    crate::discord::spawn_fetch_pins(token, channel_id, request, tx);
+                }
+                SideTool::Threads => {
+                    panel.loading = true;
+                    crate::discord::spawn_fetch_channel_threads(token, channel_id, request, tx);
+                }
+                // La búsqueda espera a que se escriba algo y se apriete Enter.
+                SideTool::Search => {}
+            }
+        }
+        self.side_tool = Some(panel);
+    }
+
+    /// Manda la búsqueda con el texto que haya en el campo.
+    pub fn submit_side_search(&mut self) {
+        let Some(panel) = self.side_tool.as_mut() else { return };
+        if panel.tool != SideTool::Search {
+            return;
+        }
+        let text = panel.query.trim().to_string();
+        if text.is_empty() {
+            panel.hits.clear();
+            panel.submitted.clear();
+            panel.total = 0;
+            panel.failed = false;
+            return;
+        }
+        let Some((token, tx)) = self.discord_token.clone().zip(self.event_tx.clone()) else {
+            return;
+        };
+        self.side_request += 1;
+        panel.request = self.side_request;
+        panel.submitted = text.clone();
+        panel.loading = true;
+        panel.failed = false;
+        panel.hits.clear();
+        crate::discord::spawn_search_messages(
+            token,
+            panel.guild_id.clone(),
+            panel.channel_id.clone(),
+            text,
+            panel.request,
+            tx,
+        );
+    }
+
+    /// Se llama cada frame con el panel a la vista: si se cambió de canal (o
+    /// de server, en la búsqueda) se vuelve a pedir lo que corresponde; si ya
+    /// no hay un chat abierto, se cierra.
+    pub fn sync_side_tool(&mut self) {
+        let Some(panel) = self.side_tool.as_ref() else { return };
+        let Some((channel_id, guild_id)) = self.side_tool_scope() else {
+            self.side_tool = None;
+            return;
+        };
+        let stale = match panel.tool {
+            SideTool::Search => match (&panel.guild_id, &guild_id) {
+                (Some(a), Some(b)) => a != b,
+                _ => panel.channel_id != channel_id,
+            },
+            _ => panel.channel_id != channel_id,
+        };
+        if !stale {
+            return;
+        }
+        let (tool, query) = (panel.tool, panel.query.clone());
+        // Los hilos solo existen en servers: en un DM no hay nada que listar.
+        if tool == SideTool::Threads && guild_id.is_none() {
+            self.side_tool = None;
+            return;
+        }
+        let resubmit = tool == SideTool::Search && !query.trim().is_empty();
+        self.open_side_tool(tool, query);
+        if resubmit {
+            self.submit_side_search();
+        }
+    }
+
+    /// Click en un resultado: abre el canal (si hace falta) y salta al mensaje.
+    pub fn open_side_hit(&mut self, channel_id: &str, message_id: &str) {
+        if let Screen::Server(i) = self.screen {
+            let position = self
+                .servers
+                .get(i)
+                .and_then(|s| s.channel_position_by_id(channel_id));
+            if let Some((category, channel)) = position {
+                if (category, channel) == self.current_channel {
+                    self.jump_to_message(channel_id, message_id);
+                } else {
+                    self.open_channel_at(i, category, channel, Some(message_id.to_string()));
+                }
+                return;
+            }
+        }
+        self.jump_to_message(channel_id, message_id);
+    }
+
     fn load_forum_posts_if_needed(&mut self) {
         let Screen::Server(index) = self.screen else { return };
         let (category, channel) = self.current_channel;
@@ -2236,6 +2611,7 @@ impl App {
     /// guardado en el server, así que reabrirlo no vuelve a pedirlos.
     pub fn open_thread_panel(&mut self, thread_id: &str, title: &str, owner_id: Option<String>) {
         let Screen::Server(index) = self.screen else { return };
+        self.side_tool = None;
         let (category, channel) = self.current_channel;
         let Some(server) = self.servers.get_mut(index) else {
             return;
@@ -3171,6 +3547,22 @@ impl App {
         });
     }
 
+    /// Pide (una vez por apertura del menú) tu propio perfil completo, para
+    /// que el menú de tu perfil use tus colores de tema, efecto y decoración.
+    /// Mientras llega, el menú sigue mostrando el último `me_profile` (si hay).
+    pub fn ensure_me_profile(&mut self) {
+        if self.me_profile_requested {
+            return;
+        }
+        let Some(me_id) = self.me.as_ref().map(|m| m.id.clone()).filter(|id| !id.is_empty()) else {
+            return;
+        };
+        if let Some((token, tx)) = self.discord_token.clone().zip(self.event_tx.clone()) {
+            self.me_profile_requested = true;
+            crate::discord::spawn_fetch_user_profile(token, me_id, None, tx);
+        }
+    }
+
     /// Cierra la tarjeta de perfil actualmente abierta, si hay alguna.
     pub fn close_profile_popup(&mut self) {
         self.profile_popup = None;
@@ -3621,6 +4013,9 @@ impl App {
         };
         crate::lib::data::publish_pick_directory(ctx, open_server);
         self.flush_member_subscription(ctx);
+        // Foco y llamada de voz para el QoS heartbeat y el opcode 41 del
+        // gateway (`foregrounded` / `rtc_connected`).
+        crate::discord::gateway::set_qos_state(self.window_focused, self.voice_target.is_some());
         // Favoritos/frecency: manda lo pendiente cuando toca (o ya, si la
         // ventana perdió el foco: cerrar la app no avisa). Si queda algo sin
         // mandar, se pide un repaint para que el temporizador siga corriendo
@@ -3668,6 +4063,7 @@ impl App {
                 | AuthStatus::Connecting
                 | AuthStatus::PasswordSubmitting
                 | AuthStatus::PasswordMfaSubmitting
+                | AuthStatus::RegisterSubmitting
         ) {
             ctx.request_repaint();
         }
@@ -3744,6 +4140,8 @@ impl App {
                 let participant_audio = crate::discord::user_settings::participant_playback_from_settings(&settings);
                 let stream_audio = crate::discord::user_settings::stream_playback_from_settings(&settings);
                 self.discord_settings = Some(*settings);
+                // Estado y estado personalizado de la cuenta -> opcode 3.
+                self.sync_presence();
                 self.ingest_stream_audio(stream_audio, true);
                 // Volumen/silencio por persona: la cuenta manda (salvo lo que
                 // se cambió acá y todavía no salió).
@@ -3755,6 +4153,10 @@ impl App {
             AppEvent::FrecencyUpdate { settings, partial } => {
                 crate::discord::frecency::ingest_update(*settings, partial);
             }
+            AppEvent::AccountEditResult { done, result } => self.on_account_edit_result(done, result),
+            AppEvent::AccountEditPicked(result) => self.on_account_edit_picked(result),
+            AppEvent::AuthSessions(result) => self.on_auth_sessions(result),
+            AppEvent::AuthSessionClosed { id_hash, result } => self.on_auth_session_closed(id_hash, result),
             AppEvent::Affinities { users, guilds } => {
                 if let Some(users) = users {
                     self.affinity_users = users;
@@ -3777,16 +4179,28 @@ impl App {
                 let stream_audio = crate::discord::user_settings::stream_playback_from_settings(&settings);
                 self.ingest_stream_audio(stream_audio, !partial);
                 let mut merged = false;
+                let mut status_changed = !partial && settings.status.is_some();
                 if partial {
                     if let Some(current) = self.discord_settings.as_mut() {
                         if settings.guild_folders.is_some() {
                             current.guild_folders = settings.guild_folders.clone();
+                        }
+                        // Interruptores y alcance de solicitudes de amistad
+                        // (Ajustes → Privacidad/Notificaciones/Apariencia).
+                        App::merge_account_toggles(current, &settings);
+                        // Estado cambiado en otro dispositivo.
+                        if settings.status.is_some() {
+                            current.status = settings.status.clone();
+                            status_changed = true;
                         }
                         merged = true;
                     }
                 }
                 if !merged {
                     self.discord_settings = Some(settings);
+                }
+                if status_changed {
+                    self.sync_presence();
                 }
             }
             AppEvent::Ready(ready) => {
@@ -4473,6 +4887,8 @@ impl App {
                 self.pending_member_subscription = None;
                 self.hover_peeks.clear();
                 self.subscribe_member_list();
+                // Los ajustes pueden haber llegado antes que el canal.
+                self.sync_presence();
             }
             AppEvent::GuildRoles { guild_id, roles } => {
                 if let Some(server) = self.servers.iter_mut().find(|s| s.guild_id == guild_id) {
@@ -4574,6 +4990,44 @@ impl App {
             } => {
                 if let Some(server) = self.servers.iter_mut().find(|s| s.has_channel(&channel_id)) {
                     server.apply_forum_page(&channel_id, offset, by_creation, page);
+                }
+            }
+            AppEvent::SidePins { request, messages } => {
+                if let Some(panel) = self.side_tool.as_mut().filter(|p| p.request == request) {
+                    panel.hits = messages.iter().map(side_hit).collect();
+                    panel.total = panel.hits.len() as u32;
+                    panel.loading = false;
+                }
+            }
+            AppEvent::SideSearch {
+                request,
+                total,
+                messages,
+            } => {
+                if let Some(panel) = self.side_tool.as_mut().filter(|p| p.request == request) {
+                    panel.hits = messages.iter().map(side_hit).collect();
+                    panel.total = total;
+                    panel.loading = false;
+                }
+            }
+            AppEvent::SideThreads { request, threads } => {
+                if let Some(panel) = self.side_tool.as_mut().filter(|p| p.request == request) {
+                    panel.threads = threads
+                        .into_iter()
+                        .map(|t| SideThread {
+                            name: t.name.clone().unwrap_or_else(|| "Hilo".to_string()),
+                            replies: t.message_count.unwrap_or(0),
+                            owner_id: t.owner_id.clone(),
+                            id: t.id,
+                        })
+                        .collect();
+                    panel.loading = false;
+                }
+            }
+            AppEvent::SideFailed { request } => {
+                if let Some(panel) = self.side_tool.as_mut().filter(|p| p.request == request) {
+                    panel.loading = false;
+                    panel.failed = true;
                 }
             }
             AppEvent::ForumPostsFailed { channel_id } => {
@@ -4810,6 +5264,7 @@ impl App {
                 self.login_email.clear();
                 self.login_password.clear();
                 self.login_mfa_code.clear();
+                self.clear_register_form();
                 self.login_sms_sent = false;
                 self.pending_mfa = None;
                 if let Some(tx) = self.event_tx.clone() {
@@ -4834,6 +5289,12 @@ impl App {
                 self.pending_mfa = None;
                 self.auth = AuthStatus::PasswordForm;
             }
+            AppEvent::RegisterFailed(message) => {
+                // Se vuelve al formulario con todo lo tipeado intacto (menos
+                // lo que el usuario quiera corregir) y el motivo arriba.
+                self.register_error = Some(message);
+                self.auth = AuthStatus::RegisterForm;
+            }
             AppEvent::PasswordLoginFailed(message) => {
                 self.login_error = Some(message);
                 // Si falló en el paso de 2FA (el ticket sigue siendo
@@ -4846,6 +5307,10 @@ impl App {
                 };
             }
             AppEvent::UserProfileFetched { user_id, profile } => {
+                // Tu propio perfil: lo usa el menú de la barra de usuario.
+                if self.me.as_ref().is_some_and(|m| m.id == user_id) {
+                    self.me_profile = Some(profile.clone());
+                }
                 // Si mientras tanto se cerró la tarjeta, o se abrió la de
                 // otra persona, esta respuesta ya llegó tarde — se
                 // descarta sin tocar nada.
@@ -5517,7 +5982,7 @@ impl App {
                     name: me.display_name().to_string(),
                     avatar_url: me.avatar_url(),
                     avatar_color: self.palette.accent,
-                    status: Status::Online,
+                    status: self.own_status(),
                     is_me: true,
                     activity: activity.clone(),
                 });
@@ -5706,9 +6171,9 @@ impl App {
     /// avatar en la tarjeta de perfil. `None` = no sabemos nada de esa persona.
     pub fn presence_status_of(&self, user_id: &str) -> Option<crate::lib::data::Status> {
         if self.me.as_ref().is_some_and(|me| me.id == user_id) {
-            // No nos llega presencia propia por el Gateway: si estamos
-            // conectados, estamos en línea (igual que `active_now_cards`).
-            return Some(crate::lib::data::Status::Online);
+            // No nos llega presencia propia por el Gateway: se lee de los
+            // ajustes de la cuenta (`status.status`), "En línea" por defecto.
+            return Some(self.own_status());
         }
         if let Some((status, _)) = self.presences.get(user_id) {
             return Some(*status);
@@ -6685,6 +7150,51 @@ impl App {
             microphone_sensitivity: settings.microphone_sensitivity,
             microphone_volume: settings.microphone_volume,
             voice_output_volume: settings.voice_output_volume,
+        }
+    }
+
+    /// Opcode 3: manda el estado visible y el estado personalizado al
+    /// Gateway. El Gateway lo recuerda y lo vuelve a mandar si la sesión se
+    /// re-identifica, así que alcanza con llamarlo cuando algo cambia (al
+    /// elegir estado, al editar el estado personalizado, o al pasar a
+    /// ausente por inactividad / perder el foco).
+    pub fn sync_presence(&mut self) {
+        let idle = self.presence_idle();
+        self.presence_idle_sent = Some(idle);
+        let Some(settings) = self.discord_settings.as_ref() else { return };
+        let update = crate::discord::user_settings::presence_from_settings(settings, idle);
+        self.set_presence(update);
+    }
+
+    /// `true` si la ventana lleva sin foco al menos `PRESENCE_IDLE_AFTER`.
+    pub fn presence_idle(&self) -> bool {
+        self.unfocused_since.is_some_and(|since| since.elapsed() >= PRESENCE_IDLE_AFTER)
+    }
+
+    /// Lleva la cuenta del foco y pasa a ausente / vuelve a en línea. Se
+    /// llama en cada vuelta de `window_logic`; agenda su propio despertar
+    /// para cuando se cumpla la espera.
+    pub fn tick_presence(&mut self, ctx: &egui::Context) {
+        if self.window_focused {
+            self.unfocused_since = None;
+        } else if self.unfocused_since.is_none() {
+            self.unfocused_since = Some(std::time::Instant::now());
+        }
+        let idle = self.presence_idle();
+        if let Some(since) = self.unfocused_since {
+            if !idle {
+                ctx.request_repaint_after(PRESENCE_IDLE_AFTER.saturating_sub(since.elapsed()));
+            }
+        }
+        if self.presence_idle_sent != Some(idle) {
+            self.sync_presence();
+        }
+    }
+
+    /// Opcode 3 ya armado.
+    pub fn set_presence(&self, update: crate::discord::gateway::PresenceUpdate) {
+        if let Some(commands) = &self.gateway_commands {
+            let _ = commands.send(crate::discord::gateway::GatewayCommand::UpdatePresence(update));
         }
     }
 
@@ -8027,6 +8537,8 @@ impl eframe::App for App {
         // de amigos) — ver `ui::profile_popup::request_open`.
         // Menú de clic derecho de volumen por persona (ver `ui::call::audio_menu`).
         self.publish_menu_context(ui.ctx());
+        // Menús del servidor, del canal y del perfil propio (ver `ui::shell::menus`).
+        crate::ui::shell::menus::apply(self, ui.ctx());
         for change in crate::ui::call::audio_menu::take_changes(ui.ctx()) {
             match change {
                 crate::ui::call::audio_menu::AudioChange::Volume(id, percent) => {

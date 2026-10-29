@@ -1142,6 +1142,8 @@ fn server_hover(
     let Some(server) = app.servers.get(index) else {
         return resp;
     };
+    // Clic derecho: menú del servidor (ver `ui::shell::menus`).
+    crate::ui::shell::menus::server_menu(&resp, &server.guild_id);
     if resp.hovered() {
         *want_members = Some(index);
     }

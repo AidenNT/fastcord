@@ -41,10 +41,11 @@
 //!   cada conexión, la API a la que va y quién lo pidió. Lo graba
 //!   `discord_client_rest::netlog`.
 //! - **Cliente** (`client`): resumen del proceso y del sistema, rendimiento,
-//!   memoria, identidad ante Discord (`X-Super-Properties`, `launch_signature`,
-//!   IDs), transmisión (codificador, perfil de NVENC, paquete libx264),
-//!   actualizaciones (estado y reinstalación forzada), entorno, y un informe de
-//!   diagnóstico listo para copiar.
+//!   memoria, seguimiento del Gateway (cuenta regresiva del opcode 41, latidos,
+//!   conexión), catálogo de opcodes del Gateway y de voz (`opcodes`), identidad
+//!   ante Discord (`X-Super-Properties`, `launch_signature`, IDs), transmisión
+//!   (codificador, perfil de NVENC, paquete libx264), actualizaciones (estado y
+//!   reinstalación forzada), entorno, y un informe de diagnóstico listo para copiar.
 //!
 //! Las pruebas de red corren en su propio runtime de tokio (`runtime`), aparte
 //! del hilo de Discord, y avisan a la UI con `request_repaint`. Nada de esto
@@ -54,6 +55,7 @@
 mod client;
 mod console;
 mod discord_api;
+mod opcodes;
 mod style;
 mod traffic;
 
@@ -624,7 +626,7 @@ const INSPECTOR_W: f32 = 330.0;
 const DOCK_H: f32 = 230.0;
 const TOAST_SECS: f32 = 2.2;
 
-const HELP: [&str; 13] = [
+const HELP: [&str; 14] = [
     "Comandos de la consola:",
     "  help                 esta lista",
     "  clear                vacía el registro",
@@ -636,6 +638,7 @@ const HELP: [&str; 13] = [
     "  get <ruta>           pedido a la API de Discord con la sesión, p. ej. get /users/@me",
     "  post|put|patch|delete <ruta> [json]   igual, con método y cuerpo opcional",
     "  toast [ps|app|<aumid>]  prueba de notificación de escritorio (Windows)",
+    "  op [número|texto]    opcodes del Gateway: detalle, plantilla y (op 41) cuánto falta",
     "Las flechas ↑ ↓ recorren el historial. Doble clic en una línea del registro la copia.",
     "Los pedidos de Discord muestran su respuesta completa en la pestaña Discord.",
 ];
@@ -1615,6 +1618,11 @@ impl DevTools {
                     self.discord.quick(ctx, &session, &command, path, body);
                 }
             }
+            "op" | "opcode" => {
+                for text in opcode_lines(rest) {
+                    capture::push(Level::Info, "consola", text);
+                }
+            }
             "toast" => {
                 const ECORD: &str = "dev.ecord.client";
                 const POWERSHELL: &str = r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe";
@@ -1805,10 +1813,23 @@ impl DevTools {
         });
 
         ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("dev_ws_opcodes")
+                .selected_text("Opcodes")
+                .width(70.0)
+                .height(360.0)
+                .show_ui(ui, |ui| {
+                    ui.weak("Carga la plantilla en el campo de envío");
+                    for op in opcodes::templates() {
+                        let label = format!("{:>2} · {}", op.code, op.name);
+                        if ui.selectable_label(false, label).on_hover_text(op.note).clicked() {
+                            self.ws_input = op.template.unwrap_or_default().to_owned();
+                        }
+                    }
+                });
             let response = ui.add_enabled(
                 connected,
                 egui::TextEdit::singleline(&mut self.ws_input)
-                    .desired_width((ui.available_width() - 190.0).max(120.0))
+                    .desired_width((ui.available_width() - 270.0).max(120.0))
                     .hint_text("Texto a enviar (JSON, por ejemplo)"),
             );
             let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -2375,6 +2396,72 @@ fn theme_warn() -> egui::Color32 {
 // ---------------------------------------------------------------------------
 // Piezas de interfaz compartidas
 // ---------------------------------------------------------------------------
+
+/// Texto del comando `op`: sin argumentos, un resumen; con un número, el
+/// detalle de ese opcode del Gateway; con texto, los que lo contengan.
+fn opcode_lines(query: &str) -> Vec<String> {
+    use crate::discord::gateway_tracking;
+
+    fn describe(op: &opcodes::Op) -> Vec<String> {
+        let mut lines = vec![format!(
+            "op {} · {} · {}{}",
+            op.code,
+            op.name,
+            op.dir.label(),
+            if op.deprecated { " · obsoleto" } else { "" }
+        )];
+        lines.push(format!("  en eCord: {}", op.ecord.unwrap_or("todavía no implementado")));
+        if !op.note.is_empty() {
+            lines.push(format!("  {}", op.note));
+        }
+        if let Some(template) = op.template {
+            lines.push(format!("  plantilla: {template}"));
+        }
+        lines
+    }
+
+    let query = query.trim();
+    if query.is_empty() {
+        let missing = opcodes::missing(&opcodes::GATEWAY);
+        return vec![
+            format!(
+                "Gateway: {} opcodes, {} implementados en eCord, {missing} sin implementar.",
+                opcodes::GATEWAY.len(),
+                opcodes::GATEWAY.len() - missing
+            ),
+            "Uso: op <número> (p. ej. op 41) u op <texto> (p. ej. op stream). Más detalle en Cliente → Opcodes.".to_owned(),
+        ];
+    }
+
+    let matches: Vec<&opcodes::Op> = match query.parse::<u8>() {
+        Ok(code) => opcodes::GATEWAY.iter().filter(|op| op.code == code).collect(),
+        Err(_) => {
+            let needle = query.to_lowercase();
+            opcodes::GATEWAY.iter().filter(|op| op.name.to_lowercase().contains(&needle)).collect()
+        }
+    };
+    if matches.is_empty() {
+        return vec![format!("Ningún opcode del Gateway coincide con \"{query}\".")];
+    }
+
+    let mut lines = Vec::new();
+    for op in matches {
+        lines.extend(describe(op));
+        if op.code == 41 {
+            let snap = gateway_tracking::snapshot();
+            lines.push(match (snap.connected, snap.time_spent_next_at) {
+                (true, Some(next)) => format!(
+                    "  próximo tick en {} · {} enviados, {} omitidos",
+                    client::fmt_duration(next.saturating_duration_since(Instant::now())),
+                    snap.time_spent_sent,
+                    snap.time_spent_skipped
+                ),
+                _ => "  sin conexión con el Gateway: no hay cuenta regresiva.".to_owned(),
+            });
+        }
+    }
+    lines
+}
 
 /// Bloque con título sobre la superficie de la paleta: agrupa una sección.
 fn card<R>(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {

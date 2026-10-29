@@ -1,10 +1,12 @@
 use crate::BoxedResult;
 use crate::clearance::{get_clearance_cookie, get_invisible};
+use discord_client_utils::chrome_client_builder;
 use log::warn;
 use regex::Regex;
+use std::sync::Arc;
 use std::time::Duration;
+use wreq::cookie::Jar;
 use wreq::{Client, Proxy, redirect};
-use wreq_util::{Emulation, Platform, Profile};
 
 pub(crate) const DEFAULT_API_VERSION: u8 = 9;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -12,22 +14,35 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub(crate) struct Bootstrap {
     pub client: Client,
+    pub cookie_jar: Arc<Jar>,
     pub api_version: u8,
 }
 
-pub(crate) fn build_emulated_client(proxy: Option<&str>) -> BoxedResult<Client> {
-    let emu = Emulation::builder()
-        .profile(Profile::Chrome149)
-        .platform(Platform::Windows)
-        .build();
+fn seed_default_cookies(jar: &Jar) {
+    const DISCORD_URI: &str = "https://discord.com";
 
-    let mut builder = Client::builder()
-        .emulation(emu)
+    jar.add(
+        "OptanonAlertBoxClosed=2025-11-07T22:31:53.959Z; Domain=discord.com; Path=/",
+        DISCORD_URI,
+    );
+    jar.add("locale=en-US; Domain=discord.com; Path=/", DISCORD_URI);
+    jar.add(
+        "OptanonConsent=isGpcEnabled; Domain=discord.com; Path=/",
+        DISCORD_URI,
+    );
+}
+
+pub(crate) fn build_emulated_client(proxy: Option<&str>) -> BoxedResult<(Client, Arc<Jar>)> {
+    let cookie_jar = Arc::new(Jar::default());
+    seed_default_cookies(&cookie_jar);
+    // La emulación (Chrome/plataforma) vive en `discord_client_utils`, así
+    // REST, clearance y super properties comparten una sola versión.
+    let mut builder = chrome_client_builder()
         .gzip(true)
         .deflate(true)
         .brotli(true)
         .zstd(true)
-        .cookie_store(true)
+        .cookie_provider(cookie_jar.clone())
         .redirect(redirect::Policy::default())
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT);
@@ -49,7 +64,7 @@ pub(crate) fn build_emulated_client(proxy: Option<&str>) -> BoxedResult<Client> 
         builder = builder.proxy(Proxy::all(proxy)?);
     }
 
-    Ok(builder.build()?)
+    Ok((builder.build()?, cookie_jar))
 }
 
 pub(crate) fn build_bot_client(proxy: Option<&str>) -> BoxedResult<Client> {
@@ -134,7 +149,7 @@ pub(crate) async fn bootstrap_client(
     custom_api_version: Option<u8>,
     proxy: Option<&str>,
 ) -> BoxedResult<Bootstrap> {
-    let client = build_emulated_client(proxy)?;
+    let (client, cookie_jar) = build_emulated_client(proxy)?;
     let body = fetch_app_shell(&client).await?;
 
     let api_version = match custom_api_version {
@@ -146,6 +161,7 @@ pub(crate) async fn bootstrap_client(
 
     Ok(Bootstrap {
         client,
+        cookie_jar,
         api_version,
     })
 }

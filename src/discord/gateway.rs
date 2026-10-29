@@ -36,6 +36,7 @@
 //! la cuenta si lo detectan es real.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use flate2::{Decompress, FlushDecompress, Status};
@@ -48,6 +49,7 @@ use url::Url;
 
 use crate::discord::AppEvent;
 use crate::discord::fingerprint::{self, ClientFingerprint};
+use crate::discord::gateway_tracking::{self as tracking, SendReason, SkipReason};
 use crate::discord::models::{
     Channel, GatewayMessage, GatewayPayload, GuildCreatePayload, GuildMemberUpdate, GuildMembersChunk,
     MemberListMember, MemberListUpdate, MessageUpdate, PresenceEvent, ReactionEvent, ReadyPayload, Role, ThreadChannel,
@@ -103,7 +105,83 @@ fn through_mock(mock: &str, real_url: &str) -> anyhow::Result<String> {
 /// sesión es un bot y no manda esos eventos — quedaría la lista de amigos
 /// siempre en "desconectado". Portado tal cual de Concord (ver el
 /// comentario original ahí para el desglose bit por bit).
-const USER_ACCOUNT_CAPABILITIES: u64 = 253;
+const USER_ACCOUNT_CAPABILITIES: u64 = 1767421;
+
+/// `qos_token` del `IDENTIFY`: siempre el mismo (protobuf vacío `0a 00` en
+/// base64). NO se guarda ni se reemplaza por el que devuelve el `READY`.
+const QOS_TOKEN: &str = "CgA=";
+
+/// Versión del latido de QoS que usa el cliente oficial (`qos.ver`).
+const QOS_HEARTBEAT_VERSION: u32 = 31;
+
+/// Cada cuánto se manda el opcode 41 (`Update Time Spent Session ID`) si la
+/// ventana tiene foco o hay una llamada de voz. Además se manda una vez al
+/// conectar.
+const TIME_SPENT_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+/// Estado que Discord quiere saber en cada QoS heartbeat (`qos.reasons`) y
+/// que decide si el opcode 41 corresponde. Lo actualiza la UI cada frame con
+/// [`set_qos_state`].
+static QOS_FOCUSED: AtomicBool = AtomicBool::new(true);
+static QOS_IN_VOICE: AtomicBool = AtomicBool::new(false);
+
+/// La UI avisa si la ventana tiene foco y si hay una llamada de voz activa.
+pub fn set_qos_state(focused: bool, in_voice: bool) {
+    QOS_FOCUSED.store(focused, Ordering::Relaxed);
+    QOS_IN_VOICE.store(in_voice, Ordering::Relaxed);
+}
+
+/// Por qué el opcode 41 NO saldría en este momento, o `None` si saldría.
+/// Es la misma regla que usa el temporizador de [`connect_and_run`] y que
+/// muestran las devtools (Cliente → Seguimiento), así no pueden divergir.
+pub fn time_spent_skip_reason(established: bool) -> Option<SkipReason> {
+    let active = QOS_FOCUSED.load(Ordering::Relaxed) || QOS_IN_VOICE.load(Ordering::Relaxed);
+    if !established {
+        Some(SkipReason::NotEstablished)
+    } else if !active {
+        Some(SkipReason::Inactive)
+    } else if !qos_heartbeat_enabled() {
+        Some(SkipReason::QosDisabled)
+    } else {
+        None
+    }
+}
+
+/// Lo que la UI le avisó al gateway: (ventana con foco, hay llamada de voz).
+pub fn qos_state() -> (bool, bool) {
+    (QOS_FOCUSED.load(Ordering::Relaxed), QOS_IN_VOICE.load(Ordering::Relaxed))
+}
+
+/// Los `reasons` que llevaría un QoS heartbeat si se mandara ahora.
+pub fn current_qos_reasons() -> Vec<&'static str> {
+    qos_reasons()
+}
+
+/// El latido que se usa: QoS (opcode 40) o el clásico (opcode 1, de respaldo).
+pub fn heartbeat_opcode() -> u8 {
+    if qos_heartbeat_enabled() { 40 } else { 1 }
+}
+
+/// Cada cuánto se manda el opcode 41 (para mostrarlo en las devtools).
+pub const fn time_spent_interval() -> Duration {
+    TIME_SPENT_INTERVAL
+}
+
+/// `foregrounded` si la ventana tiene foco, `rtc_connected` si hay llamada.
+fn qos_reasons() -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+    if QOS_FOCUSED.load(Ordering::Relaxed) {
+        reasons.push("foregrounded");
+    }
+    if QOS_IN_VOICE.load(Ordering::Relaxed) {
+        reasons.push("rtc_connected");
+    }
+    reasons
+}
+
+/// Variable de entorno para volver al heartbeat clásico (opcode 1) si algún
+/// día el QoS heartbeat (opcode 40) diera problemas: `ECORD_QOS_HEARTBEAT=0`.
+const ENV_QOS_HEARTBEAT: &str = "ECORD_QOS_HEARTBEAT";
 
 const RECONNECT_BASE_DELAY: Duration = Duration::from_millis(500);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
@@ -222,6 +300,11 @@ pub enum GatewayCommand {
     /// (`guild:<guild>:<canal>:<usuario>` o `call:<canal>:<usuario>`).
     /// Discord responde con `STREAM_CREATE` + `STREAM_SERVER_UPDATE`.
     StreamWatch { stream_key: String },
+    /// Opcode 3 (`PRESENCE_UPDATE`): cambiar el estado visible (en línea,
+    /// ausente, no molestar, invisible) y las actividades, entre ellas el
+    /// estado personalizado. Se recuerda para volver a mandarlo si la sesión
+    /// se re-identifica.
+    UpdatePresence(PresenceUpdate),
     /// Cerrar esta conexión y terminar `run` sin reintentar (la app volvió
     /// a la pantalla de login).
     Shutdown,
@@ -290,6 +373,104 @@ fn search_members_payload(guild_id: &str, query: &str) -> String {
     .to_string()
 }
 
+/// Estado visible de la cuenta, tal cual lo espera el opcode 3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresenceStatus {
+    Online,
+    Idle,
+    Dnd,
+    Invisible,
+}
+
+impl PresenceStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Online => "online",
+            Self::Idle => "idle",
+            Self::Dnd => "dnd",
+            Self::Invisible => "invisible",
+        }
+    }
+
+    /// Acepta el valor que guarda Discord en los ajustes (`"online"`, ...).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "online" => Some(Self::Online),
+            "idle" => Some(Self::Idle),
+            "dnd" => Some(Self::Dnd),
+            "invisible" | "offline" => Some(Self::Invisible),
+            _ => None,
+        }
+    }
+}
+
+/// Estado personalizado (actividad de tipo 4).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CustomStatus {
+    pub text: String,
+    /// Emoji unicode (`emoji_name` solo) o personalizado (`emoji_name` + `emoji_id`).
+    pub emoji_name: Option<String>,
+    pub emoji_id: Option<String>,
+    /// Vencimiento en ISO 8601 (`2026-10-25T20:00:00.000Z`); `None` = no vence.
+    pub expires_at: Option<String>,
+}
+
+/// Todo lo que viaja en un opcode 3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresenceUpdate {
+    pub status: PresenceStatus,
+    pub custom_status: Option<CustomStatus>,
+    /// Otras actividades ya armadas (`{"type":0,"name":...}`), si hay.
+    pub extra_activities: Vec<Value>,
+    /// Marca de "ausente desde" en ms epoch; `None` => 0 (el cliente oficial
+    /// manda 0 salvo al quedar ausente por inactividad).
+    pub since: Option<u64>,
+    pub afk: bool,
+}
+
+impl PresenceUpdate {
+    pub fn new(status: PresenceStatus) -> Self {
+        Self { status, custom_status: None, extra_activities: Vec::new(), since: None, afk: false }
+    }
+}
+
+/// Opcode 3: mismo shape que el cliente oficial
+/// (`{"status","since","activities","afk"}`).
+fn update_presence_payload(update: &PresenceUpdate) -> String {
+    let mut activities: Vec<Value> = Vec::new();
+    if let Some(custom) = update.custom_status.as_ref().filter(|c| {
+        !c.text.trim().is_empty() || c.emoji_name.is_some()
+    }) {
+        let mut activity = serde_json::json!({
+            "type": 4,
+            "name": "Custom Status",
+            "state": custom.text,
+        });
+        if let Some(name) = &custom.emoji_name {
+            let mut emoji = serde_json::json!({ "name": name });
+            if let Some(id) = &custom.emoji_id {
+                emoji["id"] = Value::String(id.clone());
+            }
+            activity["emoji"] = emoji;
+        }
+        if let Some(expires) = &custom.expires_at {
+            activity["expires_at"] = Value::String(expires.clone());
+        }
+        activities.push(activity);
+    }
+    activities.extend(update.extra_activities.iter().cloned());
+    serde_json::json!({
+        "op": 3,
+        "d": {
+            "status": update.status.as_str(),
+            "since": update.since.unwrap_or(0),
+            "activities": activities,
+            "afk": update.afk,
+        },
+    })
+    .to_string()
+}
+
 /// Opcode 4: `guild_id` va en null para una llamada de DM/grupo (Discord
 /// indexa esas por `channel_id` en el propio voice state).
 fn update_voice_state_payload(
@@ -305,6 +486,8 @@ fn update_voice_state_payload(
             "channel_id": channel_id,
             "self_mute": self_mute,
             "self_deaf": self_deaf,
+            "self_video": false,
+            "flags": 2,
         },
     })
     .to_string()
@@ -349,12 +532,15 @@ fn stream_set_paused_payload(stream_key: &str, paused: bool) -> String {
     serde_json::json!({ "op": 22, "d": { "stream_key": stream_key, "paused": paused } }).to_string()
 }
 
+/// `properties` del IDENTIFY, en el mismo orden de campos que manda el cliente
+/// web (serde respeta el orden de declaración del struct).
 #[derive(Serialize)]
 struct IdentifyProperties<'a> {
     os: &'a str,
     browser: &'static str,
     device: &'static str,
     system_locale: &'a str,
+    has_client_mods: bool,
     browser_user_agent: &'a str,
     browser_version: &'static str,
     os_version: &'a str,
@@ -364,58 +550,159 @@ struct IdentifyProperties<'a> {
     referring_domain_current: &'static str,
     release_channel: &'static str,
     client_build_number: u64,
+    client_event_source: Option<String>,
+    client_launch_id: &'a str,
+    launch_signature: &'a str,
+    client_app_state: &'static str,
+    is_fast_connect: bool,
+    gateway_connect_reasons: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     installation_id: Option<String>,
 }
 
+#[derive(Serialize)]
+struct IdentifyPresence {
+    since: u64,
+    activities: [(); 0],
+    status: &'static str,
+    afk: bool,
+}
+
+#[derive(Serialize)]
+struct IdentifyClientState {
+    guild_versions: serde_json::Map<String, Value>,
+    highest_last_message_id: &'static str,
+    read_state_version: i64,
+    user_guild_settings_version: i64,
+    user_settings_version: i64,
+    private_channels_version: &'static str,
+    api_code_version: i64,
+}
+
+#[derive(Serialize)]
+struct IdentifyData<'a> {
+    token: &'a str,
+    capabilities: u64,
+    properties: IdentifyProperties<'a>,
+    presence: IdentifyPresence,
+    // `zlib-stream` ya va en la URL; este flag es un modo de compresión de
+    // IDENTIFY aparte que el cliente web no usa.
+    compress: bool,
+    // Ningún campo de "versión de caché" real: como no guardamos el estado
+    // entre reinicios de la app, un `IDENTIFY` siempre arranca de cero.
+    client_state: IdentifyClientState,
+    // Token de QoS fijo (`QOS_TOKEN`). Va dentro del `d` del IDENTIFY.
+    qos_token: &'a str,
+}
+
+#[derive(Serialize)]
+struct IdentifyPayload<'a> {
+    op: u8,
+    d: IdentifyData<'a>,
+}
+
 fn build_identify_payload(token: &str, fp: &ClientFingerprint) -> String {
-    let properties = IdentifyProperties {
-        os: fp.os,
-        browser: fingerprint::CLIENT_BROWSER,
-        device: "",
-        system_locale: &fp.system_locale,
-        browser_user_agent: &fp.user_agent,
-        browser_version: fingerprint::CLIENT_BROWSER_VERSION,
-        os_version: &fp.os_version,
-        referrer: "",
-        referring_domain: "",
-        referrer_current: fingerprint::DISCORD_REFERRER_CURRENT,
-        referring_domain_current: fingerprint::DISCORD_REFERRING_DOMAIN_CURRENT,
-        release_channel: "stable",
-        client_build_number: fp.client_build_number,
-        installation_id: fp.installation_id(),
-    };
-    serde_json::json!({
-        "op": 2,
-        "d": {
-            "token": token,
-            "capabilities": USER_ACCOUNT_CAPABILITIES,
-            "properties": properties,
-            "presence": { "since": 0, "activities": [], "status": "online", "afk": false },
-            // `zlib-stream` ya va en la URL; este flag es un modo de
-            // compresión de IDENTIFY aparte que el cliente web no usa.
-            "compress": false,
-            // Ningún campo de "versión de caché" real: como no guardamos
-            // el estado entre reinicios de la app (a diferencia del
-            // navegador, que sí lo hace), un `IDENTIFY` siempre arranca
-            // de cero. Es exactamente lo mismo que ya hacía este cliente
-            // antes de este cambio, no una regresión.
-            "client_state": {
-                "guild_versions": {},
-                "highest_last_message_id": "0",
-                "read_state_version": 0,
-                "user_guild_settings_version": -1,
-                "user_settings_version": -1,
-                "private_channels_version": "0",
-                "api_code_version": 0,
+    let payload = IdentifyPayload {
+        op: 2,
+        d: IdentifyData {
+            token,
+            capabilities: USER_ACCOUNT_CAPABILITIES,
+            properties: IdentifyProperties {
+                os: fp.os,
+                browser: fingerprint::CLIENT_BROWSER,
+                device: "",
+                system_locale: &fp.system_locale,
+                has_client_mods: false,
+                browser_user_agent: &fp.user_agent,
+                browser_version: fingerprint::CLIENT_BROWSER_VERSION,
+                os_version: &fp.os_version,
+                referrer: "",
+                referring_domain: "",
+                referrer_current: fingerprint::DISCORD_REFERRER_CURRENT,
+                referring_domain_current: fingerprint::DISCORD_REFERRING_DOMAIN_CURRENT,
+                release_channel: "stable",
+                client_build_number: fp.client_build_number,
+                client_event_source: None,
+                client_launch_id: fp.client_launch_id(),
+                launch_signature: fp.launch_signature(),
+                // La web conecta el gateway antes de que la pestaña tenga foco.
+                client_app_state: "unfocused",
+                is_fast_connect: false,
+                gateway_connect_reasons: "AppSkeleton",
+                installation_id: fp.installation_id(),
             },
+            presence: IdentifyPresence { since: 0, activities: [], status: "unknown", afk: false },
+            compress: false,
+            client_state: IdentifyClientState {
+                guild_versions: serde_json::Map::new(),
+                highest_last_message_id: "0",
+                read_state_version: 0,
+                user_guild_settings_version: -1,
+                user_settings_version: -1,
+                private_channels_version: "0",
+                api_code_version: 0,
+            },
+            qos_token: QOS_TOKEN,
+        },
+    };
+    serde_json::to_string(&payload).expect("identify payload serializes")
+}
+
+fn build_resume_payload(token: &str, session_id: &str, sequence: u64) -> String {
+    serde_json::json!({ "op": 6, "d": { "token": token, "session_id": session_id, "seq": sequence } }).to_string()
+}
+
+/// `QoS Heartbeat` (opcode 40): el latido del cliente oficial, que además
+/// del `seq` informa su estado (`active` y los motivos, p. ej.
+/// `foregrounded` o `rtc_connected`). Discord lo contesta con el mismo
+/// Heartbeat ACK (opcode 11) que al opcode 1.
+fn build_qos_heartbeat_payload(sequence: Option<u64>, active: bool, reasons: &[&str]) -> String {
+    serde_json::json!({
+        "op": 40,
+        "d": {
+            "seq": sequence,
+            "qos": { "ver": QOS_HEARTBEAT_VERSION, "active": active, "reasons": reasons },
         },
     })
     .to_string()
 }
 
-fn build_resume_payload(token: &str, session_id: &str, sequence: u64) -> String {
-    serde_json::json!({ "op": 6, "d": { "token": token, "session_id": session_id, "seq": sequence } }).to_string()
+/// `Update Time Spent Session ID` (opcode 41): sirve para medir cuánto tiempo
+/// pasa el usuario en la sesión. Se manda al conectar y cada 30 minutos (con
+/// foco o en llamada), y siempre acompañado de un QoS heartbeat.
+fn build_time_spent_payload(fp: &ClientFingerprint) -> String {
+    serde_json::json!({
+        "op": 41,
+        "d": {
+            "initialization_timestamp": fp.client_heartbeat_session_initialized_ms(),
+            "session_id": fp.client_heartbeat_session_id(),
+            "client_launch_id": fp.client_launch_id(),
+        },
+    })
+    .to_string()
+}
+
+/// Heartbeat clásico (opcode 1), solo como respaldo (`ECORD_QOS_HEARTBEAT=0`).
+fn build_classic_heartbeat_payload(sequence: Option<u64>) -> String {
+    serde_json::json!({ "op": 1, "d": sequence }).to_string()
+}
+
+fn qos_heartbeat_enabled() -> bool {
+    !matches!(
+        std::env::var(ENV_QOS_HEARTBEAT).as_deref(),
+        Ok("0" | "false" | "off")
+    )
+}
+
+/// Latido a mandar según la configuración: QoS (opcode 40) por defecto.
+fn build_heartbeat_payload(sequence: Option<u64>) -> String {
+    if qos_heartbeat_enabled() {
+        let reasons = qos_reasons();
+        // `active`: la sesión tiene algún motivo de servicio (ver docs).
+        build_qos_heartbeat_payload(sequence, !reasons.is_empty(), &reasons)
+    } else {
+        build_classic_heartbeat_payload(sequence)
+    }
 }
 
 /// Qué hacer después de que una conexión termina (se cortó el socket, o
@@ -483,6 +770,9 @@ pub async fn run(
     // Sobrevive a las reconexiones: si la sesión se re-identifica hay que
     // volver a suscribirse a la lista de miembros que se estaba viendo.
     let mut member_list: Option<MemberListSubscription> = None;
+    // Última presencia pedida: una sesión nueva arranca en `unknown`, así que
+    // se vuelve a mandar apenas llega el READY.
+    let mut presence: Option<PresenceUpdate> = None;
     let mut backoff = RECONNECT_BASE_DELAY;
     // Se resetea cada vez que una conexión llega a establecerse de
     // verdad (READY/RESUMED) — así "5 cortes en 3 horas, cada uno
@@ -504,8 +794,10 @@ pub async fn run(
             &mut established,
             &mut commands,
             &mut member_list,
+            &mut presence,
         )
         .await;
+        tracking::connection_closed();
 
         // Cierre pedido por la UI (volvió al login): salir en silencio, sin
         // toasts ni reintentos.
@@ -575,6 +867,7 @@ async fn connect_and_run(
     established: &mut bool,
     commands: &mut UnboundedReceiver<GatewayCommand>,
     member_list: &mut Option<MemberListSubscription>,
+    presence: &mut Option<PresenceUpdate>,
 ) -> anyhow::Result<Outcome> {
     let url = if session.can_resume() {
         session.resume_url.clone().unwrap_or_else(|| GATEWAY_URL.to_string())
@@ -610,6 +903,11 @@ async fn connect_and_run(
     let mut heartbeat = tokio::time::interval(Duration::from_secs(3600));
     heartbeat.tick().await;
     let mut awaiting_ack = false;
+    // Opcode 41 cada 30 minutos (el primer tick sale al instante: se descarta;
+    // el envío "al conectar" se hace al llegar el READY / RESUMED).
+    let mut time_spent = tokio::time::interval(TIME_SPENT_INTERVAL);
+    time_spent.tick().await;
+    tracking::connection_opened(TIME_SPENT_INTERVAL);
 
     loop {
         let msg = tokio::select! {
@@ -625,9 +923,26 @@ async fn connect_and_run(
                     // esperando un ACK que ya no va a llegar.
                     return Ok(Outcome::Resume);
                 }
-                let hb = serde_json::json!({ "op": 1, "d": session.sequence });
-                write.send(Message::Text(hb.to_string().into())).await?;
+                let hb = build_heartbeat_payload(session.sequence);
+                write.send(Message::Text(hb.into())).await?;
                 awaiting_ack = true;
+                tracking::heartbeat_tick();
+                tracking::heartbeat_sent();
+                continue;
+            }
+            _ = time_spent.tick() => {
+                // Solo con foco o en llamada, como el cliente oficial, y solo
+                // con QoS heartbeat (el opcode 41 va con su latido de QoS).
+                match time_spent_skip_reason(*established) {
+                    None => {
+                        write.send(Message::Text(build_time_spent_payload(fingerprint).into())).await?;
+                        write.send(Message::Text(build_heartbeat_payload(session.sequence).into())).await?;
+                        awaiting_ack = true;
+                        tracking::time_spent_sent(SendReason::Timer, TIME_SPENT_INTERVAL);
+                        tracking::heartbeat_sent();
+                    }
+                    Some(reason) => tracking::time_spent_skipped(reason, TIME_SPENT_INTERVAL),
+                }
                 continue;
             }
             // Un pedido de la UI. Si el canal de comandos se cierra,
@@ -701,6 +1016,19 @@ async fn connect_and_run(
                         let payload = stream_delete_payload(&stream_key);
                         write.send(Message::Text(payload.into())).await?;
                     }
+                    GatewayCommand::UpdatePresence(update) => {
+                        // Igual que la suscripción de miembros: antes del
+                        // READY queda guardada y sale con él; ya
+                        // establecida, se manda al instante (sin repetir lo
+                        // que ya está vigente).
+                        if presence.as_ref() != Some(&update) {
+                            let payload = update_presence_payload(&update);
+                            *presence = Some(update);
+                            if *established {
+                                write.send(Message::Text(payload.into())).await?;
+                            }
+                        }
+                    }
                     GatewayCommand::Shutdown => return Ok(Outcome::Stop),
                     GatewayCommand::StreamSetPaused { stream_key, paused } => {
                         let payload = stream_set_paused_payload(&stream_key, paused);
@@ -740,6 +1068,7 @@ async fn connect_and_run(
         drop(text);
         if let Some(s) = payload.s {
             session.sequence = Some(s);
+            tracking::sequence(session.sequence);
         }
 
         match payload.op {
@@ -753,6 +1082,7 @@ async fn connect_and_run(
                 heartbeat = tokio::time::interval(Duration::from_millis(interval_ms));
                 tokio::time::sleep(Duration::from_millis(jitter)).await;
                 heartbeat.reset();
+                tracking::hello(Duration::from_millis(interval_ms));
 
                 crate::discord::step(
                     tx,
@@ -774,13 +1104,17 @@ async fn connect_and_run(
                 write.send(Message::Text(hello_payload.into())).await?;
             }
             // Heartbeat ACK.
-            11 => awaiting_ack = false,
+            11 => {
+                awaiting_ack = false;
+                tracking::heartbeat_ack();
+            }
             // Discord puede pedir un heartbeat inmediato (fuera del
             // intervalo normal) mandando este opcode.
             1 => {
-                let hb = serde_json::json!({ "op": 1, "d": session.sequence });
-                write.send(Message::Text(hb.to_string().into())).await?;
+                let hb = build_heartbeat_payload(session.sequence);
+                write.send(Message::Text(hb.into())).await?;
                 awaiting_ack = true;
+                tracking::heartbeat_sent();
             }
             // Dispatch: acá viajan `READY`, `MESSAGE_CREATE`, etc.
             //
@@ -798,6 +1132,15 @@ async fn connect_and_run(
                     // este dispatch, sin más datos que el nombre, es la
                     // única confirmación de que la sesión quedó viva.
                     *established = true;
+                    tracking::established();
+                    if qos_heartbeat_enabled() {
+                        write.send(Message::Text(build_time_spent_payload(fingerprint).into())).await?;
+                        write.send(Message::Text(build_heartbeat_payload(session.sequence).into())).await?;
+                        awaiting_ack = true;
+                        time_spent.reset();
+                        tracking::time_spent_sent(SendReason::Resumed, TIME_SPENT_INTERVAL);
+                        tracking::heartbeat_sent();
+                    }
                 }
                 // `GUILD_CREATE` llega uno por server (100+ de golpe tras el
                 // `READY`): se parsea directo a structs tipados desde el
@@ -854,11 +1197,27 @@ async fn connect_and_run(
                     // pudo leer, escondiendo el problema en vez de
                     // mostrarlo.
                     *established = true;
+                    tracking::established();
+                    // Opcode 41 "al conectar" + su QoS heartbeat.
+                    if qos_heartbeat_enabled() {
+                        write.send(Message::Text(build_time_spent_payload(fingerprint).into())).await?;
+                        write.send(Message::Text(build_heartbeat_payload(session.sequence).into())).await?;
+                        awaiting_ack = true;
+                        time_spent.reset();
+                        tracking::time_spent_sent(SendReason::Ready, TIME_SPENT_INTERVAL);
+                        tracking::heartbeat_sent();
+                    }
                     // Una sesión nueva arranca sin suscripciones: volver a
                     // pedir la lista de miembros que se estaba viendo. (Un
                     // RESUME conserva las de la sesión anterior.)
                     if let Some(subscription) = member_list.as_ref() {
                         let payload = member_list_subscribe_payload(subscription);
+                        write.send(Message::Text(payload.into())).await?;
+                    }
+                    // Idem con la presencia: sin esto la sesión se queda en
+                    // `unknown` (el IDENTIFY la manda así).
+                    if let Some(update) = presence.as_ref() {
+                        let payload = update_presence_payload(update);
                         write.send(Message::Text(payload.into())).await?;
                     }
                 }
@@ -1668,5 +2027,96 @@ mod mock_url_tests {
     #[test]
     fn through_mock_rechaza_una_url_invalida() {
         assert!(through_mock("no es una url", "wss://gateway.discord.gg/").is_err());
+    }
+}
+#[cfg(test)]
+mod qos_tests {
+    use super::*;
+    use serde_json::Value;
+
+    #[test]
+    fn qos_heartbeat_has_op_40_and_qos_block() {
+        let v: Value = serde_json::from_str(&build_qos_heartbeat_payload(Some(1337), true, &["foregrounded"])).unwrap();
+        assert_eq!(v["op"], 40);
+        assert_eq!(v["d"]["seq"], 1337);
+        assert_eq!(v["d"]["qos"]["ver"], 31);
+        assert_eq!(v["d"]["qos"]["active"], true);
+        assert_eq!(v["d"]["qos"]["reasons"][0], "foregrounded");
+    }
+
+    #[test]
+    fn qos_heartbeat_without_sequence_sends_null_seq() {
+        let v: Value = serde_json::from_str(&build_qos_heartbeat_payload(None, true, &[])).unwrap();
+        assert!(v["d"]["seq"].is_null());
+        assert!(v["d"]["qos"]["reasons"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn qos_reasons_follow_state() {
+        set_qos_state(true, false);
+        assert_eq!(qos_reasons(), vec!["foregrounded"]);
+        set_qos_state(true, true);
+        assert_eq!(qos_reasons(), vec!["foregrounded", "rtc_connected"]);
+        set_qos_state(false, false);
+        assert!(qos_reasons().is_empty());
+        set_qos_state(true, false);
+    }
+
+    #[test]
+    fn time_spent_payload_is_op_41() {
+        let fp = ClientFingerprint::new(1);
+        let v: Value = serde_json::from_str(&build_time_spent_payload(&fp)).unwrap();
+        assert_eq!(v["op"], 41);
+        assert_eq!(v["d"]["session_id"], fp.client_heartbeat_session_id());
+        assert_eq!(v["d"]["client_launch_id"], fp.client_launch_id());
+        assert!(v["d"]["initialization_timestamp"].as_u64().unwrap() > 0);
+        assert_eq!(TIME_SPENT_INTERVAL, Duration::from_secs(1800));
+    }
+
+    #[test]
+    fn qos_token_is_fixed() {
+        assert_eq!(QOS_TOKEN, "CgA=");
+    }
+}
+
+#[cfg(test)]
+mod presence_tests {
+    use super::*;
+
+    #[test]
+    fn presence_payload_matches_official_client() {
+        let update = PresenceUpdate::new(PresenceStatus::Idle);
+        let v: Value = serde_json::from_str(&update_presence_payload(&update)).unwrap();
+        assert_eq!(v["op"], 3);
+        assert_eq!(v["d"]["status"], "idle");
+        assert_eq!(v["d"]["since"], 0);
+        assert_eq!(v["d"]["afk"], false);
+        assert_eq!(v["d"]["activities"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn presence_payload_includes_custom_status() {
+        let mut update = PresenceUpdate::new(PresenceStatus::Dnd);
+        update.custom_status = Some(CustomStatus {
+            text: "Never meant for all of this".into(),
+            emoji_name: Some("🎧".into()),
+            emoji_id: None,
+            expires_at: None,
+        });
+        let v: Value = serde_json::from_str(&update_presence_payload(&update)).unwrap();
+        let activity = &v["d"]["activities"][0];
+        assert_eq!(activity["type"], 4);
+        assert_eq!(activity["name"], "Custom Status");
+        assert_eq!(activity["state"], "Never meant for all of this");
+        assert_eq!(activity["emoji"]["name"], "🎧");
+        assert!(activity.get("expires_at").is_none());
+    }
+
+    #[test]
+    fn presence_payload_skips_empty_custom_status() {
+        let mut update = PresenceUpdate::new(PresenceStatus::Online);
+        update.custom_status = Some(CustomStatus::default());
+        let v: Value = serde_json::from_str(&update_presence_payload(&update)).unwrap();
+        assert_eq!(v["d"]["activities"], serde_json::json!([]));
     }
 }

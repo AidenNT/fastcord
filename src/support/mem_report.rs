@@ -814,7 +814,9 @@ heap_struct!(crate::discord::models::User {
     banner_color,
     primary_guild,
     clan,
-    display_name_styles
+    display_name_styles,
+    email,
+    phone
 });
 heap_struct!(crate::discord::models::Attachment {
     id,

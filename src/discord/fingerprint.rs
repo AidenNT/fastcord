@@ -57,6 +57,9 @@ pub(crate) struct ClientFingerprint {
     launch_signature: String,
     client_launch_id: String,
     client_heartbeat_session_id: String,
+    /// Unix ms de cuando se generó `client_heartbeat_session_id` (es el
+    /// `initialization_timestamp` del opcode 41 del gateway).
+    client_heartbeat_session_initialized_ms: u64,
 }
 
 impl ClientFingerprint {
@@ -76,7 +79,18 @@ impl ClientFingerprint {
             launch_signature: generate_launch_signature(),
             client_launch_id: Uuid::new_v4().to_string(),
             client_heartbeat_session_id: Uuid::new_v4().to_string(),
+            client_heartbeat_session_initialized_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or_default(),
         }
+    }
+
+    /// El `X-Fingerprint` anónimo que Discord entregó en `/experiments`
+    /// (`None` si todavía no se consiguió). `POST /auth/register` lo repite
+    /// también dentro del cuerpo.
+    pub(crate) fn anonymous_fingerprint(&self) -> Option<&str> {
+        self.anonymous_fingerprint.as_deref()
     }
 
     fn apply_session_identifiers(&mut self, identifiers: SessionIdentifiers) {
@@ -106,6 +120,28 @@ impl ClientFingerprint {
             client_build_number: self.client_build_number,
             user_agent: self.user_agent.clone(),
         }
+    }
+
+    /// UUID de este arranque (`client_launch_id` de las super properties).
+    pub(super) fn client_launch_id(&self) -> &str {
+        &self.client_launch_id
+    }
+
+    /// `client_heartbeat_session_id` de las super properties (el mismo UUID
+    /// que va en el opcode 41 del gateway).
+    pub(super) fn client_heartbeat_session_id(&self) -> &str {
+        &self.client_heartbeat_session_id
+    }
+
+    /// Unix ms de cuando se generó `client_heartbeat_session_id`.
+    pub(super) fn client_heartbeat_session_initialized_ms(&self) -> u64 {
+        self.client_heartbeat_session_initialized_ms
+    }
+
+    /// `launch_signature` de este arranque (mismo valor que viaja en el
+    /// `X-Super-Properties` de REST, así el gateway no declara otro distinto).
+    pub(super) fn launch_signature(&self) -> &str {
+        &self.launch_signature
     }
 
     pub(super) fn installation_id(&self) -> Option<String> {

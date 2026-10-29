@@ -24,7 +24,9 @@ use crate::discord::{VoiceAudioSettings, VoiceVolumePercent};
 use crate::lib::state::{App, NotificationSide};
 use crate::ui::theme::{self, Icon, Palette, ThemeDef, ThemeMode};
 
-const CARD_SIZE: Vec2 = Vec2::new(760.0, 640.0);
+const CARD_SIZE: Vec2 = Vec2::new(980.0, 640.0);
+/// Ancho de la barra lateral de ajustes.
+const NAV_W: f32 = 232.0;
 
 /// Pestaña activa del panel. `Voice` refresca la lista de dispositivos
 /// cada vez que se entra (ver el `Action::SetTab` de más abajo), así que
@@ -34,9 +36,17 @@ pub enum SettingsTab {
     #[default]
     Appearance,
     Voice,
-    /// Ajustes de la cuenta (`PreloadedUserSettings`) en SOLO LECTURA: no
-    /// tiene ninguna `Action`, ver `ui::settings::account_settings`.
+    /// Editor de tu perfil con vista previa (`account_settings::profile_view`).
+    Profile,
+    /// Privacidad y seguridad de la cuenta (interruptores que se guardan).
+    Privacy,
+    /// Notificaciones de la cuenta (interruptores que se guardan).
+    Notifications,
+    /// Mi cuenta: datos editables, contraseña y cuentas guardadas, ver
+    /// `ui::settings::account_settings`.
     Account,
+    /// Dispositivos con sesión abierta en la cuenta.
+    Devices,
     /// Contador de memoria (RAM, GPU y caché en disco), ver `ui::settings::memory_view`.
     Memory,
     /// Calculadora de permisos de Discord, ver `ui::server::permissions_calc`.
@@ -75,6 +85,8 @@ enum Action {
     OpenCleanMic,
     /// Cambiar de cuenta, agregar otra o cerrar sesión (Ajustes → Cuenta).
     Account(crate::ui::auth::accounts::AccountAction),
+    /// Lo que piden las páginas que editan la cuenta (`account_settings`).
+    Page(account_settings::PageAction),
 }
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
@@ -95,12 +107,19 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let voice_audio = app.voice.audio.clone();
     let voice_audio_sources = app.voice.audio_sources.clone();
     let voice_audio_source_options = app.voice_audio_source_options.clone();
-    // Solo se arma cuando se está viendo la pestaña: son unas pocas filas
-    // de texto, pero no vale la pena recalcularlas cada frame si no se ven
-    // (y así evitamos clonar `discord_settings`, que puede ser grande).
-    let account_loaded = app.discord_settings.is_some();
-    let account_sections =
-        (tab == SettingsTab::Account).then(|| account_settings::build(app.me.as_ref(), app.discord_settings.as_ref()));
+    // Lo que necesitan las páginas de la cuenta (datos, interruptores,
+    // dispositivos), copiado de `App` antes de dibujar. Solo se arma en las
+    // pestañas que lo usan: no vale la pena clonarlo cada frame si no se ve.
+    let account_snapshot = matches!(
+        tab,
+        SettingsTab::Account
+            | SettingsTab::Profile
+            | SettingsTab::Privacy
+            | SettingsTab::Notifications
+            | SettingsTab::Devices
+            | SettingsTab::Appearance
+    )
+    .then(|| account_settings::Snapshot::build(app));
 
     // Cuentas guardadas (solo se copian viendo la pestaña Cuenta).
     let saved_accounts = (tab == SettingsTab::Account).then(|| app.accounts.accounts().to_vec());
@@ -163,7 +182,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 .fill(palette.overlay)
                 .stroke(Stroke::new(1.0, palette.outline))
                 .corner_radius(CornerRadius::same(theme::radius() + 6))
-                .inner_margin(Margin::same(22))
+                .inner_margin(Margin::same(0))
                 .shadow(egui::epaint::Shadow {
                     offset: [0, 16],
                     blur: 40,
@@ -171,11 +190,44 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     color: palette.shadow,
                 })
                 .show(&mut card_ui, |ui| {
-                    ui.set_width(size.x - 44.0);
-                    ui.set_height(size.y - 44.0);
+                    ui.set_width(size.x);
+                    ui.set_height(size.y);
+                    let full = egui::Rect::from_min_size(ui.max_rect().min, size);
+                    let radius = theme::radius() + 6;
+                    let nav_rect = egui::Rect::from_min_size(full.min, Vec2::new(NAV_W, size.y));
+                    let body_rect = egui::Rect::from_min_max(egui::pos2(nav_rect.right(), full.min.y), full.max);
+                    ui.painter().rect_filled(
+                        nav_rect,
+                        CornerRadius {
+                            nw: radius,
+                            sw: radius,
+                            ne: 0,
+                            se: 0,
+                        },
+                        palette.panel,
+                    );
 
+                    // Barra lateral: buscador, grupos de ajustes, cerrar sesión y versión.
+                    let mut nav_ui = ui.new_child(
+                        UiBuilder::new()
+                            .id_salt("settings_nav")
+                            .max_rect(nav_rect.shrink2(Vec2::new(12.0, 16.0)))
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    if let Some(taken) = nav_view(&mut nav_ui, &palette, tab) {
+                        action = Some(taken);
+                    }
+
+                    // Contenido de la pestaña elegida.
+                    let mut body_ui = ui.new_child(
+                        UiBuilder::new()
+                            .id_salt("settings_body")
+                            .max_rect(body_rect.shrink2(Vec2::new(28.0, 22.0)))
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    let ui = &mut body_ui;
                     ui.horizontal(|ui| {
-                        theme::text(ui, "Ajustes", theme::bold(19.0), palette.text);
+                        theme::text(ui, tab_title(tab), theme::bold(19.0), palette.text);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if theme::icon_button(ui, Icon::X, 15.0, palette.dim, palette.text, "Cerrar").clicked() {
                                 action = Some(Action::Close);
@@ -183,37 +235,6 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                         });
                     });
                     ui.add_space(12.0);
-
-                    // Mientras el editor de temas está abierto ocupa toda
-                    // la tarjeta (tiene su propio "← Volver"); las
-                    // pestañas solo tienen sentido para elegir QUÉ ver
-                    // cuando no hay ningún sub-panel tapando todo.
-                    if editor.is_none() {
-                        ui.horizontal(|ui| {
-                            if theme::soft_button(ui, &palette, None, "Cuenta", tab == SettingsTab::Account).clicked() {
-                                action = Some(Action::SetTab(SettingsTab::Account));
-                            }
-                            if theme::soft_button(ui, &palette, None, "Apariencia", tab == SettingsTab::Appearance)
-                                .clicked()
-                            {
-                                action = Some(Action::SetTab(SettingsTab::Appearance));
-                            }
-                            if theme::soft_button(ui, &palette, None, "Voz y audio", tab == SettingsTab::Voice)
-                                .clicked()
-                            {
-                                action = Some(Action::SetTab(SettingsTab::Voice));
-                            }
-                            if theme::soft_button(ui, &palette, None, "Memoria", tab == SettingsTab::Memory).clicked() {
-                                action = Some(Action::SetTab(SettingsTab::Memory));
-                            }
-                            if theme::soft_button(ui, &palette, None, "Permisos", tab == SettingsTab::Permissions)
-                                .clicked()
-                            {
-                                action = Some(Action::SetTab(SettingsTab::Permissions));
-                            }
-                        });
-                        ui.add_space(14.0);
-                    }
 
                     ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                         if let Some(ed) = editor.as_mut() {
@@ -240,8 +261,21 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                                     if let Some(taken) = new_call_ui_section(ui, &palette, new_call_ui) {
                                         action = Some(taken);
                                     }
+                                    // Interruptores de mensajes y contenido (se guardan en la cuenta).
+                                    if let Some(snap) = account_snapshot.as_ref() {
+                                        if let Some(taken) = account_settings::message_toggles(ui, &palette, snap) {
+                                            action = Some(Action::Page(taken));
+                                        }
+                                    }
                                 }
                                 SettingsTab::Account => {
+                                    // Tus datos (editables), contraseña y verificación.
+                                    if let Some(snap) = account_snapshot.as_ref() {
+                                        if let Some(taken) = account_settings::account_view(ui, &palette, snap) {
+                                            action = Some(Action::Page(taken));
+                                        }
+                                    }
+                                    ui.add_space(18.0);
                                     // Cuentas: cambiar, agregar, cerrar sesión.
                                     if let Some(taken) = crate::ui::auth::accounts::settings_section(
                                         ui,
@@ -251,14 +285,6 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                                     ) {
                                         action = Some(Action::Account(taken));
                                     }
-                                    ui.add_space(18.0);
-                                    // Ajustes de la cuenta: solo lectura.
-                                    account_settings::view(
-                                        ui,
-                                        &palette,
-                                        account_sections.as_deref().unwrap_or(&[]),
-                                        account_loaded,
-                                    );
                                     ui.add_space(18.0);
                                     theme::section_title(ui, &palette, "Acerca de");
                                     theme::text(
@@ -276,6 +302,34 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                                     ui.add_space(14.0);
                                     if let Some(taken) = updates::section(ui, &palette) {
                                         action = Some(Action::Update(taken));
+                                    }
+                                }
+                                SettingsTab::Profile => {
+                                    if let Some(snap) = account_snapshot.as_ref() {
+                                        if let Some(taken) = account_settings::profile_view(ui, &palette, snap) {
+                                            action = Some(Action::Page(taken));
+                                        }
+                                    }
+                                }
+                                SettingsTab::Privacy => {
+                                    if let Some(snap) = account_snapshot.as_ref() {
+                                        if let Some(taken) = account_settings::privacy_view(ui, &palette, snap) {
+                                            action = Some(Action::Page(taken));
+                                        }
+                                    }
+                                }
+                                SettingsTab::Notifications => {
+                                    if let Some(snap) = account_snapshot.as_ref() {
+                                        if let Some(taken) = account_settings::notifications_view(ui, &palette, snap) {
+                                            action = Some(Action::Page(taken));
+                                        }
+                                    }
+                                }
+                                SettingsTab::Devices => {
+                                    if let Some(snap) = account_snapshot.as_ref() {
+                                        if let Some(taken) = account_settings::devices_view(ui, &palette, snap) {
+                                            action = Some(Action::Page(taken));
+                                        }
                                     }
                                 }
                                 SettingsTab::Voice => {
@@ -342,7 +396,15 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             Action::SaveEditor => app.save_theme_editor(),
             Action::CancelEditor => app.cancel_theme_editor(),
             Action::SetTab(tab) => {
+                // Cambiar de página con el editor de temas abierto lo descarta.
+                if app.theme_editor.is_some() {
+                    app.cancel_theme_editor();
+                }
                 app.settings_tab = tab;
+                if tab == SettingsTab::Devices {
+                    // Los dispositivos se piden al entrar (y con "Actualizar").
+                    app.refresh_sessions();
+                }
                 if tab == SettingsTab::Voice {
                     // Recién ahora, al entrar a la pestaña, vale la pena
                     // pagar el costo de enumerar dispositivos — ver el
@@ -369,8 +431,148 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     AccountAction::Remove(user_id) => app.ask_remove_account(&user_id),
                 }
             }
+            Action::Page(page) => {
+                use account_settings::PageAction;
+                match page {
+                    PageAction::Edits(edits) => app.submit_account_edits(edits),
+                    PageAction::PickImage(which) => app.pick_profile_image(which),
+                    PageAction::Toggle(toggle, value) => app.set_account_toggle(toggle, value),
+                    PageAction::FriendSource(flags) => app.set_friend_source(flags),
+                    PageAction::GoTab(tab) => {
+                        if app.theme_editor.is_some() {
+                            app.cancel_theme_editor();
+                        }
+                        app.settings_tab = tab;
+                        if tab == SettingsTab::Devices {
+                            app.refresh_sessions();
+                        }
+                    }
+                    PageAction::RefreshSessions => app.refresh_sessions(),
+                    PageAction::LogoutSession(id_hash) => app.logout_session(id_hash),
+                }
+            }
         }
     }
+}
+
+fn tab_title(tab: SettingsTab) -> &'static str {
+    match tab {
+        SettingsTab::Account => "Mi cuenta",
+        SettingsTab::Profile => "Perfiles",
+        SettingsTab::Privacy => "Privacidad y seguridad",
+        SettingsTab::Devices => "Dispositivos",
+        SettingsTab::Notifications => "Notificaciones",
+        SettingsTab::Appearance => "Apariencia",
+        SettingsTab::Voice => "Voz y video",
+        SettingsTab::Memory => "Memoria",
+        SettingsTab::Permissions => "Permisos",
+    }
+}
+
+/// Grupos de la barra lateral: (título, [(pestaña, ícono)]).
+const NAV_GROUPS: &[(&str, &[(SettingsTab, Icon)])] = &[
+    (
+        "Ajustes de usuario",
+        &[
+            (SettingsTab::Account, Icon::User),
+            (SettingsTab::Profile, Icon::Pencil),
+            (SettingsTab::Privacy, Icon::Lock),
+            (SettingsTab::Devices, Icon::Globe),
+        ],
+    ),
+    (
+        "Ajustes de la app",
+        &[
+            (SettingsTab::Appearance, Icon::Sun),
+            (SettingsTab::Voice, Icon::Mic),
+            (SettingsTab::Notifications, Icon::Bell),
+        ],
+    ),
+    (
+        "Herramientas",
+        &[(SettingsTab::Memory, Icon::Laptop), (SettingsTab::Permissions, Icon::BadgeCheck)],
+    ),
+];
+
+/// Barra lateral de ajustes: buscador, páginas agrupadas, "Cerrar sesión" y
+/// versión. Devuelve la acción pedida (cambiar de página o cerrar sesión).
+fn nav_view(ui: &mut egui::Ui, palette: &Palette, current: SettingsTab) -> Option<Action> {
+    let mut action = None;
+    let width = ui.available_width();
+
+    // El texto del buscador vive en la memoria de egui (no en `App`).
+    let query_id = egui::Id::new("settings_nav_query");
+    let mut query: String = ui.ctx().data(|d| d.get_temp(query_id)).unwrap_or_default();
+    ui.add(
+        egui::TextEdit::singleline(&mut query)
+            .hint_text("Buscar ajustes")
+            .desired_width(width),
+    );
+    ui.ctx().data_mut(|d| d.insert_temp(query_id, query.clone()));
+    let needle = query.trim().to_lowercase();
+    ui.add_space(6.0);
+
+    for (title, tabs) in NAV_GROUPS {
+        let visible: Vec<&(SettingsTab, Icon)> = tabs
+            .iter()
+            .filter(|(tab, _)| needle.is_empty() || tab_title(*tab).to_lowercase().contains(&needle))
+            .collect();
+        if visible.is_empty() {
+            continue;
+        }
+        ui.add_space(10.0);
+        theme::text(ui, *title, theme::semibold(11.5), palette.dim);
+        ui.add_space(4.0);
+        for (tab, icon) in visible {
+            if nav_item(ui, palette, *icon, tab_title(*tab), *tab == current, false) {
+                action = Some(Action::SetTab(*tab));
+            }
+        }
+    }
+
+    ui.add_space(14.0);
+    if nav_item(ui, palette, Icon::LogOut, "Cerrar sesión", false, true) {
+        action = Some(Action::Account(crate::ui::auth::accounts::AccountAction::LogOut));
+    }
+    ui.add_space(10.0);
+    theme::text(
+        ui,
+        format!("eCord v{}", env!("CARGO_PKG_VERSION")),
+        theme::regular(12.0),
+        palette.dim,
+    );
+    action
+}
+
+/// Una fila de la barra lateral. Devuelve `true` si se la tocó.
+fn nav_item(ui: &mut egui::Ui, palette: &Palette, icon: Icon, label: &str, selected: bool, danger: bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let fill = if selected {
+        palette.surface_active
+    } else if resp.hovered() {
+        palette.surface_hover
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, CornerRadius::same(theme::radius_small()), fill);
+    let color = if danger {
+        palette.danger
+    } else if selected {
+        palette.text
+    } else {
+        palette.secondary
+    };
+    let icon_rect = egui::Rect::from_center_size(rect.left_center() + Vec2::new(18.0, 0.0), Vec2::splat(16.0));
+    theme::paint_icon(ui, icon, icon_rect, 16.0, color);
+    ui.painter().text(
+        rect.left_center() + Vec2::new(36.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        theme::medium(13.5),
+        color,
+    );
+    resp.clicked()
 }
 
 /// De qué lado de la ventana aparecen las notificaciones (menciones, DMs y

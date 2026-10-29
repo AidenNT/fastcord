@@ -9,4 +9,5 @@ description = "Undetected discord client backend reimplementation"
 discord_client_structs = { path = "../discord_client_structs" }
 wreq = { version = "0.16", features = ["gzip", "deflate", "zstd", "brotli", "json", "cookies"] }
 wreq-util = "0.2"
+serde_json = "1.0.140"
 tokio = { version = "1.45.0", features = ["rt", "macros", "rt-multi-thread"] }

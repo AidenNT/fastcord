@@ -11,7 +11,7 @@ use egui::{
     Align, CornerRadius, Frame, Layout, Margin, Rect, Sense, StrokeKind, UiBuilder, Vec2, ViewportCommand,
 };
 
-use crate::lib::state::{App, Screen, ToastKind};
+use crate::lib::state::{App, Screen, SideTool, ToastKind};
 use crate::ui::chat::emoji as twemoji;
 use crate::ui::shell::extra;
 use crate::ui::theme::{self, Icon, Palette};
@@ -123,10 +123,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                         .on_hover_text(&me_name)
                         .clicked()
                     {
-                        app.open_modal(
-                            &me_name,
-                            "Los ajustes de la cuenta todavía no están disponibles en esta demo.",
-                        );
+                        // Menú del perfil propio (ver `ui::shell::menus`).
+                        crate::ui::shell::menus::toggle_me_menu(ui.ctx(), rect);
                     }
 
                     // Notificaciones: campana con el contador de pendientes; el
@@ -547,17 +545,38 @@ pub fn show_row(app: &mut App, ui: &mut egui::Ui) {
                             action = Some(ChatTool::Members);
                         }
                         if matches!(app.screen, Screen::Server(_))
-                            && theme::icon_button(ui, Icon::ListPlus, 15.0, palette.dim, palette.text, "Hilos")
+                            && theme::icon_button(
+                                ui,
+                                Icon::ListPlus,
+                                15.0,
+                                tool_color(app, SideTool::Threads, &palette),
+                                palette.text,
+                                "Hilos",
+                            )
                                 .clicked()
                         {
                             action = Some(ChatTool::Threads);
                         }
-                        if theme::icon_button(ui, Icon::Pin, 15.0, palette.dim, palette.text, "Mensajes fijados")
+                        if theme::icon_button(
+                                ui,
+                                Icon::Pin,
+                                15.0,
+                                tool_color(app, SideTool::Pins, &palette),
+                                palette.text,
+                                "Mensajes fijados",
+                            )
                             .clicked()
                         {
                             action = Some(ChatTool::Pins);
                         }
-                        if theme::icon_button(ui, Icon::Search, 15.0, palette.dim, palette.text, "Buscar")
+                        if theme::icon_button(
+                                ui,
+                                Icon::Search,
+                                15.0,
+                                tool_color(app, SideTool::Search, &palette),
+                                palette.text,
+                                "Buscar",
+                            )
                             .clicked()
                         {
                             action = Some(ChatTool::Search);
@@ -566,21 +585,9 @@ pub fn show_row(app: &mut App, ui: &mut egui::Ui) {
                 );
                 match action {
                     Some(ChatTool::Members) => app.members_panel_open = !app.members_panel_open,
-                    Some(ChatTool::Threads) => app.push_toast(
-                        ToastKind::Info,
-                        "Hilos",
-                        "La lista de hilos todavía no está disponible en esta versión.",
-                    ),
-                    Some(ChatTool::Pins) => app.push_toast(
-                        ToastKind::Info,
-                        "Mensajes fijados",
-                        "Todavía no está disponible en esta versión.",
-                    ),
-                    Some(ChatTool::Search) => app.push_toast(
-                        ToastKind::Info,
-                        "Buscar",
-                        "Todavía no está disponible en esta versión.",
-                    ),
+                    Some(ChatTool::Threads) => app.toggle_side_tool(SideTool::Threads),
+                    Some(ChatTool::Pins) => app.toggle_side_tool(SideTool::Pins),
+                    Some(ChatTool::Search) => app.toggle_side_tool(SideTool::Search),
                     None => {}
                 }
             }
@@ -705,4 +712,14 @@ fn status_pill_impl(ui: &mut egui::Ui, palette: &Palette, icon: Icon, label: &st
         palette.secondary,
     );
     response
+}
+
+/// Color del botón de una herramienta de la píldora: más claro mientras su
+/// panel está abierto.
+fn tool_color(app: &App, tool: SideTool, palette: &crate::ui::theme::Palette) -> egui::Color32 {
+    if app.side_tool.as_ref().is_some_and(|p| p.tool == tool) {
+        palette.text
+    } else {
+        palette.dim
+    }
 }

@@ -2297,6 +2297,7 @@ name = "discord_client_utils"
 version = "0.1.0"
 dependencies = [
  "discord_client_structs",
+ "serde_json",
  "tokio",
  "wreq",
  "wreq-util",
@@ -2445,7 +2446,7 @@ dependencies = [
 
 [[package]]
 name = "ecord"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "aes-gcm 0.11.1",
  "alsa",

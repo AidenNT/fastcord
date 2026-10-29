@@ -1367,7 +1367,7 @@ fn reply_preview(original: &crate::discord::models::GatewayMessage) -> String {
     }
 }
 
-fn format_timestamp(ts: &str) -> String {
+pub fn format_timestamp(ts: &str) -> String {
     // Discord manda la hora en UTC: se muestra en la hora local de la PC.
     // Si el mensaje es de hoy sale solo la hora ("14:05"); si es de otro día
     // sale con la fecha ("08/10/2026 14:05").
@@ -2760,7 +2760,7 @@ impl Server {
     pub fn from_guild(guild: &crate::discord::models::Guild) -> Self {
         let name = guild.display_name();
         let mut server = Self {
-            name: name.to_string(),
+            name: name.clone(),
             icon_initial: name
                 .chars()
                 .find(|c| c.is_alphanumeric())

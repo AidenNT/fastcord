@@ -23,7 +23,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     // Rail de servidores + panel de amigos/DMs + barra de usuario
     // combinada; ver `ui::shell::nav`.
     nav::show(app, ui);
-    if app.members_panel_open {
+    if app.side_tool.is_some() {
+        crate::ui::shell::side_tools::show(app, ui);
+    } else if app.members_panel_open {
         profile_panel(app, ui, index);
     }
     central_panel(app, ui, index);
@@ -318,7 +320,7 @@ fn central_panel(app: &mut App, ui: &mut egui::Ui, index: usize) {
             6,
             5,
             // Sin panel a la derecha, el borde de la ventana queda a 10.
-            if app.members_panel_open { 5 } else { 10 },
+            if app.members_panel_open || app.side_tool.is_some() { 5 } else { 10 },
         ))
         .show(ui, |ui| {
             let already_connected = app

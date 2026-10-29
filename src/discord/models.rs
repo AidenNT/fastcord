@@ -78,6 +78,18 @@ pub struct User {
     /// distintivo APP).
     #[serde(default)]
     pub public_flags: u64,
+    /// Correo de la cuenta. Solo viene en el objeto del PROPIO usuario (el
+    /// `user` del `READY` y la respuesta de `PATCH /users/@me`).
+    #[serde(default)]
+    pub email: Option<String>,
+    /// Teléfono de la cuenta (solo el propio usuario). Agregarlo o cambiarlo
+    /// necesita un código por SMS, así que eCord solo lo muestra.
+    #[serde(default)]
+    pub phone: Option<String>,
+    /// `true` si la cuenta tiene verificación en dos pasos (solo el propio
+    /// usuario; `None` = Discord no lo informó).
+    #[serde(default)]
+    pub mfa_enabled: Option<bool>,
 }
 
 /// Etiqueta de servidor de un usuario, lista para dibujar.
@@ -259,17 +271,38 @@ pub struct Guild {
 }
 
 impl Guild {
+    /// Texto no vacío de un campo del guild: primero el del nivel superior
+    /// (formato viejo) y, si no está, el de `properties` (formato nuevo del
+    /// `READY` con las capabilities de cuenta de usuario, donde `name`,
+    /// `icon`, `banner`, `owner_id`... ya NO viajan en la raíz del guild).
+    fn text_field(&self, top: &Option<String>, key: &str) -> Option<String> {
+        top.clone()
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                self.properties
+                    .as_ref()
+                    .and_then(|p| p.get(key))
+                    .and_then(|v| v.as_str())
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_owned)
+            })
+    }
+
+    /// Nombre real del server (raíz o `properties.name`).
+    pub fn resolved_name(&self) -> Option<String> {
+        self.text_field(&self.name, "name")
+    }
+
+    /// Hash del ícono (raíz o `properties.icon`).
+    pub fn resolved_icon(&self) -> Option<String> {
+        self.text_field(&self.icon, "icon")
+    }
+
     /// Dueño del server, de `owner_id` o (formato nuevo) de
     /// `properties.owner_id`. Sin esto el dueño se filtra como un miembro
     /// cualquiera y se le esconden canales que sí ve.
     pub fn owner(&self) -> Option<String> {
-        self.owner_id.clone().or_else(|| {
-            self.properties
-                .as_ref()
-                .and_then(|p| p.get("owner_id"))
-                .and_then(|v| v.as_str())
-                .map(str::to_owned)
-        })
+        self.text_field(&self.owner_id, "owner_id")
     }
 }
 
@@ -475,15 +508,13 @@ impl PrivateChannel {
 impl Guild {
     /// Nombre a mostrar en el rail. Un server "unavailable" no trae nombre,
     /// así que ponemos un placeholder en vez de una entrada vacía.
-    pub fn display_name(&self) -> &str {
-        self.name
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("Servidor no disponible")
+    pub fn display_name(&self) -> String {
+        self.resolved_name()
+            .unwrap_or_else(|| "Servidor no disponible".to_owned())
     }
 
     pub fn icon_url(&self) -> Option<String> {
-        let hash = self.icon.as_ref()?;
+        let hash = self.resolved_icon()?;
         let ext = if hash.starts_with("a_") { "gif" } else { "png" };
         Some(format!(
             "https://cdn.discordapp.com/icons/{}/{}.{}?size=128",
@@ -494,17 +525,7 @@ impl Guild {
     /// URL del banner del server en el CDN (siempre `.png`: para los animados
     /// es el primer cuadro, que no cuesta memoria), o `None` si no tiene.
     pub fn banner_url(&self) -> Option<String> {
-        let hash = self
-            .banner
-            .clone()
-            .or_else(|| {
-                self.properties
-                    .as_ref()
-                    .and_then(|p| p.get("banner"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned)
-            })
-            .filter(|h| !h.is_empty())?;
+        let hash = self.text_field(&self.banner, "banner")?;
         Some(format!(
             "https://cdn.discordapp.com/banners/{}/{}.png?size=480",
             self.id, hash
@@ -696,9 +717,80 @@ pub struct UserProfileResponse {
     /// (lo completa `discord::spawn_fetch_user_profile`).
     #[serde(skip)]
     pub frame: Option<ProfileFrame>,
+    /// Widgets del tablero del perfil (juegos favoritos, "jugando ahora",
+    /// "juegos que jugué"…). Crudos (`Value`): el formato lo define Discord y
+    /// cambia seguido, así que no se tipa para no romper el perfil entero.
+    /// Ver [`UserProfileResponse::widget_games`].
+    #[serde(default)]
+    pub widgets: Vec<serde_json::Value>,
+    /// Juegos de `widgets` con nombre e ícono ya resueltos (lo completa
+    /// `discord::spawn_fetch_user_profile`: el perfil solo trae `game_id`).
+    #[serde(skip)]
+    pub games: Vec<ProfileGame>,
+}
+
+/// Un juego de la colección del perfil.
+#[derive(Debug, Clone)]
+pub struct ProfileGame {
+    pub application_id: String,
+    pub name: Option<String>,
+    pub icon_url: Option<String>,
 }
 
 impl UserProfileResponse {
+    /// Juegos mencionados en los widgets del perfil (sin repetir), en el orden
+    /// en que aparecen. Formato real: `widgets[].data.games[].game_id` (sin
+    /// nombre ni ícono). Recorre el JSON de forma tolerante: toma todo objeto
+    /// con `game_id` o `application_id` y, si trae `name`/`icon`, también.
+    pub fn widget_games(&self) -> Vec<ProfileGame> {
+        fn walk(v: &serde_json::Value, out: &mut Vec<ProfileGame>) {
+            match v {
+                serde_json::Value::Object(map) => {
+                    if let Some(id) = map
+                        .get("game_id")
+                        .or_else(|| map.get("application_id"))
+                        .and_then(|x| x.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        if !out.iter().any(|g| g.application_id == id) {
+                            let name = map.get("name").and_then(|x| x.as_str()).map(str::to_owned);
+                            let icon = ["icon", "icon_hash", "application_icon"]
+                                .iter()
+                                .find_map(|k| map.get(*k).and_then(|x| x.as_str()))
+                                .filter(|s| !s.is_empty());
+                            let icon_url = icon.map(|i| {
+                                if i.starts_with("http") {
+                                    i.to_owned()
+                                } else {
+                                    format!("https://cdn.discordapp.com/app-icons/{id}/{i}.png?size=128")
+                                }
+                            });
+                            out.push(ProfileGame {
+                                application_id: id.to_owned(),
+                                name,
+                                icon_url,
+                            });
+                        }
+                    }
+                    for child in map.values() {
+                        walk(child, out);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for child in items {
+                        walk(child, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for widget in &self.widgets {
+            walk(widget, &mut out);
+        }
+        out
+    }
+
     /// Id del efecto de perfil equipado (el del server tiene prioridad).
     pub fn profile_effect_id(&self) -> Option<String> {
         let from = |meta: &Option<UserProfileMeta>| -> Option<String> {
@@ -2499,5 +2591,51 @@ mod read_state_tests {
         let raw = serde_json::json!([{ "id": "5", "last_message_id": "7", "mention_count": 1 }]);
         assert_eq!(parse_read_state(&raw).len(), 1);
         assert!(parse_read_state(&serde_json::Value::Null).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod guild_properties_tests {
+    use super::Guild;
+    use serde_json::json;
+
+    /// Formato del `READY` con `capabilities = 1767421`: nombre, ícono,
+    /// banner y dueño viajan dentro de `properties`, no en la raíz.
+    #[test]
+    fn reads_name_icon_banner_owner_from_properties() {
+        let guild: Guild = serde_json::from_value(json!({
+            "id": "1331753694575722639",
+            "properties": {
+                "name": "Pressure LATAM",
+                "icon": "c744534ecf9eda78a4879e9c44ced832",
+                "banner": null,
+                "owner_id": "1173426442198056982"
+            },
+            "roles": [],
+            "channels": []
+        }))
+        .unwrap();
+        assert_eq!(guild.display_name(), "Pressure LATAM");
+        assert_eq!(
+            guild.icon_url().as_deref(),
+            Some("https://cdn.discordapp.com/icons/1331753694575722639/c744534ecf9eda78a4879e9c44ced832.png?size=128")
+        );
+        assert!(guild.banner_url().is_none());
+        assert_eq!(guild.owner().as_deref(), Some("1173426442198056982"));
+    }
+
+    #[test]
+    fn root_fields_still_win_and_unavailable_falls_back() {
+        let old: Guild = serde_json::from_value(json!({
+            "id": "1", "name": "Viejo", "icon": "a_abc"
+        }))
+        .unwrap();
+        assert_eq!(old.display_name(), "Viejo");
+        assert!(old.icon_url().unwrap().ends_with(".gif?size=128"));
+
+        let unavailable: Guild =
+            serde_json::from_value(json!({ "id": "2", "unavailable": true })).unwrap();
+        assert_eq!(unavailable.display_name(), "Servidor no disponible");
+        assert!(unavailable.icon_url().is_none());
     }
 }

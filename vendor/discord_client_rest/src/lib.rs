@@ -5,6 +5,7 @@ pub mod captcha;
 pub mod clearance;
 pub use discord_client_utils::header_case;
 pub mod image;
+pub mod lenient;
 pub mod mfa;
 pub mod netlog;
 mod nettrace;

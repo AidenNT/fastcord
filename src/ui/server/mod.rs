@@ -35,6 +35,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let in_voice_channel = app.servers[index].channel(cat, chan).is_some_and(|c| c.is_voice);
     if app.thread_panel.is_some() {
         thread_side_panel(app, ui, index);
+    } else if app.side_tool.is_some() {
+        crate::ui::shell::side_tools::show(app, ui);
     } else if !in_voice_channel && app.members_panel_open {
         member_list_panel(app, ui, index);
     }
@@ -323,7 +325,7 @@ pub fn channel_list_content_ex(app: &mut App, ui: &mut egui::Ui, server_index: u
                     // indicador: el clic funciona igual que siempre.
                     let locked = channel.access.show_lock();
                     if channel.is_voice {
-                        if voice_channel_row(ui, &palette, &channel.name, selected, locked) {
+                        if voice_channel_row(ui, &palette, &channel.name, selected, locked, &guild_id, channel.channel_id.as_deref()) {
                             clicked_channel = Some((cat_idx, chan_idx));
                             clicked_voice_channel_id = channel.channel_id.clone();
                         }
@@ -333,7 +335,7 @@ pub fn channel_list_content_ex(app: &mut App, ui: &mut egui::Ui, server_index: u
                             let is_me = app.me.as_ref().is_some_and(|me| me.id == occupant.user_id);
                             voice_member_row(ui, &palette, occupant, speaking, local, is_me);
                         }
-                    } else if channel_row(ui, &palette, &channel.name, selected, locked) {
+                    } else if channel_row(ui, &palette, &channel.name, selected, locked, &guild_id, channel.channel_id.as_deref()) {
                         clicked_channel = Some((cat_idx, chan_idx));
                     }
                 }
@@ -433,7 +435,15 @@ fn cover_uv(tex: Vec2, target: Vec2) -> egui::Rect {
 
 /// Fila de un canal de voz: mismo look que `channel_row` pero con un
 /// parlante en vez del `#` de texto (como en el cliente real).
-fn voice_channel_row(ui: &mut egui::Ui, palette: &Palette, name: &str, selected: bool, locked: bool) -> bool {
+fn voice_channel_row(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    name: &str,
+    selected: bool,
+    locked: bool,
+    guild_id: &str,
+    channel_id: Option<&str>,
+) -> bool {
     let desired = Vec2::new(ui.available_width() - 16.0, 30.0);
     let mut clicked = false;
     ui.horizontal(|ui| {
@@ -456,6 +466,8 @@ fn voice_channel_row(ui: &mut egui::Ui, palette: &Palette, name: &str, selected:
             twemoji::Set::Fluent,
         );
         paint_lock(ui, palette, rect, locked);
+        // Clic derecho: menú del canal (ver `ui::shell::menus`).
+        crate::ui::shell::menus::channel_menu(&resp, guild_id, channel_id);
         clicked = resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
     });
     clicked
@@ -544,7 +556,15 @@ fn paint_lock(ui: &egui::Ui, palette: &Palette, row: egui::Rect, locked: bool) {
     theme::paint_icon(ui, Icon::Lock, rect, 12.0, palette.dim);
 }
 
-fn channel_row(ui: &mut egui::Ui, palette: &Palette, name: &str, selected: bool, locked: bool) -> bool {
+fn channel_row(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    name: &str,
+    selected: bool,
+    locked: bool,
+    guild_id: &str,
+    channel_id: Option<&str>,
+) -> bool {
     let desired = Vec2::new(ui.available_width() - 16.0, 30.0);
     let mut clicked = false;
     ui.horizontal(|ui| {
@@ -573,6 +593,8 @@ fn channel_row(ui: &mut egui::Ui, palette: &Palette, name: &str, selected: bool,
             twemoji::Set::Fluent,
         );
         paint_lock(ui, palette, rect, locked);
+        // Clic derecho: menú del canal (ver `ui::shell::menus`).
+        crate::ui::shell::menus::channel_menu(&resp, guild_id, channel_id);
         clicked = resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
     });
     clicked
@@ -707,7 +729,11 @@ fn central_panel(app: &mut App, ui: &mut egui::Ui, server_index: usize) {
     let in_voice = app.servers[server_index]
         .channel(cat0, chan0)
         .is_some_and(|c| c.is_voice);
-    let right_gap = if app.thread_panel.is_some() || (!in_voice && app.members_panel_open) { 5 } else { 10 };
+    let right_gap = if app.thread_panel.is_some() || app.side_tool.is_some() || (!in_voice && app.members_panel_open) {
+        5
+    } else {
+        10
+    };
     egui::CentralPanel::default()
         .frame(theme::card_frame(
             &palette,

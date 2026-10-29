@@ -22,6 +22,7 @@ use crate::api::quests::QuestsRest;
 use crate::api::relationship::RelationshipRest;
 use crate::api::safety_hub::SafetyHubRest;
 use crate::api::scheduled_event::ScheduledEventRest;
+use crate::api::science::ScienceRest;
 use crate::api::self_user::SelfUserRest;
 use crate::api::soundboard::SoundboardRest;
 use crate::api::stage::StageRest;
@@ -57,6 +58,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Mutex;
+use wreq::cookie::Jar;
 use wreq::header::HeaderMap;
 use wreq::{Client, Method, Response};
 
@@ -176,6 +178,7 @@ pub struct RestClient {
     authentication: Authentication,
     pub user_id: u64,
     client: Client,
+    cookie_jar: Option<Arc<Jar>>,
     pub api_version: u8,
     pub application_command_index: Option<ApplicationCommandIndex>,
     locale: String,
@@ -184,9 +187,14 @@ pub struct RestClient {
     global_rate_limiter: RateLimiter,
     route_rate_limiters: Arc<Mutex<HashMap<String, RateLimiter>>>,
     client_session: ClientSession,
+    analytics_token: Mutex<Option<String>>,
 }
 
 impl RestClient {
+    pub fn locale(&self) -> &str {
+        &self.locale
+    }
+
     pub async fn connect(
         token: String,
         custom_api_version: Option<u8>,
@@ -241,13 +249,18 @@ impl RestClient {
             (Authentication::Bot, None) => BuildNumbers::new(0, None),
         };
 
-        let (client, api_version) = match authentication {
+        let (client, cookie_jar, api_version) = match authentication {
             Authentication::User => {
                 let bootstrap = bootstrap_client(custom_api_version, proxy.as_deref()).await?;
-                (bootstrap.client, bootstrap.api_version)
+                (
+                    bootstrap.client,
+                    Some(bootstrap.cookie_jar),
+                    bootstrap.api_version,
+                )
             }
             Authentication::Bot => (
                 build_bot_client(proxy.as_deref())?,
+                None,
                 custom_api_version.unwrap_or(DEFAULT_API_VERSION),
             ),
         };
@@ -364,6 +377,7 @@ impl RestClient {
             authentication,
             user_id,
             client,
+            cookie_jar,
             api_version,
             application_command_index,
             locale,
@@ -372,6 +386,7 @@ impl RestClient {
             global_rate_limiter: RateLimiter::new(),
             route_rate_limiters: Arc::new(Mutex::new(HashMap::new())),
             client_session,
+            analytics_token: Mutex::new(None),
         })
     }
 
@@ -411,6 +426,14 @@ impl RestClient {
 
     pub fn user(&self) -> UserRest<'_> {
         UserRest { client: self }
+    }
+
+    pub fn science(&self) -> ScienceRest<'_> {
+        ScienceRest { client: self }
+    }
+
+    pub(crate) fn analytics_token(&self) -> &Mutex<Option<String>> {
+        &self.analytics_token
     }
 
     pub fn relationship(&self) -> RelationshipRest<'_> {
@@ -889,6 +912,10 @@ impl RestClient {
 
     pub fn get_http_client(&self) -> &Client {
         &self.client
+    }
+
+    pub fn cookie_jar(&self) -> Option<&Arc<Jar>> {
+        self.cookie_jar.as_ref()
     }
 }
 

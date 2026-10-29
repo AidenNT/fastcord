@@ -132,6 +132,9 @@ impl App {
         self.window_focused = ctx.input(|i| {
             i.viewport().focused.unwrap_or(true) && !i.viewport().minimized.unwrap_or(false)
         });
+        // Sin foco durante un rato => ausente (opcode 3, idle + afk); al
+        // volver, en línea otra vez.
+        self.tick_presence(ctx);
         // Eventos del Gateway: acá y no en `ui`, que eframe salta si la
         // ventana está minimizada u oculta (sin esto, sin notificaciones).
         if self.poll_discord_events(ctx, WINDOW_EVENT_BUDGET) {
